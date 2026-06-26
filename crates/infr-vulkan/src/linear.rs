@@ -1,9 +1,10 @@
 //! Persistent-weight linear layer: `y = W · x` where `W` is stored `[out, in]` row-major
-//! (exactly the GGUF layout: data index `o*in + i`). The weight buffer is uploaded once
-//! (`upload_weight`) and reused across calls; only the (small) activation is moved per call.
+//! (the GGUF layout: data index `o*in + i`). The weight buffer is uploaded once
+//! (`upload_weight`) and reused; the compute pipeline is built once (cached in
+//! `VulkanShared.linear_kernel`) and reused across all calls — only the (small) activation
+//! buffers are created per call.
 //!
-//! This is the eager op the Llama forward leans on for all projections (q/k/v/o, gate/up/down,
-//! and the lm-head). WGSL → SPIR-V via naga, same pattern as `matmul.rs`.
+//! WGSL → SPIR-V via naga, same pattern as `matmul.rs`.
 
 use std::ffi::CStr;
 use std::sync::OnceLock;
@@ -67,7 +68,111 @@ fn linear_spv() -> &'static [u32] {
     })
 }
 
+/// Cached, reusable compute objects for the linear kernel (built once per device).
+pub(crate) struct LinearKernel {
+    pub shader: vk::ShaderModule,
+    pub ds_layout: vk::DescriptorSetLayout,
+    pub pipeline_layout: vk::PipelineLayout,
+    pub pipeline: vk::Pipeline,
+    pub desc_pool: vk::DescriptorPool,
+}
+
+pub(crate) fn create_linear_kernel(device: &ash::Device) -> LinearKernel {
+    let spv = linear_spv();
+    let shader = unsafe {
+        device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(spv), None)
+    }
+    .expect("create linear shader module");
+
+    let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..3)
+        .map(|i| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(i)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+        })
+        .collect();
+    let ds_layout = unsafe {
+        device.create_descriptor_set_layout(
+            &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+            None,
+        )
+    }
+    .expect("create linear ds layout");
+
+    let push_range = vk::PushConstantRange::default()
+        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+        .offset(0)
+        .size(12);
+    let pipeline_layout = unsafe {
+        device.create_pipeline_layout(
+            &vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(std::slice::from_ref(&ds_layout))
+                .push_constant_ranges(std::slice::from_ref(&push_range)),
+            None,
+        )
+    }
+    .expect("create linear pipeline layout");
+
+    let entry = CStr::from_bytes_with_nul(b"main\0").unwrap();
+    let stage = vk::PipelineShaderStageCreateInfo::default()
+        .stage(vk::ShaderStageFlags::COMPUTE)
+        .module(shader)
+        .name(entry);
+    let pipeline = unsafe {
+        device
+            .create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[vk::ComputePipelineCreateInfo::default()
+                    .stage(stage)
+                    .layout(pipeline_layout)],
+                None,
+            )
+            .expect("create linear pipeline")[0]
+    };
+
+    // Pool holds one set; we reset + reallocate it each call (single-stream gen).
+    let pool_sizes = [vk::DescriptorPoolSize {
+        ty: vk::DescriptorType::STORAGE_BUFFER,
+        descriptor_count: 3,
+    }];
+    let desc_pool = unsafe {
+        device.create_descriptor_pool(
+            &vk::DescriptorPoolCreateInfo::default()
+                .max_sets(1)
+                .pool_sizes(&pool_sizes),
+            None,
+        )
+    }
+    .expect("create linear desc pool");
+
+    LinearKernel {
+        shader,
+        ds_layout,
+        pipeline_layout,
+        pipeline,
+        desc_pool,
+    }
+}
+
+pub(crate) fn destroy_linear_kernel(device: &ash::Device, k: &LinearKernel) {
+    unsafe {
+        device.destroy_descriptor_pool(k.desc_pool, None);
+        device.destroy_pipeline(k.pipeline, None);
+        device.destroy_pipeline_layout(k.pipeline_layout, None);
+        device.destroy_descriptor_set_layout(k.ds_layout, None);
+        device.destroy_shader_module(k.shader, None);
+    }
+}
+
 impl VulkanBackend {
+    fn linear_kernel(&self) -> &LinearKernel {
+        self.shared
+            .linear_kernel
+            .get_or_init(|| create_linear_kernel(&self.shared.device))
+    }
+
     /// Upload an `[out, in]` f32 weight to a persistent device buffer.
     pub fn upload_weight(&self, data: &[f32]) -> Result<Box<dyn Buffer>> {
         let bytes: &[u8] = bytemuck::cast_slice(data);
@@ -77,6 +182,7 @@ impl VulkanBackend {
     }
 
     /// Compute `y[rows, out] = x[rows, in] · Wᵀ` where `w_buf` holds `W[out, in]`.
+    /// Reuses the cached pipeline; only the per-call x/y buffers + descriptor set are fresh.
     pub fn linear(
         &self,
         w_buf: &dyn Buffer,
@@ -86,88 +192,30 @@ impl VulkanBackend {
         out_f: usize,
     ) -> Result<Vec<f32>> {
         assert_eq!(x.len(), rows * in_f, "x must be rows*in");
-        let device = &self.shared.device;
-        let spv = linear_spv();
+        let device = self.shared.device.clone();
+        let k = self.linear_kernel();
 
-        let shader = unsafe {
-            device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(spv), None)
-        }
-        .map_err(|e| be(format!("create_shader_module: {e}")))?;
-
-        let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..3)
-            .map(|i| {
-                vk::DescriptorSetLayoutBinding::default()
-                    .binding(i)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .descriptor_count(1)
-                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            })
-            .collect();
-        let ds_layout = unsafe {
-            device.create_descriptor_set_layout(
-                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
-                None,
-            )
-        }
-        .map_err(|e| be(format!("create_descriptor_set_layout: {e}")))?;
-
-        let push_range = vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            .offset(0)
-            .size(12);
-        let pipeline_layout = unsafe {
-            device.create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default()
-                    .set_layouts(std::slice::from_ref(&ds_layout))
-                    .push_constant_ranges(std::slice::from_ref(&push_range)),
-                None,
-            )
-        }
-        .map_err(|e| be(format!("create_pipeline_layout: {e}")))?;
-
-        let entry = CStr::from_bytes_with_nul(b"main\0").unwrap();
-        let stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(shader)
-            .name(entry);
-        let pipeline = unsafe {
+        // fresh descriptor set from the cached pool
+        unsafe {
             device
-                .create_compute_pipelines(
-                    vk::PipelineCache::null(),
-                    &[vk::ComputePipelineCreateInfo::default()
-                        .stage(stage)
-                        .layout(pipeline_layout)],
-                    None,
-                )
-                .map_err(|(_, e)| be(format!("create_compute_pipelines: {e}")))?[0]
-        };
-
-        let pool_sizes = [vk::DescriptorPoolSize {
-            ty: vk::DescriptorType::STORAGE_BUFFER,
-            descriptor_count: 3,
-        }];
-        let desc_pool = unsafe {
-            device.create_descriptor_pool(
-                &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(1)
-                    .pool_sizes(&pool_sizes),
-                None,
-            )
+                .reset_descriptor_pool(k.desc_pool, vk::DescriptorPoolResetFlags::empty())
+                .map_err(|e| be(format!("reset_descriptor_pool: {e}")))?;
         }
-        .map_err(|e| be(format!("create_descriptor_pool: {e}")))?;
         let desc_set = unsafe {
             device
                 .allocate_descriptor_sets(
                     &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(desc_pool)
-                        .set_layouts(std::slice::from_ref(&ds_layout)),
+                        .descriptor_pool(k.desc_pool)
+                        .set_layouts(std::slice::from_ref(&k.ds_layout)),
                 )
                 .map_err(|e| be(format!("allocate_descriptor_sets: {e}")))?[0]
         };
 
+        // Host-visible activation buffers: upload/download become direct memcpy (no extra
+        // submit+wait), leaving the dispatch as the only GPU round-trip in this call.
         let x_bytes: &[u8] = bytemuck::cast_slice(x);
-        let buf_x = self.alloc(x_bytes.len(), BufferUsage::Activations)?;
-        let buf_y = self.alloc(rows * out_f * 4, BufferUsage::Activations)?;
+        let buf_x = self.alloc(x_bytes.len(), BufferUsage::Staging)?;
+        let buf_y = self.alloc(rows * out_f * 4, BufferUsage::Readback)?;
         self.upload(buf_x.as_ref(), x_bytes)?;
 
         let vk_w = unsafe { as_vk_buf(w_buf) }.buffer;
@@ -209,6 +257,7 @@ impl VulkanBackend {
 
         let groups = ((rows * out_f) as u32).div_ceil(64);
         let shared = std::sync::Arc::clone(&self.shared);
+        let (pipeline, pipeline_layout) = (k.pipeline, k.pipeline_layout);
         self.one_shot(move |cmd| unsafe {
             let barriers = [vk::BufferMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -250,17 +299,7 @@ impl VulkanBackend {
 
         let mut y_bytes = vec![0u8; rows * out_f * 4];
         self.download(buf_y.as_ref(), &mut y_bytes)?;
-        let y: Vec<f32> = bytemuck::cast_slice(&y_bytes).to_vec();
-
-        drop((buf_x, buf_y));
-        unsafe {
-            device.destroy_descriptor_pool(desc_pool, None);
-            device.destroy_pipeline(pipeline, None);
-            device.destroy_pipeline_layout(pipeline_layout, None);
-            device.destroy_descriptor_set_layout(ds_layout, None);
-            device.destroy_shader_module(shader, None);
-        }
-        Ok(y)
+        Ok(bytemuck::cast_slice(&y_bytes).to_vec())
     }
 }
 
@@ -273,12 +312,12 @@ mod tests {
     fn linear_matches_cpu() {
         let be = VulkanBackend::new().unwrap();
         let (rows, in_f, out_f) = (3usize, 5usize, 4usize);
-        let w: Vec<f32> = (0..out_f * in_f).map(|i| (i as f32) * 0.01).collect(); // [out,in]
+        let w: Vec<f32> = (0..out_f * in_f).map(|i| (i as f32) * 0.01).collect();
         let x: Vec<f32> = (0..rows * in_f).map(|i| (i as f32) * 0.02).collect();
         let wbuf = be.upload_weight(&w).unwrap();
+        // run twice to exercise the cached pipeline path
+        let _ = be.linear(wbuf.as_ref(), &x, rows, in_f, out_f).unwrap();
         let y = be.linear(wbuf.as_ref(), &x, rows, in_f, out_f).unwrap();
-
-        // CPU reference: y[r,o] = sum_i x[r,i] * w[o,i]
         let mut want = vec![0.0f32; rows * out_f];
         for r in 0..rows {
             for o in 0..out_f {

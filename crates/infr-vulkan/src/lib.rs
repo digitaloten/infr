@@ -59,6 +59,8 @@ struct VulkanShared {
     /// Must be dropped before the device is destroyed.
     allocator: ManuallyDrop<Mutex<Allocator>>,
     caps: Capabilities,
+    /// Lazily-built, reused compute pipeline for the linear op (see `linear.rs`).
+    linear_kernel: std::sync::OnceLock<crate::linear::LinearKernel>,
 }
 
 // ash Instances/Devices/handles are Send+Sync per the Vulkan spec when
@@ -70,6 +72,10 @@ impl Drop for VulkanShared {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            // Destroy the cached linear kernel (pipeline/layouts/shader/pool) if built.
+            if let Some(k) = self.linear_kernel.get() {
+                crate::linear::destroy_linear_kernel(&self.device, k);
+            }
             // Destroy command pool.
             let pool = *self.cmd_pool.lock().unwrap();
             self.device.destroy_command_pool(pool, None);
@@ -273,6 +279,7 @@ impl VulkanBackend {
                 cmd_pool: Mutex::new(cmd_pool),
                 allocator: ManuallyDrop::new(Mutex::new(allocator)),
                 caps,
+                linear_kernel: std::sync::OnceLock::new(),
             }),
         })
     }
@@ -390,6 +397,7 @@ impl Backend for VulkanBackend {
             BufferUsage::Weights => (MemoryLocation::GpuOnly, "weights"),
             BufferUsage::Activations => (MemoryLocation::GpuOnly, "activations"),
             BufferUsage::Staging => (MemoryLocation::CpuToGpu, "staging"),
+            BufferUsage::Readback => (MemoryLocation::GpuToCpu, "readback"),
         };
         let buf = self.make_buf(bytes, location, label)?;
         Ok(Box::new(buf))

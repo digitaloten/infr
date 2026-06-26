@@ -20,7 +20,10 @@ pub struct Capabilities {
 pub enum BufferUsage {
     Weights,
     Activations,
+    /// Host→device staging (host-visible, mapped): `upload` is a direct memcpy.
     Staging,
+    /// Device→host readback (host-visible, mapped): `download` is a direct memcpy.
+    Readback,
 }
 
 /// Opaque device-memory handle owned by a backend.
