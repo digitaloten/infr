@@ -465,8 +465,6 @@ impl Llama {
         let k_new = alloc(n * kvrow, BufferUsage::Activations)?;
         let v_new = alloc(n * kvrow, BufferUsage::Activations)?;
         let attn = alloc(n * nh * hd, BufferUsage::Activations)?;
-        let hn2 = alloc(n * ne, BufferUsage::Activations)?;
-        let gu = alloc(n * 2 * nff, BufferUsage::Activations)?;
         let act = alloc(n * nff, BufferUsage::Activations)?;
         let logits = alloc(n * c.vocab, BufferUsage::Readback)?;
 
@@ -529,23 +527,16 @@ impl Llama {
                 nh * hd,
                 ne,
             );
-            rec.rmsnorm(
+            rec.ffn_in(
                 hidden.as_ref(),
                 layer.ffn_norm_buf.as_ref(),
-                hn2.as_ref(),
+                layer.wgateup.as_ref(),
+                act.as_ref(),
                 n,
                 ne,
+                nff,
                 c.rms_eps,
             );
-            rec.linear(
-                layer.wgateup.as_ref(),
-                hn2.as_ref(),
-                gu.as_ref(),
-                n,
-                ne,
-                2 * nff,
-            );
-            rec.silu_mul_fused(gu.as_ref(), act.as_ref(), n, nff);
             rec.linear_add(
                 layer.wdown.as_ref(),
                 act.as_ref(),

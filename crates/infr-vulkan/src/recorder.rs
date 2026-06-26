@@ -265,6 +265,40 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Fused FFN input: `act = SwiGLU(rmsnorm(hidden)·Wgu)`. Requires `nff % 64 == 0`, `ne <= 8192`.
+    pub fn ffn_in(
+        &self,
+        hidden: &dyn Buffer,
+        norm_w: &dyn Buffer,
+        wgu: &dyn Buffer,
+        act: &dyn Buffer,
+        rows: usize,
+        ne: usize,
+        nff: usize,
+        eps: f32,
+    ) {
+        debug_assert_eq!(nff % 64, 0, "ffn_in requires nff % 64 == 0");
+        debug_assert!(ne <= 8192, "ffn_in requires ne <= 8192");
+        let k = self.be.kernel("ffn_in", ops::FFN_IN_WGSL, 4, 16);
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(nff as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&eps.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[
+                Self::vkb(hidden),
+                Self::vkb(norm_w),
+                Self::vkb(wgu),
+                Self::vkb(act),
+            ],
+            &[Self::vkb(act)],
+            &push,
+            ((rows * nff) as u32).div_ceil(64),
+        );
+    }
+
     pub fn rmsnorm(
         &self,
         x: &dyn Buffer,

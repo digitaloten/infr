@@ -469,6 +469,76 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// Fused FFN input: `act = SwiGLU(rmsnorm(hidden)·Wgu)`. Folds the FFN's pre-norm, the fused
+/// gate||up projection, and SwiGLU into one dispatch (was rmsnorm + linear + silu_mul_fused =
+/// 3 dispatches + 3 barriers). One workgroup owns 64 contiguous outputs of a single row
+/// (requires `nff % 64 == 0`); it cooperatively RMS-normalizes that row into shared memory once,
+/// then each thread does its two dot products. `ne <= 8192`.
+pub(crate) const FFN_IN_WGSL: &str = r#"
+struct PC { rows: u32, ne: u32, nff: u32, eps: f32 }
+var<immediate> pc: PC;
+@group(0) @binding(0) var<storage, read>       hidden: array<f32>; // [rows, ne]
+@group(0) @binding(1) var<storage, read>       nw: array<f32>;     // [ne] rmsnorm weight
+@group(0) @binding(2) var<storage, read>       wgu: array<f32>;    // [2*nff, ne] gate||up
+@group(0) @binding(3) var<storage, read_write> act: array<f32>;    // [rows, nff]
+
+var<workgroup> sh_norm: array<f32, 8192>;
+var<workgroup> ss_partial: array<f32, 64>;
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+    let t = lid.x;
+    let base = wid.x * 64u;        // first output index this workgroup owns
+    let r = base / pc.nff;         // row (shared by all 64, since nff % 64 == 0)
+    let rbase = r * pc.ne;
+
+    // 1) sum of squares of hidden[r, :]
+    var local_ss: f32 = 0.0;
+    var i = t;
+    loop {
+        if i >= pc.ne { break; }
+        let v = hidden[rbase + i];
+        local_ss = local_ss + v * v;
+        i = i + 64u;
+    }
+    ss_partial[t] = local_ss;
+    workgroupBarrier();
+    var stride = 32u;
+    loop {
+        if stride == 0u { break; }
+        if t < stride { ss_partial[t] = ss_partial[t] + ss_partial[t + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let scale = inverseSqrt(ss_partial[0] / f32(pc.ne) + pc.eps);
+
+    // 2) normalized row → shared
+    var j = t;
+    loop {
+        if j >= pc.ne { break; }
+        sh_norm[j] = hidden[rbase + j] * scale * nw[j];
+        j = j + 64u;
+    }
+    workgroupBarrier();
+
+    // 3) this thread's output: silu(gate)·up
+    let oidx = base + t;
+    if oidx >= pc.rows * pc.nff { return; }
+    let f = oidx - r * pc.nff;     // column in [0, nff)
+    let gbase = f * pc.ne;
+    let ubase = (pc.nff + f) * pc.ne;
+    var gate: f32 = 0.0;
+    var up: f32 = 0.0;
+    for (var k: u32 = 0u; k < pc.ne; k = k + 1u) {
+        let x = sh_norm[k];
+        gate = gate + wgu[gbase + k] * x;
+        up = up + wgu[ubase + k] * x;
+    }
+    act[oidx] = (gate / (1.0 + exp(-gate))) * up;
+}
+"#;
+
 pub(crate) const ATTENTION_WGSL: &str = r#"
 struct PC { t: u32, nh: u32, nkv: u32, hd: u32 }
 var<immediate> pc: PC;
