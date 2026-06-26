@@ -8,7 +8,9 @@
 
 mod linear;
 mod matmul;
+mod ops;
 
+use std::collections::HashMap;
 use std::ffi::CStr;
 use std::mem::ManuallyDrop;
 use std::sync::{Arc, Mutex};
@@ -61,6 +63,8 @@ struct VulkanShared {
     caps: Capabilities,
     /// Lazily-built, reused compute pipeline for the linear op (see `linear.rs`).
     linear_kernel: std::sync::OnceLock<crate::linear::LinearKernel>,
+    /// Generic cache of compute kernels by name (see `ops.rs`).
+    kernels: Mutex<HashMap<&'static str, crate::ops::ComputeKernel>>,
 }
 
 // ash Instances/Devices/handles are Send+Sync per the Vulkan spec when
@@ -75,6 +79,11 @@ impl Drop for VulkanShared {
             // Destroy the cached linear kernel (pipeline/layouts/shader/pool) if built.
             if let Some(k) = self.linear_kernel.get() {
                 crate::linear::destroy_linear_kernel(&self.device, k);
+            }
+            if let Ok(map) = self.kernels.lock() {
+                for k in map.values() {
+                    crate::ops::destroy_compute_kernel(&self.device, k);
+                }
             }
             // Destroy command pool.
             let pool = *self.cmd_pool.lock().unwrap();
@@ -280,6 +289,7 @@ impl VulkanBackend {
                 allocator: ManuallyDrop::new(Mutex::new(allocator)),
                 caps,
                 linear_kernel: std::sync::OnceLock::new(),
+                kernels: Mutex::new(HashMap::new()),
             }),
         })
     }
