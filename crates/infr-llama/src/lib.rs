@@ -837,6 +837,31 @@ impl Llama {
             None
         };
 
+        // Split-K for the coopmat prefill attention: the single-kernel path launches only
+        // nh*ceil(n/64) workgroups, which starves the GPU at small chunks. Split the kv loop so
+        // there are ~512 workgroups total, then combine. Only worth it when there are few query
+        // tiles; large chunks already have enough (n_splits == 1 → use the single kernel).
+        let pf_split = if use_gemm {
+            let n_qtiles = mpad / 64;
+            let want = (512 / (n_qtiles * nh)).clamp(1, 64);
+            let n_splits = want.min(kv_len.div_ceil(64)).max(1);
+            if n_splits > 1 {
+                let split_len = kv_len.div_ceil(64).div_ceil(n_splits) * 64;
+                let nparts = n_qtiles * nh * n_splits;
+                Some((
+                    n_splits,
+                    split_len,
+                    alloc(nparts * 64, BufferUsage::Activations)?,
+                    alloc(nparts * 64, BufferUsage::Activations)?,
+                    alloc(nparts * 64 * hd, BufferUsage::Activations)?,
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let prof = std::env::var("INFR_PROF").is_ok();
         let t_rec = std::time::Instant::now();
         let rec = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
@@ -1018,8 +1043,27 @@ impl Llama {
                     c.rms_eps,
                 );
             }
-            if use_gemm {
-                // prefill: coopmat flash attention (reads each K/V block once per 64-query tile).
+            if let Some((n_splits, split_len, ppm, ppl, ppacc)) = &pf_split {
+                // prefill, small chunk: split-K coopmat attention for occupancy, then combine.
+                rec.attention_prefill_split(
+                    q.as_ref(),
+                    kv.k[li].as_ref(),
+                    kv.v[li].as_ref(),
+                    attn.as_ref(),
+                    ppm.as_ref(),
+                    ppl.as_ref(),
+                    ppacc.as_ref(),
+                    n,
+                    kv_len,
+                    nh,
+                    nkv,
+                    hd,
+                    pos,
+                    *n_splits,
+                    *split_len,
+                );
+            } else if use_gemm {
+                // prefill, large chunk: single coopmat flash attention (enough query tiles already).
                 rec.attention_prefill(
                     q.as_ref(),
                     kv.k[li].as_ref(),

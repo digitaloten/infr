@@ -23,11 +23,17 @@ const GEMM_TILED_SPV_BYTES: &[u8] =
 const GEMM_PROJ_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_proj.spv"));
 const ATTN_PREFILL_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_prefill.spv"));
 const ATTN_PARTIAL_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_partial.spv"));
+const ATTN_PF_PART_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_prefill_partial.spv"));
+const ATTN_PF_COMB_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_prefill_combine.spv"));
 static GEMM_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static GEMM_TILED_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static GEMM_PROJ_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_PREFILL_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_PARTIAL_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_PF_PART_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_PF_COMB_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 
 fn gemm_spv() -> &'static [u32] {
     GEMM_SPV.get_or_init(|| spv_words(GEMM_SPV_BYTES))
@@ -46,6 +52,14 @@ pub(crate) fn attn_prefill_spv() -> &'static [u32] {
 /// SPIR-V for the subgroup-reduction flash-decoding pass-1 (split-K) kernel. Used by the recorder.
 pub(crate) fn attn_partial_spv() -> &'static [u32] {
     ATTN_PARTIAL_SPV.get_or_init(|| spv_words(ATTN_PARTIAL_SPV_BYTES))
+}
+/// SPIR-V for the split-K prefill attention partial pass. Used by the recorder.
+pub(crate) fn attn_prefill_partial_spv() -> &'static [u32] {
+    ATTN_PF_PART_SPV.get_or_init(|| spv_words(ATTN_PF_PART_SPV_BYTES))
+}
+/// SPIR-V for the split-K prefill attention combine pass. Used by the recorder.
+pub(crate) fn attn_prefill_combine_spv() -> &'static [u32] {
+    ATTN_PF_COMB_SPV.get_or_init(|| spv_words(ATTN_PF_COMB_SPV_BYTES))
 }
 
 impl VulkanBackend {
