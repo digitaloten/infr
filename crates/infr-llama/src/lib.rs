@@ -41,6 +41,9 @@ pub struct Config {
     pub rms_eps: f32,
     pub vocab: usize,
     pub eos: u32,
+    /// All tokens that end generation (the GGUF eos plus `<|im_end|>` / `<|endoftext|>` when present
+    /// in the vocab). A chat model can emit any of these; stopping only on `eos` lets it ramble.
+    pub eos_ids: Vec<u32>,
     /// Qwen3-style per-head RMSNorm on Q and K before RoPE.
     pub qk_norm: bool,
 }
@@ -622,6 +625,17 @@ impl Llama {
             None => build_tokenizer(&g)?,
         };
 
+        // Stop on the GGUF eos plus any chat-end markers in the vocab — a chat model can emit
+        // <|endoftext|> mid-turn, and stopping only on <|im_end|> lets it ramble past the answer.
+        let mut eos_ids = vec![eos];
+        for name in ["<|im_end|>", "<|endoftext|>", "<|eot_id|>"] {
+            if let Some(id) = tokenizer.token_to_id(name) {
+                if !eos_ids.contains(&id) {
+                    eos_ids.push(id);
+                }
+            }
+        }
+
         let cfg = Config {
             n_layer,
             n_head,
@@ -634,6 +648,7 @@ impl Llama {
             rms_eps,
             vocab,
             eos,
+            eos_ids,
             qk_norm,
         };
         Ok(Self {
@@ -1337,15 +1352,29 @@ impl Llama {
             i = end;
         }
         let mut generated: Vec<u32> = Vec::new();
+        // Stream UTF-8-safely: decode the whole reply each step and emit only the newly-completed
+        // suffix. A multi-byte char (e.g. an emoji) is split across byte-level BPE tokens; decoding a
+        // single token would yield a partial sequence → U+FFFD (the `�`). Holding until the decode no
+        // longer ends in the replacement char emits whole characters only. `on_token` fires once per
+        // generated token (delta may be empty while a char is mid-completion), so callers can count.
+        let mut printed = 0usize;
         for _ in 0..max_new {
             let next = argmax(&logits) as u32;
-            if next == self.cfg.eos {
+            if self.cfg.eos_ids.contains(&next) {
                 break;
             }
             generated.push(next);
-            if let Ok(piece) = self.tokenizer.decode(&[next], false) {
-                on_token(&piece);
+            let mut delta = String::new();
+            if let Ok(text) = self.tokenizer.decode(&generated, true) {
+                if !text.ends_with('\u{FFFD}')
+                    && text.len() > printed
+                    && text.is_char_boundary(printed)
+                {
+                    delta = text[printed..].to_string();
+                    printed = text.len();
+                }
             }
+            on_token(&delta);
             logits = self.forward_resident_kv(&[next], kv)?;
         }
         Ok(generated)

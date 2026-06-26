@@ -79,7 +79,7 @@ fn cmd_pull(model: &str) -> anyhow::Result<()> {
 fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     use std::io::Write;
     const MAX_CTX: usize = 8192;
-    const MAX_NEW: usize = 256;
+    const MAX_NEW: usize = 512;
     let (gguf, tok) = resolve(model)?;
     let llama = infr_llama::Llama::load_opt(&gguf, tok.as_deref())?;
 
