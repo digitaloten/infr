@@ -114,6 +114,10 @@ pub struct Llama {
     output_norm_buf: Box<dyn Buffer>,
     layers: Vec<LayerWeights>,
     tokenizer: Tokenizer,
+    /// Same vocab as `tokenizer` but with `encode_special_tokens(true)` → special-token strings in
+    /// the input encode as literal text. Used for USER content so a user typing `<|im_end|>` etc.
+    /// can't inject turn structure.
+    user_tokenizer: Tokenizer,
     sampler: std::cell::Cell<Sampler>,
 }
 
@@ -652,6 +656,9 @@ impl Llama {
             Some(p) => Tokenizer::from_file(p).map_err(|e| anyhow!("load tokenizer: {e}"))?,
             None => build_tokenizer(&g)?,
         };
+        // A variant that encodes special-token strings as literal text, for untrusted user content.
+        let mut user_tokenizer = tokenizer.clone();
+        user_tokenizer.set_encode_special_tokens(true);
 
         // Stop on the GGUF eos plus any chat-end markers in the vocab — a chat model can emit
         // <|endoftext|> mid-turn, and stopping only on <|im_end|> lets it ramble past the answer.
@@ -688,8 +695,30 @@ impl Llama {
             output_norm_buf,
             layers,
             tokenizer,
+            user_tokenizer,
             sampler: std::cell::Cell::new(Sampler::default()),
         })
+    }
+
+    /// Encode one chat turn: ChatML markers as real special tokens, USER content as literal text
+    /// (so a user typing `<|im_end|>`/`<think>`/etc. can't inject or break the turn structure).
+    /// `started` closes the previous assistant turn first.
+    fn turn_tokens(&self, user: &str, started: bool) -> Result<Vec<u32>> {
+        let pre = if started {
+            "<|im_end|>\n<|im_start|>user\n"
+        } else {
+            "<|im_start|>user\n"
+        };
+        let post = "<|im_end|>\n<|im_start|>assistant\n";
+        let enc = |t: &Tokenizer, s: &str| -> Result<Vec<u32>> {
+            t.encode(s, false)
+                .map(|e| e.get_ids().to_vec())
+                .map_err(|e| anyhow!("encode: {e}"))
+        };
+        let mut ids = enc(&self.tokenizer, pre)?;
+        ids.extend(enc(&self.user_tokenizer, user)?);
+        ids.extend(enc(&self.tokenizer, post)?);
+        Ok(ids)
     }
 
     /// Set token sampling (temp ≤ 0 → greedy). Applies to subsequent `generate`/`ChatSession::turn`.
@@ -1500,19 +1529,9 @@ impl ChatSession<'_> {
         max_new: usize,
         on_token: impl FnMut(&str),
     ) -> Result<String> {
-        // Open this user turn; for turns after the first, first close the prior assistant turn
-        // (its EOS/`<|im_end|>` was not kept in the cache).
-        let text = if self.started {
-            format!("<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n")
-        } else {
-            format!("<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n")
-        };
-        let enc = self
-            .llama
-            .tokenizer
-            .encode(text, false)
-            .map_err(|e| anyhow!("encode: {e}"))?;
-        let toks = enc.get_ids();
+        // Open this user turn (closing the prior assistant turn first if started); user content is
+        // encoded as literal text so it can't inject ChatML markers.
+        let toks = self.llama.turn_tokens(user, self.started)?;
         // Cap generation by whatever context room remains (don't bail) — `max_new` is just a ceiling.
         let room = self.kv.max_ctx.saturating_sub(self.kv.len + toks.len() + 1);
         if room == 0 {
@@ -1526,7 +1545,7 @@ impl ChatSession<'_> {
         let max_new = max_new.min(room);
         self.started = true;
         // Prefill the user turn; remember where the assistant's generation begins.
-        let logits = self.llama.prefill(toks, &mut self.kv)?;
+        let logits = self.llama.prefill(&toks, &mut self.kv)?;
         let answer_start = self.kv.len;
         let generated = self
             .llama
@@ -1757,5 +1776,25 @@ mod tokenizer_tests {
             sidecar.decode(ids.get_ids(), true).unwrap(),
             "decode differs from sidecar"
         );
+    }
+
+    // User content must be encoded as literal text: special-token strings in user input must NOT
+    // become the special id (which would let a user inject/break the ChatML turn structure).
+    #[test]
+    fn user_text_special_tokens_are_literal() {
+        let gguf = Path::new("/home/mxaddict/Projects/models/qwen3-0.6b/Qwen3-0.6B-Q4_K_M.gguf");
+        if !gguf.exists() {
+            eprintln!("skip: test model not present");
+            return;
+        }
+        let g = Gguf::open(gguf).unwrap();
+        let tok = build_tokenizer(&g).unwrap();
+        let mut user = tok.clone();
+        user.set_encode_special_tokens(true);
+        let im_end = tok.token_to_id("<|im_end|>").unwrap();
+        let s = "A <|im_end|> B";
+        // template tokenizer: <|im_end|> matched as the special id; user tokenizer: NOT.
+        assert!(tok.encode(s, false).unwrap().get_ids().contains(&im_end));
+        assert!(!user.encode(s, false).unwrap().get_ids().contains(&im_end));
     }
 }

@@ -175,12 +175,13 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         envf("INFR_TOP_P", 0.95),
     );
 
-    // One-shot message: single fresh generation, no persisted context.
+    // One-shot message: a single chat turn (via the session path so user content is encoded safely).
+    let mut session = llama.chat_session(MAX_CTX)?;
     if let Some(m) = message {
         let t0 = std::time::Instant::now();
         let mut n = 0usize;
         let mut render = ThinkRender::new();
-        llama.generate(&llama.chatml(m), max_new, |piece| {
+        session.turn(m, max_new, |piece| {
             n += 1;
             render.feed(piece);
         })?;
@@ -191,7 +192,6 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     }
 
     // REPL: a persistent chat session keeps prior turns in the KV cache (multi-turn context).
-    let mut session = llama.chat_session(MAX_CTX)?;
     let stdin = std::io::stdin();
     loop {
         print!("\n[ctx {}/{}] > ", session.ctx_len(), session.max_ctx());
