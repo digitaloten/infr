@@ -1,0 +1,90 @@
+#version 460
+// Flash-decoding pass 1 (split-K), subgroup-reduction variant. One workgroup per (head, kv-chunk);
+// it computes this chunk's softmax partials (max m, sum l, weighted V acc) for a single decode
+// query. The QK dot uses a SUBGROUP reduction: the 32 lanes of a wave cooperate on ONE key's hd
+// vector — lane reads k[key, kvh, lane + 32r] (contiguous → coalesced), partial-sums, subgroupAdd.
+// This replaces the old thread-per-key WGSL kernel whose 64 threads read keys 2KB apart (fully
+// uncoalesced, ~25x bandwidth amplification — the decode bottleneck at long context). Uses almost
+// no shared memory, so occupancy stays high. Requires requiredSubgroupSize=32 (wave32 → 2 sgs).
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint kv_len; uint nh; uint nkv; uint hd; uint chunk; uint n_chunks;
+} pc;
+layout(binding = 0) readonly buffer QB { float16_t q[]; };   // [nh, hd]
+layout(binding = 1) readonly buffer KB { float16_t k[]; };   // cache [kv_len, nkv, hd]
+layout(binding = 2) readonly buffer VB { float16_t v[]; };
+layout(binding = 3) buffer PM { float pm[]; };               // [nh, n_chunks]
+layout(binding = 4) buffer PL { float pl[]; };               // [nh, n_chunks]
+layout(binding = 5) buffer PACC { float pacc[]; };           // [nh, n_chunks, hd]
+
+shared float q_sh[128];
+shared float sc[1024];
+shared float red[64];
+
+void main() {
+    uint t = gl_LocalInvocationIndex;
+    uint h = gl_WorkGroupID.x / pc.n_chunks;
+    uint c = gl_WorkGroupID.x % pc.n_chunks;
+    uint kvh = h / (pc.nh / pc.nkv);
+    uint hd = pc.hd;
+    float scale = 1.0 / sqrt(float(hd));
+    uint j0 = c * pc.chunk;
+    uint j1 = min(j0 + pc.chunk, pc.kv_len);
+
+    for (uint d = t; d < hd; d += 64u) { q_sh[d] = float(q[h * hd + d]); }
+    barrier();
+
+    // QK via subgroup reduction (one key per subgroup-iteration; coalesced K reads).
+    uint sg = gl_SubgroupID;            // 0..1
+    uint lane = gl_SubgroupInvocationID; // 0..31
+    uint nsg = gl_NumSubgroups;          // 2
+    float lmax = -3.0e38;
+    for (uint j = j0 + sg; j < j1; j += nsg) {
+        uint kbase = (j * pc.nkv + kvh) * hd;
+        float part = 0.0;
+        for (uint d = lane; d < hd; d += 32u) { part += q_sh[d] * float(k[kbase + d]); }
+        float dot = subgroupAdd(part) * scale;  // all lanes get the sum
+        if (lane == 0u) { sc[j - j0] = dot; }
+        lmax = max(lmax, dot);
+    }
+    red[t] = lmax;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (t < s) { red[t] = max(red[t], red[t + s]); }
+        barrier();
+    }
+    float m = red[0];
+    barrier();
+
+    // exp(s - m) → sc, sum l
+    float lsum = 0.0;
+    for (uint j = j0 + t; j < j1; j += 64u) {
+        float p = exp(sc[j - j0] - m);
+        sc[j - j0] = p;
+        lsum += p;
+    }
+    red[t] = lsum;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (t < s) { red[t] += red[t + s]; }
+        barrier();
+    }
+    float l = red[0];
+
+    // V: thread-per-dim (coalesced — consecutive threads read consecutive hd of the same key).
+    uint pbase = (h * pc.n_chunks + c) * hd;
+    for (uint d = t; d < hd; d += 64u) {
+        float acc = 0.0;
+        for (uint j = j0; j < j1; j += 1u) {
+            acc += sc[j - j0] * float(v[(j * pc.nkv + kvh) * hd + d]);
+        }
+        pacc[pbase + d] = acc;
+    }
+    if (t == 0u) { pm[h * pc.n_chunks + c] = m; pl[h * pc.n_chunks + c] = l; }
+}

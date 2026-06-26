@@ -10,6 +10,7 @@ fn main() {
         "gemm_coopmat_tiled",
         "gemm_proj",
         "attn_prefill",
+        "attn_partial",
     ] {
         let src = format!("shaders/{name}.comp");
         let dst = format!("{out}/{name}.spv");

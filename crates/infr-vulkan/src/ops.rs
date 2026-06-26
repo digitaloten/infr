@@ -945,80 +945,8 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 /// for the single decode query. Many chunks → many workgroups → the GPU stays busy at long
 /// context (the non-split kernel used only `nh` workgroups). Combine merges them. `hd<=128`,
 /// `chunk<=1024`. q is `[nh, hd]` (q_len==1).
-pub(crate) const ATTN_PARTIAL_WGSL: &str = r#"
-enable f16;
-struct PC { kv_len: u32, nh: u32, nkv: u32, hd: u32, chunk: u32, n_chunks: u32 }
-var<immediate> pc: PC;
-@group(0) @binding(0) var<storage, read>       q: array<f16>;    // [nh, hd] f16
-@group(0) @binding(1) var<storage, read>       k: array<f16>;    // cache [kv_len, nkv, hd] f16
-@group(0) @binding(2) var<storage, read>       v: array<f16>;
-@group(0) @binding(3) var<storage, read_write> pm: array<f32>;   // [nh, n_chunks]
-@group(0) @binding(4) var<storage, read_write> pl: array<f32>;   // [nh, n_chunks]
-@group(0) @binding(5) var<storage, read_write> pacc: array<f32>; // [nh, n_chunks, hd]
-
-var<workgroup> q_sh: array<f32, 128>;
-var<workgroup> sc: array<f32, 1024>;
-var<workgroup> red: array<f32, 64>;
-
-@compute @workgroup_size(64, 1, 1)
-fn main(@builtin(local_invocation_id) lid: vec3<u32>,
-        @builtin(workgroup_id) wid: vec3<u32>) {
-    let t = lid.x;
-    let h = wid.x / pc.n_chunks;
-    let c = wid.x % pc.n_chunks;
-    let kvh = h / (pc.nh / pc.nkv);
-    let hd = pc.hd;
-    let scale = 1.0 / sqrt(f32(hd));
-    let j0 = c * pc.chunk;
-    var j1 = j0 + pc.chunk;
-    if j1 > pc.kv_len { j1 = pc.kv_len; }
-
-    for (var d: u32 = t; d < hd; d = d + 64u) { q_sh[d] = f32(q[h * hd + d]); }
-    workgroupBarrier();
-
-    var lmax: f32 = -3.0e38;
-    for (var j: u32 = j0 + t; j < j1; j = j + 64u) {
-        let kbase = (j * pc.nkv + kvh) * hd;
-        var dot: f32 = 0.0;
-        for (var d: u32 = 0u; d < hd; d = d + 1u) { dot = dot + q_sh[d] * f32(k[kbase + d]); }
-        let s = dot * scale;
-        sc[j - j0] = s;
-        lmax = max(lmax, s);
-    }
-    red[t] = lmax;
-    workgroupBarrier();
-    var stride = 32u;
-    loop { if stride == 0u { break; }
-        if t < stride { red[t] = max(red[t], red[t + stride]); }
-        workgroupBarrier(); stride = stride / 2u; }
-    let m = red[0];
-    workgroupBarrier();
-
-    var lsum: f32 = 0.0;
-    for (var j: u32 = j0 + t; j < j1; j = j + 64u) {
-        let p = exp(sc[j - j0] - m);
-        sc[j - j0] = p;
-        lsum = lsum + p;
-    }
-    red[t] = lsum;
-    workgroupBarrier();
-    stride = 32u;
-    loop { if stride == 0u { break; }
-        if t < stride { red[t] = red[t] + red[t + stride]; }
-        workgroupBarrier(); stride = stride / 2u; }
-    let l = red[0];
-
-    let pbase = (h * pc.n_chunks + c) * hd;
-    for (var d: u32 = t; d < hd; d = d + 64u) {
-        var acc: f32 = 0.0;
-        for (var j: u32 = j0; j < j1; j = j + 1u) {
-            acc = acc + sc[j - j0] * f32(v[(j * pc.nkv + kvh) * hd + d]);
-        }
-        pacc[pbase + d] = acc;
-    }
-    if t == 0u { pm[h * pc.n_chunks + c] = m; pl[h * pc.n_chunks + c] = l; }
-}
-"#;
+// Flash-decoding pass 1 (split-K) is now a GLSL subgroup-reduction kernel: shaders/attn_partial.comp
+// (the old thread-per-key WGSL version had uncoalesced K reads that dominated long-context decode).
 
 /// Flash-decoding pass 2 (combine): ONE workgroup per head. Merges the `n_chunks` partials via the
 /// online-softmax rule (`M=max mₖ; l=Σ lₖ·e^{mₖ−M}; acc=Σ accₖ·e^{mₖ−M}; o=acc/l`), parallel over

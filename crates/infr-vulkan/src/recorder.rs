@@ -779,11 +779,11 @@ impl<'a> Recorder<'a> {
         chunk: usize,
         n_chunks: usize,
     ) {
-        // pass 1: per-chunk partials
+        // pass 1: per-chunk partials (subgroup-reduction QK; needs requiredSubgroupSize=32)
         self.stamp("attn_partial");
         let k1 = self
             .be
-            .kernel("attn_partial", ops::ATTN_PARTIAL_WGSL, 6, 24);
+            .kernel_spv_sg("attn_partial", crate::gemm::attn_partial_spv(), 6, 24, 32);
         let mut p1 = [0u8; 24];
         p1[0..4].copy_from_slice(&(kv_len as u32).to_ne_bytes());
         p1[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
