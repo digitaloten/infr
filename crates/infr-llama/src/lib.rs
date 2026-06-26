@@ -1513,15 +1513,17 @@ impl ChatSession<'_> {
             .encode(text, false)
             .map_err(|e| anyhow!("encode: {e}"))?;
         let toks = enc.get_ids();
-        if self.kv.len + toks.len() + max_new + 1 > self.kv.max_ctx {
+        // Cap generation by whatever context room remains (don't bail) — `max_new` is just a ceiling.
+        let room = self.kv.max_ctx.saturating_sub(self.kv.len + toks.len() + 1);
+        if room == 0 {
             bail!(
-                "context full: {} held + {} prompt + {} max_new > {} cap — start a new session",
+                "context full: {} held + {} prompt = {} cap — start a new session",
                 self.kv.len,
                 toks.len(),
-                max_new,
                 self.kv.max_ctx
             );
         }
+        let max_new = max_new.min(room);
         self.started = true;
         // Prefill the user turn; remember where the assistant's generation begins.
         let logits = self.llama.prefill(toks, &mut self.kv)?;

@@ -150,11 +150,6 @@ impl ThinkRender {
 fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     use std::io::Write;
     const MAX_CTX: usize = 8192;
-    const MAX_NEW: usize = 512;
-    let (gguf, tok) = resolve(model)?;
-    let llama = infr_llama::Llama::load_opt(&gguf, tok.as_deref())?;
-    // Qwen3's recommended sampling — pure greedy makes thinking models degenerate (unterminated
-    // <think>, no answer). Tune via INFR_TEMP / INFR_TOP_K / INFR_TOP_P.
     let envf = |k: &str, d: f32| {
         std::env::var(k)
             .ok()
@@ -167,6 +162,13 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
             .and_then(|v| v.parse().ok())
             .unwrap_or(d)
     };
+    // Generation ceiling per reply (a turn also caps to remaining context). High enough for long
+    // answers (lists/stories); override with INFR_MAX_NEW.
+    let max_new = envu("INFR_MAX_NEW", 2048);
+    let (gguf, tok) = resolve(model)?;
+    let llama = infr_llama::Llama::load_opt(&gguf, tok.as_deref())?;
+    // Qwen3's recommended sampling — pure greedy makes thinking models degenerate (unterminated
+    // <think>, no answer). Tune via INFR_TEMP / INFR_TOP_K / INFR_TOP_P.
     llama.set_sampling(
         envf("INFR_TEMP", 0.6),
         envu("INFR_TOP_K", 20),
@@ -178,7 +180,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         let t0 = std::time::Instant::now();
         let mut n = 0usize;
         let mut render = ThinkRender::new();
-        llama.generate(&llama.chatml(m), MAX_NEW, |piece| {
+        llama.generate(&llama.chatml(m), max_new, |piece| {
             n += 1;
             render.feed(piece);
         })?;
@@ -205,7 +207,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         let t0 = std::time::Instant::now();
         let mut n = 0usize;
         let mut render = ThinkRender::new();
-        let res = session.turn(line, MAX_NEW, |piece| {
+        let res = session.turn(line, max_new, |piece| {
             n += 1;
             render.feed(piece);
         });
