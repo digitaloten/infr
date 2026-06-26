@@ -1,0 +1,57 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/infr-core",
+    "crates/infr-vulkan",
+    "crates/infr-hub",
+    "crates/infr-gguf",
+    "crates/infr-model",
+    "crates/infr-decode",
+    "crates/infr-engine",
+    "crates/infr-server",
+    "crates/infr-cli",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/kryptic-sh/infr"
+
+[workspace.dependencies]
+# internal
+infr-core = { path = "crates/infr-core" }
+infr-vulkan = { path = "crates/infr-vulkan" }
+infr-hub = { path = "crates/infr-hub" }
+infr-gguf = { path = "crates/infr-gguf" }
+infr-model = { path = "crates/infr-model" }
+infr-decode = { path = "crates/infr-decode" }
+infr-engine = { path = "crates/infr-engine" }
+infr-server = { path = "crates/infr-server" }
+
+# shared third-party
+thiserror = "2"
+anyhow = "1"
+half = "2"
+bytemuck = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+memmap2 = "0.9"
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+tower-http = { version = "0.6", features = ["trace"] }
+clap = { version = "4", features = ["derive"] }
+minijinja = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ash = "0.38"
+gpu-allocator = { version = "0.27", features = ["vulkan"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "rustls-tls",
+    "json",
+    "stream",
+] }
+sha2 = "0.10"
+indicatif = "0.17"
+dirs = "5"
