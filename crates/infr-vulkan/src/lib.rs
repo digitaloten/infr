@@ -6,6 +6,8 @@
 //! `VK_KHR_shader_subgroup_extended_types`. See PLAN.md.
 #![allow(dead_code)]
 
+mod matmul;
+
 use std::ffi::CStr;
 use std::mem::ManuallyDrop;
 use std::sync::{Arc, Mutex};
@@ -510,6 +512,54 @@ impl Backend for VulkanBackend {
 mod tests {
     use super::*;
     use infr_core::Backend;
+
+    /// GPU f32 matmul correctness: compares `VulkanBackend::matmul_f32` against a CPU
+    /// reference; asserts max relative error < 1e-3.
+    ///
+    /// Run with: `cargo test -p infr-vulkan -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn test_matmul_f32() {
+        let backend = VulkanBackend::new().expect("VulkanBackend::new failed");
+        let caps = backend.capabilities();
+        println!("device: {}", caps.name);
+
+        let (m, k, n) = (32usize, 32usize, 32usize);
+        let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.01).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.01).collect();
+
+        // CPU reference
+        let mut c_ref = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f32;
+                for kk in 0..k {
+                    sum += a[i * k + kk] * b[kk * n + j];
+                }
+                c_ref[i * n + j] = sum;
+            }
+        }
+
+        let c_gpu = backend
+            .matmul_f32(&a, &b, m, k, n)
+            .expect("matmul_f32 failed");
+
+        let max_abs = c_gpu
+            .iter()
+            .zip(c_ref.iter())
+            .map(|(g, r)| (*g - r).abs())
+            .fold(0.0f32, f32::max);
+        let max_ref = c_ref.iter().map(|r| r.abs()).fold(0.0f32, f32::max);
+        let rel_err = if max_ref > 1e-6 {
+            max_abs / max_ref
+        } else {
+            max_abs
+        };
+
+        println!("matmul {m}×{k}×{n}: max_rel_err = {rel_err:.2e}");
+        assert!(rel_err < 1e-3, "matmul rel error too large: {rel_err:.2e}");
+        println!("matmul GPU test PASS");
+    }
 
     /// End-to-end roundtrip: init → alloc (device-local) → upload → download → assert.
     ///
