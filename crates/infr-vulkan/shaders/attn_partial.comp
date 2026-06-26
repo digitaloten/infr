@@ -17,8 +17,8 @@ layout(push_constant) uniform PC {
     uint kv_len; uint nh; uint nkv; uint hd; uint chunk; uint n_chunks;
 } pc;
 layout(binding = 0) readonly buffer QB { float16_t q[]; };   // [nh, hd]
-layout(binding = 1) readonly buffer KB { float16_t k[]; };   // cache [kv_len, nkv, hd]
-layout(binding = 2) readonly buffer VB { float16_t v[]; };
+layout(binding = 1) readonly buffer KB { f16vec4 k4[]; };    // cache [kv_len, nkv, hd] as vec4
+layout(binding = 2) readonly buffer VB { f16vec4 v4[]; };
 layout(binding = 3) buffer PM { float pm[]; };               // [nh, n_chunks]
 layout(binding = 4) buffer PL { float pl[]; };               // [nh, n_chunks]
 layout(binding = 5) buffer PACC { float pacc[]; };           // [nh, n_chunks, hd]
@@ -44,11 +44,18 @@ void main() {
     uint sg = gl_SubgroupID;            // 0..1
     uint lane = gl_SubgroupInvocationID; // 0..31
     uint nsg = gl_NumSubgroups;          // 2
+    // vec4 K reads: each lane loads 4 contiguous hd values (8B) → 32 lanes cover 128 hd in one wide
+    // coalesced transaction (vs 4 separate f16 reads), which gets RDNA closer to peak bandwidth.
+    uint hd4 = hd >> 2u;
     float lmax = -3.0e38;
     for (uint j = j0 + sg; j < j1; j += nsg) {
-        uint kbase = (j * pc.nkv + kvh) * hd;
+        uint kbase4 = (j * pc.nkv + kvh) * hd4;
         float part = 0.0;
-        for (uint d = lane; d < hd; d += 32u) { part += q_sh[d] * float(k[kbase + d]); }
+        for (uint r = lane; r < hd4; r += 32u) {
+            vec4 kv = vec4(k4[kbase4 + r]);
+            vec4 qv = vec4(q_sh[4u * r], q_sh[4u * r + 1u], q_sh[4u * r + 2u], q_sh[4u * r + 3u]);
+            part += dot(qv, kv);
+        }
         float dot = subgroupAdd(part) * scale;  // all lanes get the sum
         if (lane == 0u) { sc[j - j0] = dot; }
         lmax = max(lmax, dot);
@@ -77,14 +84,17 @@ void main() {
     }
     float l = red[0];
 
-    // V: thread-per-dim (coalesced — consecutive threads read consecutive hd of the same key).
+    // V: vec4 reads (thread owns a vec4 of output dims; one wide coalesced load per key).
     uint pbase = (h * pc.n_chunks + c) * hd;
-    for (uint d = t; d < hd; d += 64u) {
-        float acc = 0.0;
+    for (uint g = t; g < hd4; g += 64u) {
+        vec4 acc = vec4(0.0);
         for (uint j = j0; j < j1; j += 1u) {
-            acc += sc[j - j0] * float(v[(j * pc.nkv + kvh) * hd + d]);
+            acc += sc[j - j0] * vec4(v4[(j * pc.nkv + kvh) * hd4 + g]);
         }
-        pacc[pbase + d] = acc;
+        pacc[pbase + 4u * g] = acc.x;
+        pacc[pbase + 4u * g + 1u] = acc.y;
+        pacc[pbase + 4u * g + 2u] = acc.z;
+        pacc[pbase + 4u * g + 3u] = acc.w;
     }
     if (t == 0u) { pm[h * pc.n_chunks + c] = m; pl[h * pc.n_chunks + c] = l; }
 }
