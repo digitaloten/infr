@@ -47,10 +47,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// Like `LINEAR_WGSL` but adds a residual: `y = residual + x·Wᵀ`. `r_buf` and `y_buf` may alias
 /// (in-place residual): each invocation reads and writes only index `idx`, so it is safe.
 pub(crate) const LINEAR_RES_WGSL: &str = r#"
+enable f16;
 struct PushConstants { rows: u32, in_f: u32, out_f: u32 }
 var<immediate> pc: PushConstants;
 
-@group(0) @binding(0) var<storage, read>       w_buf: array<f32>; // [out, in]
+@group(0) @binding(0) var<storage, read>       w_buf: array<f16>; // [out, in] f16
 @group(0) @binding(1) var<storage, read>       x_buf: array<f32>; // [rows, in]
 @group(0) @binding(2) var<storage, read>       r_buf: array<f32>; // [rows, out] residual
 @group(0) @binding(3) var<storage, read_write> y_buf: array<f32>; // [rows, out]
@@ -66,9 +67,37 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let xbase = r * pc.in_f;
     var acc: f32 = 0.0;
     for (var i: u32 = 0u; i < pc.in_f; i = i + 1u) {
-        acc = acc + w_buf[wbase + i] * x_buf[xbase + i];
+        acc = acc + f32(w_buf[wbase + i]) * x_buf[xbase + i];
     }
     y_buf[idx] = r_buf[idx] + acc;
+}
+"#;
+
+/// f16-weight GEMV `y = x·Wᵀ` for the recorder (e.g. the LM head). Same as `LINEAR_WGSL` but
+/// reads f16 weights; activations/output stay f32. (The host `linear` keeps the f32 `LINEAR_WGSL`.)
+pub(crate) const LINEAR_F16_WGSL: &str = r#"
+enable f16;
+struct PushConstants { rows: u32, in_f: u32, out_f: u32 }
+var<immediate> pc: PushConstants;
+
+@group(0) @binding(0) var<storage, read>       w_buf: array<f16>; // [out, in] f16
+@group(0) @binding(1) var<storage, read>       x_buf: array<f32>; // [rows, in]
+@group(0) @binding(2) var<storage, read_write> y_buf: array<f32>; // [rows, out]
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = pc.rows * pc.out_f;
+    if idx >= total { return; }
+    let r = idx / pc.out_f;
+    let o = idx % pc.out_f;
+    let wbase = o * pc.in_f;
+    let xbase = r * pc.in_f;
+    var acc: f32 = 0.0;
+    for (var i: u32 = 0u; i < pc.in_f; i = i + 1u) {
+        acc = acc + f32(w_buf[wbase + i]) * x_buf[xbase + i];
+    }
+    y_buf[r * pc.out_f + o] = acc;
 }
 "#;
 
@@ -204,6 +233,24 @@ impl VulkanBackend {
     /// Upload an `[out, in]` f32 weight to a persistent device buffer.
     pub fn upload_weight(&self, data: &[f32]) -> Result<Box<dyn Buffer>> {
         let bytes: &[u8] = bytemuck::cast_slice(data);
+        let buf = self.alloc(bytes.len(), BufferUsage::Weights)?;
+        self.upload(buf.as_ref(), bytes)?;
+        Ok(buf)
+    }
+
+    /// Upload an `[out, in]` weight as f16 (halves device bandwidth for the GEMV/matmul kernels
+    /// that read weights). Source stays f32; converted on the host.
+    pub fn upload_weight_f16(&self, data: &[f32]) -> Result<Box<dyn Buffer>> {
+        let f16: Vec<u16> = data
+            .iter()
+            .map(|&x| half::f16::from_f32(x).to_bits())
+            .collect();
+        self.upload_weight_bytes(bytemuck::cast_slice(&f16))
+    }
+
+    /// Upload raw weight bytes (already in the target dtype) to a persistent device buffer.
+    /// Use for f16 GGUF tensors to skip the f16→f32→f16 round-trip.
+    pub fn upload_weight_bytes(&self, bytes: &[u8]) -> Result<Box<dyn Buffer>> {
         let buf = self.alloc(bytes.len(), BufferUsage::Weights)?;
         self.upload(buf.as_ref(), bytes)?;
         Ok(buf)

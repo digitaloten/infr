@@ -30,9 +30,12 @@ fn compile_wgsl(src: &str) -> Vec<u32> {
     use naga::front::wgsl;
     use naga::valid::{Capabilities, ValidationFlags, Validator};
     let module = wgsl::parse_str(src).expect("WGSL parse");
-    let info = Validator::new(ValidationFlags::all(), Capabilities::IMMEDIATES)
-        .validate(&module)
-        .expect("WGSL validate");
+    let info = Validator::new(
+        ValidationFlags::all(),
+        Capabilities::IMMEDIATES | Capabilities::SHADER_FLOAT16,
+    )
+    .validate(&module)
+    .expect("WGSL validate");
     spv::write_vec(
         &module,
         &info,
@@ -475,11 +478,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// (requires `nff % 64 == 0`); it cooperatively RMS-normalizes that row into shared memory once,
 /// then each thread does its two dot products. `ne <= 8192`.
 pub(crate) const FFN_IN_WGSL: &str = r#"
+enable f16;
 struct PC { rows: u32, ne: u32, nff: u32, eps: f32 }
 var<immediate> pc: PC;
 @group(0) @binding(0) var<storage, read>       hidden: array<f32>; // [rows, ne]
 @group(0) @binding(1) var<storage, read>       nw: array<f32>;     // [ne] rmsnorm weight
-@group(0) @binding(2) var<storage, read>       wgu: array<f32>;    // [2*nff, ne] gate||up
+@group(0) @binding(2) var<storage, read>       wgu: array<f16>;    // [2*nff, ne] gate||up (f16)
 @group(0) @binding(3) var<storage, read_write> act: array<f32>;    // [rows, nff]
 
 var<workgroup> sh_norm: array<f32, 8192>;
@@ -532,8 +536,8 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     var up: f32 = 0.0;
     for (var k: u32 = 0u; k < pc.ne; k = k + 1u) {
         let x = sh_norm[k];
-        gate = gate + wgu[gbase + k] * x;
-        up = up + wgu[ubase + k] * x;
+        gate = gate + f32(wgu[gbase + k]) * x;
+        up = up + f32(wgu[ubase + k]) * x;
     }
     act[oidx] = (gate / (1.0 + exp(-gate))) * up;
 }
@@ -547,13 +551,14 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 /// thread computes both members of its pair's raw dot products so it can rotate. Requires
 /// `q_dim%64==0`, `kv_dim%64==0`, `hd` even, `ne<=8192`.
 pub(crate) const ATTN_IN_WGSL: &str = r#"
+enable f16;
 struct PC { rows: u32, ne: u32, q_dim: u32, kv_dim: u32, hd: u32, rope_dim: u32, theta: f32, pos: u32, eps: f32 }
 var<immediate> pc: PC;
 @group(0) @binding(0) var<storage, read>       hidden: array<f32>; // [rows, ne]
 @group(0) @binding(1) var<storage, read>       nw: array<f32>;     // [ne]
-@group(0) @binding(2) var<storage, read>       wq: array<f32>;     // [q_dim, ne]
-@group(0) @binding(3) var<storage, read>       wk: array<f32>;     // [kv_dim, ne]
-@group(0) @binding(4) var<storage, read>       wv: array<f32>;     // [kv_dim, ne]
+@group(0) @binding(2) var<storage, read>       wq: array<f16>;     // [q_dim, ne] f16
+@group(0) @binding(3) var<storage, read>       wk: array<f16>;     // [kv_dim, ne] f16
+@group(0) @binding(4) var<storage, read>       wv: array<f16>;     // [kv_dim, ne] f16
 @group(0) @binding(5) var<storage, read_write> q: array<f32>;      // [rows, q_dim]
 @group(0) @binding(6) var<storage, read_write> kout: array<f32>;   // KV cache [ctx, kv_dim]
 @group(0) @binding(7) var<storage, read_write> vout: array<f32>;   // KV cache [ctx, kv_dim]
@@ -562,11 +567,11 @@ var<workgroup> sh_norm: array<f32, 8192>;
 var<workgroup> ss_partial: array<f32, 64>;
 
 fn dot_q(row: u32) -> f32 { var a: f32 = 0.0; let b = row * pc.ne;
-    for (var k: u32 = 0u; k < pc.ne; k = k + 1u) { a = a + wq[b + k] * sh_norm[k]; } return a; }
+    for (var k: u32 = 0u; k < pc.ne; k = k + 1u) { a = a + f32(wq[b + k]) * sh_norm[k]; } return a; }
 fn dot_k(row: u32) -> f32 { var a: f32 = 0.0; let b = row * pc.ne;
-    for (var k: u32 = 0u; k < pc.ne; k = k + 1u) { a = a + wk[b + k] * sh_norm[k]; } return a; }
+    for (var k: u32 = 0u; k < pc.ne; k = k + 1u) { a = a + f32(wk[b + k]) * sh_norm[k]; } return a; }
 fn dot_v(row: u32) -> f32 { var a: f32 = 0.0; let b = row * pc.ne;
-    for (var k: u32 = 0u; k < pc.ne; k = k + 1u) { a = a + wv[b + k] * sh_norm[k]; } return a; }
+    for (var k: u32 = 0u; k < pc.ne; k = k + 1u) { a = a + f32(wv[b + k]) * sh_norm[k]; } return a; }
 
 // rotate element at within-head index `ih` given its pair's raw values (a=even, b=odd).
 fn rope_elem(ih: u32, a: f32, b: f32) -> f32 {

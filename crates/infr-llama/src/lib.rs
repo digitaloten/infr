@@ -87,6 +87,29 @@ fn load_f32(g: &Gguf, name: &str) -> Result<(Vec<f32>, Vec<usize>)> {
     Ok((v, info.shape))
 }
 
+/// Return a tensor's data as raw f16 bytes (little-endian u16). F16 tensors pass through with no
+/// conversion (fast path for f16 GGUFs); F32 tensors are converted on the host.
+fn f16_bytes(g: &Gguf, name: &str) -> Result<Vec<u8>> {
+    let info = g
+        .tensors()
+        .iter()
+        .find(|t| t.name == name)
+        .ok_or_else(|| anyhow!("tensor not found: {name}"))?
+        .clone();
+    let bytes = g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?;
+    match info.dtype {
+        infr_core::DType::F16 => Ok(bytes.to_vec()),
+        infr_core::DType::F32 => {
+            let f16: Vec<u16> = bytemuck::cast_slice::<u8, f32>(bytes)
+                .iter()
+                .map(|&x| half::f16::from_f32(x).to_bits())
+                .collect();
+            Ok(bytemuck::cast_slice(&f16).to_vec())
+        }
+        other => bail!("unsupported dtype {other:?} for {name} (bring-up wants F16/F32)"),
+    }
+}
+
 impl Llama {
     pub fn config(&self) -> &Config {
         &self.cfg
@@ -131,14 +154,12 @@ impl Llama {
         // token embeddings (host) + lm head (GPU). tied unless output.weight present.
         let (token_embd, te_shape) = load_f32(&g, "token_embd.weight")?;
         let vocab = te_shape[1];
-        let lm_head_data = if g.tensors().iter().any(|t| t.name == "output.weight") {
-            load_f32(&g, "output.weight")?.0
+        let lm_head = if g.tensors().iter().any(|t| t.name == "output.weight") {
+            be.upload_weight_bytes(&f16_bytes(&g, "output.weight")?)
         } else {
-            token_embd.clone()
-        };
-        let lm_head = be
-            .upload_weight(&lm_head_data)
-            .map_err(|e| anyhow!("upload lm_head: {e}"))?;
+            be.upload_weight_f16(&token_embd) // tied; token_embd held as f32 for host gather
+        }
+        .map_err(|e| anyhow!("upload lm_head: {e}"))?;
 
         let (output_norm, _) = load_f32(&g, "output_norm.weight")?;
         let output_norm_buf = be
@@ -149,8 +170,7 @@ impl Llama {
         for l in 0..n_layer {
             let p = |s: &str| format!("blk.{l}.{s}");
             let up = |be: &VulkanBackend, name: String| -> Result<Box<dyn Buffer>> {
-                let (d, _) = load_f32(&g, &name)?;
-                be.upload_weight(&d)
+                be.upload_weight_bytes(&f16_bytes(&g, &name)?)
                     .map_err(|e| anyhow!("upload {name}: {e}"))
             };
             let attn_norm = load_f32(&g, &p("attn_norm.weight"))?.0;
@@ -161,11 +181,11 @@ impl Llama {
             let ffn_norm_buf = be
                 .upload_weight(&ffn_norm)
                 .map_err(|e| anyhow!("upload ffn_norm {l}: {e}"))?;
-            // fuse gate + up into one [2*n_ff, n_embd] weight (concat rows)
-            let mut gateup = load_f32(&g, &p("ffn_gate.weight"))?.0;
-            gateup.extend_from_slice(&load_f32(&g, &p("ffn_up.weight"))?.0);
+            // fuse gate + up into one [2*n_ff, n_embd] f16 weight (concat rows, no f32 round-trip)
+            let mut gateup = f16_bytes(&g, &p("ffn_gate.weight"))?;
+            gateup.extend_from_slice(&f16_bytes(&g, &p("ffn_up.weight"))?);
             let wgateup = be
-                .upload_weight(&gateup)
+                .upload_weight_bytes(&gateup)
                 .map_err(|e| anyhow!("upload wgateup {l}: {e}"))?;
             layers.push(LayerWeights {
                 attn_norm,

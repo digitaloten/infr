@@ -219,7 +219,9 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        let k = self.be.kernel("linear", crate::linear::LINEAR_WGSL, 3, 12);
+        let k = self
+            .be
+            .kernel("linear_f16", crate::linear::LINEAR_F16_WGSL, 3, 12);
         let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
@@ -605,8 +607,9 @@ mod tests {
             .map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.05)
             .collect();
         let nw: Vec<f32> = (0..ne).map(|i| 1.0 + (i % 5) as f32 * 0.01).collect();
+        // f16-rounded weights so the test checks kernel logic, not f16 precision.
         let wgu: Vec<f32> = (0..2 * nff * ne)
-            .map(|i| ((i * 31 % 97) as f32 - 48.0) * 0.002)
+            .map(|i| half::f16::from_f32(((i * 31 % 97) as f32 - 48.0) * 0.002).to_f32())
             .collect();
 
         let up = |v: &[f32], u| {
@@ -616,7 +619,7 @@ mod tests {
         };
         let bh = up(&hidden, BufferUsage::Staging);
         let bn = up(&nw, BufferUsage::Staging);
-        let bw = up(&wgu, BufferUsage::Weights);
+        let bw = be.upload_weight_f16(&wgu).unwrap();
         let act = be.alloc(nff * 4, BufferUsage::Readback).unwrap();
         let rec = be.recorder().unwrap();
         rec.ffn_in(
@@ -657,9 +660,12 @@ mod tests {
             .map(|i| ((i * 5 % 11) as f32 - 5.0) * 0.04)
             .collect();
         let nw: Vec<f32> = (0..ne).map(|i| 1.0 + (i % 7) as f32 * 0.01).collect();
+        // f16-rounded weights so the test checks kernel logic, not f16 precision.
         let mkw = |rows: usize, salt: usize| -> Vec<f32> {
             (0..rows * ne)
-                .map(|i| (((i + salt) * 17 % 89) as f32 - 44.0) * 0.003)
+                .map(|i| {
+                    half::f16::from_f32((((i + salt) * 17 % 89) as f32 - 44.0) * 0.003).to_f32()
+                })
                 .collect()
         };
         let wq = mkw(q_dim, 1);
@@ -673,9 +679,9 @@ mod tests {
         };
         let bh = up(&hidden, BufferUsage::Staging);
         let bn = up(&nw, BufferUsage::Staging);
-        let bwq = up(&wq, BufferUsage::Weights);
-        let bwk = up(&wk, BufferUsage::Weights);
-        let bwv = up(&wv, BufferUsage::Weights);
+        let bwq = be.upload_weight_f16(&wq).unwrap();
+        let bwk = be.upload_weight_f16(&wk).unwrap();
+        let bwv = be.upload_weight_f16(&wv).unwrap();
         let bq = be.alloc(q_dim * 4, BufferUsage::Readback).unwrap();
         let bkc = be.alloc(ctx * kv_dim * 4, BufferUsage::Readback).unwrap();
         let bvc = be.alloc(ctx * kv_dim * 4, BufferUsage::Readback).unwrap();
