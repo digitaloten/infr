@@ -1,6 +1,25 @@
+use std::process::Command;
+
+/// Compile GLSL compute shaders (which need features WGSL/naga can't express, e.g.
+/// cooperative matrix) to SPIR-V via `glslc` at build time. Output to OUT_DIR.
 fn main() {
-    // TODO(sonnet): compile shaders/*.comp -> SPIR-V here (e.g. via the `shaderc` crate),
-    // or copy/reuse precompiled .spv from the ggml-vulkan build. Emit them to OUT_DIR and
-    // include_bytes! them in src/. See PLAN.md "compute / Vulkan".
     println!("cargo:rerun-if-changed=shaders");
+    let out = std::env::var("OUT_DIR").expect("OUT_DIR");
+    for name in ["gemm_coopmat"] {
+        let src = format!("shaders/{name}.comp");
+        let dst = format!("{out}/{name}.spv");
+        println!("cargo:rerun-if-changed={src}");
+        let status = Command::new("glslc")
+            .args([
+                "-fshader-stage=comp",
+                "--target-env=vulkan1.3",
+                "-O",
+                &src,
+                "-o",
+                &dst,
+            ])
+            .status()
+            .expect("failed to run glslc — install shaderc (provides glslc)");
+        assert!(status.success(), "glslc failed for {src}");
+    }
 }

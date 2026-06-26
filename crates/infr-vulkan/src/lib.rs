@@ -6,6 +6,7 @@
 //! `VK_KHR_shader_subgroup_extended_types`. See PLAN.md.
 #![allow(dead_code)]
 
+mod gemm;
 mod linear;
 mod matmul;
 mod ops;
@@ -230,14 +231,28 @@ impl VulkanBackend {
             .queue_family_index(queue_family_index)
             .queue_priorities(&priorities);
 
-        // Enable float16 if available; setting it to false is a no-op.
+        // Feature chain — needed for cooperative-matrix kernels:
+        //   shaderFloat16 (f16 math), 16-bit storage (f16 SSBOs), Vulkan memory model
+        //   (required by coopmat), cooperativeMatrix itself.
         let mut shader_f16_ci =
             vk::PhysicalDeviceShaderFloat16Int8Features::default().shader_float16(has_f16);
+        let mut storage16_ci = vk::PhysicalDevice16BitStorageFeatures::default()
+            .storage_buffer16_bit_access(has_16bit_storage);
+        let mut memmodel_ci = vk::PhysicalDeviceVulkanMemoryModelFeatures::default()
+            .vulkan_memory_model(true)
+            .vulkan_memory_model_device_scope(true);
+        let mut coopmat_ci =
+            vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
 
-        let device_ci = vk::DeviceCreateInfo::default()
+        let mut device_ci = vk::DeviceCreateInfo::default()
             .queue_create_infos(std::slice::from_ref(&queue_ci))
             .enabled_extension_names(&ext_ptrs)
-            .push_next(&mut shader_f16_ci);
+            .push_next(&mut shader_f16_ci)
+            .push_next(&mut storage16_ci)
+            .push_next(&mut memmodel_ci);
+        if has_coop_matrix {
+            device_ci = device_ci.push_next(&mut coopmat_ci);
+        }
 
         let device = unsafe { instance.create_device(physical_device, &device_ci, None) }
             .map_err(|e| be(format!("create_device: {e}")))?;

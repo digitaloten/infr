@@ -51,9 +51,17 @@ pub(crate) fn make_compute_kernel(
     n_buf: usize,
     push_size: u32,
 ) -> ComputeKernel {
-    let spv = compile_wgsl(wgsl);
+    make_compute_kernel_from_spv(device, &compile_wgsl(wgsl), n_buf, push_size)
+}
+
+pub(crate) fn make_compute_kernel_from_spv(
+    device: &ash::Device,
+    spv: &[u32],
+    n_buf: usize,
+    push_size: u32,
+) -> ComputeKernel {
     let shader = unsafe {
-        device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&spv), None)
+        device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(spv), None)
     }
     .expect("shader module");
 
@@ -150,6 +158,20 @@ impl VulkanBackend {
         let mut map = self.shared.kernels.lock().unwrap();
         *map.entry(name)
             .or_insert_with(|| make_compute_kernel(&self.shared.device, wgsl, n_buf, push_size))
+    }
+
+    /// Like `kernel`, but from precompiled SPIR-V (for GLSL-compiled coopmat shaders).
+    pub(crate) fn kernel_spv(
+        &self,
+        name: &'static str,
+        spv: &[u32],
+        n_buf: usize,
+        push_size: u32,
+    ) -> ComputeKernel {
+        let mut map = self.shared.kernels.lock().unwrap();
+        *map.entry(name).or_insert_with(|| {
+            make_compute_kernel_from_spv(&self.shared.device, spv, n_buf, push_size)
+        })
     }
 
     /// Eagerly run a kernel: bind `inputs` (read) then one output buffer (read_write), push
