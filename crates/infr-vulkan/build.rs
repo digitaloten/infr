@@ -17,6 +17,7 @@ fn main() {
         ("gemm_proj_warp", "gemm_proj_warp", &[]),
         ("attn_partial", "attn_partial", &[]),
         ("attn_qk", "attn_qk", &[]),
+        ("attn_qk_warp", "attn_qk_warp", &[]),
         ("attn_softmax", "attn_softmax", &[]),
         ("attn_pv", "attn_pv", &[]),
         ("attn_pv_reduce", "attn_pv_reduce", &[]),

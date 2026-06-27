@@ -880,15 +880,22 @@ impl<'a> Recorder<'a> {
         pos_offset: usize,
     ) {
         let mpad = (n.div_ceil(64) * 64) as u32;
-        let kv_pad = (kv_len.div_ceil(64) * 64) as u32;
+        // kv padded to 256 (the 8-warp attn_qk's BN); extra cols are masked in softmax. Still %64 so
+        // the 4-warp fallback + softmax + attn_pv are unaffected.
+        let kv_pad = (kv_len.div_ceil(256) * 256) as u32;
         let hdu = hd as u32;
         let scale = 1.0f32 / (hd as f32).sqrt();
 
-        // stage 1: S = scale·Q·Kᵀ  (one coopmat GEMM per head)
+        // stage 1: S = scale·Q·Kᵀ. 8-warp/256-thread warptile (BN=256, matches ollama's mul_mm)
+        // unless INFR_NO_QK_WARP forces the 4-warp/2×2 attn_qk.
         self.stamp("attn_qk");
-        let kqk = self
-            .be
-            .kernel_spv_sg("attn_qk", crate::gemm::attn_qk_spv(), 3, 24, 32);
+        let qk_warp = std::env::var("INFR_NO_QK_WARP").is_err();
+        let (qk_name, qk_spv, qk_bn) = if qk_warp {
+            ("attn_qk_warp", crate::gemm::attn_qk_warp_spv(), 256u32)
+        } else {
+            ("attn_qk", crate::gemm::attn_qk_spv(), 64u32)
+        };
+        let kqk = self.be.kernel_spv_sg(qk_name, qk_spv, 3, 24, 32);
         let mut p = [0u8; 24];
         p[0..4].copy_from_slice(&mpad.to_ne_bytes());
         p[4..8].copy_from_slice(&kv_pad.to_ne_bytes());
@@ -896,7 +903,7 @@ impl<'a> Recorder<'a> {
         p[12..16].copy_from_slice(&(nh as u32).to_ne_bytes());
         p[16..20].copy_from_slice(&(nkv as u32).to_ne_bytes());
         p[20..24].copy_from_slice(&scale.to_ne_bytes());
-        let qk_tiles = (mpad / 64) * (kv_pad / 64);
+        let qk_tiles = (mpad / 64) * (kv_pad / qk_bn);
         self.dispatch3(
             kqk,
             &[Self::vkb(q), Self::vkb(kc), Self::vkb(s)],
@@ -1529,7 +1536,7 @@ mod tests {
         let be = VulkanBackend::new().unwrap();
         let pos_offset = kv_len - q_len;
         let mpad = q_len.div_ceil(64) * 64;
-        let kv_pad = kv_len.div_ceil(64) * 64;
+        let kv_pad = kv_len.div_ceil(256) * 256; // recorder pads kv to 256 (8-warp attn_qk BN)
         let gen = |n: usize, salt: usize| -> Vec<f32> {
             (0..n)
                 .map(|i| (((i * 13 + salt) % 29) as f32 - 14.0) * 0.05)
@@ -1540,10 +1547,11 @@ mod tests {
         let v = r16(&gen(kv_len * nkv * hd, 3));
         let mut qp = q.clone();
         qp.resize(mpad * nh * hd, 0.0);
+        // K/V must cover the padded kv (the kernel reads padded rows; softmax masks them).
         let mut kp = k.clone();
-        kp.resize((kv_len + 64) * nkv * hd, 0.0);
+        kp.resize((kv_pad + 64) * nkv * hd, 0.0);
         let mut vp = v.clone();
-        vp.resize((kv_len + 64) * nkv * hd, 0.0);
+        vp.resize((kv_pad + 64) * nkv * hd, 0.0);
         let bq = upf16(&be, &qp);
         let bk = upf16(&be, &kp);
         let bv = upf16(&be, &vp);

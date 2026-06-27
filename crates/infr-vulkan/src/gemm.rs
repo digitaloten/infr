@@ -30,6 +30,7 @@ const GEMM_PROJ_WARP_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemm_proj_warp.spv"));
 const ATTN_PARTIAL_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_partial.spv"));
 const ATTN_QK_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_qk.spv"));
+const ATTN_QK_WARP_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_qk_warp.spv"));
 const ATTN_SM_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_softmax.spv"));
 const ATTN_PV_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_pv.spv"));
 const ATTN_PV_REDUCE_SPV_BYTES: &[u8] =
@@ -50,6 +51,7 @@ static GEMM_PROJ_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static GEMM_PROJ_WARP_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_PARTIAL_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_QK_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_QK_WARP_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_SM_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_PV_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_PV_REDUCE_SPV: OnceLock<Vec<u32>> = OnceLock::new();
@@ -94,6 +96,11 @@ pub(crate) fn attn_partial_spv() -> &'static [u32] {
 /// SPIR-V for the non-FA prefill attention kernels (QK scores / row softmax / PV). Recorder use.
 pub(crate) fn attn_qk_spv() -> &'static [u32] {
     ATTN_QK_SPV.get_or_init(|| spv_words(ATTN_QK_SPV_BYTES))
+}
+/// 8-warp/256-thread QK GEMM (kv_pad % 256). Matches ollama's mul_mm warptile; the recorder uses it
+/// over the 4-warp attn_qk unless INFR_NO_QK_WARP is set.
+pub(crate) fn attn_qk_warp_spv() -> &'static [u32] {
+    ATTN_QK_WARP_SPV.get_or_init(|| spv_words(ATTN_QK_WARP_SPV_BYTES))
 }
 pub(crate) fn attn_softmax_spv() -> &'static [u32] {
     ATTN_SM_SPV.get_or_init(|| spv_words(ATTN_SM_SPV_BYTES))

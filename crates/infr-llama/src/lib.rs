@@ -1036,9 +1036,10 @@ impl Llama {
         // workgroups) with a 64-key floor. Reused across layers.
         let kv_len = pos + n;
         let chunk = (kv_len / 64).clamp(64, 512);
-        // Non-FA scores scratch: [nh, mpad, kv_pad] f16 (kv padded to 64).
+        // Non-FA scores scratch: [nh, mpad, kv_pad] f16 (kv padded to 256 — the 8-warp attn_qk's BN;
+        // the recorder uses the same padding).
         let nonfa_s = if nonfa {
-            let kv_pad = kv_len.div_ceil(64) * 64;
+            let kv_pad = kv_len.div_ceil(256) * 256;
             Some(
                 self.be
                     .alloc(nh * mpad * kv_pad * 2, BufferUsage::Activations)
