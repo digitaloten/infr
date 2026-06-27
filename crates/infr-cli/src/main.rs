@@ -183,7 +183,13 @@ fn print_run_stats(
 
 fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     use std::io::Write;
-    const MAX_CTX: usize = 8192;
+    // Default 8192; override with INFR_MAX_CTX (e.g. 32768 to exercise high-ctx prefill).
+    let max_ctx: usize = std::env::var("INFR_MAX_CTX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8192);
+    #[allow(non_snake_case)]
+    let MAX_CTX = max_ctx;
     let envf = |k: &str, d: f32| {
         std::env::var(k)
             .ok()
