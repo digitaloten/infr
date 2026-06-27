@@ -991,21 +991,23 @@ impl<'a> Recorder<'a> {
             &p1,
             (nh * n_chunks) as u32,
         );
-        // pass 2: combine
+        // pass 2: combine — split each head's hd outputs across `ntile` workgroups for occupancy.
         self.stamp("attn_combine");
         let k2 = self
             .be
-            .kernel("attn_combine", ops::ATTN_COMBINE_WGSL, 4, 12);
-        let mut p2 = [0u8; 12];
+            .kernel("attn_combine", ops::ATTN_COMBINE_WGSL, 4, 16);
+        let ntile = if hd % 4 == 0 { 4u32 } else { 1u32 };
+        let mut p2 = [0u8; 16];
         p2[0..4].copy_from_slice(&(nh as u32).to_ne_bytes());
         p2[4..8].copy_from_slice(&(hd as u32).to_ne_bytes());
         p2[8..12].copy_from_slice(&(n_chunks as u32).to_ne_bytes());
+        p2[12..16].copy_from_slice(&ntile.to_ne_bytes());
         self.dispatch(
             k2,
             &[Self::vkb(pm), Self::vkb(pl), Self::vkb(pacc), Self::vkb(o)],
             1,
             &p2,
-            nh as u32,
+            nh as u32 * ntile,
         );
     }
 

@@ -1036,7 +1036,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 /// online-softmax rule (`M=max mₖ; l=Σ lₖ·e^{mₖ−M}; acc=Σ accₖ·e^{mₖ−M}; o=acc/l`), parallel over
 /// the head dim. `n_chunks<=64`.
 pub(crate) const ATTN_COMBINE_WGSL: &str = r#"
-struct PC { nh: u32, hd: u32, n_chunks: u32 }
+struct PC { nh: u32, hd: u32, n_chunks: u32, ntile: u32 }
 var<immediate> pc: PC;
 @group(0) @binding(0) var<storage, read>       pm: array<f32>;   // [nh, n_chunks]
 @group(0) @binding(1) var<storage, read>       pl: array<f32>;   // [nh, n_chunks]
@@ -1045,22 +1045,27 @@ var<immediate> pc: PC;
 
 var<workgroup> wexp: array<f32, 512>; // exp(pm[c]-max) per chunk, precomputed once and reused
 
-@compute @workgroup_size(64, 1, 1)
+// One workgroup per (head, hd-tile): nh workgroups starved a 96-CU GPU (combine was latency-bound),
+// so split each head's hd outputs across `ntile` workgroups for occupancy. m/l are cheap to recompute
+// per tile (a scan over n_chunks), which avoids any cross-workgroup reduction.
+@compute @workgroup_size(32, 1, 1)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         @builtin(workgroup_id) wid: vec3<u32>) {
-    let h = wid.x;
-    let t = lid.x;
+    let h = wid.x / pc.ntile;
+    let tile = wid.x % pc.ntile;
     let hd = pc.hd;
+    let hdt = hd / pc.ntile;
+    let d0 = tile * hdt;
+    let t = lid.x;
     let base = h * pc.n_chunks;
     var mm: f32 = -3.0e38;
     for (var c: u32 = 0u; c < pc.n_chunks; c = c + 1u) { mm = max(mm, pm[base + c]); }
-    // Precompute the per-chunk softmax weight ONCE (was recomputed via exp() for every (d,c)).
-    for (var c: u32 = t; c < pc.n_chunks; c = c + 64u) { wexp[c] = exp(pm[base + c] - mm); }
+    for (var c: u32 = t; c < pc.n_chunks; c = c + 32u) { wexp[c] = exp(pm[base + c] - mm); }
     workgroupBarrier();
     var l: f32 = 0.0;
     for (var c: u32 = 0u; c < pc.n_chunks; c = c + 1u) { l = l + pl[base + c] * wexp[c]; }
     let inv = 1.0 / l;
-    for (var d: u32 = t; d < hd; d = d + 64u) {
+    for (var d: u32 = d0 + t; d < d0 + hdt; d = d + 32u) {
         var acc: f32 = 0.0;
         for (var c: u32 = 0u; c < pc.n_chunks; c = c + 1u) {
             acc = acc + pacc[(base + c) * hd + d] * wexp[c];
