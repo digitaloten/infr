@@ -326,16 +326,22 @@ impl<'a> Recorder<'a> {
         blk_shift: u32,
     ) {
         self.stamp("matmul_proj");
-        let kern = self
-            .be
-            .kernel_spv_sg("gemm_proj", crate::gemm::gemm_proj_spv(), 5, 20, 32);
+        // Warp tile (BM=64,BN=128) wins for large M (low/mid-ctx prefill: +10-12%) but its halved
+        // workgroup count loses occupancy when M is small (high ctx, tiny chunk). Pick per chunk.
+        let warp = m >= 1024 && n % 128 == 0;
+        let (name, spv, tiles_n) = if warp {
+            ("gemm_proj_warp", crate::gemm::gemm_proj_warp_spv(), n / 128)
+        } else {
+            ("gemm_proj", crate::gemm::gemm_proj_spv(), n / 64)
+        };
+        let kern = self.be.kernel_spv_sg(name, spv, 5, 20, 32);
         let mut push = [0u8; 20];
         push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&bits.to_ne_bytes());
         push[16..20].copy_from_slice(&blk_shift.to_ne_bytes());
-        let groups = (m.div_ceil(64) * (n / 64)) as u32;
+        let groups = (m.div_ceil(64) * tiles_n) as u32; // both kernels use BM=64
         self.dispatch(
             kern,
             &[

@@ -22,6 +22,8 @@ const GEMM_TILED_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coopmat_tiled.spv"));
 const GEMM_WARP_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_warp.spv"));
 const GEMM_PROJ_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_proj.spv"));
+const GEMM_PROJ_WARP_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemm_proj_warp.spv"));
 const ATTN_PARTIAL_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_partial.spv"));
 const ATTN_QK_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_qk.spv"));
 const ATTN_SM_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_softmax.spv"));
@@ -36,6 +38,7 @@ static GEMM_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static GEMM_TILED_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static GEMM_WARP_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static GEMM_PROJ_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static GEMM_PROJ_WARP_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_PARTIAL_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_QK_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_SM_SPV: OnceLock<Vec<u32>> = OnceLock::new();
@@ -57,6 +60,11 @@ fn gemm_warp_spv() -> &'static [u32] {
 /// SPIR-V for the prefill projection GEMM (`C=A·Wᵀ`, f16/quant W). Used by the recorder.
 pub(crate) fn gemm_proj_spv() -> &'static [u32] {
     GEMM_PROJ_SPV.get_or_init(|| spv_words(GEMM_PROJ_SPV_BYTES))
+}
+/// Warp-tiled projection GEMM (BM=64,BN=128). Faster for large M (low/mid-ctx prefill); the recorder
+/// falls back to `gemm_proj_spv` for small M (high ctx) where its fewer workgroups lose occupancy.
+pub(crate) fn gemm_proj_warp_spv() -> &'static [u32] {
+    GEMM_PROJ_WARP_SPV.get_or_init(|| spv_words(GEMM_PROJ_WARP_SPV_BYTES))
 }
 /// SPIR-V for the subgroup-reduction flash-decoding pass-1 (split-K) kernel. Used by the recorder.
 pub(crate) fn attn_partial_spv() -> &'static [u32] {
