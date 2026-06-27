@@ -18,6 +18,7 @@ infr-server.workspace = true
 infr-llama = { path = "../infr-llama" }
 clap.workspace = true
 anyhow.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

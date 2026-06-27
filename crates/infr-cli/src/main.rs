@@ -44,6 +44,11 @@ enum Cmd {
         /// Context depth pre-filled (untimed) before measuring — matches llama-bench -d.
         #[arg(short = 'd', long = "n-depth", default_value_t = 0)]
         depth: usize,
+        /// Combined prompt+gen turn `P,G` (matches llama-bench -pg): time ingesting P tokens THEN
+        /// generating G; throughput = (P+G)/time. Models one coding-agent turn (read a file/tool
+        /// result, then emit a reply). Overrides -p/-n when set.
+        #[arg(long = "pg")]
+        pg: Option<String>,
         /// Logical batch size (matches llama-bench -b). Accepted for flag-parity; the engine
         /// chunks by ubatch, so only -ub affects per-forward work.
         #[arg(short = 'b', long = "batch-size", default_value_t = 2048)]
@@ -58,6 +63,32 @@ enum Cmd {
         /// Emit `[{"avg_ts": X}]` (same shape as `llama-bench -o json`) for scripted comparison.
         #[arg(long)]
         json: bool,
+    },
+    /// Compare infr vs llama.cpp on coding-agent-shaped workloads (long context, replies at depth,
+    /// whole turns). Shells out to `infr bench` and `llama-bench` with matching flags, same model+GPU.
+    Compare {
+        model: String,
+        /// llama-bench device for the same GPU (override if device order differs).
+        #[arg(long, default_value = "Vulkan0")]
+        dev: String,
+        /// Repetitions per measurement (reported value is the average).
+        #[arg(short = 'r', long, default_value_t = 3)]
+        reps: usize,
+        /// Pin the ubatch (per-forward chunk) on both tools. 0 = each tool's own default.
+        #[arg(short = 'u', long = "ubatch-size", default_value_t = 0)]
+        ubatch: usize,
+        /// Session depths / prefill sizes (coding-agent scale). Stay within the model's context.
+        #[arg(long, value_delimiter = ',', default_values_t = [8000usize, 16000, 32000])]
+        ctx: Vec<usize>,
+        /// Reply length for the decode-at-depth scenario.
+        #[arg(long, default_value_t = 256)]
+        gen: usize,
+        /// Session turns as `P,G` (ingest P tokens, generate G). Repeat the flag for several shapes.
+        #[arg(long = "turn", default_values_t = ["2048,256".to_string(), "8192,512".to_string()])]
+        turns: Vec<String>,
+        /// Path to the llama-bench binary.
+        #[arg(long, default_value = "llama-bench")]
+        llama_bench: String,
     },
 }
 
@@ -78,11 +109,22 @@ fn main() -> anyhow::Result<()> {
             n_prompt,
             n_gen,
             depth,
+            pg,
             batch,
             ubatch,
             reps,
             json,
-        } => cmd_bench(&model, n_prompt, n_gen, depth, ubatch, reps, json),
+        } => cmd_bench(&model, n_prompt, n_gen, depth, pg, ubatch, reps, json),
+        Cmd::Compare {
+            model,
+            dev,
+            reps,
+            ubatch,
+            ctx,
+            gen,
+            turns,
+            llama_bench,
+        } => cmd_compare(&model, &dev, reps, ubatch, &ctx, gen, &turns, &llama_bench),
     }
 }
 
@@ -346,18 +388,27 @@ impl infr_server::ChatGenerator for LlamaGenerator {
 /// Benchmark prefill (pp) or decode (tg) tok/s with the same -p/-n/-d/-r interface as
 /// `llama-bench`, so `infr bench` and `llama-bench` are directly comparable. Dummy tokens (timing
 /// is data-independent), `prefill_chunk` policy for the prefill batching (the engine's real path).
+#[allow(clippy::too_many_arguments)]
 fn cmd_bench(
     model: &str,
     n_prompt: usize,
     n_gen: usize,
     depth: usize,
+    pg: Option<String>,
     ubatch: usize,
     reps: usize,
     json: bool,
 ) -> anyhow::Result<()> {
+    // -pg "P,G": a coding-agent turn (ingest P then generate G); throughput = (P+G)/time.
+    let pg = pg
+        .map(|s| -> anyhow::Result<(usize, usize)> {
+            let (p, g) = s.split_once(',').context("--pg expects `P,G`")?;
+            Ok((p.trim().parse()?, g.trim().parse()?))
+        })
+        .transpose()?;
     let (gguf, tok) = resolve(model)?;
     let llama = infr_llama::Llama::load_opt(&gguf, tok.as_deref())?;
-    let measure_tg = n_gen > 0;
+    let measure_tg = pg.is_none() && n_gen > 0;
     let dummy =
         |pos: usize, c: usize| -> Vec<u32> { (0..c).map(|i| ((pos + i) % 100) as u32).collect() };
     // ubatch>0 pins the prefill chunk (= llama-bench -ub); 0 = the engine's adaptive policy.
@@ -368,30 +419,37 @@ fn cmd_bench(
             llama.prefill_chunk(pos)
         }
     };
+    // prefill `count` tokens starting at the cache head, chunked. Returns the throughput's token count.
+    let prefill = |kv: &mut infr_llama::KvCache, count: usize| -> anyhow::Result<()> {
+        let mut done = 0usize;
+        while done < count {
+            let pos = kv.len();
+            let c = chunk(pos).min(count - done);
+            llama.forward_resident_kv(&dummy(pos, c), kv)?;
+            done += c;
+        }
+        Ok(())
+    };
+    let cap = depth + pg.map_or(n_prompt + n_gen, |(p, g)| p + g) + 64;
     let mut samples = Vec::with_capacity(reps);
     for _ in 0..reps {
-        let mut kv = llama.new_kv(depth + n_prompt + n_gen + 64)?;
-        // warm to `depth` (untimed)
-        let mut pos = 0usize;
-        while pos < depth {
-            let c = chunk(pos).min(depth - pos);
-            llama.forward_resident_kv(&dummy(pos, c), &mut kv)?;
-            pos += c;
-        }
+        let mut kv = llama.new_kv(cap)?;
+        prefill(&mut kv, depth)?; // warm to `depth` (untimed)
         let t = std::time::Instant::now();
-        if measure_tg {
+        if let Some((p, g)) = pg {
+            // coding-agent turn: time prompt ingest + reply generation together.
+            prefill(&mut kv, p)?;
+            for _ in 0..g {
+                llama.forward_resident_kv(&[7u32], &mut kv)?;
+            }
+            samples.push((p + g) as f64 / t.elapsed().as_secs_f64());
+        } else if measure_tg {
             for _ in 0..n_gen {
                 llama.forward_resident_kv(&[7u32], &mut kv)?;
             }
             samples.push(n_gen as f64 / t.elapsed().as_secs_f64());
         } else {
-            let mut done = 0usize;
-            while done < n_prompt {
-                let c = chunk(pos).min(n_prompt - done);
-                llama.forward_resident_kv(&dummy(pos, c), &mut kv)?;
-                pos += c;
-                done += c;
-            }
+            prefill(&mut kv, n_prompt)?;
             samples.push(n_prompt as f64 / t.elapsed().as_secs_f64());
         }
     }
@@ -399,7 +457,9 @@ fn cmd_bench(
     if json {
         println!("[{{\"avg_ts\": {avg:.2}}}]");
     } else {
-        let label = if measure_tg {
+        let label = if let Some((p, g)) = pg {
+            format!("pg{p}+{g}")
+        } else if measure_tg {
             format!("tg{n_gen}")
         } else {
             format!("pp{n_prompt}")
@@ -410,6 +470,134 @@ fn cmd_bench(
             String::new()
         };
         println!("{label}{d}: {avg:.1} t/s  ({reps} reps)");
+    }
+    Ok(())
+}
+
+/// Compare infr vs llama.cpp on coding-agent-shaped workloads. Shells out to `infr bench` (this same
+/// binary) and `llama-bench` with matching flags, so both run the SAME model + GPU under one driver.
+/// Scenarios (the target workload — see memory infr-optimization-priority):
+///   • CONTEXT LOAD — cold prefill of a repo/file dump (pp at each ctx size)
+///   • REPLY @depth — decode a `gen`-token reply with a session already in context (tg @ depth)
+///   • SESSION TURN — ingest P then generate G at session depth (pg, the realistic per-turn unit)
+#[allow(clippy::too_many_arguments)]
+fn cmd_compare(
+    model: &str,
+    dev: &str,
+    reps: usize,
+    ubatch: usize,
+    ctx: &[usize],
+    gen: usize,
+    turns: &[String],
+    llama_bench: &str,
+) -> anyhow::Result<()> {
+    use std::process::Command;
+    let exe = std::env::current_exe().context("locating the infr binary")?;
+    let reps_s = reps.to_string();
+
+    // Run `infr bench` (this binary) and read its single-row [{"avg_ts":X}].
+    let infr_b = |args: &[&str]| -> anyhow::Result<f64> {
+        let mut c = Command::new(&exe);
+        c.arg("bench").arg(model).args(["-r", &reps_s]);
+        if ubatch > 0 {
+            c.args(["-u", &ubatch.to_string()]);
+        }
+        c.args(args).arg("--json");
+        let out = c.output().context("running `infr bench`")?;
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).with_context(|| {
+            format!(
+                "parsing infr bench output: {}",
+                String::from_utf8_lossy(&out.stdout)
+            )
+        })?;
+        v[0]["avg_ts"]
+            .as_f64()
+            .context("infr bench: missing avg_ts")
+    };
+
+    // Run `llama-bench -o json` and pick the row matching (n_prompt, n_gen): -pg adds extra rows.
+    let llama_b = |np: usize, ng: usize, args: &[&str]| -> Option<f64> {
+        let mut c = Command::new(llama_bench);
+        c.args([
+            "-m", model, "-ngl", "99", "-dev", dev, "-fa", "auto", "-r", &reps_s, "-o", "json",
+        ]);
+        if ubatch > 0 {
+            c.args(["-ub", &ubatch.to_string()]);
+        }
+        c.args(args);
+        let out = c.output().ok()?;
+        let rows: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+        rows.as_array()?.iter().find_map(|r| {
+            let p = r["n_prompt"].as_u64()? as usize;
+            let g = r["n_gen"].as_u64()? as usize;
+            (p == np && g == ng).then(|| r["avg_ts"].as_f64())?
+        })
+    };
+
+    let model_name = Path::new(model)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(model);
+    let ub_s = if ubatch > 0 {
+        ubatch.to_string()
+    } else {
+        "tool-default".into()
+    };
+    println!("\nmodel: {model_name}   reps: {reps}   ubatch: {ub_s}");
+
+    let row = |label: String, i: anyhow::Result<f64>, l: Option<f64>| {
+        let is = i
+            .as_ref()
+            .map(|v| format!("{v:.0}"))
+            .unwrap_or_else(|_| "ERR".into());
+        let ls = l.map(|v| format!("{v:.0}")).unwrap_or_else(|| "NA".into());
+        let ratio = match (i.as_ref().ok(), l) {
+            (Some(&iv), Some(lv)) if lv > 0.0 => format!("{:.2}x", iv / lv),
+            _ => "-".into(),
+        };
+        println!("{label:<17} | {is:>10} | {ls:>10} | {ratio:>8}");
+    };
+    let hdr = |title: &str| {
+        println!(
+            "\n{title:<17} | {:>10} | {:>10} | {:>8}",
+            "infr", "llama.cpp", "infr/llama"
+        );
+        println!("{:-<18}+{:-<12}+{:-<12}+{:-<10}", "", "", "", "");
+    };
+
+    hdr("CONTEXT LOAD"); // cold prefill of a repo/file dump
+    for &n in ctx {
+        let np = n.to_string();
+        row(
+            format!("pp{n}"),
+            infr_b(&["-p", &np, "-n", "0"]),
+            llama_b(n, 0, &["-p", &np, "-n", "0"]),
+        );
+    }
+
+    hdr("REPLY @depth"); // decode a reply with a session already in context
+    let g = gen.to_string();
+    for &d in ctx {
+        let ds = d.to_string();
+        row(
+            format!("tg{gen}@{d}"),
+            infr_b(&["-p", "0", "-n", &g, "-d", &ds]),
+            llama_b(0, gen, &["-p", "0", "-n", &g, "-d", &ds]),
+        );
+    }
+
+    for t in turns {
+        let (p, gg) = t.split_once(',').context("--turn expects `P,G`")?;
+        let (pn, gn): (usize, usize) = (p.trim().parse()?, gg.trim().parse()?);
+        hdr(&format!("TURN {t}")); // ingest P then generate G at session depth
+        for &d in ctx {
+            let ds = d.to_string();
+            row(
+                format!("pg{t}@{d}"),
+                infr_b(&["--pg", t, "-d", &ds]),
+                llama_b(pn, gn, &["-p", "0", "-n", "0", "-pg", t, "-d", &ds]),
+            );
+        }
     }
     Ok(())
 }

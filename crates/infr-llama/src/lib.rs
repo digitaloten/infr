@@ -129,6 +129,18 @@ pub struct KvCache {
     max_ctx: usize,
 }
 
+impl KvCache {
+    /// Tokens currently resident in the cache (the next forward's start position).
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// True when no tokens are resident yet.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 fn meta_u64(g: &Gguf, key: &str) -> Option<u64> {
     g.metadata().u64(key)
 }
