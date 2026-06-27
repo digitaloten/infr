@@ -1,0 +1,67 @@
+#version 460
+// RAW dp4a GEMM ceiling probe: C[M,N] int32 = A[M,K] · B[N,K] (both int8, K contiguous, packed 4/u32).
+// Scalar register-blocked tile (no coopmat — RADV's int8 WMMA hangs). Each thread owns TM×TN int32
+// accumulators; inner loop uses dotPacked4x8EXT (hardware-accelerated 4×8-bit integer dot). No scales
+// — purely to measure the dp4a throughput vs the f16 WMMA path before building the real mmq kernel.
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_control_flow_attributes : require
+
+const uint BM = 64u;
+const uint BN = 64u;
+const uint BKP = 8u;       // packed-k per tile step (= 32 int8 elements)
+const uint TM = 4u;
+const uint TN = 4u;
+const uint THREADS = (BM / TM) * (BN / TN); // 16*16 = 256
+const uint SAP = BKP + 1u;  // shared stride (pad)
+const uint SBP = BKP + 1u;
+
+layout(local_size_x = THREADS, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint m; uint n; uint kp; } pc; // kp = K/4 (packed words along K)
+layout(binding = 0) readonly buffer ABuf { uint a[]; };  // [M, kp]
+layout(binding = 1) readonly buffer BBuf { uint b[]; };  // [N, kp]
+layout(binding = 2) writeonly buffer CBuf { int c[]; };  // [M, N]
+
+shared uint As[BM * SAP];
+shared uint Bs[BN * SBP];
+
+void main() {
+    uint wgRow = gl_WorkGroupID.y * BM;
+    uint wgCol = gl_WorkGroupID.x * BN;
+    uint li = gl_LocalInvocationIndex;
+    uint tr = li / (BN / TN);   // thread row 0..15
+    uint tc = li % (BN / TN);   // thread col 0..15
+
+    int acc[TM][TN];
+    [[unroll]] for (uint i = 0u; i < TM; i++)
+        [[unroll]] for (uint j = 0u; j < TN; j++) acc[i][j] = 0;
+
+    for (uint k0 = 0u; k0 < pc.kp; k0 += BKP) {
+        for (uint idx = li; idx < BM * BKP; idx += THREADS) {
+            uint r = idx / BKP;
+            uint cc = idx % BKP;
+            As[r * SAP + cc] = a[(wgRow + r) * pc.kp + k0 + cc];
+        }
+        for (uint idx = li; idx < BN * BKP; idx += THREADS) {
+            uint r = idx / BKP;
+            uint cc = idx % BKP;
+            Bs[r * SBP + cc] = b[(wgCol + r) * pc.kp + k0 + cc];
+        }
+        barrier();
+        [[unroll]] for (uint kk = 0u; kk < BKP; kk++) {
+            int av[TM];
+            int bv[TN];
+            [[unroll]] for (uint i = 0u; i < TM; i++) av[i] = int(As[(tr * TM + i) * SAP + kk]);
+            [[unroll]] for (uint j = 0u; j < TN; j++) bv[j] = int(Bs[(tc * TN + j) * SBP + kk]);
+            [[unroll]] for (uint i = 0u; i < TM; i++)
+                [[unroll]] for (uint j = 0u; j < TN; j++)
+                    acc[i][j] = dotPacked4x8AccSatEXT(av[i], bv[j], acc[i][j]);
+        }
+        barrier();
+    }
+
+    [[unroll]] for (uint i = 0u; i < TM; i++)
+        [[unroll]] for (uint j = 0u; j < TN; j++)
+            c[(wgRow + tr * TM + i) * pc.n + (wgCol + tc * TN + j)] = acc[i][j];
+}

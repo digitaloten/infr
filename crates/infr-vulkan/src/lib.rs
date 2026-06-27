@@ -205,6 +205,7 @@ impl VulkanBackend {
 
         let has_coop_matrix = has_ext(c"VK_KHR_cooperative_matrix");
         let has_16bit_storage = has_ext(c"VK_KHR_16bit_storage");
+        let has_8bit_storage = has_ext(c"VK_KHR_8bit_storage");
         let has_subgroup_ext = has_ext(c"VK_KHR_shader_subgroup_extended_types");
 
         // ── probe f16 feature (via VK 1.1 get_physical_device_features2) ──────
@@ -221,6 +222,9 @@ impl VulkanBackend {
         if has_16bit_storage {
             ext_ptrs.push(c"VK_KHR_16bit_storage".as_ptr());
         }
+        if has_8bit_storage {
+            ext_ptrs.push(c"VK_KHR_8bit_storage".as_ptr());
+        }
         if has_subgroup_ext {
             ext_ptrs.push(c"VK_KHR_shader_subgroup_extended_types".as_ptr());
         }
@@ -234,10 +238,13 @@ impl VulkanBackend {
         // Feature chain — needed for cooperative-matrix kernels:
         //   shaderFloat16 (f16 math), 16-bit storage (f16 SSBOs), Vulkan memory model
         //   (required by coopmat), cooperativeMatrix itself.
-        let mut shader_f16_ci =
-            vk::PhysicalDeviceShaderFloat16Int8Features::default().shader_float16(has_f16);
+        let mut shader_f16_ci = vk::PhysicalDeviceShaderFloat16Int8Features::default()
+            .shader_float16(has_f16)
+            .shader_int8(true);
         let mut storage16_ci = vk::PhysicalDevice16BitStorageFeatures::default()
             .storage_buffer16_bit_access(has_16bit_storage);
+        let mut storage8_ci = vk::PhysicalDevice8BitStorageFeatures::default()
+            .storage_buffer8_bit_access(has_8bit_storage);
         let mut memmodel_ci = vk::PhysicalDeviceVulkanMemoryModelFeatures::default()
             .vulkan_memory_model(true)
             .vulkan_memory_model_device_scope(true);
@@ -253,6 +260,7 @@ impl VulkanBackend {
             .enabled_extension_names(&ext_ptrs)
             .push_next(&mut shader_f16_ci)
             .push_next(&mut storage16_ci)
+            .push_next(&mut storage8_ci)
             .push_next(&mut memmodel_ci)
             .push_next(&mut sgsize_ci);
         if has_coop_matrix {

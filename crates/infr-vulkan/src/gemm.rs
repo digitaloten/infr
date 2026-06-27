@@ -21,6 +21,7 @@ const GEMM_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coo
 const GEMM_TILED_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coopmat_tiled.spv"));
 const GEMM_WARP_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_warp.spv"));
+const GEMM_DP4A_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_dp4a.spv"));
 const GEMM_PROJ_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_proj.spv"));
 const GEMM_PROJ_WARP_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemm_proj_warp.spv"));
@@ -37,6 +38,7 @@ const MMV_Q8_RES_SPV_BYTES: &[u8] =
 static GEMM_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static GEMM_TILED_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static GEMM_WARP_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static GEMM_DP4A_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static GEMM_PROJ_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static GEMM_PROJ_WARP_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_PARTIAL_SPV: OnceLock<Vec<u32>> = OnceLock::new();
@@ -56,6 +58,9 @@ fn gemm_tiled_spv() -> &'static [u32] {
 }
 fn gemm_warp_spv() -> &'static [u32] {
     GEMM_WARP_SPV.get_or_init(|| spv_words(GEMM_WARP_SPV_BYTES))
+}
+fn gemm_dp4a_spv() -> &'static [u32] {
+    GEMM_DP4A_SPV.get_or_init(|| spv_words(GEMM_DP4A_SPV_BYTES))
 }
 /// SPIR-V for the prefill projection GEMM (`C=A·Wᵀ`, f16/quant W). Used by the recorder.
 pub(crate) fn gemm_proj_spv() -> &'static [u32] {
@@ -322,6 +327,92 @@ impl VulkanBackend {
         t.elapsed().as_secs_f64() / iters as f64
     }
 
+    /// Benchmark the RAW dp4a scalar GEMM (m,n %64, k %32). Ceiling probe. Returns avg sec/dispatch.
+    #[doc(hidden)]
+    pub fn bench_dp4a_gemm(&self, m: usize, k: usize, n: usize, iters: usize) -> f64 {
+        let kp = k / 4;
+        let kern = self.kernel_spv_sg("gemm_dp4a", gemm_dp4a_spv(), 3, 12, 32);
+        let buf_a = self.alloc(m * kp * 4, BufferUsage::Staging).unwrap();
+        let buf_b = self.alloc(n * kp * 4, BufferUsage::Staging).unwrap();
+        let buf_c = self.alloc(m * n * 4, BufferUsage::Activations).unwrap();
+        self.upload(buf_a.as_ref(), &vec![0u8; m * kp * 4]).unwrap();
+        self.upload(buf_b.as_ref(), &vec![0u8; n * kp * 4]).unwrap();
+        let device = self.shared.device.clone();
+        unsafe {
+            device
+                .reset_descriptor_pool(kern.desc_pool, vk::DescriptorPoolResetFlags::empty())
+                .unwrap();
+        }
+        let set = unsafe {
+            device
+                .allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(kern.desc_pool)
+                        .set_layouts(std::slice::from_ref(&kern.ds_layout)),
+                )
+                .unwrap()[0]
+        };
+        let bufs = [
+            unsafe { as_vk_buf(buf_a.as_ref()) }.buffer,
+            unsafe { as_vk_buf(buf_b.as_ref()) }.buffer,
+            unsafe { as_vk_buf(buf_c.as_ref()) }.buffer,
+        ];
+        let infos: Vec<vk::DescriptorBufferInfo> = bufs
+            .iter()
+            .map(|&buffer| vk::DescriptorBufferInfo {
+                buffer,
+                offset: 0,
+                range: vk::WHOLE_SIZE,
+            })
+            .collect();
+        let writes: Vec<vk::WriteDescriptorSet> = (0..3)
+            .map(|i| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(i as u32)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&infos[i..i + 1])
+            })
+            .collect();
+        unsafe { device.update_descriptor_sets(&writes, &[]) };
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(kp as u32).to_ne_bytes());
+        let (gx, gy) = ((n / 64) as u32, (m / 64) as u32);
+        let dispatch = || {
+            let shared = std::sync::Arc::clone(&self.shared);
+            self.one_shot(move |cmd| unsafe {
+                shared
+                    .device
+                    .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, kern.pipeline);
+                shared.device.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    kern.pipeline_layout,
+                    0,
+                    &[set],
+                    &[],
+                );
+                shared.device.cmd_push_constants(
+                    cmd,
+                    kern.pipeline_layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    &push,
+                );
+                shared.device.cmd_dispatch(cmd, gx, gy, 1);
+            })
+            .unwrap();
+        };
+        dispatch(); // warm
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            dispatch();
+        }
+        t.elapsed().as_secs_f64() / iters as f64
+    }
+
     fn run_gemm(
         &self,
         kern: super::ops::ComputeKernel,
@@ -491,6 +582,26 @@ mod tests {
 
     #[test]
     #[ignore = "benchmark, requires GPU"]
+    fn dp4a_ceiling() {
+        use std::io::Write as _;
+        let be = VulkanBackend::new().unwrap();
+        for &(m, k, n, label) in &[
+            (2048usize, 2048usize, 2048usize, "dp4a 2048^3"),
+            (2048, 1024, 2048, "dp4a proj m2048 k1024 n2048"),
+            (512, 1024, 2048, "dp4a proj-smallM m512 k1024 n2048"),
+            (2048, 1024, 6144, "dp4a ffn m2048 k1024 n6144"),
+        ] {
+            print!("running {label}... ");
+            std::io::stdout().flush().ok();
+            let dt = be.bench_dp4a_gemm(m, k, n, 30);
+            let flops = 2.0 * m as f64 * k as f64 * n as f64;
+            println!("{:.3} ms, {:.0} GFLOP/s", dt * 1e3, flops / dt / 1e9);
+            std::io::stdout().flush().ok();
+        }
+    }
+
+    #[test]
+    #[ignore = "benchmark, requires GPU"]
     fn coopmat_gemm_bench() {
         let be = VulkanBackend::new().unwrap();
         for s in [1024usize, 2048, 4096] {
@@ -522,6 +633,20 @@ mod tests {
             (512, 32768, 128, "warp PV m512 k32k n128"),
         ] {
             let dt = be.bench_warp_gemm(m, k, n, 20);
+            let flops = 2.0 * m as f64 * k as f64 * n as f64;
+            println!(
+                "{label}: {:.3} ms, {:.0} GFLOP/s",
+                dt * 1e3,
+                flops / dt / 1e9
+            );
+        }
+        // RAW dp4a scalar ceiling (int8 WMMA hangs on RADV). GFLOP/s comparable to the f16 numbers.
+        for &(m, k, n, label) in &[
+            (2048usize, 2048usize, 2048usize, "dp4a 2048^3"),
+            (2048, 1024, 2048, "dp4a proj m2048 k1024 n2048"),
+            (512, 1024, 2048, "dp4a proj-smallM m512 k1024 n2048"),
+        ] {
+            let dt = be.bench_dp4a_gemm(m, k, n, 20);
             let flops = 2.0 * m as f64 * k as f64 * n as f64;
             println!(
                 "{label}: {:.3} ms, {:.0} GFLOP/s",
