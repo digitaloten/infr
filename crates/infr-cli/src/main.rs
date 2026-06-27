@@ -31,6 +31,26 @@ enum Cmd {
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: String,
     },
+    /// Benchmark prefill/decode tok/s — same interface as llama.cpp's `llama-bench` (-p/-n/-d/-r),
+    /// so the two are directly comparable. Prefill (pp) when -n 0; decode (tg) when -p 0.
+    Bench {
+        model: String,
+        /// Prompt tokens to process (prefill). pp throughput = n_prompt / time.
+        #[arg(short = 'p', long = "n-prompt", default_value_t = 512)]
+        n_prompt: usize,
+        /// Tokens to generate (decode). tg throughput = n_gen / time. Set -p 0 to measure decode.
+        #[arg(short = 'n', long = "n-gen", default_value_t = 0)]
+        n_gen: usize,
+        /// Context depth pre-filled (untimed) before measuring — matches llama-bench -d.
+        #[arg(short = 'd', long = "n-depth", default_value_t = 0)]
+        depth: usize,
+        /// Repetitions (reported value is the average).
+        #[arg(short = 'r', long, default_value_t = 3)]
+        reps: usize,
+        /// Emit `[{"avg_ts": X}]` (same shape as `llama-bench -o json`) for scripted comparison.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -45,6 +65,14 @@ fn main() -> anyhow::Result<()> {
         Cmd::Pull { model } => cmd_pull(&model),
         Cmd::Run { model, message } => cmd_run(&model, message.as_deref()),
         Cmd::Serve { model, addr } => cmd_serve(&model, &addr),
+        Cmd::Bench {
+            model,
+            n_prompt,
+            n_gen,
+            depth,
+            reps,
+            json,
+        } => cmd_bench(&model, n_prompt, n_gen, depth, reps, json),
     }
 }
 
@@ -303,6 +331,68 @@ impl infr_server::ChatGenerator for LlamaGenerator {
         })?;
         Ok(())
     }
+}
+
+/// Benchmark prefill (pp) or decode (tg) tok/s with the same -p/-n/-d/-r interface as
+/// `llama-bench`, so `infr bench` and `llama-bench` are directly comparable. Dummy tokens (timing
+/// is data-independent), `prefill_chunk` policy for the prefill batching (the engine's real path).
+fn cmd_bench(
+    model: &str,
+    n_prompt: usize,
+    n_gen: usize,
+    depth: usize,
+    reps: usize,
+    json: bool,
+) -> anyhow::Result<()> {
+    let (gguf, tok) = resolve(model)?;
+    let llama = infr_llama::Llama::load_opt(&gguf, tok.as_deref())?;
+    let measure_tg = n_gen > 0;
+    let dummy =
+        |pos: usize, c: usize| -> Vec<u32> { (0..c).map(|i| ((pos + i) % 100) as u32).collect() };
+    let mut samples = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let mut kv = llama.new_kv(depth + n_prompt + n_gen + 64)?;
+        // warm to `depth` (untimed)
+        let mut pos = 0usize;
+        while pos < depth {
+            let c = llama.prefill_chunk(pos).min(depth - pos);
+            llama.forward_resident_kv(&dummy(pos, c), &mut kv)?;
+            pos += c;
+        }
+        let t = std::time::Instant::now();
+        if measure_tg {
+            for _ in 0..n_gen {
+                llama.forward_resident_kv(&[7u32], &mut kv)?;
+            }
+            samples.push(n_gen as f64 / t.elapsed().as_secs_f64());
+        } else {
+            let mut done = 0usize;
+            while done < n_prompt {
+                let c = llama.prefill_chunk(pos).min(n_prompt - done);
+                llama.forward_resident_kv(&dummy(pos, c), &mut kv)?;
+                pos += c;
+                done += c;
+            }
+            samples.push(n_prompt as f64 / t.elapsed().as_secs_f64());
+        }
+    }
+    let avg = samples.iter().sum::<f64>() / samples.len() as f64;
+    if json {
+        println!("[{{\"avg_ts\": {avg:.2}}}]");
+    } else {
+        let label = if measure_tg {
+            format!("tg{n_gen}")
+        } else {
+            format!("pp{n_prompt}")
+        };
+        let d = if depth > 0 {
+            format!(" @ d{depth}")
+        } else {
+            String::new()
+        };
+        println!("{label}{d}: {avg:.1} t/s  ({reps} reps)");
+    }
+    Ok(())
 }
 
 fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
