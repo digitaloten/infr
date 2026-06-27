@@ -25,6 +25,7 @@ layout(binding = 5) buffer PACC { float pacc[]; };           // [nh, n_chunks, h
 
 shared float sc[1024];
 shared float red[64];
+shared vec4 vsh[32];   // one subgroup's V partial, summed into the other (full-occupancy V pass)
 
 void main() {
     uint t = gl_LocalInvocationIndex;
@@ -113,17 +114,49 @@ void main() {
     }
     float l = red[0];
 
-    // V: vec4 reads (thread owns a vec4 of output dims; one wide coalesced load per key).
+    // V: thread owns a vec4 of output dims; one wide coalesced load per key.
     uint pbase = (h * pc.n_chunks + c) * hd;
-    for (uint g = t; g < hd4; g += 64u) {
+    if (hd4 <= 32u) {
+        // Full-occupancy V: each lane owns dim `lane`, and the TWO subgroups split the key range
+        // (sg reads keys j0+sg, j0+sg+nsg, …). Both subgroups now issue V loads — the old loop ran V
+        // on a single subgroup (32 idle threads), capping V-read throughput at half the K pass. The
+        // two partials are summed via shared `vsh`. Software-pipeline 2 keys to keep loads in flight.
         vec4 acc = vec4(0.0);
-        for (uint j = j0; j < j1; j += 1u) {
-            acc += sc[j - j0] * vec4(v4[(j * pc.nkv + kvh) * hd4 + g]);
+        if (lane < hd4) {
+            uint base = kvh * hd4 + lane;
+            uint stride = pc.nkv * hd4;
+            uint j = j0 + sg;
+            for (; j + nsg < j1; j += 2u * nsg) {
+                vec4 b0 = vec4(v4[j * stride + base]);
+                vec4 b1 = vec4(v4[(j + nsg) * stride + base]);
+                acc += sc[j - j0] * b0;
+                acc += sc[j + nsg - j0] * b1;
+            }
+            for (; j < j1; j += nsg) {
+                acc += sc[j - j0] * vec4(v4[j * stride + base]);
+            }
         }
-        pacc[pbase + 4u * g] = acc.x;
-        pacc[pbase + 4u * g + 1u] = acc.y;
-        pacc[pbase + 4u * g + 2u] = acc.z;
-        pacc[pbase + 4u * g + 3u] = acc.w;
+        if (sg == 1u && lane < hd4) { vsh[lane] = acc; }
+        barrier();
+        if (sg == 0u && lane < hd4) {
+            acc += vsh[lane];
+            pacc[pbase + 4u * lane] = acc.x;
+            pacc[pbase + 4u * lane + 1u] = acc.y;
+            pacc[pbase + 4u * lane + 2u] = acc.z;
+            pacc[pbase + 4u * lane + 3u] = acc.w;
+        }
+    } else {
+        // General fallback (hd4 > 32): all 64 threads each own a dim, loop over all keys.
+        for (uint g = t; g < hd4; g += 64u) {
+            vec4 acc = vec4(0.0);
+            for (uint j = j0; j < j1; j += 1u) {
+                acc += sc[j - j0] * vec4(v4[(j * pc.nkv + kvh) * hd4 + g]);
+            }
+            pacc[pbase + 4u * g] = acc.x;
+            pacc[pbase + 4u * g + 1u] = acc.y;
+            pacc[pbase + 4u * g + 2u] = acc.z;
+            pacc[pbase + 4u * g + 3u] = acc.w;
+        }
     }
     if (t == 0u) { pm[h * pc.n_chunks + c] = m; pl[h * pc.n_chunks + c] = l; }
 }
