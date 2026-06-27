@@ -1118,6 +1118,99 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// FlashAttention-2 register-O prefill (Br=128, per-thread register accumulator → no [Br][HD]
+    /// shared O; 2× the query tile of the shared-Os flash → fewer q-tiles). hd MUST be 128 and the
+    /// caller MUST allocate q/attn/po to mpad128 = ceil(n/128)*128 rows. Split-K → partials → combine.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_prefill_flash_reg(
+        &self,
+        q: &dyn Buffer,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        attn: &dyn Buffer,
+        po: &dyn Buffer,
+        pm: &dyn Buffer,
+        pl: &dyn Buffer,
+        n: usize,
+        kv_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        pos_offset: usize,
+    ) {
+        let mpad = (n.div_ceil(128) * 128) as u32; // Br=128
+        let base_wg = (mpad / 128) * nh as u32;
+        let n_splits = match std::env::var("INFR_FLASH_SPLITS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            Some(v) => v,
+            None => {
+                if base_wg >= 1024 || kv_len < 4096 {
+                    1u32
+                } else {
+                    (2048 / base_wg.max(1))
+                        .clamp(2, 8)
+                        .min((kv_len / 2048).max(1) as u32)
+                }
+            }
+        };
+        let ksplit = (kv_len as u32).div_ceil(n_splits).div_ceil(64) * 64;
+        self.stamp("attn_flash");
+        let kp = self.be.kernel_spv_sg(
+            "attn_flash_reg",
+            crate::gemm::attn_flash_reg_spv(),
+            6,
+            32,
+            32,
+        );
+        let mut pp = [0u8; 32];
+        pp[0..4].copy_from_slice(&mpad.to_ne_bytes());
+        pp[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());
+        pp[8..12].copy_from_slice(&(nh as u32).to_ne_bytes());
+        pp[12..16].copy_from_slice(&(nkv as u32).to_ne_bytes());
+        pp[16..20].copy_from_slice(&(hd as u32).to_ne_bytes());
+        pp[20..24].copy_from_slice(&(pos_offset as u32).to_ne_bytes());
+        pp[24..28].copy_from_slice(&n_splits.to_ne_bytes());
+        pp[28..32].copy_from_slice(&ksplit.to_ne_bytes());
+        self.dispatch3(
+            kp,
+            &[
+                Self::vkb(q),
+                Self::vkb(kc),
+                Self::vkb(vc),
+                Self::vkb(po),
+                Self::vkb(pm),
+                Self::vkb(pl),
+            ],
+            3,
+            &pp,
+            base_wg,
+            n_splits,
+            1,
+        );
+        self.stamp("attn_flash");
+        let kc2 = self.be.kernel_spv_sg(
+            "attn_flash_combine",
+            crate::gemm::attn_flash_combine_spv(),
+            4,
+            16,
+            32,
+        );
+        let mut pc2 = [0u8; 16];
+        pc2[0..4].copy_from_slice(&mpad.to_ne_bytes());
+        pc2[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
+        pc2[8..12].copy_from_slice(&(hd as u32).to_ne_bytes());
+        pc2[12..16].copy_from_slice(&n_splits.to_ne_bytes());
+        self.dispatch(
+            kc2,
+            &[Self::vkb(po), Self::vkb(pm), Self::vkb(pl), Self::vkb(attn)],
+            1,
+            &pc2,
+            mpad * nh as u32,
+        );
+    }
+
     /// Cast-copy f32 `src[0..n]` → f16 `dst[off..off+n]` (write f32 activations into the f16 cache).
     pub fn store_f16(&self, src: &dyn Buffer, dst: &dyn Buffer, n: usize, off: usize) {
         self.stamp("store_f16");
@@ -1797,6 +1890,85 @@ mod tests {
             .fold(0f32, f32::max);
         println!("attn_prefill_flash q_len={q_len} kv_len={kv_len} max_err={err:e}");
         assert!(err < 5e-3, "attn_prefill_flash mismatch: {err}");
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn attention_prefill_flash_reg_matches_cpu() {
+        for &(q, kv, nh, nkv) in &[
+            (128usize, 128usize, 4usize, 2usize),
+            (128, 300, 2, 1),
+            (200, 600, 8, 4),
+            (448, 2000, 16, 8), // qwen3-shaped
+            (100, 100, 2, 2),   // q<128 → padded tile
+        ] {
+            run_attn_flash_reg(q, kv, nh, nkv, 128);
+        }
+        std::env::set_var("INFR_FLASH_SPLITS", "4");
+        run_attn_flash_reg(128, 2000, 16, 8, 128);
+        run_attn_flash_reg(200, 600, 2, 1, 128);
+        std::env::remove_var("INFR_FLASH_SPLITS");
+    }
+
+    fn run_attn_flash_reg(q_len: usize, kv_len: usize, nh: usize, nkv: usize, hd: usize) {
+        let be = VulkanBackend::new().unwrap();
+        let pos_offset = kv_len - q_len;
+        let mpad = q_len.div_ceil(128) * 128;
+        let gen = |n: usize, salt: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((i * 13 + salt) % 29) as f32 - 14.0) * 0.05)
+                .collect()
+        };
+        let q = r16(&gen(q_len * nh * hd, 1));
+        let k = r16(&gen(kv_len * nkv * hd, 2));
+        let v = r16(&gen(kv_len * nkv * hd, 3));
+        let mut qp = q.clone();
+        qp.resize(mpad * nh * hd, 0.0);
+        let mut kp = k.clone();
+        kp.resize((kv_len + 128) * nkv * hd, 0.0);
+        let mut vp = v.clone();
+        vp.resize((kv_len + 128) * nkv * hd, 0.0);
+        let bq = upf16(&be, &qp);
+        let bk = upf16(&be, &kp);
+        let bv = upf16(&be, &vp);
+        let bo = be.alloc(mpad * nh * hd * 4, BufferUsage::Readback).unwrap();
+        let po = be
+            .alloc(8 * mpad * nh * hd * 4, BufferUsage::Activations)
+            .unwrap();
+        let pmb = be
+            .alloc(8 * mpad * nh * 4, BufferUsage::Activations)
+            .unwrap();
+        let plb = be
+            .alloc(8 * mpad * nh * 4, BufferUsage::Activations)
+            .unwrap();
+        let rec = be.recorder().unwrap();
+        rec.attention_prefill_flash_reg(
+            bq.as_ref(),
+            bk.as_ref(),
+            bv.as_ref(),
+            bo.as_ref(),
+            po.as_ref(),
+            pmb.as_ref(),
+            plb.as_ref(),
+            q_len,
+            kv_len,
+            nh,
+            nkv,
+            hd,
+            pos_offset,
+        );
+        rec.finish().unwrap();
+        let mut bytes = vec![0u8; mpad * nh * hd * 4];
+        be.download(bo.as_ref(), &mut bytes).unwrap();
+        let got: &[f32] = bytemuck::cast_slice(&bytes);
+        let want = attn_kv_cpu(&q, &k, &v, q_len, nh, nkv, hd, pos_offset);
+        let err = got[..q_len * nh * hd]
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        println!("attn_flash_reg q_len={q_len} kv_len={kv_len} nh={nh} max_err={err:e}");
+        assert!(err < 5e-3, "attn_flash_reg mismatch: {err}");
     }
 
     #[test]

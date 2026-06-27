@@ -964,7 +964,16 @@ impl Llama {
         // watchdog. Decode (n==1) and Llama stay on the fused GEMV path. GEMM writes ceil(n/64)*64
         // rows (extra rows are 0), so its output buffers are M-padded to mpad.
         let use_gemm = c.qk_norm && n >= 64 && std::env::var("INFR_NOGEMM").is_err();
-        let mpad = if use_gemm { n.div_ceil(64) * 64 } else { n };
+        // Register-O flash (FlashAttention-2 layout, Br=128) is opt-in (INFR_FLASH_REG) while it's
+        // A/B'd vs the BM=64 flash; it needs mpad padded to 128 (q/attn/scratch).
+        let use_flash_reg = use_gemm && hd == 128 && std::env::var("INFR_FLASH_REG").is_ok();
+        let mpad = if use_flash_reg {
+            n.div_ceil(128) * 128
+        } else if use_gemm {
+            n.div_ceil(64) * 64
+        } else {
+            n
+        };
         // Prefill attention has TWO interchangeable algorithms — keep BOTH; which one wins is
         // HARDWARE-dependent (the card's compute:bandwidth ratio):
         //  • flash (attention_prefill_flash, split-K, 8-warp register-blocked for hd=128): never
@@ -1059,7 +1068,7 @@ impl Llama {
         };
         // Split-K PV partials: [max_splits, mpad, nh*hd] f32 (summed by attn_pv_reduce). Max 8 splits.
         // Flash split-K scratch: po=[≤8, mpad, nh, hd] f32 partials + pm/pl=[≤8, mpad, nh] f32.
-        let flash_bufs = if use_flash {
+        let flash_bufs = if use_flash || use_flash_reg {
             Some((
                 alloc(8 * mpad * nh * hd, BufferUsage::Activations)?,
                 alloc(8 * mpad * nh, BufferUsage::Activations)?,
@@ -1354,7 +1363,25 @@ impl Llama {
                     c.rms_eps,
                 );
             }
-            if use_flash {
+            if use_flash_reg {
+                // prefill: FlashAttention-2 register-O (Br=128) — opt-in A/B vs the BM=64 flash.
+                let (po, pm, pl) = flash_bufs.as_ref().unwrap();
+                rec.attention_prefill_flash_reg(
+                    q.as_ref(),
+                    kv.k[li].as_ref(),
+                    kv.v[li].as_ref(),
+                    attn.as_ref(),
+                    po.as_ref(),
+                    pm.as_ref(),
+                    pl.as_ref(),
+                    n,
+                    kv_len,
+                    nh,
+                    nkv,
+                    hd,
+                    pos,
+                );
+            } else if use_flash {
                 // prefill: fused flash attention (no materialized S buffer), split-K for occupancy.
                 let (po, pm, pl) = flash_bufs.as_ref().unwrap();
                 rec.attention_prefill_flash(

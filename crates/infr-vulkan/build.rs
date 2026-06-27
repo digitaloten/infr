@@ -21,6 +21,7 @@ fn main() {
         ("attn_flash", "attn_flash", &[]),
         ("attn_flash_partial", "attn_flash_partial", &[]),
         ("attn_flash_warp", "attn_flash_warp", &[]),
+        ("attn_flash_reg", "attn_flash_reg", &[]),
         ("attn_flash_combine", "attn_flash_combine", &[]),
         ("attn_softmax", "attn_softmax", &[]),
         ("attn_pv", "attn_pv", &[]),

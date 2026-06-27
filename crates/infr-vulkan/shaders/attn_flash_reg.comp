@@ -1,0 +1,170 @@
+#version 460
+// FlashAttention-2-style prefill with the O accumulator in PER-THREAD REGISTERS (llama.cpp cm1
+// layout), so the [Br][HD] O never lives in shared → Br can be 128 (2× the shared-Os flash, → fewer
+// q-tiles → fewer K/V re-reads + bigger GEMM reuse). Thread t owns row (t/2) and dims [cw*64,+64)
+// with cw=t%2; O is Of[16] vec4 in registers. Per-row online-softmax rescale is a trivial register
+// multiply (thread owns its row). hd=128 specialized. Split-K over kv via gl_WorkGroupID.y; emits
+// un-normalized partials (Of, m, l) for attn_flash_combine. sg32, 8 subgroups.
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+const uint BR = 128u;   // query rows per tile
+const uint BC = 64u;    // kv cols per block
+const uint HD = 128u;
+const uint DPT = 16u;   // vec4 per thread = (HD/2)/4 — each thread owns 64 dims of its row
+
+layout(push_constant) uniform PC {
+    uint q_len;     // mpad (multiple of BR)
+    uint kv_len;
+    uint nh;
+    uint nkv;
+    uint hd;        // == 128
+    uint pos_offset;
+    uint n_splits;
+    uint ksplit;
+} pc;
+layout(binding = 0) readonly buffer QB { float16_t q[]; };
+layout(binding = 1) readonly buffer KB { float16_t k[]; };   // QK: ColumnMajor coopMatLoad
+layout(binding = 2) readonly buffer VB { float16_t v[]; };   // PV: RowMajor coopMatLoad
+layout(binding = 3) writeonly buffer POB { vec4 po[]; };     // [n_splits, mpad, nh, hd/4] un-norm O
+layout(binding = 4) writeonly buffer PMB { float pm[]; };    // [n_splits, mpad, nh]
+layout(binding = 5) writeonly buffer PLB { float pl[]; };    // [n_splits, mpad, nh]
+
+shared float sfsh[BR * BC];      // scores (f32)
+shared float16_t Psh[BR * BC];   // probs (f16) for PV coopmat
+shared float pvsh[8u * 16u * 16u]; // per-subgroup PV tile (16×16)
+shared float mrow[BR];
+shared float lrow[BR];
+shared float corr[BR];
+
+void main() {
+    uint qt = gl_WorkGroupID.x / pc.nh;
+    uint h = gl_WorkGroupID.x % pc.nh;
+    uint split = gl_WorkGroupID.y;
+    uint qr0 = qt * BR;
+    uint kvh = h / (pc.nh / pc.nkv);
+    uint tid = gl_LocalInvocationIndex;
+    uint sg = gl_SubgroupID;          // 0..7 → row-panel sg
+    uint lane = gl_SubgroupInvocationID; // 0..31
+    uint warp_r = sg % 4u;            // QK warptile: 4×2 warps
+    uint warp_c = sg / 4u;
+    uint nhhd = pc.nh * HD;
+    uint nkvhd = pc.nkv * HD;
+    float scale = 1.0 / sqrt(float(HD));
+
+    // this thread's logical row + column-worker (for softmax + register O)
+    uint row = sg * 16u + lane / 2u;  // 0..127
+    uint cw = lane & 1u;              // 0/1 → owns dims [cw*64, +64)
+
+    vec4 Of[DPT];
+    [[unroll]] for (uint d = 0u; d < DPT; d++) Of[d] = vec4(0.0);
+    if (tid < BR) { mrow[tid] = -1e30; lrow[tid] = 0.0; }
+    barrier();
+
+    uint qmax = pc.pos_offset + qr0 + BR - 1u;
+    uint kvend = min(min(pc.kv_len, qmax + 1u), split * pc.ksplit + pc.ksplit);
+    for (uint kv0 = split * pc.ksplit; kv0 < kvend; kv0 += BC) {
+        // ---- QK: S = Q·Kᵀ, 8-warp register-blocked (4×2), warp owns rows [warp_r*32,+32) ----
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> sacc[2][2];
+        [[unroll]] for (uint a = 0u; a < 2u; a++)
+            [[unroll]] for (uint b = 0u; b < 2u; b++)
+                sacc[a][b] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        [[unroll]] for (uint kf = 0u; kf < HD; kf += 16u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A[2];
+            [[unroll]] for (uint a = 0u; a < 2u; a++)
+                coopMatLoad(A[a], q, (qr0 + warp_r * 32u + a * 16u) * nhhd + h * HD + kf, nhhd,
+                            gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (uint b = 0u; b < 2u; b++) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
+                coopMatLoad(B, k, (kv0 + warp_c * 32u + b * 16u) * nkvhd + kvh * HD + kf, nkvhd,
+                            gl_CooperativeMatrixLayoutColumnMajor);
+                [[unroll]] for (uint a = 0u; a < 2u; a++) sacc[a][b] = coopMatMulAdd(A[a], B, sacc[a][b]);
+            }
+        }
+        [[unroll]] for (uint a = 0u; a < 2u; a++)
+            [[unroll]] for (uint b = 0u; b < 2u; b++)
+                coopMatStore(sacc[a][b], sfsh, (warp_r * 32u + a * 16u) * BC + warp_c * 32u + b * 16u,
+                             BC, gl_CooperativeMatrixLayoutRowMajor);
+        barrier();
+
+        // ---- online softmax: 2 lanes/row (cluster of 2), each owns cols [cw*32,+32) ----
+        {
+            uint qpos = pc.pos_offset + qr0 + row;
+            float oldm = mrow[row];
+            float lmax = -1e30;
+            [[unroll]] for (uint jj = 0u; jj < 32u; jj++) {
+                uint j = cw * 32u + jj;
+                uint kpos = kv0 + j;
+                float s = (kpos > qpos || kpos >= pc.kv_len) ? -1e30 : sfsh[row * BC + j] * scale;
+                sfsh[row * BC + j] = s;
+                lmax = max(lmax, s);
+            }
+            float rmax = max(oldm, subgroupClusteredMax(lmax, 2u));
+            float cf = exp(oldm - rmax);
+            float lsum = 0.0;
+            [[unroll]] for (uint jj = 0u; jj < 32u; jj++) {
+                uint j = cw * 32u + jj;
+                float p = exp(sfsh[row * BC + j] - rmax);
+                Psh[row * BC + j] = float16_t(p);
+                lsum += p;
+            }
+            float rsum = subgroupClusteredAdd(lsum, 2u);
+            if (cw == 0u) { lrow[row] = lrow[row] * cf + rsum; mrow[row] = rmax; corr[row] = cf; }
+        }
+        barrier();
+
+        // rescale register O by this block's per-row correction
+        float e = corr[row];
+        [[unroll]] for (uint d = 0u; d < DPT; d++) Of[d] *= e;
+
+        // ---- PV: subgroup sg computes panel sg (rows [sg*16,+16)) × HD, 8 col-tiles ----
+        uint pvb = sg * 256u;
+        [[unroll]] for (uint ct = 0u; ct < HD / 16u; ct++) {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> pacc =
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+            [[unroll]] for (uint bc = 0u; bc < BC; bc += 16u) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> Pm;
+                coopMatLoad(Pm, Psh, (sg * 16u) * BC + bc, BC, gl_CooperativeMatrixLayoutRowMajor);
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> Vm;
+                coopMatLoad(Vm, v, (kv0 + bc) * nkvhd + kvh * HD + ct * 16u, nkvhd,
+                            gl_CooperativeMatrixLayoutRowMajor);
+                pacc = coopMatMulAdd(Pm, Vm, pacc);
+            }
+            coopMatStore(pacc, pvsh, pvb, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+            // owned lanes (cw matches this ct) add the 16 dims of this tile into register O
+            if (ct >= cw * 4u && ct < cw * 4u + 4u) {
+                uint rl = lane / 2u; // row within panel
+                uint base = (ct - cw * 4u) * 16u; // local dim offset 0..63
+                [[unroll]] for (uint q4 = 0u; q4 < 4u; q4++) {
+                    uint ld = base + q4 * 4u;
+                    Of[ld / 4u] += vec4(pvsh[pvb + rl * 16u + q4 * 4u + 0u],
+                                        pvsh[pvb + rl * 16u + q4 * 4u + 1u],
+                                        pvsh[pvb + rl * 16u + q4 * 4u + 2u],
+                                        pvsh[pvb + rl * 16u + q4 * 4u + 3u]);
+                }
+            }
+            subgroupBarrier();
+        }
+        barrier();
+    }
+
+    // emit un-normalized partial: Of, m, l
+    uint sl = split * pc.q_len;
+    uint orow = qr0 + row;
+    uint obase = (sl + orow) * pc.nh * (HD / 4u) + h * (HD / 4u) + cw * 16u;
+    [[unroll]] for (uint d = 0u; d < DPT; d++) po[obase + d] = Of[d];
+    if (cw == 0u) {
+        uint idx = (sl + orow) * pc.nh + h;
+        pm[idx] = mrow[row];
+        pl[idx] = lrow[row];
+    }
+}

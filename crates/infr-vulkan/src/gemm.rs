@@ -36,6 +36,8 @@ const ATTN_FLASH_PARTIAL_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_partial.spv"));
 const ATTN_FLASH_WARP_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_warp.spv"));
+const ATTN_FLASH_REG_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_reg.spv"));
 const ATTN_FLASH_COMBINE_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_combine.spv"));
 const ATTN_SM_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_softmax.spv"));
@@ -63,6 +65,7 @@ static ATTN_QK_WARP_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_PARTIAL_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_WARP_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_REG_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_COMBINE_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_SM_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_PV_SPV: OnceLock<Vec<u32>> = OnceLock::new();
@@ -126,6 +129,10 @@ pub(crate) fn attn_flash_partial_spv() -> &'static [u32] {
 /// 8-warp register-blocked flash partial (hd=128). Used over attn_flash_partial when hd==128.
 pub(crate) fn attn_flash_warp_spv() -> &'static [u32] {
     ATTN_FLASH_WARP_SPV.get_or_init(|| spv_words(ATTN_FLASH_WARP_SPV_BYTES))
+}
+/// FlashAttention-2 register-O flash partial (Br=128, per-thread register accumulator). hd=128.
+pub(crate) fn attn_flash_reg_spv() -> &'static [u32] {
+    ATTN_FLASH_REG_SPV.get_or_init(|| spv_words(ATTN_FLASH_REG_SPV_BYTES))
 }
 /// Flash-attention split-K combine (merge partials → final O). Recorder use.
 pub(crate) fn attn_flash_combine_spv() -> &'static [u32] {
