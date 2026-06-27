@@ -965,6 +965,10 @@ impl Llama {
         // rows (extra rows are 0), so its output buffers are M-padded to mpad.
         let use_gemm = c.qk_norm && n >= 64 && std::env::var("INFR_NOGEMM").is_err();
         let mpad = if use_gemm { n.div_ceil(64) * 64 } else { n };
+        // Non-FA prefill attention (clean QK→softmax→PV GEMMs) wins at low/mid context where the
+        // coopmat GEMMs run efficiently; above ~12k the materialized scores buffer makes it HBM-bound
+        // and the flash kernel (scores in shared) wins. Hybrid: non-FA below the threshold.
+        let nonfa = use_gemm && (pos + n) <= 8192 && std::env::var("INFR_NO_NONFA").is_err();
         let hidden = alloc(n * ne, BufferUsage::Staging)?;
         self.be
             .upload(hidden.as_ref(), bytemuck::cast_slice(&hidden_host))
@@ -1018,6 +1022,17 @@ impl Llama {
         // workgroups) with a 64-key floor. Reused across layers.
         let kv_len = pos + n;
         let chunk = (kv_len / 64).clamp(64, 512);
+        // Non-FA scores scratch: [nh, mpad, kv_pad] f16 (kv padded to 64).
+        let nonfa_s = if nonfa {
+            let kv_pad = kv_len.div_ceil(64) * 64;
+            Some(
+                self.be
+                    .alloc(nh * mpad * kv_pad * 2, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
+            )
+        } else {
+            None
+        };
         let use_split = n == 1 && kv_len > chunk;
         let n_chunks = if use_split { kv_len.div_ceil(chunk) } else { 0 };
         let split_bufs = if use_split {
@@ -1294,7 +1309,22 @@ impl Llama {
                     c.rms_eps,
                 );
             }
-            if let Some((n_splits, split_len, ppm, ppl, ppacc)) = &pf_split {
+            if let Some(s) = &nonfa_s {
+                // prefill: non-FA clean GEMMs (QK → softmax → PV).
+                rec.attention_prefill_nonfa(
+                    q.as_ref(),
+                    kv.k[li].as_ref(),
+                    kv.v[li].as_ref(),
+                    attn.as_ref(),
+                    s.as_ref(),
+                    n,
+                    kv_len,
+                    nh,
+                    nkv,
+                    hd,
+                    pos,
+                );
+            } else if let Some((n_splits, split_len, ppm, ppl, ppacc)) = &pf_split {
                 // prefill, small chunk: split-K coopmat attention for occupancy, then combine.
                 rec.attention_prefill_split(
                     q.as_ref(),

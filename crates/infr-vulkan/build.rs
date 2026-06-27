@@ -14,6 +14,9 @@ fn main() {
         ("attn_prefill_partial", "attn_prefill_partial", &[]),
         ("attn_prefill_combine", "attn_prefill_combine", &[]),
         ("attn_partial", "attn_partial", &[]),
+        ("attn_qk", "attn_qk", &[]),
+        ("attn_softmax", "attn_softmax", &[]),
+        ("attn_pv", "attn_pv", &[]),
         // Decode GEMV: q4/q8 × plain/residual specializations from one source.
         ("mul_mat_vec_q", "mul_mat_vec_q4", &["-DQBITS=4"]),
         ("mul_mat_vec_q", "mul_mat_vec_q8", &["-DQBITS=8"]),

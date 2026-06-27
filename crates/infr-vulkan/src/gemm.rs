@@ -27,6 +27,9 @@ const ATTN_PF_PART_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_prefill_partial.spv"));
 const ATTN_PF_COMB_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_prefill_combine.spv"));
+const ATTN_QK_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_qk.spv"));
+const ATTN_SM_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_softmax.spv"));
+const ATTN_PV_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_pv.spv"));
 const MMV_Q4_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q4.spv"));
 const MMV_Q8_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q8.spv"));
 const MMV_Q4_RES_SPV_BYTES: &[u8] =
@@ -40,6 +43,9 @@ static ATTN_PREFILL_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_PARTIAL_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_PF_PART_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_PF_COMB_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_QK_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_SM_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_PV_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static MMV_Q4_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static MMV_Q8_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static MMV_Q4_RES_SPV: OnceLock<Vec<u32>> = OnceLock::new();
@@ -70,6 +76,16 @@ pub(crate) fn attn_prefill_partial_spv() -> &'static [u32] {
 /// SPIR-V for the split-K prefill attention combine pass. Used by the recorder.
 pub(crate) fn attn_prefill_combine_spv() -> &'static [u32] {
     ATTN_PF_COMB_SPV.get_or_init(|| spv_words(ATTN_PF_COMB_SPV_BYTES))
+}
+/// SPIR-V for the non-FA prefill attention kernels (QK scores / row softmax / PV). Recorder use.
+pub(crate) fn attn_qk_spv() -> &'static [u32] {
+    ATTN_QK_SPV.get_or_init(|| spv_words(ATTN_QK_SPV_BYTES))
+}
+pub(crate) fn attn_softmax_spv() -> &'static [u32] {
+    ATTN_SM_SPV.get_or_init(|| spv_words(ATTN_SM_SPV_BYTES))
+}
+pub(crate) fn attn_pv_spv() -> &'static [u32] {
+    ATTN_PV_SPV.get_or_init(|| spv_words(ATTN_PV_SPV_BYTES))
 }
 /// SPIR-V for the subgroup decode GEMV (`y=x·Wᵀ`). `bits`=4/8 picks the quant variant; `res` adds
 /// a fused residual. Used by the recorder's `linear_q` / `linear_add_q`.

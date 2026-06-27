@@ -205,6 +205,20 @@ impl<'a> Recorder<'a> {
         push: &[u8],
         groups: u32,
     ) {
+        self.dispatch3(k, buffers, n_out, push, groups, 1, 1);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch3(
+        &self,
+        k: ComputeKernel,
+        buffers: &[vk::Buffer],
+        n_out: usize,
+        push: &[u8],
+        gx: u32,
+        gy: u32,
+        gz: u32,
+    ) {
         // The last `n_out` bound buffers are outputs; the rest are inputs. Inputs keep in-place
         // buffers (e.g. rope x==y) so a RAW from a prior op is still seen.
         let split = buffers.len() - n_out;
@@ -258,7 +272,7 @@ impl<'a> Recorder<'a> {
                     push,
                 );
             }
-            device.cmd_dispatch(self.cmd, groups, 1, 1);
+            device.cmd_dispatch(self.cmd, gx, gy, gz);
         }
     }
 
@@ -772,6 +786,88 @@ impl<'a> Recorder<'a> {
     /// tile, head); both matmuls run on cooperative-matrix fragments. `q`/`kc`/`vc` are f16, `o` is
     /// f32. `hd` must be a multiple of 16 and <= 128. Output buffer `o` and the `q` buffer must be
     /// allocated for ceil(q_len/64)*64 rows (the last tile writes/reads padded rows).
+    /// Non-FA prefill attention: clean coopmat QK → row softmax → coopmat PV (ollama's approach).
+    /// `q`=[mpad,nh,hd] f16, `kc`/`vc`=[kv_len,nkv,hd] f16, `attn`=[mpad,nh*hd] f32 out, `s`=
+    /// [nh,mpad,kv_pad] f16 scratch (mpad=ceil(n/64)*64, kv_pad=ceil(kv_len/64)*64). `pos_offset` is
+    /// the absolute position of query row 0 (for causal masking).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_prefill_nonfa(
+        &self,
+        q: &dyn Buffer,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        attn: &dyn Buffer,
+        s: &dyn Buffer,
+        n: usize,
+        kv_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        pos_offset: usize,
+    ) {
+        let mpad = (n.div_ceil(64) * 64) as u32;
+        let kv_pad = (kv_len.div_ceil(64) * 64) as u32;
+        let hdu = hd as u32;
+        let scale = 1.0f32 / (hd as f32).sqrt();
+
+        // stage 1: S = scale·Q·Kᵀ  (one coopmat GEMM per head)
+        self.stamp("attn_qk");
+        let kqk = self
+            .be
+            .kernel_spv_sg("attn_qk", crate::gemm::attn_qk_spv(), 3, 24, 32);
+        let mut p = [0u8; 24];
+        p[0..4].copy_from_slice(&mpad.to_ne_bytes());
+        p[4..8].copy_from_slice(&kv_pad.to_ne_bytes());
+        p[8..12].copy_from_slice(&hdu.to_ne_bytes());
+        p[12..16].copy_from_slice(&(nh as u32).to_ne_bytes());
+        p[16..20].copy_from_slice(&(nkv as u32).to_ne_bytes());
+        p[20..24].copy_from_slice(&scale.to_ne_bytes());
+        let qk_tiles = (mpad / 64) * (kv_pad / 64);
+        self.dispatch3(
+            kqk,
+            &[Self::vkb(q), Self::vkb(kc), Self::vkb(s)],
+            1,
+            &p,
+            qk_tiles,
+            1,
+            nh as u32,
+        );
+
+        // stage 2: row softmax (causal), in place S → P
+        self.stamp("attn_softmax");
+        let ksm = self
+            .be
+            .kernel_spv("attn_softmax", crate::gemm::attn_softmax_spv(), 1, 16);
+        let mut ps = [0u8; 16];
+        ps[0..4].copy_from_slice(&mpad.to_ne_bytes());
+        ps[4..8].copy_from_slice(&kv_pad.to_ne_bytes());
+        ps[8..12].copy_from_slice(&(kv_len as u32).to_ne_bytes());
+        ps[12..16].copy_from_slice(&(pos_offset as u32).to_ne_bytes());
+        self.dispatch3(ksm, &[Self::vkb(s)], 1, &ps, mpad, 1, nh as u32);
+
+        // stage 3: O = P·V  (one coopmat GEMM per head)
+        self.stamp("attn_pv");
+        let kpv = self
+            .be
+            .kernel_spv_sg("attn_pv", crate::gemm::attn_pv_spv(), 3, 20, 32);
+        let mut pp = [0u8; 20];
+        pp[0..4].copy_from_slice(&mpad.to_ne_bytes());
+        pp[4..8].copy_from_slice(&kv_pad.to_ne_bytes());
+        pp[8..12].copy_from_slice(&hdu.to_ne_bytes());
+        pp[12..16].copy_from_slice(&(nh as u32).to_ne_bytes());
+        pp[16..20].copy_from_slice(&(nkv as u32).to_ne_bytes());
+        let pv_tiles = (mpad / 64) * (hdu / 64);
+        self.dispatch3(
+            kpv,
+            &[Self::vkb(s), Self::vkb(vc), Self::vkb(attn)],
+            1,
+            &pp,
+            pv_tiles,
+            1,
+            nh as u32,
+        );
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn attention_prefill(
         &self,
@@ -1556,6 +1652,70 @@ mod tests {
         run_attn_prefill(70, 70, 2, 2, 128); // q_len not %64 → padded rows + partial kv tile
         run_attn_prefill(192, 500, 2, 1, 128); // many kv tiles
         run_attn_prefill(80, 300, 9, 3, 64); // hd=64, GQA 3:1
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn attention_prefill_nonfa_matches_cpu() {
+        run_attn_prefill_nonfa(64, 64, 2, 1, 128);
+        run_attn_prefill_nonfa(128, 200, 4, 2, 128);
+        run_attn_prefill_nonfa(70, 70, 2, 2, 128);
+        run_attn_prefill_nonfa(192, 500, 2, 1, 128);
+        run_attn_prefill_nonfa(80, 300, 9, 3, 64);
+    }
+
+    fn run_attn_prefill_nonfa(q_len: usize, kv_len: usize, nh: usize, nkv: usize, hd: usize) {
+        let be = VulkanBackend::new().unwrap();
+        let pos_offset = kv_len - q_len;
+        let mpad = q_len.div_ceil(64) * 64;
+        let kv_pad = kv_len.div_ceil(64) * 64;
+        let gen = |n: usize, salt: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((i * 13 + salt) % 29) as f32 - 14.0) * 0.05)
+                .collect()
+        };
+        let q = r16(&gen(q_len * nh * hd, 1));
+        let k = r16(&gen(kv_len * nkv * hd, 2));
+        let v = r16(&gen(kv_len * nkv * hd, 3));
+        let mut qp = q.clone();
+        qp.resize(mpad * nh * hd, 0.0);
+        let mut kp = k.clone();
+        kp.resize((kv_len + 64) * nkv * hd, 0.0);
+        let mut vp = v.clone();
+        vp.resize((kv_len + 64) * nkv * hd, 0.0);
+        let bq = upf16(&be, &qp);
+        let bk = upf16(&be, &kp);
+        let bv = upf16(&be, &vp);
+        let bo = be.alloc(mpad * nh * hd * 4, BufferUsage::Readback).unwrap();
+        let bs = be
+            .alloc(nh * mpad * kv_pad * 2, BufferUsage::Activations)
+            .unwrap();
+        let rec = be.recorder().unwrap();
+        rec.attention_prefill_nonfa(
+            bq.as_ref(),
+            bk.as_ref(),
+            bv.as_ref(),
+            bo.as_ref(),
+            bs.as_ref(),
+            q_len,
+            kv_len,
+            nh,
+            nkv,
+            hd,
+            pos_offset,
+        );
+        rec.finish().unwrap();
+        let mut bytes = vec![0u8; mpad * nh * hd * 4];
+        be.download(bo.as_ref(), &mut bytes).unwrap();
+        let got: &[f32] = bytemuck::cast_slice(&bytes);
+        let want = attn_kv_cpu(&q, &k, &v, q_len, nh, nkv, hd, pos_offset);
+        let err = got[..q_len * nh * hd]
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        println!("attn_prefill_nonfa q_len={q_len} kv_len={kv_len} max_err={err:e}");
+        assert!(err < 5e-3, "attn_prefill_nonfa mismatch: {err}");
     }
 
     #[test]
