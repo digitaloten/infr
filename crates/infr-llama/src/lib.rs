@@ -966,18 +966,18 @@ impl Llama {
         let use_gemm = c.qk_norm && n >= 64 && std::env::var("INFR_NOGEMM").is_err();
         let mpad = if use_gemm { n.div_ceil(64) * 64 } else { n };
         // Prefill attention has TWO interchangeable algorithms — keep BOTH; which one wins is
-        // HARDWARE-dependent (the card's compute:bandwidth ratio), not a universal choice:
-        //  • non-FA (attn_qk → softmax → attn_pv): materializes the S=[m,kv] scores buffer → more
-        //    HBM traffic, but runs the efficient 8-warp warptile coopmat GEMMs. Wins when bandwidth
-        //    is plentiful vs compute (e.g. RX 7900 XTX ~960 GB/s, ~125 FLOP/byte → non-FA faster).
-        //  • flash (attention_prefill_flash, split-K): never writes S → far less HBM, but the fused
-        //    kernel is more compute/overhead-heavy. Wins on bandwidth-starved cards (low GB/s-per-
-        //    FLOP: APUs, cut-down/older GPUs) and as context grows (S traffic ∝ m·kv).
+        // HARDWARE-dependent (the card's compute:bandwidth ratio):
+        //  • flash (attention_prefill_flash, split-K, 8-warp register-blocked for hd=128): never
+        //    materializes the S=[m,kv] scores buffer → far less HBM. After warptile-izing its GEMMs
+        //    it now also wins on this bandwidth-rich card (+8-12% across ctx, 32k 2351→2620) AND is
+        //    the right choice on bandwidth-starved cards (APUs, cut-down GPUs) / very long context.
+        //  • non-FA (attn_qk → softmax → attn_pv): materializes S (more HBM) but uses big-tile
+        //    (BN=256) warptile GEMMs. Fallback for hd≠128 (the flash warptile is hd=128-specialized)
+        //    or via INFR_NO_FLASH.
         // Both are correctness-tested (attention_prefill_{nonfa,flash}_matches_cpu) so neither rots.
-        // Default = non-FA (fastest on this card); INFR_FLASH selects flash. TODO: auto-select from
-        // device bandwidth/FLOP caps instead of an env knob.
-        let nonfa = use_gemm;
-        let use_flash = use_gemm && std::env::var("INFR_FLASH").is_ok();
+        // DEFAULT = flash for hd=128. TODO: auto-select from device bandwidth/FLOP caps.
+        let use_flash = use_gemm && hd == 128 && std::env::var("INFR_NO_FLASH").is_err();
+        let nonfa = use_gemm && !use_flash;
         let hidden = alloc(n * ne, BufferUsage::Staging)?;
         self.be
             .upload(hidden.as_ref(), bytemuck::cast_slice(&hidden_host))

@@ -1037,7 +1037,10 @@ impl<'a> Recorder<'a> {
                 }
             }
         };
-        if n_splits == 1 {
+        // hd=128 → 8-warp register-blocked partial (always via partial+combine). Other hd → the
+        // 4-subgroup path: single fused kernel for n_splits==1, else the scalar partial.
+        let warp = hd == 128 && std::env::var("INFR_NO_FLASH_WARP").is_err();
+        if n_splits == 1 && !warp {
             self.stamp("attn_flash");
             let k = self
                 .be
@@ -1061,13 +1064,12 @@ impl<'a> Recorder<'a> {
         // split-K partials
         self.stamp("attn_flash");
         let ksplit = (kv_len as u32).div_ceil(n_splits).div_ceil(64) * 64;
-        let kp = self.be.kernel_spv_sg(
-            "attn_flash_partial",
-            crate::gemm::attn_flash_partial_spv(),
-            6,
-            32,
-            32,
-        );
+        let (pname, pspv) = if warp {
+            ("attn_flash_warp", crate::gemm::attn_flash_warp_spv())
+        } else {
+            ("attn_flash_partial", crate::gemm::attn_flash_partial_spv())
+        };
+        let kp = self.be.kernel_spv_sg(pname, pspv, 6, 32, 32);
         let mut pp = [0u8; 32];
         pp[0..4].copy_from_slice(&mpad.to_ne_bytes());
         pp[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());
