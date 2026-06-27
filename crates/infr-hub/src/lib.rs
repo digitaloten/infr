@@ -1,12 +1,14 @@
-//! Model acquisition: resolve a reference to a local GGUF, reusing/extending the **Ollama
-//! store** (same dir + format) so existing Ollama downloads work with zero re-download.
+//! Model acquisition: resolve a reference to a local GGUF, pulling from HuggingFace or the Ollama
+//! registry over plain HTTP (no external CLI). Downloads land in **our own** content-addressed
+//! store (never the system Ollama dirs), with resume + a progress bar.
 //!
-//! See PLAN.md §"fetch / model acquisition (infr-hub)". Store layout:
+//! See PLAN.md §"fetch / model acquisition (infr-hub)". Store layout (root = `$INFR_MODELS` or
+//! `$XDG_CACHE_HOME/infr/models`):
 //!
 //! ```text
-//! $INFR_MODELS | $OLLAMA_MODELS | ~/.ollama/models
-//!   manifests/<registry>/<ns>/<name>/<tag>   (OCI-style JSON)
-//!   blobs/sha256-<digest>                    (layer blobs; model layer == GGUF)
+//!   manifests/registry.ollama.ai/<ns>/<name>/<tag>   (ollama pulls)
+//!   manifests/huggingface.co/<org>/<repo>/<file>     (hf pulls)
+//!   blobs/sha256-<digest>                            (layer blobs; model layer == GGUF)
 //! ```
 
 mod model_ref;

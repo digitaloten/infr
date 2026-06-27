@@ -1,13 +1,20 @@
-//! Model download: HF hub (streaming + sha256 verification) and Ollama registry.
+//! Model download: HuggingFace hub + Ollama registry. Both are standalone HTTP (reqwest) — no
+//! external CLI (`ollama` / `huggingface-cli`) is ever invoked. Downloads stream into our own
+//! content-addressed blob store with **resume** (HTTP Range) and a progress bar, and are
+//! sha256-verified (against the registry digest for Ollama; by computed hash for HF).
 
-use crate::{model_ref::ModelRef, store::Store};
+use crate::{
+    model_ref::ModelRef,
+    store::{OllamaManifest, Store, OLLAMA_MODEL_MEDIA_TYPE},
+};
 use indicatif::{ProgressBar, ProgressStyle};
 use infr_core::error::{Error, Result};
+use reqwest::blocking::{Client, Response};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 use tracing::{debug, info};
 
@@ -15,222 +22,69 @@ use tracing::{debug, info};
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Download a model into the shared store, returning the GGUF blob path.
+/// Download a model into our store, returning the GGUF blob path. Idempotent: a model already in
+/// the store is returned without re-downloading.
 ///
-/// - `Path`   → returned as-is (no download).
-/// - `Hf`     → streamed from HuggingFace with progress + sha256 verification.
-/// - `Ollama` → returns [`Error::Unsupported`]; use `ollama pull` then
-///              [`Store::resolve`] to consume pre-pulled models.
+/// - `Path` → returned as-is (no download).
+/// - `Hf`   → streamed from HuggingFace.
+/// - `Ollama` → manifest + blob streamed from the Ollama registry.
 pub fn pull(r: &ModelRef) -> Result<PathBuf> {
     match r {
         ModelRef::Path(p) => Ok(p.clone()),
         ModelRef::Hf { repo, file } => pull_hf(repo, file.as_deref()),
-        ModelRef::Ollama { .. } => Err(Error::Unsupported(
-            "ollama registry pull not yet implemented; pre-pull with `ollama pull`".into(),
-        )),
+        ModelRef::Ollama { name, tag } => pull_ollama(name, tag),
     }
 }
 
+fn http_client() -> Result<Client> {
+    Client::builder()
+        .user_agent("infr-hub/0.1")
+        .build()
+        .map_err(|e| Error::Other(format!("building HTTP client: {e}")))
+}
+
 // ---------------------------------------------------------------------------
-// HuggingFace pull
+// HuggingFace
 // ---------------------------------------------------------------------------
 
 fn pull_hf(repo: &str, file: Option<&str>) -> Result<PathBuf> {
     let store = Store::discover()?;
-
-    // Determine the filename to download.
     let filename = match file {
         Some(f) => f.to_owned(),
         None => choose_hf_file(repo)?,
     };
 
-    info!("Pulling hf:{repo}:{filename}");
-
-    let url = format!("https://huggingface.co/{repo}/resolve/main/{filename}");
-    debug!("GET {url}");
-
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("infr-hub/0.1")
-        .build()
-        .map_err(|e| Error::Other(format!("building HTTP client: {e}")))?;
-
-    let mut req = client.get(&url);
-    if let Ok(token) = std::env::var("HF_TOKEN") {
-        req = req.bearer_auth(token);
-    }
-
-    let resp = req
-        .send()
-        .map_err(|e| Error::Other(format!("HTTP request: {e}")))?;
-
-    if !resp.status().is_success() {
-        return Err(Error::Other(format!(
-            "HF download failed: HTTP {}",
-            resp.status()
-        )));
-    }
-
-    let total_size = resp.content_length();
-
-    // Progress bar
-    let pb: ProgressBar = match total_size {
-        Some(n) => {
-            let pb = ProgressBar::new(n);
-            pb.set_style(
-                ProgressStyle::with_template(
-                    "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] \
-                     {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
-                )
-                .unwrap()
-                .progress_chars("#>-"),
-            );
-            pb
-        }
-        None => {
-            let pb = ProgressBar::new_spinner();
-            pb.set_style(
-                ProgressStyle::with_template(
-                    "{spinner:.green} [{elapsed_precise}] {bytes} ({bytes_per_sec})",
-                )
-                .unwrap(),
-            );
-            pb
-        }
+    // Idempotent: already in the store?
+    let cached = ModelRef::Hf {
+        repo: repo.to_owned(),
+        file: Some(filename.clone()),
     };
-    pb.set_message(filename.clone());
-
-    // Prepare blobs directory and a temporary file.
-    let blobs_dir = store.blobs_dir();
-    fs::create_dir_all(&blobs_dir).map_err(Error::from)?;
-
-    // Use a sanitised temp name to avoid path issues.
-    let tmp_path = blobs_dir.join(format!(".dl-{}", sanitise(&filename)));
-
-    let download_result = stream_to_file(resp, &tmp_path, &pb);
-
-    if let Err(e) = &download_result {
-        // Best-effort cleanup of the temp file on failure.
-        let _ = fs::remove_file(&tmp_path);
-        return Err(Error::Other(format!("download failed: {e}")));
+    if let Some(p) = store.resolve(&cached)? {
+        debug!("hf:{repo}:{filename} already cached");
+        return Ok(p);
     }
 
-    let (digest_hex, byte_count) = download_result.unwrap();
-    pb.finish_with_message(format!("✓ {filename} ({byte_count} bytes)"));
+    info!("Pulling hf:{repo}:{filename}");
+    let url = format!("https://huggingface.co/{repo}/resolve/main/{filename}");
+    let token = std::env::var("HF_TOKEN").ok();
+    let (blob, hex, size) =
+        download_to_blob(&http_client()?, &url, token.as_deref(), &store, &filename)?;
 
-    let digest = format!("sha256:{digest_hex}");
-    let blob_name = format!("sha256-{digest_hex}");
-    let blob_path = blobs_dir.join(&blob_name);
-
-    // Atomically rename to the content-addressed path.
-    fs::rename(&tmp_path, &blob_path).map_err(Error::from)?;
-    info!("Saved blob: {blob_path:?}");
-
-    // Write a minimal Ollama-style manifest so the blob is reusable.
-    write_hf_manifest(&store, repo, &filename, &digest, byte_count)?;
-
-    Ok(blob_path)
+    write_hf_manifest(&store, repo, &filename, &format!("sha256:{hex}"), size)?;
+    Ok(blob)
 }
-
-/// Stream `response` to `dest`, computing sha256 and counting bytes.
-/// Returns `(hex_digest, bytes_written)`.
-fn stream_to_file(
-    mut response: reqwest::blocking::Response,
-    dest: &std::path::Path,
-    pb: &ProgressBar,
-) -> std::result::Result<(String, u64), Box<dyn std::error::Error>> {
-    let mut out = fs::File::create(dest)?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 65536];
-    let mut total = 0u64;
-
-    loop {
-        let n = response.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-        out.write_all(&buf[..n])?;
-        total += n as u64;
-        pb.inc(n as u64);
-    }
-
-    let result = hasher.finalize();
-    let hex: String = result.iter().map(|b| format!("{b:02x}")).collect();
-    Ok((hex, total))
-}
-
-/// Write a minimal Ollama-style manifest for an HF-downloaded blob.
-///
-/// Path: `<store>/manifests/huggingface.co/<org>/<model>/<filename>`
-fn write_hf_manifest(
-    store: &Store,
-    repo: &str,
-    filename: &str,
-    digest: &str,
-    size: u64,
-) -> Result<()> {
-    // repo = "org/model" → namespace="org", model_name="model"
-    let (namespace, model_name) = split_repo(repo);
-
-    let manifest_dir = store
-        .root
-        .join("manifests")
-        .join("huggingface.co")
-        .join(namespace)
-        .join(model_name);
-    fs::create_dir_all(&manifest_dir).map_err(Error::from)?;
-
-    let manifest = serde_json::json!({
-        "schemaVersion": 2,
-        "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
-        "config": {
-            "mediaType": "application/vnd.ollama.image.config",
-            "digest": digest,
-            "size": 0
-        },
-        "layers": [
-            {
-                "mediaType": "application/vnd.ollama.image.model",
-                "digest": digest,
-                "size": size
-            }
-        ]
-    });
-
-    let manifest_path = manifest_dir.join(filename);
-    fs::write(
-        &manifest_path,
-        serde_json::to_string_pretty(&manifest).unwrap(),
-    )
-    .map_err(Error::from)?;
-
-    debug!("Wrote manifest: {manifest_path:?}");
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// HuggingFace API: pick a .gguf file from repo
-// ---------------------------------------------------------------------------
 
 /// Query the HF model API and choose a `.gguf` file (prefer `Q4_K_M`).
 fn choose_hf_file(repo: &str) -> Result<String> {
     let url = format!("https://huggingface.co/api/models/{repo}");
     debug!("GET {url}");
-
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("infr-hub/0.1")
-        .build()
-        .map_err(|e| Error::Other(format!("building HTTP client: {e}")))?;
-
-    let mut req = client.get(&url);
+    let mut req = http_client()?.get(&url);
     if let Ok(token) = std::env::var("HF_TOKEN") {
         req = req.bearer_auth(token);
     }
-
     let resp = req
         .send()
         .map_err(|e| Error::Other(format!("HF API request: {e}")))?;
-
     if !resp.status().is_success() {
         return Err(Error::Other(format!(
             "HF API failed: HTTP {}",
@@ -246,47 +100,271 @@ fn choose_hf_file(repo: &str) -> Result<String> {
     struct ModelInfo {
         siblings: Vec<Sibling>,
     }
-
     let info: ModelInfo = resp
         .json()
         .map_err(|e| Error::Other(format!("parsing HF API response: {e}")))?;
 
-    let gguf_files: Vec<String> = info
+    let gguf: Vec<String> = info
         .siblings
         .into_iter()
-        .filter(|s| s.rfilename.ends_with(".gguf"))
         .map(|s| s.rfilename)
+        .filter(|f| f.ends_with(".gguf"))
         .collect();
-
-    if gguf_files.is_empty() {
+    if gguf.is_empty() {
         return Err(Error::Other(format!("no .gguf files found in {repo}")));
     }
-
-    // Prefer Q4_K_M variant.
-    if let Some(f) = gguf_files
-        .iter()
-        .find(|f| f.to_lowercase().contains("q4_k_m"))
-    {
+    if let Some(f) = gguf.iter().find(|f| f.to_lowercase().contains("q4_k_m")) {
         return Ok(f.clone());
     }
+    Ok(gguf.into_iter().next().unwrap())
+}
 
-    // Fall back to the first .gguf found.
-    Ok(gguf_files.into_iter().next().unwrap())
+/// Construct a minimal Ollama-style manifest for an HF-downloaded blob so `resolve` can find it.
+fn write_hf_manifest(
+    store: &Store,
+    repo: &str,
+    filename: &str,
+    digest: &str,
+    size: u64,
+) -> Result<()> {
+    let manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+        "config": { "mediaType": "application/vnd.ollama.image.config", "digest": digest, "size": 0 },
+        "layers": [ { "mediaType": OLLAMA_MODEL_MEDIA_TYPE, "digest": digest, "size": size } ]
+    });
+    write_text(
+        &store.hf_manifest_path(repo, filename),
+        &serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Ollama registry
+// ---------------------------------------------------------------------------
+
+fn pull_ollama(name: &str, tag: &str) -> Result<PathBuf> {
+    let store = Store::discover()?;
+    let cached = ModelRef::Ollama {
+        name: name.to_owned(),
+        tag: tag.to_owned(),
+    };
+    if let Some(p) = store.resolve(&cached)? {
+        debug!("ollama:{name}:{tag} already cached");
+        return Ok(p);
+    }
+
+    let full = Store::ollama_full_name(name);
+    info!("Pulling ollama:{name}:{tag}");
+    let client = http_client()?;
+
+    // 1. Manifest (the registry needs the docker manifest Accept header).
+    let manifest_url = format!("https://registry.ollama.ai/v2/{full}/manifests/{tag}");
+    debug!("GET {manifest_url}");
+    let resp = client
+        .get(&manifest_url)
+        .header(
+            reqwest::header::ACCEPT,
+            "application/vnd.docker.distribution.manifest.v2+json",
+        )
+        .send()
+        .map_err(|e| Error::Other(format!("ollama manifest request: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(Error::Other(format!(
+            "ollama manifest failed: HTTP {} for {name}:{tag}",
+            resp.status()
+        )));
+    }
+    let manifest_text = resp
+        .text()
+        .map_err(|e| Error::Other(format!("reading ollama manifest: {e}")))?;
+    let manifest: OllamaManifest = serde_json::from_str(&manifest_text)
+        .map_err(|e| Error::Other(format!("parsing ollama manifest: {e}")))?;
+    let layer = manifest
+        .layers
+        .iter()
+        .find(|l| l.media_type == OLLAMA_MODEL_MEDIA_TYPE)
+        .ok_or_else(|| Error::Other(format!("ollama:{name}:{tag} has no model layer")))?;
+    let digest = layer.digest.clone(); // "sha256:<hex>"
+    let want_hex = digest.strip_prefix("sha256:").unwrap_or(&digest).to_owned();
+
+    // 2. Blob (content-addressed → skip if another tag already pulled the same weights).
+    let blob_path = store.blobs_dir().join(format!("sha256-{want_hex}"));
+    if blob_path.exists() {
+        debug!("ollama blob {want_hex} already present");
+    } else {
+        let blob_url = format!("https://registry.ollama.ai/v2/{full}/blobs/{digest}");
+        let (blob, got_hex, _size) = download_to_blob(&client, &blob_url, None, &store, &want_hex)?;
+        if got_hex != want_hex {
+            let _ = fs::remove_file(&blob);
+            return Err(Error::Other(format!(
+                "ollama blob digest mismatch: got {got_hex}, want {want_hex}"
+            )));
+        }
+    }
+
+    // 3. Persist the manifest in our store so future runs resolve without a network call.
+    write_text(&store.ollama_manifest_path(name, tag), &manifest_text)?;
+    Ok(blob_path)
+}
+
+// ---------------------------------------------------------------------------
+// Shared streaming download (resume + progress + sha256)
+// ---------------------------------------------------------------------------
+
+/// Stream `url` into the content-addressed blob store, resuming a prior partial if present.
+/// Returns `(blob_path, hex_digest, total_bytes)`. `label` names the temp file + progress message.
+/// On error the partial temp file is KEPT so a later call resumes from where it stopped.
+fn download_to_blob(
+    client: &Client,
+    url: &str,
+    bearer: Option<&str>,
+    store: &Store,
+    label: &str,
+) -> Result<(PathBuf, String, u64)> {
+    let blobs = store.blobs_dir();
+    fs::create_dir_all(&blobs).map_err(Error::from)?;
+    let tmp = blobs.join(format!(".dl-{}", sanitise(label)));
+    let have = fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+
+    debug!("GET {url}{}", if have > 0 { " (resume)" } else { "" });
+    let mut req = client.get(url);
+    if let Some(t) = bearer {
+        req = req.bearer_auth(t);
+    }
+    if have > 0 {
+        req = req.header(reqwest::header::RANGE, format!("bytes={have}-"));
+    }
+    let resp = req
+        .send()
+        .map_err(|e| Error::Other(format!("HTTP request: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(Error::Other(format!(
+            "download failed: HTTP {}",
+            resp.status()
+        )));
+    }
+    // The server honours the Range only with 206; on 200 it sends the whole file → restart clean.
+    let resuming = have > 0 && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    let remaining = resp.content_length();
+    let total = remaining.map(|r| if resuming { have + r } else { r });
+
+    let mut hasher = Sha256::new();
+    let mut file = if resuming {
+        hash_file(&tmp, &mut hasher)?; // fold the bytes already on disk into the digest
+        info!("resuming {label} at {have} bytes");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&tmp)
+            .map_err(Error::from)?
+    } else {
+        fs::File::create(&tmp).map_err(Error::from)? // truncates any stale partial
+    };
+    let start = if resuming { have } else { 0 };
+
+    let pb = progress_bar(total, label);
+    pb.set_position(start);
+
+    if let Err(e) = stream_into(resp, &mut file, &mut hasher, &pb) {
+        pb.abandon_with_message(format!("⚠ {label} interrupted (resumable)"));
+        return Err(Error::Other(format!(
+            "download failed (partial kept for resume): {e}"
+        )));
+    }
+
+    let hex: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let size = fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+    pb.finish_with_message(format!("✓ {label} ({} MiB)", size / (1024 * 1024)));
+
+    let blob = blobs.join(format!("sha256-{hex}"));
+    fs::rename(&tmp, &blob).map_err(Error::from)?;
+    info!("Saved blob: {blob:?}");
+    Ok((blob, hex, size))
+}
+
+/// Read an existing file fully through `hasher` (to continue a resumed digest).
+fn hash_file(path: &Path, hasher: &mut Sha256) -> Result<()> {
+    let mut f = fs::File::open(path).map_err(Error::from)?;
+    let mut buf = [0u8; 1 << 16];
+    loop {
+        let n = f.read(&mut buf).map_err(Error::from)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(())
+}
+
+/// Stream the response body into `file`, updating the digest and progress bar.
+fn stream_into(
+    mut resp: Response,
+    file: &mut fs::File,
+    hasher: &mut Sha256,
+    pb: &ProgressBar,
+) -> std::result::Result<(), std::io::Error> {
+    let mut buf = [0u8; 1 << 16];
+    loop {
+        let n = resp.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        file.write_all(&buf[..n])?;
+        pb.inc(n as u64);
+    }
+    file.flush()
+}
+
+/// A byte-progress bar (or a spinner when the size is unknown).
+fn progress_bar(total: Option<u64>, label: &str) -> ProgressBar {
+    let pb = match total {
+        Some(n) => {
+            let pb = ProgressBar::new(n);
+            pb.set_style(
+                ProgressStyle::with_template(
+                    "{msg}\n  {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] \
+                     {bytes}/{total_bytes}  {bytes_per_sec}  ETA {eta}",
+                )
+                .unwrap()
+                .progress_chars("━━╾─"),
+            );
+            pb
+        }
+        None => {
+            let pb = ProgressBar::new_spinner();
+            pb.set_style(
+                ProgressStyle::with_template(
+                    "{msg}\n  {spinner:.green} [{elapsed_precise}] {bytes} {bytes_per_sec}",
+                )
+                .unwrap(),
+            );
+            pb
+        }
+    };
+    pb.set_message(label.to_owned());
+    pb
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Split `"org/model"` into `("org", "model")`, falling back to `("library", repo)`.
-fn split_repo(repo: &str) -> (&str, &str) {
-    match repo.splitn(2, '/').collect::<Vec<_>>()[..] {
-        [ns, name] => (ns, name),
-        _ => ("library", repo),
+/// Write `text` to `path`, creating parent directories.
+fn write_text(path: &Path, text: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(Error::from)?;
     }
+    fs::write(path, text).map_err(Error::from)?;
+    debug!("wrote manifest {path:?}");
+    Ok(())
 }
 
-/// Replace characters unsafe for use in a filename with `_`.
+/// Replace characters unsafe in a filename with `_`.
 fn sanitise(s: &str) -> String {
     s.chars()
         .map(|c| {

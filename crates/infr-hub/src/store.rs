@@ -1,9 +1,12 @@
-//! The shared on-disk model store (Ollama-compatible layout).
+//! infr's own on-disk model store. The blob/manifest layout is OCI/Ollama-style (content-addressed
+//! blobs + small JSON manifests, so registry pulls dedup naturally), but the ROOT is our own cache
+//! dir — we never read or write the system Ollama dirs (`~/.ollama`, `/var/lib/ollama`).
 //!
-//! Layout inside `root`:
+//! Layout inside `root` (default `$XDG_CACHE_HOME/infr/models`):
 //! ```text
-//! manifests/registry.ollama.ai/library/<name>/<tag>   (OCI-style JSON)
-//! blobs/sha256-<hex>                                  (layer blobs; model layer == GGUF)
+//! manifests/registry.ollama.ai/<ns>/<name>/<tag>   (ollama pulls)
+//! manifests/huggingface.co/<org>/<repo>/<file>     (hf pulls)
+//! blobs/sha256-<hex>                               (layer blobs; model layer == GGUF)
 //! ```
 
 use crate::model_ref::ModelRef;
@@ -16,16 +19,19 @@ use std::{fs, path::PathBuf};
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-struct OllamaManifest {
-    layers: Vec<OllamaLayer>,
+pub(crate) struct OllamaManifest {
+    pub(crate) layers: Vec<OllamaLayer>,
 }
 
 #[derive(Deserialize)]
-struct OllamaLayer {
+pub(crate) struct OllamaLayer {
     #[serde(rename = "mediaType")]
-    media_type: String,
-    digest: String,
+    pub(crate) media_type: String,
+    pub(crate) digest: String,
 }
+
+/// Media type of the GGUF model layer in an Ollama manifest.
+pub(crate) const OLLAMA_MODEL_MEDIA_TYPE: &str = "application/vnd.ollama.image.model";
 
 // ---------------------------------------------------------------------------
 // Store
@@ -37,29 +43,45 @@ pub struct Store {
 }
 
 impl Store {
-    /// Locate the store root: `$INFR_MODELS` → `$OLLAMA_MODELS` → `~/.ollama/models` (if it exists)
-    /// → `/var/lib/ollama` (the systemd-service store, if it exists) → `~/.ollama/models`.
-    ///
-    /// The chosen directory is not required to exist (the final fallback may be absent).
+    /// Locate the store root: `$INFR_MODELS`, else `$XDG_CACHE_HOME/infr/models` (`~/.cache/infr/models`).
+    /// Always our own writable dir — we never touch the system Ollama dirs. Need not exist yet.
     pub fn discover() -> Result<Self> {
         let root = if let Ok(p) = std::env::var("INFR_MODELS") {
             PathBuf::from(p)
-        } else if let Ok(p) = std::env::var("OLLAMA_MODELS") {
-            PathBuf::from(p)
         } else {
-            let home = dirs::home_dir()
-                .ok_or_else(|| Error::Other("cannot determine home directory".into()))?;
-            let user_store = home.join(".ollama").join("models");
-            let systemd_store = PathBuf::from("/var/lib/ollama");
-            if user_store.exists() {
-                user_store
-            } else if systemd_store.exists() {
-                systemd_store
-            } else {
-                user_store
-            }
+            dirs::cache_dir()
+                .ok_or_else(|| Error::Other("cannot determine cache directory".into()))?
+                .join("infr")
+                .join("models")
         };
         Ok(Store { root })
+    }
+
+    /// Canonical `<namespace>/<name>` for an ollama ref: bare names get the `library/` namespace.
+    pub(crate) fn ollama_full_name(name: &str) -> String {
+        if name.contains('/') {
+            name.to_string()
+        } else {
+            format!("library/{name}")
+        }
+    }
+
+    /// Manifest path for an ollama ref: `<root>/manifests/registry.ollama.ai/<ns>/<name>/<tag>`.
+    pub(crate) fn ollama_manifest_path(&self, name: &str, tag: &str) -> PathBuf {
+        self.root
+            .join("manifests")
+            .join("registry.ollama.ai")
+            .join(Self::ollama_full_name(name))
+            .join(tag)
+    }
+
+    /// Manifest path for an hf ref: `<root>/manifests/huggingface.co/<repo>/<file>`.
+    pub(crate) fn hf_manifest_path(&self, repo: &str, file: &str) -> PathBuf {
+        self.root
+            .join("manifests")
+            .join("huggingface.co")
+            .join(repo)
+            .join(file)
     }
 
     /// Return the blobs directory (`<root>/blobs`).
@@ -67,65 +89,33 @@ impl Store {
         self.root.join("blobs")
     }
 
-    /// If the referenced model already exists locally, return the GGUF blob path.
+    /// If the referenced model already exists in our store, return the GGUF blob path.
     ///
     /// - `Path(p)` → `Some(p)` if the file exists.
-    /// - `Hf`     → `Ok(None)` (HF refs are resolved only by `pull`).
-    /// - `Ollama` → read the Ollama manifest, find the model layer digest,
-    ///              return the blob path if present.
+    /// - `Hf`     → read the cached hf manifest (needs a known filename; `file: None` → `None`).
+    /// - `Ollama` → read the cached ollama manifest, find the model layer, return the blob.
     pub fn resolve(&self, r: &ModelRef) -> Result<Option<PathBuf>> {
         match r {
-            ModelRef::Path(p) => {
-                if p.exists() {
-                    Ok(Some(p.clone()))
-                } else {
-                    Ok(None)
-                }
+            ModelRef::Path(p) => Ok(p.exists().then(|| p.clone())),
+            ModelRef::Hf {
+                repo,
+                file: Some(f),
+            } => self.blob_if_manifest(&self.hf_manifest_path(repo, f)),
+            // No filename → we can't name the manifest without the HF API; `pull` resolves it.
+            ModelRef::Hf { file: None, .. } => Ok(None),
+            ModelRef::Ollama { name, tag } => {
+                self.blob_if_manifest(&self.ollama_manifest_path(name, tag))
             }
-            ModelRef::Hf { .. } => Ok(None),
-            ModelRef::Ollama { name, tag } => self.resolve_ollama(name, tag),
         }
     }
 
-    fn resolve_ollama(&self, name: &str, tag: &str) -> Result<Option<PathBuf>> {
-        // Primary path: manifests/registry.ollama.ai/library/<name>/<tag>
-        let primary = self
-            .root
-            .join("manifests")
-            .join("registry.ollama.ai")
-            .join("library")
-            .join(name)
-            .join(tag);
-
-        // Secondary path (only when name already contains a namespace slash):
-        // manifests/registry.ollama.ai/<name>/<tag>
-        // e.g. name="library/qwen" → manifests/registry.ollama.ai/library/qwen/<tag>
-        let secondary = if name.contains('/') {
-            Some(
-                self.root
-                    .join("manifests")
-                    .join("registry.ollama.ai")
-                    .join(name)
-                    .join(tag),
-            )
+    /// Read a manifest at `path` (if present) and return its model-layer blob (if present).
+    fn blob_if_manifest(&self, path: &std::path::Path) -> Result<Option<PathBuf>> {
+        if path.exists() {
+            self.blob_from_manifest(path)
         } else {
-            None
-        };
-
-        // Pick whichever manifest file exists; prefer primary.
-        let manifest_path = if primary.exists() {
-            primary
-        } else if let Some(sec) = secondary {
-            if sec.exists() {
-                sec
-            } else {
-                return Ok(None);
-            }
-        } else {
-            return Ok(None);
-        };
-
-        self.blob_from_manifest(&manifest_path)
+            Ok(None)
+        }
     }
 
     /// Parse a manifest file and return the GGUF blob path if it exists.

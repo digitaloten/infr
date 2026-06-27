@@ -1,4 +1,5 @@
-//! Parsed model-reference grammar: `hf:org/repo[:file]`, `ollama:name[:tag]`, plain path.
+//! Parsed model-reference grammar: `hf:`/`huggingface:` `org/repo[:file]`, `ol:`/`ollama:`
+//! `name[:tag]`, or a plain filesystem path.
 
 use infr_core::error::{Error, Result};
 use std::path::PathBuf;
@@ -15,23 +16,27 @@ pub enum ModelRef {
 }
 
 impl ModelRef {
-    /// Parse `hf:…`, `ollama:…`, or a plain filesystem path.
+    /// Parse an `hf:`/`huggingface:` ref, an `ol:`/`ollama:` ref, or a plain filesystem path.
     ///
-    /// - `hf:org/repo`              → `Hf { repo: "org/repo", file: None }`
-    /// - `hf:org/repo:file.gguf`    → `Hf { repo: "org/repo", file: Some("file.gguf") }`
-    /// - `ollama:name`              → `Ollama { name: "name", tag: "latest" }`
-    /// - `ollama:name:tag`          → `Ollama { name: "name", tag: "tag" }`
-    /// - `ollama:ns/name:tag`       → `Ollama { name: "ns/name", tag: "tag" }`
-    /// - anything else              → `Path(PathBuf::from(s))`
+    /// - `hf:org/repo` / `huggingface:org/repo`        → `Hf { repo, file: None }`
+    /// - `hf:org/repo:file.gguf`                       → `Hf { repo, file: Some(file) }`
+    /// - `ol:name` / `ollama:name`                     → `Ollama { name, tag: "latest" }`
+    /// - `ollama:name:tag` / `ollama:ns/name:tag`      → `Ollama { name, tag }`
+    /// - anything else                                 → `Path(PathBuf::from(s))`
     pub fn parse(s: &str) -> Result<Self> {
-        if let Some(rest) = s.strip_prefix("hf:") {
+        if let Some(rest) = strip_prefix_any(s, &["huggingface:", "hf:"]) {
             parse_hf(rest)
-        } else if let Some(rest) = s.strip_prefix("ollama:") {
+        } else if let Some(rest) = strip_prefix_any(s, &["ollama:", "ol:"]) {
             parse_ollama(rest)
         } else {
             Ok(ModelRef::Path(PathBuf::from(s)))
         }
     }
+}
+
+/// Return the remainder after the first matching prefix in `prefixes`, if any.
+fn strip_prefix_any<'a>(s: &'a str, prefixes: &[&str]) -> Option<&'a str> {
+    prefixes.iter().find_map(|p| s.strip_prefix(p))
 }
 
 /// Parse everything after the `hf:` prefix.
@@ -151,6 +156,28 @@ mod tests {
     #[test]
     fn hf_empty_file_is_err() {
         assert!(ModelRef::parse("hf:org/repo:").is_err());
+    }
+
+    #[test]
+    fn hf_alias_huggingface() {
+        assert_eq!(
+            ModelRef::parse("huggingface:org/repo:m.gguf").unwrap(),
+            ModelRef::Hf {
+                repo: "org/repo".into(),
+                file: Some("m.gguf".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn ollama_alias_ol() {
+        assert_eq!(
+            ModelRef::parse("ol:qwen3:0.6b").unwrap(),
+            ModelRef::Ollama {
+                name: "qwen3".into(),
+                tag: "0.6b".into(),
+            }
+        );
     }
 
     #[test]
