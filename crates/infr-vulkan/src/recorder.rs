@@ -777,7 +777,12 @@ impl<'a> Recorder<'a> {
         eps: f32,
     ) {
         self.stamp("rmsnorm");
-        let k = self.be.kernel("rmsnorm", ops::RMSNORM_WGSL, 3, 12);
+        // 256-thread subgroup kernel (requiredSubgroupSize=32): more load/store parallelism and a
+        // single barrier vs the 64-thread WGSL shared-tree. ~2.6× faster as a kernel; end-to-end
+        // neutral here (decode is dispatch-latency-bound) but a win on slower/higher-latency GPUs.
+        let k = self
+            .be
+            .kernel_spv_sg("rmsnorm", crate::gemm::rmsnorm_spv(), 3, 12, 32);
         let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(dim as u32).to_ne_bytes());

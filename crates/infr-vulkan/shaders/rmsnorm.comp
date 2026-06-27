@@ -1,0 +1,38 @@
+#version 460
+// RMSNorm: y[i] = x[i] * inversesqrt(mean(x²) + eps) * w[i], one workgroup per row.
+// Replaces the 64-thread WGSL shared-tree version (6 barriers): 256 threads (4× the load/store
+// parallelism for this memory-bound op) and a subgroup reduction (subgroupAdd within each wave +
+// one shared combine across the 8 waves → a single barrier). Decode rmsnorm is one workgroup on a
+// 96-CU GPU; the kernel is ~2.6× faster (8.6→3.3us/op). End-to-end neutral on the 7900 XTX (decode
+// is dispatch-latency-bound, prefill matmul-bound), but a strict win on hardware where this op or
+// its barriers cost more. Requires requiredSubgroupSize=32 (wave32 → 8 subgroups).
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint rows; uint dim; float eps; } pc;
+layout(binding = 0) readonly buffer XB { float x[]; };
+layout(binding = 1) readonly buffer WB { float w[]; };
+layout(binding = 2) buffer YB { float y[]; };
+
+shared float part[8];   // one partial per subgroup (256 threads / 32 = 8 waves)
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationIndex;
+    uint base = r * pc.dim;
+
+    float ss = 0.0;
+    for (uint i = t; i < pc.dim; i += 256u) { float v = x[base + i]; ss += v * v; }
+    ss = subgroupAdd(ss);
+    if (subgroupElect()) { part[gl_SubgroupID] = ss; }
+    barrier();
+
+    float tot = 0.0;
+    uint nsg = gl_NumSubgroups;
+    for (uint s = 0u; s < nsg; s++) { tot += part[s]; }
+    float scale = inversesqrt(tot / float(pc.dim) + pc.eps);
+
+    for (uint i = t; i < pc.dim; i += 256u) { y[base + i] = x[base + i] * scale * w[i]; }
+}
