@@ -33,6 +33,7 @@ const ATTN_QK_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_
 const ATTN_QK_WARP_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_qk_warp.spv"));
 const ATTN_SM_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_softmax.spv"));
 const ATTN_PV_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_pv.spv"));
+const ATTN_PV_WARP_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_pv_warp.spv"));
 const ATTN_PV_REDUCE_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_pv_reduce.spv"));
 const MMV_Q4_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q4.spv"));
@@ -54,6 +55,7 @@ static ATTN_QK_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_QK_WARP_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_SM_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_PV_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_PV_WARP_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_PV_REDUCE_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static MMV_Q4_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static MMV_Q8_SPV: OnceLock<Vec<u32>> = OnceLock::new();
@@ -107,6 +109,11 @@ pub(crate) fn attn_softmax_spv() -> &'static [u32] {
 }
 pub(crate) fn attn_pv_spv() -> &'static [u32] {
     ATTN_PV_SPV.get_or_init(|| spv_words(ATTN_PV_SPV_BYTES))
+}
+/// 8-warp/256-thread PV GEMM (BN=128=hd, hd % 128). The recorder uses it over the 4-warp attn_pv
+/// when hd % 128 == 0 and INFR_NO_PV_WARP is unset.
+pub(crate) fn attn_pv_warp_spv() -> &'static [u32] {
+    ATTN_PV_WARP_SPV.get_or_init(|| spv_words(ATTN_PV_WARP_SPV_BYTES))
 }
 /// SPIR-V for the attn_pv split-K partial reducer (sums n_splits partial-O buffers).
 pub(crate) fn attn_pv_reduce_spv() -> &'static [u32] {

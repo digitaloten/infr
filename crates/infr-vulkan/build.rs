@@ -20,6 +20,7 @@ fn main() {
         ("attn_qk_warp", "attn_qk_warp", &[]),
         ("attn_softmax", "attn_softmax", &[]),
         ("attn_pv", "attn_pv", &[]),
+        ("attn_pv_warp", "attn_pv_warp", &[]),
         ("attn_pv_reduce", "attn_pv_reduce", &[]),
         // Decode GEMV: q4/q8 × plain/residual specializations from one source.
         ("mul_mat_vec_q", "mul_mat_vec_q4", &["-DQBITS=4"]),

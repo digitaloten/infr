@@ -949,9 +949,15 @@ impl<'a> Recorder<'a> {
             }
         };
         let ksplit = kv_pad.div_ceil(n_splits).div_ceil(32) * 32;
-        let kpv = self
-            .be
-            .kernel_spv_sg("attn_pv", crate::gemm::attn_pv_spv(), 3, 28, 32);
+        // 8-warp/256-thread PV warptile (BN=128=hd, matches ollama's mul_mm) when hd%128; else the
+        // 4-warp/2×2 attn_pv (also handles hd<128, e.g. hd=64). INFR_NO_PV_WARP forces the 4-warp.
+        let pv_warp = hdu % 128 == 0 && std::env::var("INFR_NO_PV_WARP").is_err();
+        let (pv_name, pv_spv, pv_bn) = if pv_warp {
+            ("attn_pv_warp", crate::gemm::attn_pv_warp_spv(), 128u32)
+        } else {
+            ("attn_pv", crate::gemm::attn_pv_spv(), 64u32)
+        };
+        let kpv = self.be.kernel_spv_sg(pv_name, pv_spv, 3, 28, 32);
         let mut pp = [0u8; 28];
         pp[0..4].copy_from_slice(&mpad.to_ne_bytes());
         pp[4..8].copy_from_slice(&kv_pad.to_ne_bytes());
@@ -960,7 +966,7 @@ impl<'a> Recorder<'a> {
         pp[16..20].copy_from_slice(&(nkv as u32).to_ne_bytes());
         pp[20..24].copy_from_slice(&n_splits.to_ne_bytes());
         pp[24..28].copy_from_slice(&ksplit.to_ne_bytes());
-        let pv_tiles = (mpad / 64) * (hdu / 64);
+        let pv_tiles = (mpad / 64) * (hdu / pv_bn);
         let pv_out = if n_splits == 1 { attn } else { pv_part };
         self.dispatch3(
             kpv,
