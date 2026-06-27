@@ -18,6 +18,7 @@ const uint WPB = BLK / 4u;  // packed u32 words per block per row/col = 8
 const uint TM = 4u;
 const uint TN = 4u;
 const uint THREADS = (BM / TM) * (BN / TN); // 256
+const uint SP = WPB + 1u; // shared stride: bank-conflict pad
 
 layout(local_size_x = THREADS, local_size_y = 1, local_size_z = 1) in;
 
@@ -30,8 +31,8 @@ layout(binding = 4) readonly buffer SC { float16_t scales[]; }; // [n*nblk]
 layout(binding = 5) readonly buffer MN { float16_t mins[]; };   // [n*nblk]
 layout(binding = 6) writeonly buffer CB { float c[]; };         // [m, n]
 
-shared uint As[BM * WPB]; // packed int8 activations for the tile block
-shared uint Bs[BN * WPB]; // packed int8 (unpacked nibbles) weights for the tile block
+shared uint As[BM * SP]; // packed int8 activations for the tile block
+shared uint Bs[BN * SP]; // packed int8 (unpacked nibbles) weights for the tile block
 
 void main() {
     uint nblk = pc.k / BLK;
@@ -52,7 +53,7 @@ void main() {
         for (uint idx = li; idx < BM * WPB; idx += THREADS) {
             uint r = idx / WPB;
             uint p = idx % WPB;
-            As[idx] = qa[(wgRow + r) * kw + blk * WPB + p];
+            As[r * SP + p] = qa[(wgRow + r) * kw + blk * WPB + p];
         }
         // stage weights: BN cols × (BLK/8=4) source words, each → 2 packed-int8 words
         for (uint idx = li; idx < BN * (BLK / 8u); idx += THREADS) {
@@ -63,8 +64,8 @@ void main() {
                     | ((word >> 8u) & 0xFu) << 16u | ((word >> 12u) & 0xFu) << 24u;
             uint hi = ((word >> 16u) & 0xFu) | ((word >> 20u) & 0xFu) << 8u
                     | ((word >> 24u) & 0xFu) << 16u | ((word >> 28u) & 0xFu) << 24u;
-            Bs[cc * WPB + 2u * p4] = lo;
-            Bs[cc * WPB + 2u * p4 + 1u] = hi;
+            Bs[cc * SP + 2u * p4] = lo;
+            Bs[cc * SP + 2u * p4 + 1u] = hi;
         }
         barrier();
 
@@ -74,8 +75,8 @@ void main() {
         [[unroll]] for (uint p = 0u; p < WPB; p++) {
             int av[TM];
             int bv[TN];
-            [[unroll]] for (uint i = 0u; i < TM; i++) av[i] = int(As[(tr * TM + i) * WPB + p]);
-            [[unroll]] for (uint j = 0u; j < TN; j++) bv[j] = int(Bs[(tc * TN + j) * WPB + p]);
+            [[unroll]] for (uint i = 0u; i < TM; i++) av[i] = int(As[(tr * TM + i) * SP + p]);
+            [[unroll]] for (uint j = 0u; j < TN; j++) bv[j] = int(Bs[(tc * TN + j) * SP + p]);
             [[unroll]] for (uint i = 0u; i < TM; i++)
                 [[unroll]] for (uint j = 0u; j < TN; j++)
                     qsum[i][j] = dotPacked4x8AccSatEXT(av[i], bv[j], qsum[i][j]);

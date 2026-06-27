@@ -1014,6 +1014,20 @@ impl Llama {
         } else {
             None
         };
+        // mmq (dp4a integer) prefill scratch: int8 activations + per-32-block f16 scale/sum, sized
+        // for the largest projection K. Reused across all u4 projections. (q6/q8/f16 stay on the
+        // f16 warp matmul_proj.)
+        let mmq_bufs = if use_gemm && std::env::var("INFR_MMQ").is_ok() {
+            let maxk = ne.max(nh * hd).max(nff);
+            let nblk = maxk / 32;
+            Some((
+                alloc(mpad * maxk, BufferUsage::Activations)?, // qa int8 (1 byte/elem)
+                alloc(mpad * nblk * 2, BufferUsage::Activations)?, // dact f16
+                alloc(mpad * nblk * 2, BufferUsage::Activations)?, // sact f16
+            ))
+        } else {
+            None
+        };
 
         // Flash-decoding: for single-token decode, split each head's KV range across many
         // workgroups (partials in pm/pl/pacc), so attention isn't stuck on `nh` workgroups. The
@@ -1131,6 +1145,11 @@ impl Llama {
             ),
         };
         // coopmat GEMM `c = a · Wᵀ` for prefill; binds the dummy buffer as scales/mins for f16.
+        // Integer dp4a mmq path is OPT-IN (INFR_MMQ): in-situ it only MATCHES the f16 warp matmul
+        // (both ~724us/op — the dominant ffn ops are already compute-bound, not dequant-bound), and
+        // adds the quant_q8 pass, so it's net-neutral-to-slightly-worse. Kept for future tuning
+        // (the raw dp4a ceiling is ~3× higher, not yet realized in-kernel).
+        let use_mmq = std::env::var("INFR_MMQ").is_ok();
         let mm = |w: &Wt, a: &dyn Buffer, cbuf: &dyn Buffer, rows: usize, k: usize, outf: usize| {
             let dummy = gemm_bufs.as_ref().unwrap().3.as_ref();
             match w {
@@ -1143,18 +1162,39 @@ impl Llama {
                     m,
                     bits,
                     blk_shift,
-                } => rec.matmul_proj(
-                    a,
-                    q.as_ref(),
-                    s.as_ref(),
-                    m.as_ref(),
-                    cbuf,
-                    rows,
-                    k,
-                    outf,
-                    *bits,
-                    *blk_shift,
-                ),
+                } => {
+                    // u4 → dp4a integer mmq (no per-GEMM dequant; weights stay quantized). q6/q8
+                    // keep the f16 warp matmul_proj. Requires k%32, outf%64 (all projections satisfy).
+                    if *bits == 4 && k % 32 == 0 && outf % 64 == 0 && use_mmq {
+                        let (qa, dact, sact) = mmq_bufs.as_ref().unwrap();
+                        rec.matmul_proj_mmq(
+                            a,
+                            q.as_ref(),
+                            s.as_ref(),
+                            m.as_ref(),
+                            cbuf,
+                            qa.as_ref(),
+                            dact.as_ref(),
+                            sact.as_ref(),
+                            rows,
+                            k,
+                            outf,
+                        );
+                    } else {
+                        rec.matmul_proj(
+                            a,
+                            q.as_ref(),
+                            s.as_ref(),
+                            m.as_ref(),
+                            cbuf,
+                            rows,
+                            k,
+                            outf,
+                            *bits,
+                            *blk_shift,
+                        );
+                    }
+                }
             }
         };
         for (li, layer) in self.layers.iter().enumerate() {
