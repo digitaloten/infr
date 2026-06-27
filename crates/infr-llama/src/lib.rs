@@ -1034,8 +1034,9 @@ impl Llama {
         };
         // mmq (dp4a integer) prefill scratch: int8 activations + per-32-block f16 scale/sum, sized
         // for the largest projection K. Reused across all u4 projections. (q6/q8/f16 stay on the
-        // f16 warp matmul_proj.)
-        let mmq_bufs = if use_gemm && std::env::var("INFR_MMQ").is_ok() {
+        // f16 warp matmul_proj.) DEFAULT for u4 prefill (INFR_NOMMQ to disable).
+        let use_mmq_alloc = use_gemm && std::env::var("INFR_NOMMQ").is_err();
+        let mmq_bufs = if use_mmq_alloc {
             let maxk = ne.max(nh * hd).max(nff);
             let nblk = maxk / 32;
             Some((
@@ -1184,11 +1185,12 @@ impl Llama {
             ),
         };
         // coopmat GEMM `c = a · Wᵀ` for prefill; binds the dummy buffer as scales/mins for f16.
-        // Integer dp4a mmq path is OPT-IN (INFR_MMQ): in-situ it only MATCHES the f16 warp matmul
-        // (both ~724us/op — the dominant ffn ops are already compute-bound, not dequant-bound), and
-        // adds the quant_q8 pass, so it's net-neutral-to-slightly-worse. Kept for future tuning
-        // (the raw dp4a ceiling is ~3× higher, not yet realized in-kernel).
-        let use_mmq = std::env::var("INFR_MMQ").is_ok();
+        // Integer dp4a mmq path is DEFAULT for u4 projections (INFR_NOMMQ to disable). It keeps the
+        // weight quantized (no per-GEMM dequant), which is the win at SMALL ubatch where the f16 path
+        // falls back to the dequant-bound BN=64 gemm_proj and re-dequantizes the whole weight once
+        // per BM-row-tile: mmq is +26..50% at ub≤512 and still +3..5% at ub=4096 (where the f16 warp
+        // matmul is compute-bound). Adds a cheap quant_q8 activation pass amortized across projections.
+        let use_mmq = use_mmq_alloc;
         let mm = |w: &Wt, a: &dyn Buffer, cbuf: &dyn Buffer, rows: usize, k: usize, outf: usize| {
             let dummy = gemm_bufs.as_ref().unwrap().3.as_ref();
             match w {
