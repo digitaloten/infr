@@ -147,6 +147,40 @@ impl ThinkRender {
     }
 }
 
+/// Print prefill / decode rates separately (like `ollama run --verbose`), splitting at the
+/// first emitted token. `prefill` = prompt tokens over time-to-first-token; `decode` = the
+/// remaining tokens over the time after the first. This avoids the misleading single amortized
+/// rate, which folds prefill into decode and tanks for short generations.
+fn print_run_stats(
+    t0: std::time::Instant,
+    t_first: Option<std::time::Instant>,
+    n_gen: usize,
+    prompt_toks: usize,
+    ctx: Option<(usize, usize)>,
+) {
+    let now = std::time::Instant::now();
+    let ttft = t_first.unwrap_or(now).duration_since(t0).as_secs_f32();
+    let decode_dt = now.duration_since(t_first.unwrap_or(now)).as_secs_f32();
+    let decode_n = n_gen.saturating_sub(1); // tokens produced after the first
+    let pf_rate = if ttft > 0.0 {
+        prompt_toks as f32 / ttft
+    } else {
+        0.0
+    };
+    let dec_rate = if decode_dt > 0.0 {
+        decode_n as f32 / decode_dt
+    } else {
+        0.0
+    };
+    let ctxs = ctx
+        .map(|(c, m)| format!(" | ctx {c}/{m}"))
+        .unwrap_or_default();
+    eprintln!(
+        "[prefill {prompt_toks} tok @ {pf_rate:.0} tok/s ({:.0} ms) | decode {n_gen} tok @ {dec_rate:.1} tok/s{ctxs}]",
+        ttft * 1000.0,
+    );
+}
+
 fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     use std::io::Write;
     const MAX_CTX: usize = 8192;
@@ -178,16 +212,21 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     // One-shot message: a single chat turn (via the session path so user content is encoded safely).
     let mut session = llama.chat_session(MAX_CTX)?;
     if let Some(m) = message {
+        let c0 = session.ctx_len();
         let t0 = std::time::Instant::now();
         let mut n = 0usize;
+        let mut t_first: Option<std::time::Instant> = None;
         let mut render = ThinkRender::new();
         session.turn(m, max_new, |piece| {
+            if t_first.is_none() {
+                t_first = Some(std::time::Instant::now());
+            }
             n += 1;
             render.feed(piece);
         })?;
         render.finish();
-        let dt = t0.elapsed().as_secs_f32();
-        eprintln!("[{n} tokens, {dt:.2}s, {:.1} tok/s]", n as f32 / dt);
+        let prompt_toks = session.ctx_len().saturating_sub(c0).saturating_sub(n);
+        print_run_stats(t0, t_first, n, prompt_toks, None);
         return Ok(());
     }
 
@@ -207,22 +246,28 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         if matches!(line, "exit" | "quit" | ":q" | ":quit") {
             break;
         }
+        let c0 = session.ctx_len();
         let t0 = std::time::Instant::now();
         let mut n = 0usize;
+        let mut t_first: Option<std::time::Instant> = None;
         let mut render = ThinkRender::new();
         let res = session.turn(line, max_new, |piece| {
+            if t_first.is_none() {
+                t_first = Some(std::time::Instant::now());
+            }
             n += 1;
             render.feed(piece);
         });
         render.finish();
         match res {
             Ok(_) => {
-                let dt = t0.elapsed().as_secs_f32();
-                eprintln!(
-                    "[{n} tokens, {dt:.2}s, {:.1} tok/s | ctx {}/{}]",
-                    n as f32 / dt,
-                    session.ctx_len(),
-                    session.max_ctx()
+                let prompt_toks = session.ctx_len().saturating_sub(c0).saturating_sub(n);
+                print_run_stats(
+                    t0,
+                    t_first,
+                    n,
+                    prompt_toks,
+                    Some((session.ctx_len(), session.max_ctx())),
                 );
             }
             Err(e) => eprintln!("error: {e}"),
