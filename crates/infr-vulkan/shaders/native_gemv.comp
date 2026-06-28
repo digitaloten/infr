@@ -177,6 +177,105 @@ float dq(uint g) {
 }
 #endif
 
+// ── codebook formats (small const tables / decode fns, no grid) ──
+#if defined(FMT_IQ4NL) || defined(FMT_IQ4XS)
+const int KV_IQ4NL[16] = int[](-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
+#endif
+#if defined(FMT_MXFP4) || defined(FMT_NVFP4)
+const int KV_MXFP4[16] = int[](0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
+#endif
+#if defined(FMT_TQ1_0)
+const uint POW3[6] = uint[](1u, 3u, 9u, 27u, 81u, 243u);
+#endif
+#if defined(FMT_MXFP4)
+float e8m0_half(uint x) {
+    if (x < 2u) { return uintBitsToFloat(0x00200000u << x); }
+    return uintBitsToFloat((x - 1u) << 23u);
+}
+#endif
+#if defined(FMT_NVFP4)
+float ue4m3(uint x) {
+    if (x == 0u || x == 0x7Fu) { return 0.0; }
+    uint e = (x >> 3u) & 0xFu; float man = float(x & 7u);
+    float raw = (e == 0u) ? (man * exp2(-9.0)) : ((1.0 + man / 8.0) * exp2(float(int(e) - 7)));
+    return raw * 0.5;
+}
+#endif
+
+#if defined(FMT_IQ4NL)
+// IQ4_NL: [f16 d][u8 qs[16]] = 18 bytes, 32 elements.
+float dq(uint g) {
+    uint b = g / 32u; uint j = g % 32u; uint bd = b * 18u;
+    float d = f16tof32(ru16(bd));
+    uint idx = (j < 16u) ? (rb(bd + 2u + j) & 0xFu) : (rb(bd + 2u + j - 16u) >> 4u);
+    return d * float(KV_IQ4NL[idx]);
+}
+#endif
+
+#if defined(FMT_IQ4XS)
+// IQ4_XS: [f16 d][u16 scales_h][u8 scales_l[4]][u8 qs[128]] = 136 bytes, 256 elements.
+float dq(uint g) {
+    uint b = g / 256u; uint p = g % 256u; uint bd = b * 136u;
+    float d = f16tof32(ru16(bd));
+    uint scales_h = ru16(bd + 2u);
+    uint ib = p / 32u; uint within = p % 32u;
+    uint lo = (rb(bd + 4u + (ib / 2u)) >> (4u * (ib & 1u))) & 0xFu;
+    uint hi = (scales_h >> (2u * ib)) & 3u;
+    uint ls = lo | (hi << 4u);
+    float dl = d * float(int(ls) - 32);
+    uint qoff = bd + 8u + 16u * ib;
+    uint idx = (within < 16u) ? (rb(qoff + within) & 0xFu) : (rb(qoff + within - 16u) >> 4u);
+    return dl * float(KV_IQ4NL[idx]);
+}
+#endif
+
+#if defined(FMT_MXFP4)
+// MXFP4: [u8 e8m0][u8 qs[16]] = 17 bytes, 32 elements.
+float dq(uint g) {
+    uint b = g / 32u; uint j = g % 32u; uint bd = b * 17u;
+    float d = e8m0_half(rb(bd));
+    uint idx = (j < 16u) ? (rb(bd + 1u + j) & 0xFu) : (rb(bd + 1u + j - 16u) >> 4u);
+    return float(KV_MXFP4[idx]) * d;
+}
+#endif
+
+#if defined(FMT_NVFP4)
+// NVFP4: [u8 scales[4]][u8 qs[32]] = 36 bytes, 64 elements.
+float dq(uint g) {
+    uint b = g / 64u; uint p = g % 64u; uint bd = b * 36u;
+    uint s = p / 16u; uint within = p % 16u;
+    float d = ue4m3(rb(bd + s));
+    uint idx = (within < 8u) ? (rb(bd + 4u + s * 8u + within) & 0xFu) : (rb(bd + 4u + s * 8u + within - 8u) >> 4u);
+    return float(KV_MXFP4[idx]) * d;
+}
+#endif
+
+#if defined(FMT_TQ1_0)
+// TQ1_0: [u8 qs[48]][u8 qh[4]][f16 d] = 54 bytes, 256 elements. Ternary via pow-3.
+float dq(uint g) {
+    uint b = g / 256u; uint p = g % 256u; uint bd = b * 54u;
+    float d = f16tof32(ru16(bd + 52u));
+    uint src; uint n;
+    if (p < 160u) { n = p / 32u; src = rb(bd + (p % 32u)); }
+    else if (p < 240u) { uint pp = p - 160u; n = pp / 16u; src = rb(bd + 32u + (pp % 16u)); }
+    else { uint pp = p - 240u; n = pp / 4u; src = rb(bd + 48u + (pp % 4u)); }
+    uint q = (src * POW3[n]) & 0xFFu;
+    uint xi = (q * 3u) >> 8u;
+    return float(int(xi) - 1) * d;
+}
+#endif
+
+#if defined(FMT_TQ2_0)
+// TQ2_0: [u8 qs[64]][f16 d] = 66 bytes, 256 elements. 2-bit ternary.
+float dq(uint g) {
+    uint b = g / 256u; uint p = g % 256u; uint bd = b * 66u;
+    float d = f16tof32(ru16(bd + 64u));
+    uint chunk = p / 128u; uint rem = p % 128u; uint l = rem / 32u; uint m = rem % 32u;
+    uint q = (rb(bd + chunk * 32u + m) >> (l * 2u)) & 3u;
+    return (float(q) - 1.0) * d;
+}
+#endif
+
 void main() {
     uint unit = gl_WorkGroupID.x;
     uint o = unit % pc.out_f;

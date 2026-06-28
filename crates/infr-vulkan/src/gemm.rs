@@ -52,6 +52,18 @@ pub(crate) fn native_build_spv(dtype: infr_core::DType, res: bool) -> Option<&'s
         (Q5K, true) => v!("native_q5k_res"),
         (Q6K, false) => v!("native_q6k"),
         (Q6K, true) => v!("native_q6k_res"),
+        (Iq4Nl, false) => v!("native_iq4nl"),
+        (Iq4Nl, true) => v!("native_iq4nl_res"),
+        (Iq4Xs, false) => v!("native_iq4xs"),
+        (Iq4Xs, true) => v!("native_iq4xs_res"),
+        (Mxfp4, false) => v!("native_mxfp4"),
+        (Mxfp4, true) => v!("native_mxfp4_res"),
+        (Nvfp4, false) => v!("native_nvfp4"),
+        (Nvfp4, true) => v!("native_nvfp4_res"),
+        (Tq1_0, false) => v!("native_tq1_0"),
+        (Tq1_0, true) => v!("native_tq1_0_res"),
+        (Tq2_0, false) => v!("native_tq2_0"),
+        (Tq2_0, true) => v!("native_tq2_0_res"),
         _ => return None,
     })
 }

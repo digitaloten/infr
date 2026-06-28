@@ -50,6 +50,42 @@ fn main() {
         ("attn_in_q", "attn_in_q", &[]),
         // Native-block dequant GEMVs: one .spv per (quant format, residual) from one source.
         ("native_gemv", "native_q8_0", &["-DFMT_Q8_0"]),
+        ("native_gemv", "native_iq4nl", &["-DFMT_IQ4NL"]),
+        (
+            "native_gemv",
+            "native_iq4nl_res",
+            &["-DFMT_IQ4NL", "-DUSE_RES"],
+        ),
+        ("native_gemv", "native_iq4xs", &["-DFMT_IQ4XS"]),
+        (
+            "native_gemv",
+            "native_iq4xs_res",
+            &["-DFMT_IQ4XS", "-DUSE_RES"],
+        ),
+        ("native_gemv", "native_mxfp4", &["-DFMT_MXFP4"]),
+        (
+            "native_gemv",
+            "native_mxfp4_res",
+            &["-DFMT_MXFP4", "-DUSE_RES"],
+        ),
+        ("native_gemv", "native_nvfp4", &["-DFMT_NVFP4"]),
+        (
+            "native_gemv",
+            "native_nvfp4_res",
+            &["-DFMT_NVFP4", "-DUSE_RES"],
+        ),
+        ("native_gemv", "native_tq1_0", &["-DFMT_TQ1_0"]),
+        (
+            "native_gemv",
+            "native_tq1_0_res",
+            &["-DFMT_TQ1_0", "-DUSE_RES"],
+        ),
+        ("native_gemv", "native_tq2_0", &["-DFMT_TQ2_0"]),
+        (
+            "native_gemv",
+            "native_tq2_0_res",
+            &["-DFMT_TQ2_0", "-DUSE_RES"],
+        ),
         ("native_gemv", "native_q4_0", &["-DFMT_Q4_0"]),
         (
             "native_gemv",
