@@ -197,10 +197,16 @@ bails on non-llama|qwen3; add an MoE arch (qwen3moe/gemma3moe) reading n_expert/
 n_expert_used/`*_exps` tensors; (2) router = ffn_gate_inp → top-k
 experts+weights; (3) expert-dispatch FFN forward: ExpertPool.resident per routed
 expert → matmul vs the slot → weighted-accumulate; (4) loader picks all-resident
-vs streaming via the footprint. No in-store MoE model runs today
-(diffusiongemma-26B is MoE but unsupported arch). PCIe caveat: per-token
-streaming only pays off if the working set fits the pool (LRU hit-rate); else
-load all-resident when it fits VRAM.
+vs streaming via the footprint.
+
+QWEN3MOE WIRED + VALIDATED (done): arch="qwen3moe" → `Config::moe` (MoeConfig:
+n*expert/n_used/n_ff_exp; meta keys expert_count/expert_used_count/
+expert_feed_forward_length). `FfnWt::{Dense|Moe}`; `load_moe` slices each expert
+from stacked
+`ffn*{gate,up,down}\_exps`(contiguous 1/n_expert block) via`upload_wt_bytes`(experts stay quantized).`forward_moe`= eager, NO KV: GPU matmuls via`gemv_wt`(one-submit linear, any Wt kind), host qk-norm/RoPE/causal- GQA/router-softmax-topk(renorm)/expert-combine.`generate_moe`+ cmd_run branch (one-shot). TEST MODEL:`hf:unsloth/Qwen3-30B-A3B-GGUF:Qwen3-30B-A3B-Q4_K_M.gguf`(~18.6GB). RESULT: loads at weights 18.35GB (dense 0.80 + experts 17.55, footprint split correct, arena reserves it, fits 24GB ALL-RESIDENT so ExpertPool not needed here); greedy output correct + coherent ("<think>\nOkay, the user asked..."). PERF ~0.3 tok/s — eager no-KV O(n²) + per-token per-expert submits (~1200 submits/tok). MoE PERF FOLLOW-ON (open): KV cache + recorder integration; GPU top-k + gathered`mul_mat_id`
+expert matmul (avoid per-expert submit); batch tokens by expert. ExpertPool
+streaming only needed for MoE models that DON'T fit VRAM (PCIe caveat: pays off
+only if working set fits the pool / high LRU hit-rate).
 
 Infra:
 
