@@ -3947,6 +3947,23 @@ impl Llama {
         let (hn, hn2) = (al(t * ne)?, al(t * ne)?);
         let ao = al(gmp * ne)?;
         let (qr, kr, vr) = (al(gmp * nh * hd)?, al(gmp * nkv * hd)?, al(gmp * nkv * hd)?);
+        // Q4_K Q/K/O projections use dp4a (mmq): quantize the projection inputs (hn for Q/K, attn for
+        // O) to int8 once each. q4_proj gates on Q (q/k/o are Q4_K in this model; v is Q6_K → coopmat).
+        let q4_proj = matches!(native_parts(&self.layers[0].wq).0, infr_core::DType::Q4K);
+        let qbufs = |in_f: usize| -> Result<(Box<dyn Buffer>, Box<dyn Buffer>, Box<dyn Buffer>)> {
+            Ok((
+                ab(gmp * in_f)?,
+                ab(gmp * (in_f / 32) * 2)?,
+                ab(gmp * (in_f / 32) * 2)?,
+            ))
+        };
+        let (qa_h, da_h, sa_h, qa_o, da_o, sa_o) = if q4_proj {
+            let (a, b, c2) = qbufs(ne)?;
+            let (d, e, f) = qbufs(nh * hd)?;
+            (Some(a), Some(b), Some(c2), Some(d), Some(e), Some(f))
+        } else {
+            (None, None, None, None, None, None)
+        };
         // Flash prefill attention (split-K, register-blocked, never materializes the score matrix) is
         // hd=128-specialized and wants 64-row tiles → pad q/attn to mpad rows. Small chunks (t<64) or
         // other head dims fall back to the basic per-query attention_kv. INFR_NO_FLASH forces fallback.
@@ -4003,8 +4020,37 @@ impl Llama {
                 ne,
                 c.rms_eps,
             );
-            rec_proj(&rec, &layer.wq, hn.as_ref(), qr.as_ref(), t, ne, nh * hd);
-            rec_proj(&rec, &layer.wk, hn.as_ref(), kr.as_ref(), t, ne, nkv * hd);
+            if let (Some(qa), Some(da), Some(sa)) = (&qa_h, &da_h, &sa_h) {
+                // Q4_K Q/K via dp4a (quantize hn once); V (Q6_K) via coopmat.
+                rec.quant_q8(hn.as_ref(), qa.as_ref(), da.as_ref(), sa.as_ref(), t, ne);
+                let (_, wqb) = native_parts(&layer.wq);
+                let (_, wkb) = native_parts(&layer.wk);
+                rec.matmul_mmq_q4k(
+                    qa.as_ref(),
+                    da.as_ref(),
+                    sa.as_ref(),
+                    wqb,
+                    0,
+                    qr.as_ref(),
+                    t,
+                    ne,
+                    nh * hd,
+                );
+                rec.matmul_mmq_q4k(
+                    qa.as_ref(),
+                    da.as_ref(),
+                    sa.as_ref(),
+                    wkb,
+                    0,
+                    kr.as_ref(),
+                    t,
+                    ne,
+                    nkv * hd,
+                );
+            } else {
+                rec_proj(&rec, &layer.wq, hn.as_ref(), qr.as_ref(), t, ne, nh * hd);
+                rec_proj(&rec, &layer.wk, hn.as_ref(), kr.as_ref(), t, ne, nkv * hd);
+            }
             rec_proj(&rec, &layer.wv, hn.as_ref(), vr.as_ref(), t, ne, nkv * hd);
             let (qn, kn) = (
                 layer.q_norm_buf.as_ref().unwrap().as_ref(),
@@ -4067,7 +4113,30 @@ impl Llama {
                     pos,
                 );
             }
-            rec_proj(&rec, &layer.wo, attn.as_ref(), ao.as_ref(), t, nh * hd, ne);
+            if let (Some(qa), Some(da), Some(sa)) = (&qa_o, &da_o, &sa_o) {
+                rec.quant_q8(
+                    attn.as_ref(),
+                    qa.as_ref(),
+                    da.as_ref(),
+                    sa.as_ref(),
+                    t,
+                    nh * hd,
+                );
+                let (_, wob) = native_parts(&layer.wo);
+                rec.matmul_mmq_q4k(
+                    qa.as_ref(),
+                    da.as_ref(),
+                    sa.as_ref(),
+                    wob,
+                    0,
+                    ao.as_ref(),
+                    t,
+                    nh * hd,
+                    ne,
+                );
+            } else {
+                rec_proj(&rec, &layer.wo, attn.as_ref(), ao.as_ref(), t, nh * hd, ne);
+            }
             rec.add(hidden.as_ref(), ao.as_ref(), hidden.as_ref(), t * ne); // residual
             rec.rmsnorm(
                 hidden.as_ref(),
