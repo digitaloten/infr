@@ -624,6 +624,38 @@ fn dequant_unified(dtype: infr_core::DType, bytes: &[u8]) -> (Vec<u8>, Vec<f32>,
 /// Ref: llama.cpp ggml-common.h l.1121: `#define IQ1S_DELTA 0.125f`
 const IQ1S_DELTA: f32 = 0.125;
 
+/// MXFP4 / NVFP4 signed 4-bit codebook (E2M1 format × 2).
+/// Ref: llama.cpp ggml-common.h l.1116: `kvalues_mxfp4`
+const KVALUES_MXFP4: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
+/// Decode an E8M0 exponent byte to float32, halved (= 2^(x-128)).
+/// Matches llama.cpp `ggml_e8m0_to_fp32_half` (ggml-impl.h l.477).
+#[inline(always)]
+fn e8m0_to_fp32_half(x: u8) -> f32 {
+    if x < 2 {
+        f32::from_bits(0x0020_0000u32 << x)
+    } else {
+        f32::from_bits(((x as u32) - 1) << 23)
+    }
+}
+
+/// Decode a UE4M3 byte (unsigned, 4 exp bits bias=7, 3 mantissa bits) to float32, halved.
+/// Matches llama.cpp `ggml_ue4m3_to_fp32` (ggml-impl.h l.502).
+#[inline(always)]
+fn ue4m3_to_fp32(x: u8) -> f32 {
+    if x == 0 || x == 0x7F {
+        return 0.0;
+    }
+    let exp = ((x >> 3) & 0xF) as i32;
+    let man = (x & 0x7) as f32;
+    let raw = if exp == 0 {
+        man * f32::powi(2.0, -9)
+    } else {
+        (1.0 + man / 8.0) * f32::powi(2.0, exp - 7)
+    };
+    raw * 0.5
+}
+
 /// IQ4_NL / IQ4_XS 16-entry signed-integer codebook.
 /// Ref: llama.cpp ggml-common.h `kvalues_iq4nl` (l.1110)
 const KVALUES_IQ4NL: [i8; 16] = [
@@ -1214,6 +1246,58 @@ fn dequant_codebook(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
                             out[base + outoff] = (q - 1) as f32 * d;
                             outoff += 1;
                         }
+                    }
+                }
+            }
+            out
+        }
+        // ── MXFP4: block = [u8 e][u8 qs[16]], 17 bytes, QK_MXFP4=32 ─────────────
+        // E8M0 shared exponent + nibble-packed E2M1 4-bit values.
+        //   d = e8m0_to_fp32_half(e) = 2^(e-128)
+        //   x0 = kvalues_mxfp4[qs[j] & 0xF]; x1 = kvalues_mxfp4[qs[j] >> 4]
+        //   y[j+0] = x0*d; y[j+16] = x1*d
+        // Ref: llama.cpp dequantize_row_mxfp4 (ggml-quants.c l.511)
+        Mxfp4 => {
+            let bpb = 17usize; // 1 + 16
+            let nblk = bytes.len() / bpb;
+            let mut out = vec![0.0f32; nblk * 32];
+            for b in 0..nblk {
+                let blk = &bytes[b * bpb..(b + 1) * bpb];
+                let d = e8m0_to_fp32_half(blk[0]);
+                let qs = &blk[1..17];
+                let base = b * 32;
+                for j in 0..16usize {
+                    let x0 = KVALUES_MXFP4[(qs[j] & 0xF) as usize] as f32;
+                    let x1 = KVALUES_MXFP4[(qs[j] >> 4) as usize] as f32;
+                    out[base + j] = x0 * d;
+                    out[base + j + 16] = x1 * d;
+                }
+            }
+            out
+        }
+        // ── NVFP4: block = [u8 d[4]][u8 qs[32]], 36 bytes, QK_NVFP4=64 ──────────
+        // 4 sub-blocks of 16 elements each; UE4M3 scale per sub-block.
+        //   For s in 0..4: d = ue4m3_to_fp32(scales[s])
+        //     For j in 0..7: v0 = kvalues_mxfp4[qs[s*8+j] & 0xF]; v1 = qs[s*8+j] >> 4
+        //     yb[j] = v0*d; yb[j+8] = v1*d
+        // Ref: llama.cpp dequantize_row_nvfp4 (ggml-quants.c l.531)
+        Nvfp4 => {
+            let bpb = 36usize; // 4 + 32
+            let nblk = bytes.len() / bpb;
+            let mut out = vec![0.0f32; nblk * 64];
+            for b in 0..nblk {
+                let blk = &bytes[b * bpb..(b + 1) * bpb];
+                let scales = &blk[0..4];
+                let qs = &blk[4..36];
+                let base = b * 64;
+                for s in 0..4usize {
+                    let d = ue4m3_to_fp32(scales[s]);
+                    let ybase = base + s * 16;
+                    for j in 0..8usize {
+                        let v0 = KVALUES_MXFP4[(qs[s * 8 + j] & 0xF) as usize] as f32;
+                        let v1 = KVALUES_MXFP4[(qs[s * 8 + j] >> 4) as usize] as f32;
+                        out[ybase + j] = v0 * d;
+                        out[ybase + j + 8] = v1 * d;
                     }
                 }
             }
@@ -2901,6 +2985,48 @@ mod dequant_tests {
                 "iq1s y[{i}] expected {expected}, got {}",
                 y[i]
             );
+        }
+    }
+
+    // ── MXFP4 ───────────────────────────────────────────────────────────────────
+    // Block: [u8 e][u8 qs[16]], 17 bytes, QK_MXFP4=32
+    // e=128 → d=e8m0_to_fp32_half(128)=2^(128-128)=1.0; qs[0]=0x21 → lo=1, hi=2
+    //   y[0] = KVALUES_MXFP4[1]*1.0 = 1.0; y[16] = KVALUES_MXFP4[2]*1.0 = 2.0
+    // Ref: llama.cpp dequantize_row_mxfp4 (ggml-quants.c l.511)
+    #[test]
+    fn mxfp4_single_block() {
+        let mut block = vec![0u8; 17];
+        block[0] = 128; // e=128 → d=1.0
+        block[1] = 0x21; // lo nibble=1→1, hi nibble=2→2
+        let y = dequant_codebook(infr_core::DType::Mxfp4, &block);
+        assert_eq!(y.len(), 32);
+        assert!(
+            (y[0] - 1.0).abs() < 1e-5,
+            "mxfp4 y[0] expected 1.0, got {}",
+            y[0]
+        );
+        assert!(
+            (y[16] - 2.0).abs() < 1e-5,
+            "mxfp4 y[16] expected 2.0, got {}",
+            y[16]
+        );
+        // rest of qs=0 → x0=x1=0 → y=0.0
+        for i in 1..16 {
+            assert!(y[i].abs() < 1e-5, "mxfp4 y[{i}] expected 0.0, got {}", y[i]);
+        }
+    }
+
+    // ── NVFP4 ───────────────────────────────────────────────────────────────────
+    // Block: [u8 d[4]][u8 qs[32]], 36 bytes, QK_NVFP4=64
+    // All-zero scales: d=ue4m3_to_fp32(0)=0.0 → all y=0.0
+    // Ref: llama.cpp dequantize_row_nvfp4 (ggml-quants.c l.531)
+    #[test]
+    fn nvfp4_single_block() {
+        let block = vec![0u8; 36];
+        let y = dequant_codebook(infr_core::DType::Nvfp4, &block);
+        assert_eq!(y.len(), 64);
+        for i in 0..64 {
+            assert!(y[i].abs() < 1e-5, "nvfp4 y[{i}] expected 0.0, got {}", y[i]);
         }
     }
 
