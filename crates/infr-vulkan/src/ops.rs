@@ -397,7 +397,7 @@ impl VulkanBackend {
         in_f: usize,
         out_f: usize,
     ) -> Result<Vec<f32>> {
-        let k = self.kernel("linear_f16_eager", crate::linear::LINEAR_F16_WGSL, 3, 12);
+        let k = self.kernel_spv("linear_f16_eager", crate::gemm::linear_f16_spv(), 3, 12);
         self.linear_wbuf(k, (rows * out_f) as u32, w_buf, x, rows, in_f, out_f)
     }
 

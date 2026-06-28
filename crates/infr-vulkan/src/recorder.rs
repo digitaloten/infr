@@ -293,7 +293,7 @@ impl<'a> Recorder<'a> {
         self.stamp("lm_head");
         let k = self
             .be
-            .kernel("linear_f16", crate::linear::LINEAR_F16_WGSL, 3, 12);
+            .kernel_spv("linear_f16", crate::gemm::linear_f16_spv(), 3, 12);
         let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
