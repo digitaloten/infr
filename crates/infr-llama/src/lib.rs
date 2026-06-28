@@ -620,6 +620,10 @@ fn dequant_unified(dtype: infr_core::DType, bytes: &[u8]) -> (Vec<u8>, Vec<f32>,
 
 // ─── codebook (non-affine) dequant ───────────────────────────────────────────
 
+/// IQ1_S / IQ1_M delta offset applied to each grid element.
+/// Ref: llama.cpp ggml-common.h l.1121: `#define IQ1S_DELTA 0.125f`
+const IQ1S_DELTA: f32 = 0.125;
+
 /// IQ4_NL / IQ4_XS 16-entry signed-integer codebook.
 /// Ref: llama.cpp ggml-common.h `kvalues_iq4nl` (l.1110)
 const KVALUES_IQ4NL: [i8; 16] = [
@@ -991,6 +995,141 @@ fn dequant_codebook(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
                     qh_off += 2;
                     qs_off += 8;
                     signs_off += 4;
+                }
+            }
+            out
+        }
+        // ── IQ1_S: block = [half d][u8 qs[32]][u16 qh[8]], 50 bytes, QK_K=256 ────
+        // 8 sub-blocks of 32 elements (4 groups of 8 each).
+        //   dl = d * (2*((qh[ib] >> 12) & 7) + 1)
+        //   delta = if qh[ib] & 0x8000 { -IQ1S_DELTA } else { IQ1S_DELTA }
+        //   For l in 0..4: grid_idx = qs[l] | (((qh[ib] >> 3*l) & 7) << 8)
+        //     y[j] = dl * (grid[j] as f32 + delta)
+        // Ref: llama.cpp dequantize_row_iq1_s (ggml-quants.c l.2578)
+        Iq1S => {
+            use iquant_grids::IQ1S_GRID;
+            let bpb = 50usize; // 2 + 32 + 16
+            let nblk = bytes.len() / bpb;
+            let mut out = vec![0.0f32; nblk * 256];
+            for b in 0..nblk {
+                let blk = &bytes[b * bpb..(b + 1) * bpb];
+                let d = rdf16(blk);
+                let qs = &blk[2..34]; // 32 bytes
+                let qh_raw = &blk[34..50]; // 16 bytes = 8 × u16
+                let base = b * 256;
+                let mut outoff = 0usize;
+                let mut qs_off = 0usize;
+                for ib in 0..8usize {
+                    let qh = u16::from_le_bytes(qh_raw[2 * ib..2 * ib + 2].try_into().unwrap());
+                    let dl = d * (2.0 * ((qh >> 12) & 7) as f32 + 1.0);
+                    let delta = if qh & 0x8000 != 0 {
+                        -IQ1S_DELTA
+                    } else {
+                        IQ1S_DELTA
+                    };
+                    for l in 0..4usize {
+                        let grid_idx =
+                            qs[qs_off + l] as usize | (((qh >> (3 * l)) & 7) as usize) << 8;
+                        let grid_u64 = IQ1S_GRID[grid_idx];
+                        for j in 0..8usize {
+                            let gv = ((grid_u64 >> (8 * j)) & 0xFF) as i8 as f32;
+                            out[base + outoff + j] = dl * (gv + delta);
+                        }
+                        outoff += 8;
+                    }
+                    qs_off += 4;
+                }
+            }
+            out
+        }
+        // ── IQ1_M: block = [u8 qs[32]][u8 qh[16]][u8 scales[8]], 56 bytes, QK_K=256
+        // No separate `d` field — d is a f16 packed into the high 4 bits of each u16 of scales.
+        //   sc[i] = scales reinterpreted as u16[4]; d extracted via:
+        //   scale.u16 = (sc[0]>>12) | ((sc[1]>>8)&0xf0) | ((sc[2]>>4)&0xf00) | (sc[3]&0xf000)
+        //   dl1 = d * (2*((sc[ib/2] >> (6*(ib%2)+0)) & 7) + 1)
+        //   dl2 = d * (2*((sc[ib/2] >> (6*(ib%2)+3)) & 7) + 1)
+        //   idx[0..4] from qs[0..3] and qh[0..1]:
+        //     idx[0] = qs[0] | ((qh[0] << 8) & 0x700);  delta[0] = qh[0]&0x08 ? neg : pos
+        //     idx[1] = qs[1] | ((qh[0] << 4) & 0x700);  delta[1] = qh[0]&0x80 ? neg : pos
+        //     idx[2] = qs[2] | ((qh[1] << 8) & 0x700);  delta[2] = qh[1]&0x08 ? neg : pos
+        //     idx[3] = qs[3] | ((qh[1] << 4) & 0x700);  delta[3] = qh[1]&0x80 ? neg : pos
+        //   l=0,1: y[j] = dl1*(grid[j]+delta[l]); l=2,3: y[j] = dl2*(grid[j]+delta[l])
+        // Ref: llama.cpp dequantize_row_iq1_m (ggml-quants.c l.2603)
+        Iq1M => {
+            use iquant_grids::IQ1S_GRID;
+            let bpb = 56usize; // 32 + 16 + 8
+            let nblk = bytes.len() / bpb;
+            let mut out = vec![0.0f32; nblk * 256];
+            for b in 0..nblk {
+                let blk = &bytes[b * bpb..(b + 1) * bpb];
+                let qs_arr = &blk[0..32]; // 32 bytes
+                let qh_arr = &blk[32..48]; // 16 bytes
+                let scales_raw = &blk[48..56]; // 8 bytes = 4 × u16
+                                               // Extract d from high-nibble packing of the 4 scale u16s
+                let sc0 = u16::from_le_bytes(scales_raw[0..2].try_into().unwrap());
+                let sc1 = u16::from_le_bytes(scales_raw[2..4].try_into().unwrap());
+                let sc2 = u16::from_le_bytes(scales_raw[4..6].try_into().unwrap());
+                let sc3 = u16::from_le_bytes(scales_raw[6..8].try_into().unwrap());
+                let sc = [sc0, sc1, sc2, sc3];
+                let d_bits: u16 =
+                    (sc0 >> 12) | ((sc1 >> 8) & 0x00f0) | ((sc2 >> 4) & 0x0f00) | (sc3 & 0xf000);
+                let d = half::f16::from_bits(d_bits).to_f32();
+                let base = b * 256;
+                let mut outoff = 0usize;
+                let mut qs_off = 0usize;
+                let mut qh_off = 0usize;
+                for ib in 0..8usize {
+                    let dl1 = d * (2.0 * ((sc[ib / 2] >> (6 * (ib % 2) + 0)) & 7) as f32 + 1.0);
+                    let dl2 = d * (2.0 * ((sc[ib / 2] >> (6 * (ib % 2) + 3)) & 7) as f32 + 1.0);
+                    let qh0 = qh_arr[qh_off];
+                    let qh1 = qh_arr[qh_off + 1];
+                    let idx = [
+                        qs_arr[qs_off + 0] as usize | (((qh0 as usize) << 8) & 0x700),
+                        qs_arr[qs_off + 1] as usize | (((qh0 as usize) << 4) & 0x700),
+                        qs_arr[qs_off + 2] as usize | (((qh1 as usize) << 8) & 0x700),
+                        qs_arr[qs_off + 3] as usize | (((qh1 as usize) << 4) & 0x700),
+                    ];
+                    let delta = [
+                        if qh0 & 0x08 != 0 {
+                            -IQ1S_DELTA
+                        } else {
+                            IQ1S_DELTA
+                        },
+                        if qh0 & 0x80 != 0 {
+                            -IQ1S_DELTA
+                        } else {
+                            IQ1S_DELTA
+                        },
+                        if qh1 & 0x08 != 0 {
+                            -IQ1S_DELTA
+                        } else {
+                            IQ1S_DELTA
+                        },
+                        if qh1 & 0x80 != 0 {
+                            -IQ1S_DELTA
+                        } else {
+                            IQ1S_DELTA
+                        },
+                    ];
+                    // l=0,1: use dl1; l=2,3: use dl2
+                    for l in 0..2usize {
+                        let grid_u64 = IQ1S_GRID[idx[l]];
+                        for j in 0..8usize {
+                            let gv = ((grid_u64 >> (8 * j)) & 0xFF) as i8 as f32;
+                            out[base + outoff + j] = dl1 * (gv + delta[l]);
+                        }
+                        outoff += 8;
+                    }
+                    for l in 2..4usize {
+                        let grid_u64 = IQ1S_GRID[idx[l]];
+                        for j in 0..8usize {
+                            let gv = ((grid_u64 >> (8 * j)) & 0xFF) as i8 as f32;
+                            out[base + outoff + j] = dl2 * (gv + delta[l]);
+                        }
+                        outoff += 8;
+                    }
+                    qs_off += 4;
+                    qh_off += 2;
                 }
             }
             out
@@ -2652,6 +2791,45 @@ mod dequant_tests {
                 "iq4xs y[{i}] expected {expected}, got {}",
                 y[i]
             );
+        }
+    }
+
+    // ── IQ1_S ───────────────────────────────────────────────────────────────────
+    // Block: [half d][u8 qs[32]][u16 qh[8]], 50 bytes, QK_K=256
+    // All-zero block: d=1.0, qh=0 → dl=1.0*(2*0+1)=1.0, delta=+0.125, grid_idx=0
+    //   IQ1S_GRID[0] = 0xffffffffffffffff → gv=-1 for all j
+    //   y[j] = 1.0 * (-1.0 + 0.125) = -0.875 for all 256 elements
+    // Ref: llama.cpp dequantize_row_iq1_s (ggml-quants.c l.2578)
+    #[test]
+    fn iq1s_single_block() {
+        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 50];
+        block[0..2].copy_from_slice(&d_bytes);
+        // qs=0, qh=0 → grid_idx=0, dl=1.0, delta=+0.125
+        let y = dequant_codebook(infr_core::DType::Iq1S, &block);
+        assert_eq!(y.len(), 256);
+        // IQ1S_GRID[0] = 0xffffffffffffffff → all bytes 0xFF = -1i8
+        let expected = 1.0_f32 * (-1.0_f32 + IQ1S_DELTA);
+        for i in 0..256 {
+            assert!(
+                (y[i] - expected).abs() < 1e-4,
+                "iq1s y[{i}] expected {expected}, got {}",
+                y[i]
+            );
+        }
+    }
+
+    // ── IQ1_M ───────────────────────────────────────────────────────────────────
+    // Block: [u8 qs[32]][u8 qh[16]][u8 scales[8]], 56 bytes, QK_K=256
+    // All-zero: scales=0 → d_bits=0 → d=0.0 → all y=0.0
+    // Ref: llama.cpp dequantize_row_iq1_m (ggml-quants.c l.2603)
+    #[test]
+    fn iq1m_single_block() {
+        let block = vec![0u8; 56];
+        let y = dequant_codebook(infr_core::DType::Iq1M, &block);
+        assert_eq!(y.len(), 256);
+        for i in 0..256 {
+            assert!(y[i].abs() < 1e-4, "iq1m y[{i}] expected 0.0, got {}", y[i]);
         }
     }
 
