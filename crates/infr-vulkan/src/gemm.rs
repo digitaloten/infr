@@ -357,7 +357,7 @@ impl VulkanBackend {
         n: usize,
     ) -> Result<Vec<f32>> {
         assert!(m.is_multiple_of(16) && n.is_multiple_of(16) && k.is_multiple_of(16));
-        let kern = self.kernel_spv("gemm_coopmat", gemm_spv(), 3, 12);
+        let kern = self.kernel("gemm_coopmat", gemm_spv(), 3, 12);
         self.run_gemm(kern, a, b, m, k, n, (n / 16) as u32, (m / 16) as u32)
     }
 
@@ -371,7 +371,7 @@ impl VulkanBackend {
         n: usize,
     ) -> Result<Vec<f32>> {
         assert!(m.is_multiple_of(128) && n.is_multiple_of(128) && k.is_multiple_of(16));
-        let kern = self.kernel_spv_sg("gemm_warp", gemm_warp_spv(), 3, 12, 32);
+        let kern = self.kernel_sg("gemm_warp", gemm_warp_spv(), 3, 12, 32);
         self.run_gemm(kern, a, b, m, k, n, (n / 128) as u32, (m / 128) as u32)
     }
 
@@ -389,7 +389,7 @@ impl VulkanBackend {
             m.is_multiple_of(64) && n.is_multiple_of(64) && k.is_multiple_of(32),
             "tiled coopmat GEMM needs m,n %64 and k %32 (got {m},{k},{n})"
         );
-        let kern = self.kernel_spv_sg("gemm_coopmat_tiled", gemm_tiled_spv(), 3, 12, 32);
+        let kern = self.kernel_sg("gemm_coopmat_tiled", gemm_tiled_spv(), 3, 12, 32);
         self.run_gemm(kern, a, b, m, k, n, (n / 64) as u32, (m / 64) as u32)
     }
 
@@ -397,7 +397,7 @@ impl VulkanBackend {
     /// conversion / transfer in the loop). Returns avg seconds per dispatch.
     #[doc(hidden)]
     pub fn bench_tiled_gemm(&self, m: usize, k: usize, n: usize, iters: usize) -> f64 {
-        let kern = self.kernel_spv_sg("gemm_coopmat_tiled", gemm_tiled_spv(), 3, 12, 32);
+        let kern = self.kernel_sg("gemm_coopmat_tiled", gemm_tiled_spv(), 3, 12, 32);
         let a16 = vec![0u16; m * k];
         let b16 = vec![0u16; k * n];
         let buf_a = self.alloc(a16.len() * 2, BufferUsage::Staging).unwrap();
@@ -489,7 +489,7 @@ impl VulkanBackend {
     /// Benchmark the mul_mm-style warp-tiled GEMM (m,n %128, k %16). Returns avg sec/dispatch.
     #[doc(hidden)]
     pub fn bench_warp_gemm(&self, m: usize, k: usize, n: usize, iters: usize) -> f64 {
-        let kern = self.kernel_spv_sg("gemm_warp", gemm_warp_spv(), 3, 12, 32);
+        let kern = self.kernel_sg("gemm_warp", gemm_warp_spv(), 3, 12, 32);
         let a16 = vec![0u16; m * k];
         let b16 = vec![0u16; k * n];
         let buf_a = self.alloc(a16.len() * 2, BufferUsage::Staging).unwrap();
@@ -579,7 +579,7 @@ impl VulkanBackend {
     #[doc(hidden)]
     pub fn bench_dp4a_gemm(&self, m: usize, k: usize, n: usize, iters: usize) -> f64 {
         let kp = k / 4;
-        let kern = self.kernel_spv_sg("gemm_dp4a", gemm_dp4a_spv(), 3, 12, 32);
+        let kern = self.kernel_sg("gemm_dp4a", gemm_dp4a_spv(), 3, 12, 32);
         let buf_a = self.alloc(m * kp * 4, BufferUsage::Staging).unwrap();
         let buf_b = self.alloc(n * kp * 4, BufferUsage::Staging).unwrap();
         let buf_c = self.alloc(m * n * 4, BufferUsage::Activations).unwrap();

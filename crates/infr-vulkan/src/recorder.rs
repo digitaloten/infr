@@ -293,7 +293,7 @@ impl<'a> Recorder<'a> {
         self.stamp("lm_head");
         let k = self
             .be
-            .kernel_spv("linear_f16", crate::gemm::linear_f16_spv(), 3, 12);
+            .kernel("linear_f16", crate::gemm::linear_f16_spv(), 3, 12);
         let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
@@ -336,7 +336,7 @@ impl<'a> Recorder<'a> {
         } else {
             ("gemm_proj", crate::gemm::gemm_proj_spv(), n / 64)
         };
-        let kern = self.be.kernel_spv_sg(name, spv, 5, 20, 32);
+        let kern = self.be.kernel_sg(name, spv, 5, 20, 32);
         let mut push = [0u8; 20];
         push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
@@ -383,7 +383,7 @@ impl<'a> Recorder<'a> {
         self.stamp("quant_q8");
         let kq = self
             .be
-            .kernel_spv_sg("quant_q8", crate::gemm::quant_q8_spv(), 4, 12, 32);
+            .kernel_sg("quant_q8", crate::gemm::quant_q8_spv(), 4, 12, 32);
         let mut p1 = [0u8; 12];
         p1[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
         p1[4..8].copy_from_slice(&(k as u32).to_ne_bytes());
@@ -402,9 +402,9 @@ impl<'a> Recorder<'a> {
         );
         // pass 2: integer dp4a matmul
         self.stamp("matmul_proj");
-        let km =
-            self.be
-                .kernel_spv_sg("gemm_proj_mmq", crate::gemm::gemm_proj_mmq_spv(), 7, 12, 32);
+        let km = self
+            .be
+            .kernel_sg("gemm_proj_mmq", crate::gemm::gemm_proj_mmq_spv(), 7, 12, 32);
         let mut p2 = [0u8; 12];
         p2[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
         p2[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
@@ -466,13 +466,9 @@ impl<'a> Recorder<'a> {
                 } else {
                     "mul_mat_vec_q8"
                 };
-                let k = self.be.kernel_spv_sg(
-                    name,
-                    crate::gemm::mul_mat_vec_q_spv(bits, false),
-                    5,
-                    20,
-                    32,
-                );
+                let k =
+                    self.be
+                        .kernel_sg(name, crate::gemm::mul_mat_vec_q_spv(bits, false), 5, 20, 32);
                 let groups = (out_f as u32).div_ceil(MMV_NUM_ROWS);
                 self.dispatch(k, &bufs, 1, &push, rows as u32 * groups);
                 return;
@@ -480,7 +476,7 @@ impl<'a> Recorder<'a> {
         }
         let k = self
             .be
-            .kernel_spv("linear_q", crate::gemm::linear_q_spv(), 5, 20);
+            .kernel("linear_q", crate::gemm::linear_q_spv(), 5, 20);
         self.dispatch(k, &bufs, 1, &push, (rows * out_f) as u32);
     }
 
@@ -500,7 +496,7 @@ impl<'a> Recorder<'a> {
         self.stamp("lm_head");
         let name = crate::linear::native_kernel_name(dtype, false);
         let spv = crate::gemm::native_build_spv(dtype, false).expect("native GEMV spv");
-        let k = self.be.kernel_spv(name, spv, 3, 12);
+        let k = self.be.kernel(name, spv, 3, 12);
         let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
@@ -530,7 +526,7 @@ impl<'a> Recorder<'a> {
         self.stamp("o_or_down");
         let name = crate::linear::native_kernel_name(dtype, true);
         let spv = crate::gemm::native_build_spv(dtype, true).expect("native GEMV spv");
-        let k = self.be.kernel_spv(name, spv, 4, 12);
+        let k = self.be.kernel(name, spv, 4, 12);
         let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
@@ -587,13 +583,9 @@ impl<'a> Recorder<'a> {
                 } else {
                     "mul_mat_vec_q8_res"
                 };
-                let k = self.be.kernel_spv_sg(
-                    name,
-                    crate::gemm::mul_mat_vec_q_spv(bits, true),
-                    6,
-                    20,
-                    32,
-                );
+                let k =
+                    self.be
+                        .kernel_sg(name, crate::gemm::mul_mat_vec_q_spv(bits, true), 6, 20, 32);
                 let groups = (out_f as u32).div_ceil(MMV_NUM_ROWS);
                 self.dispatch(k, &bufs, 1, &push, rows as u32 * groups);
                 return;
@@ -601,7 +593,7 @@ impl<'a> Recorder<'a> {
         }
         let k = self
             .be
-            .kernel_spv("linear_res_q", crate::gemm::linear_res_q_spv(), 6, 20);
+            .kernel("linear_res_q", crate::gemm::linear_res_q_spv(), 6, 20);
         self.dispatch(k, &bufs, 1, &push, (rows * out_f) as u32);
     }
 
@@ -620,7 +612,7 @@ impl<'a> Recorder<'a> {
         self.stamp("o_or_down");
         let k = self
             .be
-            .kernel_spv("linear_res", crate::gemm::linear_res_spv(), 4, 12);
+            .kernel("linear_res", crate::gemm::linear_res_spv(), 4, 12);
         let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
@@ -666,9 +658,7 @@ impl<'a> Recorder<'a> {
         let q_dim = nh * hd;
         let kv_dim = nkv * hd;
         debug_assert_eq!(hd % 2, 0, "attn_in requires even hd (RoPE pairs)");
-        let kern = self
-            .be
-            .kernel_spv("attn_in", crate::gemm::attn_in_spv(), 8, 36);
+        let kern = self.be.kernel("attn_in", crate::gemm::attn_in_spv(), 8, 36);
         let mut push = [0u8; 36];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
@@ -718,7 +708,7 @@ impl<'a> Recorder<'a> {
         self.stamp("ffn_in");
         let k = self
             .be
-            .kernel_spv("ffn_in_q", crate::gemm::ffn_in_q_spv(), 6, 24);
+            .kernel("ffn_in_q", crate::gemm::ffn_in_q_spv(), 6, 24);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
@@ -767,7 +757,7 @@ impl<'a> Recorder<'a> {
         self.stamp("attn_in_q");
         let k = self
             .be
-            .kernel_spv("attn_in_q", crate::gemm::attn_in_q_spv(), 14, 44);
+            .kernel("attn_in_q", crate::gemm::attn_in_q_spv(), 14, 44);
         let mut push = [0u8; 44];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
@@ -818,9 +808,7 @@ impl<'a> Recorder<'a> {
         eps: f32,
     ) {
         self.stamp("ffn_in");
-        let k = self
-            .be
-            .kernel_spv("ffn_in", crate::gemm::ffn_in_spv(), 4, 16);
+        let k = self.be.kernel("ffn_in", crate::gemm::ffn_in_spv(), 4, 16);
         let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
@@ -855,7 +843,7 @@ impl<'a> Recorder<'a> {
         // neutral here (decode is dispatch-latency-bound) but a win on slower/higher-latency GPUs.
         let k = self
             .be
-            .kernel_spv_sg("rmsnorm", crate::gemm::rmsnorm_spv(), 3, 12, 32);
+            .kernel_sg("rmsnorm", crate::gemm::rmsnorm_spv(), 3, 12, 32);
         let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(dim as u32).to_ne_bytes());
@@ -884,7 +872,7 @@ impl<'a> Recorder<'a> {
         pos_offset: usize,
     ) {
         self.stamp("rope");
-        let k = self.be.kernel_spv("rope", crate::gemm::rope_spv(), 2, 24);
+        let k = self.be.kernel("rope", crate::gemm::rope_spv(), 2, 24);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n_heads as u32).to_ne_bytes());
@@ -920,7 +908,7 @@ impl<'a> Recorder<'a> {
         self.stamp("attention_kv");
         let kern = self
             .be
-            .kernel_spv("attention_kv", crate::gemm::attention_kv_spv(), 4, 24);
+            .kernel("attention_kv", crate::gemm::attention_kv_spv(), 4, 24);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(q_len as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());
@@ -973,7 +961,7 @@ impl<'a> Recorder<'a> {
         } else {
             ("attn_qk", crate::gemm::attn_qk_spv(), 64u32)
         };
-        let kqk = self.be.kernel_spv_sg(qk_name, qk_spv, 3, 24, 32);
+        let kqk = self.be.kernel_sg(qk_name, qk_spv, 3, 24, 32);
         let mut p = [0u8; 24];
         p[0..4].copy_from_slice(&mpad.to_ne_bytes());
         p[4..8].copy_from_slice(&kv_pad.to_ne_bytes());
@@ -996,7 +984,7 @@ impl<'a> Recorder<'a> {
         self.stamp("attn_softmax");
         let ksm = self
             .be
-            .kernel_spv("attn_softmax", crate::gemm::attn_softmax_spv(), 1, 16);
+            .kernel("attn_softmax", crate::gemm::attn_softmax_spv(), 1, 16);
         let mut ps = [0u8; 16];
         ps[0..4].copy_from_slice(&mpad.to_ne_bytes());
         ps[4..8].copy_from_slice(&kv_pad.to_ne_bytes());
@@ -1035,7 +1023,7 @@ impl<'a> Recorder<'a> {
         } else {
             ("attn_pv", crate::gemm::attn_pv_spv(), 64u32)
         };
-        let kpv = self.be.kernel_spv_sg(pv_name, pv_spv, 3, 28, 32);
+        let kpv = self.be.kernel_sg(pv_name, pv_spv, 3, 28, 32);
         let mut pp = [0u8; 28];
         pp[0..4].copy_from_slice(&mpad.to_ne_bytes());
         pp[4..8].copy_from_slice(&kv_pad.to_ne_bytes());
@@ -1061,7 +1049,7 @@ impl<'a> Recorder<'a> {
             let total = mpad * nh as u32 * hdu;
             let kr = self
                 .be
-                .kernel_spv("attn_pv_reduce", crate::gemm::attn_pv_reduce_spv(), 2, 8);
+                .kernel("attn_pv_reduce", crate::gemm::attn_pv_reduce_spv(), 2, 8);
             let mut pr = [0u8; 8];
             pr[0..4].copy_from_slice(&total.to_ne_bytes());
             pr[4..8].copy_from_slice(&n_splits.to_ne_bytes());
@@ -1122,7 +1110,7 @@ impl<'a> Recorder<'a> {
             self.stamp("attn_flash");
             let k = self
                 .be
-                .kernel_spv_sg("attn_flash", crate::gemm::attn_flash_spv(), 4, 24, 32);
+                .kernel_sg("attn_flash", crate::gemm::attn_flash_spv(), 4, 24, 32);
             let mut p = [0u8; 24];
             p[0..4].copy_from_slice(&mpad.to_ne_bytes());
             p[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());
@@ -1147,7 +1135,7 @@ impl<'a> Recorder<'a> {
         } else {
             ("attn_flash_partial", crate::gemm::attn_flash_partial_spv())
         };
-        let kp = self.be.kernel_spv_sg(pname, pspv, 6, 32, 32);
+        let kp = self.be.kernel_sg(pname, pspv, 6, 32, 32);
         let mut pp = [0u8; 32];
         pp[0..4].copy_from_slice(&mpad.to_ne_bytes());
         pp[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());
@@ -1175,7 +1163,7 @@ impl<'a> Recorder<'a> {
         );
         // combine → attn
         self.stamp("attn_flash");
-        let kc2 = self.be.kernel_spv_sg(
+        let kc2 = self.be.kernel_sg(
             "attn_flash_combine",
             crate::gemm::attn_flash_combine_spv(),
             4,
@@ -1235,7 +1223,7 @@ impl<'a> Recorder<'a> {
         };
         let ksplit = (kv_len as u32).div_ceil(n_splits).div_ceil(64) * 64;
         self.stamp("attn_flash");
-        let kp = self.be.kernel_spv_sg(
+        let kp = self.be.kernel_sg(
             "attn_flash_reg",
             crate::gemm::attn_flash_reg_spv(),
             6,
@@ -1268,7 +1256,7 @@ impl<'a> Recorder<'a> {
             1,
         );
         self.stamp("attn_flash");
-        let kc2 = self.be.kernel_spv_sg(
+        let kc2 = self.be.kernel_sg(
             "attn_flash_combine",
             crate::gemm::attn_flash_combine_spv(),
             4,
@@ -1294,7 +1282,7 @@ impl<'a> Recorder<'a> {
         self.stamp("store_f16");
         let k = self
             .be
-            .kernel_spv("store_f16", crate::gemm::store_f16_spv(), 2, 8);
+            .kernel("store_f16", crate::gemm::store_f16_spv(), 2, 8);
         let mut push = [0u8; 8];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
@@ -1327,7 +1315,7 @@ impl<'a> Recorder<'a> {
         self.stamp("qk_norm_rope");
         let k = self
             .be
-            .kernel_spv("qk_norm_rope", crate::gemm::qk_norm_rope_spv(), 3, 32);
+            .kernel("qk_norm_rope", crate::gemm::qk_norm_rope_spv(), 3, 32);
         let mut push = [0u8; 32];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(nheads as u32).to_ne_bytes());
@@ -1370,7 +1358,7 @@ impl<'a> Recorder<'a> {
         self.stamp("attn_partial");
         let k1 = self
             .be
-            .kernel_spv_sg("attn_partial", crate::gemm::attn_partial_spv(), 6, 24, 32);
+            .kernel_sg("attn_partial", crate::gemm::attn_partial_spv(), 6, 24, 32);
         let mut p1 = [0u8; 24];
         p1[0..4].copy_from_slice(&(kv_len as u32).to_ne_bytes());
         p1[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
@@ -1396,7 +1384,7 @@ impl<'a> Recorder<'a> {
         self.stamp("attn_combine");
         let k2 = self
             .be
-            .kernel_spv("attn_combine", crate::gemm::attn_combine_spv(), 4, 16);
+            .kernel("attn_combine", crate::gemm::attn_combine_spv(), 4, 16);
         let ntile = if hd.is_multiple_of(4) { 4u32 } else { 1u32 };
         let mut p2 = [0u8; 16];
         p2[0..4].copy_from_slice(&(nh as u32).to_ne_bytes());
@@ -1452,7 +1440,7 @@ impl<'a> Recorder<'a> {
         self.stamp("attention");
         let kern = self
             .be
-            .kernel_spv("attention", crate::gemm::attention_spv(), 4, 16);
+            .kernel("attention", crate::gemm::attention_spv(), 4, 16);
         let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
@@ -1471,7 +1459,7 @@ impl<'a> Recorder<'a> {
     pub fn silu_mul_fused(&self, gu: &dyn Buffer, y: &dyn Buffer, rows: usize, nff: usize) {
         let k = self
             .be
-            .kernel_spv("silu_mul_fused", crate::gemm::silu_mul_fused_spv(), 2, 8);
+            .kernel("silu_mul_fused", crate::gemm::silu_mul_fused_spv(), 2, 8);
         let mut push = [0u8; 8];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(nff as u32).to_ne_bytes());
@@ -1487,7 +1475,7 @@ impl<'a> Recorder<'a> {
     pub fn silu_mul(&self, gate: &dyn Buffer, up: &dyn Buffer, y: &dyn Buffer, n: usize) {
         let k = self
             .be
-            .kernel_spv("silu_mul", crate::gemm::silu_mul_spv(), 3, 4);
+            .kernel("silu_mul", crate::gemm::silu_mul_spv(), 3, 4);
         self.dispatch(
             k,
             &[Self::vkb(gate), Self::vkb(up), Self::vkb(y)],
@@ -1499,7 +1487,7 @@ impl<'a> Recorder<'a> {
 
     /// Elementwise add; in place allowed (`a` may equal `y`).
     pub fn add(&self, a: &dyn Buffer, b: &dyn Buffer, y: &dyn Buffer, n: usize) {
-        let k = self.be.kernel_spv("add", crate::gemm::add_spv(), 3, 4);
+        let k = self.be.kernel("add", crate::gemm::add_spv(), 3, 4);
         self.dispatch(
             k,
             &[Self::vkb(a), Self::vkb(b), Self::vkb(y)],

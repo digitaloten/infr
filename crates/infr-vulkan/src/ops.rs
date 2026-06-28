@@ -27,7 +27,7 @@ pub(crate) struct ComputeKernel {
     pub push_size: u32,
 }
 
-pub(crate) fn make_compute_kernel_from_spv(
+pub(crate) fn make_compute_kernel(
     device: &ash::Device,
     spv: &[u32],
     n_buf: usize,
@@ -130,7 +130,7 @@ pub(crate) fn destroy_compute_kernel(device: &ash::Device, k: &ComputeKernel) {
 
 impl VulkanBackend {
     /// Fetch-or-build a named kernel from precompiled SPIR-V (build-compiled GLSL → `.spv`).
-    pub(crate) fn kernel_spv(
+    pub(crate) fn kernel(
         &self,
         name: &'static str,
         spv: &[u32],
@@ -139,12 +139,12 @@ impl VulkanBackend {
     ) -> ComputeKernel {
         let mut map = self.shared.kernels.lock().unwrap();
         *map.entry(name).or_insert_with(|| {
-            make_compute_kernel_from_spv(&self.shared.device, spv, n_buf, push_size, None)
+            make_compute_kernel(&self.shared.device, spv, n_buf, push_size, None)
         })
     }
 
-    /// Like `kernel_spv`, but pins the pipeline's subgroup size (coopmat needs wave32 on RDNA3).
-    pub(crate) fn kernel_spv_sg(
+    /// Like `kernel`, but pins the pipeline's subgroup size (coopmat needs wave32 on RDNA3).
+    pub(crate) fn kernel_sg(
         &self,
         name: &'static str,
         spv: &[u32],
@@ -154,7 +154,7 @@ impl VulkanBackend {
     ) -> ComputeKernel {
         let mut map = self.shared.kernels.lock().unwrap();
         *map.entry(name).or_insert_with(|| {
-            make_compute_kernel_from_spv(&self.shared.device, spv, n_buf, push_size, Some(sg_size))
+            make_compute_kernel(&self.shared.device, spv, n_buf, push_size, Some(sg_size))
         })
     }
 
@@ -352,7 +352,7 @@ impl VulkanBackend {
         in_f: usize,
         out_f: usize,
     ) -> Result<Vec<f32>> {
-        let k = self.kernel_spv("linear_f16_eager", crate::gemm::linear_f16_spv(), 3, 12);
+        let k = self.kernel("linear_f16_eager", crate::gemm::linear_f16_spv(), 3, 12);
         self.linear_wbuf(k, (rows * out_f) as u32, w_buf, x, rows, in_f, out_f)
     }
 
@@ -365,7 +365,7 @@ impl VulkanBackend {
         in_f: usize,
         out_f: usize,
     ) -> Result<Vec<f32>> {
-        let k = self.kernel_spv("linear_bf16_eager", crate::gemm::linear_bf16_spv(), 3, 12);
+        let k = self.kernel("linear_bf16_eager", crate::gemm::linear_bf16_spv(), 3, 12);
         self.linear_wbuf(k, (rows * out_f) as u32, w_buf, x, rows, in_f, out_f)
     }
 
@@ -378,7 +378,7 @@ impl VulkanBackend {
         dim: usize,
         eps: f32,
     ) -> Result<Vec<f32>> {
-        let k = self.kernel_spv_sg("rmsnorm", crate::gemm::rmsnorm_spv(), 3, 12, 32);
+        let k = self.kernel_sg("rmsnorm", crate::gemm::rmsnorm_spv(), 3, 12, 32);
         let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(dim as u32).to_ne_bytes());
@@ -396,7 +396,7 @@ impl VulkanBackend {
         rope_dim: usize,
         theta: f32,
     ) -> Result<Vec<f32>> {
-        let k = self.kernel_spv("rope", crate::gemm::rope_spv(), 2, 24);
+        let k = self.kernel("rope", crate::gemm::rope_spv(), 2, 24);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n_heads as u32).to_ne_bytes());
@@ -409,7 +409,7 @@ impl VulkanBackend {
 
     /// SwiGLU activation: `y[i] = silu(gate[i]) * up[i]`.
     pub fn silu_mul(&self, gate: &[f32], up: &[f32], n: usize) -> Result<Vec<f32>> {
-        let k = self.kernel_spv("silu_mul", crate::gemm::silu_mul_spv(), 3, 4);
+        let k = self.kernel("silu_mul", crate::gemm::silu_mul_spv(), 3, 4);
         self.run_kernel(
             k,
             &[gate, up],
@@ -421,7 +421,7 @@ impl VulkanBackend {
 
     /// Elementwise add: `y[i] = a[i] + b[i]`.
     pub fn add(&self, a: &[f32], b: &[f32], n: usize) -> Result<Vec<f32>> {
-        let k = self.kernel_spv("add", crate::gemm::add_spv(), 3, 4);
+        let k = self.kernel("add", crate::gemm::add_spv(), 3, 4);
         self.run_kernel(
             k,
             &[a, b],
@@ -444,7 +444,7 @@ impl VulkanBackend {
         hd: usize,
     ) -> Result<Vec<f32>> {
         assert!(hd <= 128, "attention kernel supports hd<=128");
-        let kern = self.kernel_spv("attention", crate::gemm::attention_spv(), 4, 16);
+        let kern = self.kernel("attention", crate::gemm::attention_spv(), 4, 16);
         let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
