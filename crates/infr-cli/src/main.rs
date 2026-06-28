@@ -489,6 +489,13 @@ fn cmd_bench(
             }
             Ok(())
         };
+        // Warmup (untimed): compile all pipelines / first-touch GPU state so the timed reps measure
+        // compute, not one-time setup (weights are already uploaded synchronously at load).
+        {
+            let mut wk = llama.new_moe_kv(cap)?;
+            prefill(&llama, &mut wk, chunk(0).min(64))?;
+            llama.forward_moe_chunk(&[7u32], &mut wk)?;
+        }
         for _ in 0..reps {
             let mut kv = llama.new_moe_kv(cap)?;
             prefill(&llama, &mut kv, depth)?; // warm to `depth` (untimed)
@@ -521,6 +528,12 @@ fn cmd_bench(
             }
             Ok(())
         };
+        // Warmup (untimed): compile pipelines / first-touch so timed reps measure compute, not setup.
+        {
+            let mut wk = llama.new_kv(cap)?;
+            prefill(&mut wk, chunk(0).min(64))?;
+            llama.forward_resident_kv(&[7u32], &mut wk)?;
+        }
         for _ in 0..reps {
             let mut kv = llama.new_kv(cap)?;
             prefill(&mut kv, depth)?; // warm to `depth` (untimed)
