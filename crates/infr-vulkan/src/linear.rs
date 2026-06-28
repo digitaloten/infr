@@ -651,6 +651,138 @@ fn dq(g: u32) -> f32 {
 }
 "#;
 
+// ── Codebook-format helpers (shared const tables / decode fns, prepended per format) ──
+
+/// IQ4_NL / IQ4_XS 16-entry signed codebook (kvalues_iq4nl).
+const KV_IQ4NL_DEF: &str = r#"
+const KV_IQ4NL = array<i32,16>(-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113);
+"#;
+/// MXFP4 / NVFP4 E2M1 4-bit codebook (kvalues_mxfp4).
+const KV_MXFP4_DEF: &str = r#"
+const KV_MXFP4 = array<i32,16>(0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12);
+"#;
+/// TQ1_0 ternary powers of 3.
+const POW3_TQ_DEF: &str = r#"
+const POW3_TQ = array<u32,6>(1u,3u,9u,27u,81u,243u);
+"#;
+/// E8M0 exponent byte → fp32 (halved): `2^(x-128)`.
+const E8M0_FN: &str = r#"
+fn e8m0_half(x: u32) -> f32 {
+    if x < 2u { return bitcast<f32>(0x00200000u << x); }
+    return bitcast<f32>((x - 1u) << 23u);
+}
+"#;
+/// UE4M3 byte → fp32 (halved): 4 exp bits (bias 7), 3 mantissa bits.
+const UE4M3_FN: &str = r#"
+fn ue4m3(x: u32) -> f32 {
+    if x == 0u || x == 0x7Fu { return 0.0; }
+    let e = (x >> 3u) & 0xFu;
+    let man = f32(x & 7u);
+    var raw: f32;
+    if e == 0u { raw = man * exp2(-9.0); }
+    else { raw = (1.0 + man / 8.0) * exp2(f32(i32(e) - 7)); }
+    return raw * 0.5;
+}
+"#;
+
+/// IQ4_NL: [f16 d][u8 qs[16]] = 18 bytes, 32 elements. y = d * kv[nibble].
+const DQ_IQ4_NL: &str = r#"
+fn dq(g: u32) -> f32 {
+    let b = g / 32u;
+    let j = g % 32u;
+    let bd = b * 18u;
+    let d = f16tof32(ru16(bd));
+    var idx: u32;
+    if j < 16u { idx = rb(bd + 2u + j) & 0xFu; } else { idx = rb(bd + 2u + (j - 16u)) >> 4u; }
+    return d * f32(KV_IQ4NL[idx]);
+}
+"#;
+
+/// IQ4_XS: [f16 d][u16 scales_h][u8 scales_l[4]][u8 qs[128]] = 136 bytes, 256 elements.
+/// 8 sub-blocks of 32; 6-bit per-sub-block scale `ls`; y = d*(ls-32) * kv[nibble].
+const DQ_IQ4_XS: &str = r#"
+fn dq(g: u32) -> f32 {
+    let b = g / 256u;
+    let p = g % 256u;
+    let bd = b * 136u;
+    let d = f16tof32(ru16(bd));
+    let scales_h = ru16(bd + 2u);
+    let ib = p / 32u;
+    let within = p % 32u;
+    let lo = (rb(bd + 4u + (ib / 2u)) >> (4u * (ib & 1u))) & 0xFu;
+    let hi = (scales_h >> (2u * ib)) & 3u;
+    let ls = lo | (hi << 4u);
+    let dl = d * f32(i32(ls) - 32);
+    let qoff = bd + 8u + 16u * ib;
+    var idx: u32;
+    if within < 16u { idx = rb(qoff + within) & 0xFu; } else { idx = rb(qoff + (within - 16u)) >> 4u; }
+    return dl * f32(KV_IQ4NL[idx]);
+}
+"#;
+
+/// MXFP4: [u8 e8m0][u8 qs[16]] = 17 bytes, 32 elements. y = kv_mxfp4[nibble] * 2^(e-128).
+const DQ_MXFP4: &str = r#"
+fn dq(g: u32) -> f32 {
+    let b = g / 32u;
+    let j = g % 32u;
+    let bd = b * 17u;
+    let d = e8m0_half(rb(bd));
+    var idx: u32;
+    if j < 16u { idx = rb(bd + 1u + j) & 0xFu; } else { idx = rb(bd + 1u + (j - 16u)) >> 4u; }
+    return f32(KV_MXFP4[idx]) * d;
+}
+"#;
+
+/// NVFP4: [u8 scales[4]][u8 qs[32]] = 36 bytes, 64 elements. 4 sub-blocks of 16, UE4M3 scale each.
+const DQ_NVFP4: &str = r#"
+fn dq(g: u32) -> f32 {
+    let b = g / 64u;
+    let p = g % 64u;
+    let bd = b * 36u;
+    let s = p / 16u;
+    let within = p % 16u;
+    let d = ue4m3(rb(bd + s));
+    var idx: u32;
+    if within < 8u { idx = rb(bd + 4u + s * 8u + within) & 0xFu; }
+    else { idx = rb(bd + 4u + s * 8u + (within - 8u)) >> 4u; }
+    return f32(KV_MXFP4[idx]) * d;
+}
+"#;
+
+/// TQ1_0: [u8 qs[48]][u8 qh[4]][f16 d] = 54 bytes, 256 elements. Ternary via pow-3 digit extract.
+const DQ_TQ1_0: &str = r#"
+fn dq(g: u32) -> f32 {
+    let b = g / 256u;
+    let p = g % 256u;
+    let bd = b * 54u;
+    let d = f16tof32(ru16(bd + 52u));
+    var src: u32;
+    var n: u32;
+    if p < 160u { n = p / 32u; src = rb(bd + (p % 32u)); }
+    else if p < 240u { let pp = p - 160u; n = pp / 16u; src = rb(bd + 32u + (pp % 16u)); }
+    else { let pp = p - 240u; n = pp / 4u; src = rb(bd + 48u + (pp % 4u)); }
+    let q = (src * POW3_TQ[n]) & 0xFFu;
+    let xi = (q * 3u) >> 8u;
+    return f32(i32(xi) - 1) * d;
+}
+"#;
+
+/// TQ2_0: [u8 qs[64]][f16 d] = 66 bytes, 256 elements. 2-bit ternary, y = (q-1)*d.
+const DQ_TQ2_0: &str = r#"
+fn dq(g: u32) -> f32 {
+    let b = g / 256u;
+    let p = g % 256u;
+    let bd = b * 66u;
+    let d = f16tof32(ru16(bd + 64u));
+    let chunk = p / 128u;
+    let rem = p % 128u;
+    let l = rem / 32u;
+    let m = rem % 32u;
+    let q = (rb(bd + chunk * 32u + m) >> (l * 2u)) & 3u;
+    return (f32(q) - 1.0) * d;
+}
+"#;
+
 /// Return the static kernel name for a native-block GEMV (Phase 0-2).
 pub fn native_kernel_name(dtype: infr_core::DType, residual: bool) -> &'static str {
     use infr_core::DType::*;
@@ -675,6 +807,18 @@ pub fn native_kernel_name(dtype: infr_core::DType, residual: bool) -> &'static s
         (Q5K, true) => "native_q5k_res",
         (Q6K, false) => "native_q6k",
         (Q6K, true) => "native_q6k_res",
+        (Iq4Nl, false) => "native_iq4nl",
+        (Iq4Nl, true) => "native_iq4nl_res",
+        (Iq4Xs, false) => "native_iq4xs",
+        (Iq4Xs, true) => "native_iq4xs_res",
+        (Mxfp4, false) => "native_mxfp4",
+        (Mxfp4, true) => "native_mxfp4_res",
+        (Nvfp4, false) => "native_nvfp4",
+        (Nvfp4, true) => "native_nvfp4_res",
+        (Tq1_0, false) => "native_tq1_0",
+        (Tq1_0, true) => "native_tq1_0_res",
+        (Tq2_0, false) => "native_tq2_0",
+        (Tq2_0, true) => "native_tq2_0_res",
         _ => panic!("no native GEMV for {:?}", dtype),
     }
 }
@@ -701,6 +845,13 @@ pub fn native_gemv_wgsl(dtype: infr_core::DType, residual: bool) -> String {
         Q4K => return format!("{hdr}{K4_FN}{DQ_Q4K}{body}"),
         Q5K => return format!("{hdr}{K4_FN}{DQ_Q5K}{body}"),
         Q6K => DQ_Q6K,
+        // Codebook formats: prepend their const table(s) / decode fn(s).
+        Iq4Nl => return format!("{hdr}{KV_IQ4NL_DEF}{DQ_IQ4_NL}{body}"),
+        Iq4Xs => return format!("{hdr}{KV_IQ4NL_DEF}{DQ_IQ4_XS}{body}"),
+        Mxfp4 => return format!("{hdr}{KV_MXFP4_DEF}{E8M0_FN}{DQ_MXFP4}{body}"),
+        Nvfp4 => return format!("{hdr}{KV_MXFP4_DEF}{UE4M3_FN}{DQ_NVFP4}{body}"),
+        Tq1_0 => return format!("{hdr}{POW3_TQ_DEF}{DQ_TQ1_0}{body}"),
+        Tq2_0 => return format!("{hdr}{DQ_TQ2_0}{body}"),
         _ => panic!("no native GEMV for {dtype:?}"),
     };
     format!("{hdr}{dq}{body}")

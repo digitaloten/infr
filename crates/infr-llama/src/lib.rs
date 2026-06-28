@@ -1402,12 +1402,28 @@ fn use_native() -> bool {
     std::env::var("INFR_NATIVE").is_ok()
 }
 
-/// True for affine quant types that have a native-block GEMV shader.
+/// True for quant types that have a native-block GEMV shader (affine + codebook formats with no
+/// grid-table dependency). Grid-based i-quants (IQ2*/IQ3*/IQ1*) are not yet native — they stay on
+/// the host-dequant → f16 path.
 fn is_native_supported(d: infr_core::DType) -> bool {
     use infr_core::DType::*;
     matches!(
         d,
-        Q8_0 | Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q2K | Q3K | Q4K | Q5K | Q6K
+        Q8_0 | Q4_0
+            | Q4_1
+            | Q5_0
+            | Q5_1
+            | Q2K
+            | Q3K
+            | Q4K
+            | Q5K
+            | Q6K
+            | Iq4Nl
+            | Iq4Xs
+            | Mxfp4
+            | Nvfp4
+            | Tq1_0
+            | Tq2_0
     )
 }
 
@@ -4308,6 +4324,114 @@ mod gpu_affine_tests {
             gpu_out[max_idx],
             cpu_out[max_idx]
         );
+    }
+
+    // ── Native-block codebook formats (IQ4_NL/XS, MXFP4, NVFP4, TQ1_0, TQ2_0) ────
+    //
+    // CPU reference is `dequant_codebook` (the verified host port). GPU runs `linear_native`
+    // with x=all-1.0 so the output is the sum of dequantized weights.
+
+    fn check_native_cb(dtype: infr_core::DType, block_bytes: &[u8]) {
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan GPU");
+                return;
+            }
+        };
+        use infr_vulkan::linear::pad_to_u32_align;
+        let cpu = dequant_codebook(dtype, block_bytes);
+        let numel = cpu.len();
+        let cpu_out: f32 = cpu.iter().sum();
+
+        let padded = pad_to_u32_align(block_bytes);
+        let wbuf = be.upload_weight_bytes(&padded).unwrap();
+        let x: Vec<f32> = vec![1.0f32; numel];
+        let xbuf = be.alloc(x.len() * 4, BufferUsage::Staging).unwrap();
+        be.upload(xbuf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+        let ybuf = be.alloc(4, BufferUsage::Readback).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.linear_native(
+            dtype,
+            wbuf.as_ref(),
+            xbuf.as_ref(),
+            ybuf.as_ref(),
+            1,
+            numel,
+            1,
+        );
+        rec.finish().unwrap();
+        let mut out_bytes = vec![0u8; 4];
+        be.download(ybuf.as_ref(), &mut out_bytes).unwrap();
+        let gpu_out: f32 = bytemuck::cast_slice(&out_bytes)[0];
+        let rel = (gpu_out - cpu_out).abs() / (cpu_out.abs() + 1e-4);
+        assert!(
+            rel < 5e-3,
+            "{dtype:?} native cb GPU vs CPU: gpu={gpu_out} cpu={cpu_out} rel={rel}"
+        );
+    }
+
+    // varied non-trivial byte pattern
+    fn fill(buf: &mut [u8], mul: u8, add: u8) {
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(mul).wrapping_add(add);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn iq4nl_native_matches_cpu() {
+        let mut block = vec![0u8; 18];
+        block[0..2].copy_from_slice(&half::f16::from_f32(1.5).to_bits().to_le_bytes());
+        fill(&mut block[2..18], 23, 7);
+        check_native_cb(infr_core::DType::Iq4Nl, &block);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn iq4xs_native_matches_cpu() {
+        let mut block = vec![0u8; 136];
+        block[0..2].copy_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
+        block[2..4].copy_from_slice(&0x9ce3u16.to_le_bytes()); // scales_h varied
+        fill(&mut block[4..8], 53, 11); // scales_l
+        fill(&mut block[8..136], 13, 3); // qs
+        check_native_cb(infr_core::DType::Iq4Xs, &block);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn mxfp4_native_matches_cpu() {
+        let mut block = vec![0u8; 17];
+        block[0] = 128; // e8m0 → d=1.0
+        fill(&mut block[1..17], 29, 5);
+        check_native_cb(infr_core::DType::Mxfp4, &block);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn nvfp4_native_matches_cpu() {
+        let mut block = vec![0u8; 36];
+        block[0..4].copy_from_slice(&[0x38, 0x40, 0x48, 0x30]); // valid ue4m3 scales
+        fill(&mut block[4..36], 19, 9);
+        check_native_cb(infr_core::DType::Nvfp4, &block);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn tq1_0_native_matches_cpu() {
+        let mut block = vec![0u8; 54];
+        fill(&mut block[0..52], 17, 1); // qs + qh
+        block[52..54].copy_from_slice(&half::f16::from_f32(0.75).to_bits().to_le_bytes());
+        check_native_cb(infr_core::DType::Tq1_0, &block);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn tq2_0_native_matches_cpu() {
+        let mut block = vec![0u8; 66];
+        fill(&mut block[0..64], 11, 3); // qs
+        block[64..66].copy_from_slice(&half::f16::from_f32(1.25).to_bits().to_le_bytes());
+        check_native_cb(infr_core::DType::Tq2_0, &block);
     }
 }
 
