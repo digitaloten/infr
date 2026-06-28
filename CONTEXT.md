@@ -155,27 +155,36 @@ Infra:
   small ops can't be sped up end-to-end. Next real decode lever would be KV
   quant (q8_0) — trades quality, not pursued.
 
-## Native GEMV perf (INFR_NATIVE=1) — decode now beats unified
+## Native perf (INFR_NATIVE=1) — decode AND prefill now beat unified
 
-- Native = raw GGUF blocks on GPU, in-shader dequant (`native_gemv.comp`).
-  Unified (`Wt::Q`) = pre-repacked at load (u4/u8 idx + f16 scale/min), decoded
-  by `mul_mat_vec_q.comp` (subgroup). Native = smaller VRAM + fast load.
-- ROOT CAUSE native was slow: per-element `dq(g)` re-decoded the block's f16
-  scale (+ Q4_K 6-bit sub-scale, Q3_K 12-byte recon) EVERY element via
-  byte-addressed `rb()` scalar loads. ~16 elems/thread = 16x redundant decode.
-- FIX (done): sub-block-major. Each thread owns whole 32-elem sub-blocks,
-  decodes scale ONCE, loops 32 elems. Uniform `main()` over `dqsub()`; formats
-  w/o optimized `dqsub` fall back to looping `dq()` (no regression). Optimized
-  `dqsub` added for Q8_0, Q4_0/1, Q5_0/1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K.
-- DEAD END: subgroup reduction (64→32 lanes) made it WORSE — decode-bound, K
-  parallelism matters more than dropping the 6 reduce barriers. Reverted.
-- DECODE result (qwen3-0.6b, ctx=128, t/s) native vs unified — native WINS all:
-  Q8_0 423/365, Q6_K 413/357, Q5_K 376/365, Q4_K 506/480 (was 259 pre-fix). All
-  36 gpu_affine tests pass; e2e output correct.
-- STILL OPEN — native PREFILL 3x slower: pp512 native 3402 vs unified 10732.
-  Native uses per-row GEMV for the matmul; unified uses tiled coopmat GEMM
-  (`gemm_proj`). Native lacks a tiled dequant-GEMM path → why it stays opt-in,
-  NOT default. Next lever: native tiled GEMM (dequant tiles + coopmat).
+- Native = raw GGUF blocks on GPU, in-shader dequant. Unified (`Wt::Q`) =
+  pre-repacked at load (u4/u8 idx + f16 scale/min). Native = smaller VRAM + fast
+  load. Decode uses `native_gemv.comp`; prefill uses `native_gemm.comp` (NEW).
+- Shared decode lib `native_decode.glsl`: per-format `dq(g)` (single elem) +
+  amortized `dqblk(gstart, out v[32])` (decode block scale ONCE per
+  32-sub-block, reused across the sub-block). Included by BOTH gemv + gemm. The
+  includer declares the weight SSBO as `uint nw[]` (any binding).
+- ROOT CAUSE native decode was slow: per-element `dq(g)` re-decoded the block's
+  f16 scale (+ Q4_K 6-bit sub-scale, Q3_K 12-byte recon) EVERY element. Fix:
+  sub-block-major via dqblk. DEAD END: subgroup reduction (64→32 lanes) WORSE —
+  decode-bound, K parallelism beats dropping the 6 reduce barriers.
+- ROOT CAUSE native prefill was 3x slow: per-row GEMV for the matmul. FIX:
+  `matmul_native` = tiled coopmat GEMM (copy of gemm_proj) that dequants weights
+  via dqblk during shared staging → decode-once per weight elem, reused across
+  the 64-row tile. Dispatched when n%64 && k%32 (else GEMV fallback). GOTCHA
+  fixed: `matmul_native(dtype, a, w, c)` — a=ACTIVATIONS, w=WEIGHTS; both call
+  sites first passed (weight, activation) → swapped buffers → garbage/NaN.
+- DECODE (qwen3-0.6b, ctx=128, t/s) native vs unified — native WINS all: Q8_0
+  423/365, Q6_K 413/357, Q5_K 376/365, Q4_K 506/480 (was 259 pre-fix).
+- PREFILL (pp512, t/s) native vs unified — native wins K-quants: Q8_0 8487/6283,
+  Q6_K 7622/5437, Q5_K 8018/6320, Q4_K 10248/10744 (unified dp4a mmq still edges
+  Q4_K by ~5%). Was native ~3400 (3x slower) pre-GEMM.
+- ⇒ Native now faster on decode (all) + prefill (except Q4_K ~5%) AND smaller
+  VRAM. Candidate to flip to DEFAULT (currently opt-in via INFR_NATIVE) —
+  pending user decision; only Q4_K prefill regresses slightly.
+- Tests: 36 `*_native_matches_cpu` (GEMV decode) + 3
+  `*_native_gemm_matches_gemv` (GEMM vs trusted GEMV, M spans row-tiles,
+  col-varied weights). All pass.
 - Codebook/grid i-quants (IQ\*, MXFP4, NVFP4, TQ) still use fallback `dqsub`
   (got contiguous layout, not decode amortization) — low priority, rarely used.
 
