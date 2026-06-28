@@ -212,12 +212,23 @@ on CPU (`cpu_expert_matvec`: dequant+matvec); rest GPU-resident.
 `ExpertW = Gpu(Wt) | Cpu{dtype,bytes}`; `load_moe(...on_cpu)` places per layer
 (l<n_cpu_moe). Pre-flight footprint + arena subtract the offloaded experts'
 uniform-per-layer VRAM share, so GPU total/reserve are real; bail msg suggests
-raising INFR_NCMOE. VERIFIED 30B-A3B: NCMOE=24 → GPU 18.35→9.57GB (-8.78),
-output coherent, 0.8 tok/s (CPU layers slow — unoptimized full-dequant matvec;
-rayon + dequant-cache = follow-on). NCMOE=0 default = all-GPU 38 tok/s. ⇒ lets a
-too-big MoE fit by offloading enough layers. ExpertPool streaming (the OTHER
-not-fit strategy) still only needed when even host RAM + streaming is wanted;
-PCIe caveat: pays off only if working set fits the pool.
+raising INFR_NCMOE. NCMOE=0 default = all-GPU.
+
+THREE MoE EXPERT MODES (all done): set how offloaded experts compute — (1)
+all-GPU (NCMOE=0): every expert resident, 38 tok/s @ 18.35GB. (2) STREAM
+(NCMOE=N + `INFR_MOE_STREAM=1`): offloaded layers keep experts in host RAM but
+stream the ACTIVE ones into a VRAM `ExpertPool` (LRU, upload-on-miss) and
+GPU-compute via `linear_native` (`stream_experts`/`gemv_native_one`; pool in
+`MoeKv`, keyed (layer,expert,role), n_used\*3+headroom slots of one role's
+native bytes). 7.7 tok/s @ 9.57GB. (3) CPU (NCMOE=N): offloaded experts run on
+CPU (`cpu_expert_matvec`). 0.8 tok/s @ 9.57GB. VERIFIED 30B-A3B NCMOE=24: all
+three same VRAM split (18.35→9.57GB), coherent; stream ~10x CPU (prefill 1.8s vs
+24s). `ExpertW=Gpu|Cpu{dtype,bytes}`; placement per layer at load; pre-flight
+footprint+arena subtract offloaded experts. ⇒ stream = the "model bigger than
+VRAM, pay PCIe not CPU" sweet spot (decode: only n_used/n_expert active, GPU
+matmul ≫ CPU; small pool = per-layer stream buffer, no cross-token cache;
+prefill could thrash → batch-tokens-by-expert is a follow-on). Stream falls back
+to CPU for non-native-supported quants.
 
 Infra:
 
