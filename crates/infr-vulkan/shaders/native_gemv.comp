@@ -23,6 +23,10 @@ uint ru32b(uint bo) { return rb(bo) | (rb(bo + 1u) << 8u) | (rb(bo + 2u) << 16u)
 float f16tof32(uint bits) { return unpackHalf2x16(bits & 0xffffu).x; }
 int sgn8(uint byte) { return int(byte) - int(byte >= 128u ? 256u : 0u); }
 
+#ifdef USE_GRID
+#include "native_grids.glsl"
+#endif
+
 #if defined(FMT_Q8_0)
 // Q8_0: [f16 d][i8 qs[32]] = 34 bytes, 32 elements. y = d * qs[j].
 float dq(uint g) {
@@ -273,6 +277,136 @@ float dq(uint g) {
     uint chunk = p / 128u; uint rem = p % 128u; uint l = rem / 32u; uint m = rem % 32u;
     uint q = (rb(bd + chunk * 32u + m) >> (l * 2u)) & 3u;
     return (float(q) - 1.0) * d;
+}
+#endif
+
+// ── grid-based i-quants (tables from native_grids.glsl) ──
+#if defined(FMT_IQ2XXS)
+float dq(uint g) {
+    uint b = g / 256u; uint p = g % 256u; uint bd = b * 66u;
+    float d = f16tof32(ru16(bd));
+    uint ib32 = p / 32u; uint l = (p % 32u) / 8u; uint j = p % 8u;
+    uint off = bd + 2u + ib32 * 8u;
+    uint aux0 = ru32b(off); uint aux1 = ru32b(off + 4u);
+    uint grid_idx = (aux0 >> (8u * l)) & 0xFFu;
+    uint sign_idx = (aux1 >> (7u * l)) & 127u;
+    float db = d * (0.5 + float(aux1 >> 28u)) * 0.25;
+    uint bv = (j < 4u) ? ((G_IQ2XXS[2u * grid_idx] >> (8u * j)) & 0xFFu)
+                       : ((G_IQ2XXS[2u * grid_idx + 1u] >> (8u * (j - 4u))) & 0xFFu);
+    float sign = (((KSIGNS[sign_idx] >> j) & 1u) != 0u) ? -1.0 : 1.0;
+    return db * float(sgn8(bv)) * sign;
+}
+#endif
+
+#if defined(FMT_IQ2XS)
+float dq(uint g) {
+    uint b = g / 256u; uint p = g % 256u; uint bd = b * 74u;
+    float d = f16tof32(ru16(bd));
+    uint ib32 = p / 32u; uint l = (p % 32u) / 8u; uint j = p % 8u;
+    uint qs16 = ru16(bd + 2u + (ib32 * 4u + l) * 2u);
+    uint grid_idx = qs16 & 511u; uint sign_idx = qs16 >> 9u;
+    uint sc = rb(bd + 66u + ib32);
+    float dl = (l < 2u) ? (d * (0.5 + float(sc & 0xFu)) * 0.25) : (d * (0.5 + float(sc >> 4u)) * 0.25);
+    uint bv = (j < 4u) ? ((G_IQ2XS[2u * grid_idx] >> (8u * j)) & 0xFFu)
+                       : ((G_IQ2XS[2u * grid_idx + 1u] >> (8u * (j - 4u))) & 0xFFu);
+    float sign = (((KSIGNS[sign_idx] >> j) & 1u) != 0u) ? -1.0 : 1.0;
+    return dl * float(sgn8(bv)) * sign;
+}
+#endif
+
+#if defined(FMT_IQ2S)
+float dq(uint g) {
+    uint b = g / 256u; uint p = g % 256u; uint bd = b * 82u;
+    float d = f16tof32(ru16(bd));
+    uint ib32 = p / 32u; uint l = (p % 32u) / 8u; uint j = p % 8u;
+    uint qs_byte = rb(bd + 2u + ib32 * 4u + l);
+    uint sign_byte = rb(bd + 2u + 32u + ib32 * 4u + l);
+    uint qh_byte = rb(bd + 66u + ib32);
+    uint grid_idx = qs_byte | ((qh_byte << (8u - 2u * l)) & 0x300u);
+    uint sc = rb(bd + 74u + ib32);
+    float dl = (l < 2u) ? (d * (0.5 + float(sc & 0xFu)) * 0.25) : (d * (0.5 + float(sc >> 4u)) * 0.25);
+    uint bv = (j < 4u) ? ((G_IQ2S[2u * grid_idx] >> (8u * j)) & 0xFFu)
+                       : ((G_IQ2S[2u * grid_idx + 1u] >> (8u * (j - 4u))) & 0xFFu);
+    float sign = (((sign_byte >> j) & 1u) != 0u) ? -1.0 : 1.0;
+    return dl * float(sgn8(bv)) * sign;
+}
+#endif
+
+#if defined(FMT_IQ3XXS)
+float dq(uint g) {
+    uint b = g / 256u; uint p = g % 256u; uint bd = b * 98u;
+    float d = f16tof32(ru16(bd));
+    uint ib32 = p / 32u; uint l = (p % 32u) / 8u; uint j8 = p % 8u;
+    uint g1_idx = rb(bd + 2u + ib32 * 8u + 2u * l);
+    uint g2_idx = rb(bd + 2u + ib32 * 8u + 2u * l + 1u);
+    uint aux32 = ru32b(bd + 66u + 4u * ib32);
+    float db = d * (0.5 + float(aux32 >> 28u)) * 0.5;
+    uint signs = KSIGNS[(aux32 >> (7u * l)) & 127u];
+    uint gidx = (j8 < 4u) ? g1_idx : g2_idx;
+    uint bytej = (j8 < 4u) ? j8 : (j8 - 4u);
+    uint bv = (G_IQ3XXS[gidx] >> (8u * bytej)) & 0xFFu;
+    float sign = (((signs >> j8) & 1u) != 0u) ? -1.0 : 1.0;
+    return db * float(sgn8(bv)) * sign;
+}
+#endif
+
+#if defined(FMT_IQ3S)
+float dq(uint g) {
+    uint b = g / 256u; uint p = g % 256u; uint bd = b * 110u;
+    float d = f16tof32(ru16(bd));
+    uint pair = p / 64u; uint grp = (p % 64u) / 32u; uint within = p % 32u; uint l = within / 8u; uint j8 = within % 8u;
+    uint sc = rb(bd + 106u + pair);
+    float db = (grp == 1u) ? (d * (1.0 + 2.0 * float(sc >> 4u))) : (d * (1.0 + 2.0 * float(sc & 0xFu)));
+    uint qh = rb(bd + 66u + pair * 2u + grp);
+    uint qs_base = bd + 2u + pair * 16u + grp * 8u;
+    uint signs_byte = rb(bd + 74u + pair * 8u + grp * 4u + l);
+    uint grididx; uint bytej;
+    if (j8 < 4u) { grididx = rb(qs_base + 2u * l) | ((qh << (8u - 2u * l)) & 256u); bytej = j8; }
+    else { grididx = rb(qs_base + 2u * l + 1u) | ((qh << (7u - 2u * l)) & 256u); bytej = j8 - 4u; }
+    uint bv = (G_IQ3S[grididx] >> (8u * bytej)) & 0xFFu;
+    float sign = (((signs_byte >> j8) & 1u) != 0u) ? -1.0 : 1.0;
+    return db * float(sgn8(bv)) * sign;
+}
+#endif
+
+#if defined(FMT_IQ1S)
+float dq(uint g) {
+    uint b = g / 256u; uint p = g % 256u; uint bd = b * 50u;
+    float d = f16tof32(ru16(bd));
+    uint ib = p / 32u; uint l = (p % 32u) / 8u; uint j = p % 8u;
+    uint qh = ru16(bd + 34u + 2u * ib);
+    float dl = d * (2.0 * float((qh >> 12u) & 7u) + 1.0);
+    float delta = ((qh & 0x8000u) != 0u) ? -0.125 : 0.125;
+    uint grid_idx = rb(bd + 2u + ib * 4u + l) | (((qh >> (3u * l)) & 7u) << 8u);
+    uint bv = (j < 4u) ? ((G_IQ1S[2u * grid_idx] >> (8u * j)) & 0xFFu)
+                       : ((G_IQ1S[2u * grid_idx + 1u] >> (8u * (j - 4u))) & 0xFFu);
+    return dl * (float(sgn8(bv)) + delta);
+}
+#endif
+
+#if defined(FMT_IQ1M)
+float dq(uint g) {
+    uint b = g / 256u; uint p = g % 256u; uint bd = b * 56u;
+    uint sc0 = ru16(bd + 48u); uint sc1 = ru16(bd + 50u); uint sc2 = ru16(bd + 52u); uint sc3 = ru16(bd + 54u);
+    uint d_bits = (sc0 >> 12u) | ((sc1 >> 8u) & 0xF0u) | ((sc2 >> 4u) & 0xF00u) | (sc3 & 0xF000u);
+    float d = f16tof32(d_bits);
+    uint ib = p / 32u; uint l = (p % 32u) / 8u; uint j = p % 8u;
+    uint scidx = ib / 2u; uint scw;
+    if (scidx == 0u) { scw = sc0; } else if (scidx == 1u) { scw = sc1; }
+    else if (scidx == 2u) { scw = sc2; } else { scw = sc3; }
+    float dl1 = d * (2.0 * float((scw >> (6u * (ib & 1u))) & 7u) + 1.0);
+    float dl2 = d * (2.0 * float((scw >> (6u * (ib & 1u) + 3u)) & 7u) + 1.0);
+    float dl = (l >= 2u) ? dl2 : dl1;
+    uint qh0 = rb(bd + 32u + ib * 2u); uint qh1 = rb(bd + 32u + ib * 2u + 1u);
+    uint grididx; bool deltaneg;
+    if (l == 0u) { grididx = rb(bd + ib * 4u) | ((qh0 << 8u) & 0x700u); deltaneg = (qh0 & 0x08u) != 0u; }
+    else if (l == 1u) { grididx = rb(bd + ib * 4u + 1u) | ((qh0 << 4u) & 0x700u); deltaneg = (qh0 & 0x80u) != 0u; }
+    else if (l == 2u) { grididx = rb(bd + ib * 4u + 2u) | ((qh1 << 8u) & 0x700u); deltaneg = (qh1 & 0x08u) != 0u; }
+    else { grididx = rb(bd + ib * 4u + 3u) | ((qh1 << 4u) & 0x700u); deltaneg = (qh1 & 0x80u) != 0u; }
+    float delta = deltaneg ? -0.125 : 0.125;
+    uint bv = (j < 4u) ? ((G_IQ1S[2u * grididx] >> (8u * j)) & 0xFFu)
+                       : ((G_IQ1S[2u * grididx + 1u] >> (8u * (j - 4u))) & 0xFFu);
+    return dl * (float(sgn8(bv)) + delta);
 }
 #endif
 
