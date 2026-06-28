@@ -1,0 +1,31 @@
+#version 460
+// f16-weight GEMV with fused residual: y = residual + x·Wᵀ. Cooperative-over-K; dispatch rows*out_f.
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint rows; uint in_f; uint out_f; } pc;
+layout(binding = 0) readonly buffer WB { float16_t w[]; }; // [out, in] f16
+layout(binding = 1) readonly buffer XB { float x[]; };     // [rows, in]
+layout(binding = 2) readonly buffer RB { float res[]; };   // [rows, out] residual
+layout(binding = 3) buffer YB { float y[]; };              // [rows, out]
+
+shared float red[64];
+
+void main() {
+    uint unit = gl_WorkGroupID.x;
+    uint o = unit % pc.out_f;
+    uint r = unit / pc.out_f;
+    uint t = gl_LocalInvocationID.x;
+    uint wbase = o * pc.in_f;
+    uint xbase = r * pc.in_f;
+    float acc = 0.0;
+    for (uint i = t; i < pc.in_f; i += 64u) { acc += float(w[wbase + i]) * x[xbase + i]; }
+    red[t] = acc;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride /= 2u) {
+        if (t < stride) { red[t] += red[t + stride]; }
+        barrier();
+    }
+    if (t == 0u) { y[unit] = res[unit] + red[0]; }
+}

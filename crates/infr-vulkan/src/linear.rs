@@ -18,46 +18,6 @@ use infr_core::{
 
 use super::{as_vk_buf, be, VulkanBackend};
 
-/// Like `LINEAR_WGSL` but adds a residual: `y = residual + x·Wᵀ`. `r_buf` and `y_buf` may alias
-/// (in-place residual): each invocation reads and writes only index `idx`, so it is safe.
-pub(crate) const LINEAR_RES_WGSL: &str = r#"
-enable f16;
-struct PushConstants { rows: u32, in_f: u32, out_f: u32 }
-var<immediate> pc: PushConstants;
-
-@group(0) @binding(0) var<storage, read>       w_buf: array<f16>; // [out, in] f16
-@group(0) @binding(1) var<storage, read>       x_buf: array<f32>; // [rows, in]
-@group(0) @binding(2) var<storage, read>       r_buf: array<f32>; // [rows, out] residual
-@group(0) @binding(3) var<storage, read_write> y_buf: array<f32>; // [rows, out]
-
-var<workgroup> red: array<f32, 64>;
-
-@compute @workgroup_size(64, 1, 1)
-fn main(@builtin(local_invocation_id) lid: vec3<u32>,
-        @builtin(workgroup_id) wid: vec3<u32>) {
-    let unit = wid.x;            // = r * out_f + o
-    let o = unit % pc.out_f;
-    let r = unit / pc.out_f;
-    let t = lid.x;
-    let wbase = o * pc.in_f;
-    let xbase = r * pc.in_f;
-    var acc: f32 = 0.0;
-    for (var i: u32 = t; i < pc.in_f; i = i + 64u) {
-        acc = acc + f32(w_buf[wbase + i]) * x_buf[xbase + i];
-    }
-    red[t] = acc;
-    workgroupBarrier();
-    var stride = 32u;
-    loop {
-        if stride == 0u { break; }
-        if t < stride { red[t] = red[t] + red[t + stride]; }
-        workgroupBarrier();
-        stride = stride / 2u;
-    }
-    if t == 0u { y_buf[unit] = r_buf[unit] + red[0]; }
-}
-"#;
-
 /// Unified quant dequant GEMV with fused residual add: `y = residual + x·Wᵀ`.
 pub(crate) const LINEAR_RES_Q_WGSL: &str = r#"
 enable f16;
