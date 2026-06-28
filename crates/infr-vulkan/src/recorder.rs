@@ -524,14 +524,32 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
+        self.linear_native_off(dtype, w, 0, x, y, rows, in_f, out_f);
+    }
+
+    /// Native-block dequant GEMV reading the weight from element offset `w_base` — lets one stacked
+    /// MoE expert tensor serve all experts (`w_base = expert_id * out_f * in_f`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_native_off(
+        &self,
+        dtype: infr_core::DType,
+        w: &dyn Buffer,
+        w_base: usize,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
         self.stamp("lm_head");
         let name = crate::linear::native_kernel_name(dtype, false);
         let spv = crate::gemm::native_build_spv(dtype, false).expect("native GEMV spv");
-        let k = self.be.kernel(name, spv, 3, 12);
-        let mut push = [0u8; 12];
+        let k = self.be.kernel(name, spv, 3, 16);
+        let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
         self.dispatch(
             k,
             &[Self::vkb(w), Self::vkb(x), Self::vkb(y)],
@@ -557,11 +575,12 @@ impl<'a> Recorder<'a> {
         self.stamp("o_or_down");
         let name = crate::linear::native_kernel_name(dtype, true);
         let spv = crate::gemm::native_build_spv(dtype, true).expect("native GEMV spv");
-        let k = self.be.kernel(name, spv, 4, 12);
-        let mut push = [0u8; 12];
+        let k = self.be.kernel(name, spv, 4, 16);
+        let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        // push[12..16] = w_base, 0 (residual native GEMV is not used for stacked experts).
         self.dispatch(
             k,
             &[

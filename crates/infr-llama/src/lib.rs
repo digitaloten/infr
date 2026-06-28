@@ -163,6 +163,17 @@ struct ExpertWt {
     down: ExpertW,
 }
 
+/// Stacked GPU expert bank: one Native buffer per role holding all experts contiguously, addressed
+/// by element offset (`expert_id * stride`). Lets the GPU-resident decode/prefill dispatch every
+/// expert from a single buffer (so an on-GPU router id can pick the expert — no host round-trip).
+/// Built only for fully-GPU, native-quant, non-offloaded models; offloaded models keep `experts`.
+struct MoeStacked {
+    gate: Wt,
+    up: Wt,
+    down: Wt,
+    stride: usize, // elements per expert (n_ff_exp * n_embd), identical for gate/up/down
+}
+
 /// A layer's FFN: dense fused gate‖up + down, or a routed MoE bank (router + per-expert weights).
 enum FfnWt {
     Dense {
@@ -171,7 +182,8 @@ enum FfnWt {
     },
     Moe {
         gate_inp: Wt,
-        experts: Vec<ExpertWt>,
+        experts: Vec<ExpertWt>, // empty when `stacked` is Some (per-expert buffers dropped)
+        stacked: Option<MoeStacked>,
     },
 }
 
@@ -204,8 +216,22 @@ impl LayerWeights {
     }
     fn moe(&self) -> (&Wt, &[ExpertWt]) {
         match &self.ffn {
-            FfnWt::Moe { gate_inp, experts } => (gate_inp, experts),
+            FfnWt::Moe {
+                gate_inp, experts, ..
+            } => (gate_inp, experts),
             FfnWt::Dense { .. } => panic!("dense layer has no MoE bank"),
+        }
+    }
+    /// The router weight + stacked expert bank, when this layer is a fully-GPU native MoE layer
+    /// (the GPU-resident decode/prefill path). `None` for offloaded / per-expert layers.
+    fn moe_stacked(&self) -> Option<(&Wt, &MoeStacked)> {
+        match &self.ffn {
+            FfnWt::Moe {
+                gate_inp,
+                stacked: Some(s),
+                ..
+            } => Some((gate_inp, s)),
+            _ => None,
         }
     }
 }
@@ -1724,6 +1750,8 @@ fn load_moe(
     prefix: &str,
     n_expert: usize,
     on_cpu: bool,
+    build_stacked: bool,
+    stride_elems: usize,
 ) -> Result<FfnWt> {
     let gate_inp = upload_wt(be, g, &format!("{prefix}ffn_gate_inp.weight"))?;
     let stacked = |role: &str| -> Result<(infr_core::DType, &[u8])> {
@@ -1740,6 +1768,27 @@ fn load_moe(
     let (gdt, gbytes) = stacked("gate")?;
     let (udt, ubytes) = stacked("up")?;
     let (ddt, dbytes) = stacked("down")?;
+
+    // Fully-GPU native model: upload each role's whole `*_exps` tensor as ONE Native buffer and
+    // address experts by element offset. Per-expert buffers are dropped (same VRAM, one allocation),
+    // and the on-GPU router can index experts without a host round-trip.
+    let native_ok = [gdt, udt, ddt]
+        .iter()
+        .all(|&d| use_native_for(d) && is_native_supported(d));
+    if build_stacked && !on_cpu && native_ok {
+        let mk = |dt, b| upload_wt_bytes(be, dt, b);
+        return Ok(FfnWt::Moe {
+            gate_inp,
+            experts: Vec::new(),
+            stacked: Some(MoeStacked {
+                gate: mk(gdt, gbytes)?,
+                up: mk(udt, ubytes)?,
+                down: mk(ddt, dbytes)?,
+                stride: stride_elems,
+            }),
+        });
+    }
+
     let (gstride, ustride, dstride) = (
         gbytes.len() / n_expert,
         ubytes.len() / n_expert,
@@ -1762,7 +1811,11 @@ fn load_moe(
             down: place(ddt, &dbytes[e * dstride..(e + 1) * dstride])?,
         });
     }
-    Ok(FfnWt::Moe { gate_inp, experts })
+    Ok(FfnWt::Moe {
+        gate_inp,
+        experts,
+        stacked: None,
+    })
 }
 
 impl Llama {
@@ -1999,7 +2052,15 @@ impl Llama {
                 .map_err(|e| anyhow!("upload ffn_norm {l}: {e}"))?;
             // MoE layer: router + per-expert bank. Dense layer: fused gate‖up + down.
             let ffn = if let Some(mc) = moe {
-                load_moe(&be, &g, &format!("blk.{l}."), mc.n_expert, l < n_cpu_moe)?
+                load_moe(
+                    &be,
+                    &g,
+                    &format!("blk.{l}."),
+                    mc.n_expert,
+                    l < n_cpu_moe,
+                    n_cpu_moe == 0,
+                    mc.n_ff_exp * n_embd,
+                )?
             } else {
                 FfnWt::Dense {
                     wgateup: build_wgateup(&be, &g, &format!("blk.{l}."))?,
@@ -3514,7 +3575,7 @@ impl Llama {
                 ne,
                 c.rms_eps,
             );
-            let (gate_inp, experts) = layer.moe();
+            let (gate_inp, st) = layer.moe_stacked().expect("stacked experts");
             rec_linear(
                 &rec,
                 gate_inp,
@@ -3534,21 +3595,25 @@ impl Llama {
             let (idx, weights) = moe_topk(bytemuck::cast_slice(&lb), &mc);
 
             // recorder 2: selected experts' FFN, accumulated into the resident hidden on the GPU.
+            // Each expert is addressed by element offset into the stacked role buffer.
             let rec2 = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
             for (ki, &e) in idx.iter().enumerate() {
-                let ew = &experts[e];
-                rec_linear(
+                rec_linear_expert(
                     &rec2,
-                    ew.gate.gpu(),
+                    &st.gate,
+                    e,
+                    st.stride,
                     hn2.as_ref(),
                     g.as_ref(),
                     1,
                     ne,
                     mc.n_ff_exp,
                 );
-                rec_linear(
+                rec_linear_expert(
                     &rec2,
-                    ew.up.gpu(),
+                    &st.up,
+                    e,
+                    st.stride,
                     hn2.as_ref(),
                     u.as_ref(),
                     1,
@@ -3556,9 +3621,11 @@ impl Llama {
                     mc.n_ff_exp,
                 );
                 rec2.silu_mul(g.as_ref(), u.as_ref(), act.as_ref(), mc.n_ff_exp);
-                rec_linear(
+                rec_linear_expert(
                     &rec2,
-                    ew.down.gpu(),
+                    &st.down,
+                    e,
+                    st.stride,
                     act.as_ref(),
                     y.as_ref(),
                     1,
@@ -3747,7 +3814,7 @@ impl Llama {
                 ne,
                 c.rms_eps,
             );
-            let (gate_inp, experts) = layer.moe();
+            let (gate_inp, st) = layer.moe_stacked().expect("stacked experts");
             rec_linear(
                 &rec,
                 gate_inp,
@@ -3798,12 +3865,41 @@ impl Llama {
                     al(m * nff)?,
                     al(m * ne)?,
                 );
-                let ew = &experts[e];
                 rec2.gather_rows(hn2.as_ref(), idxb.as_ref(), xe.as_ref(), m, ne);
-                rec_linear(&rec2, ew.gate.gpu(), xe.as_ref(), ge.as_ref(), m, ne, nff);
-                rec_linear(&rec2, ew.up.gpu(), xe.as_ref(), ue.as_ref(), m, ne, nff);
+                rec_linear_expert(
+                    &rec2,
+                    &st.gate,
+                    e,
+                    st.stride,
+                    xe.as_ref(),
+                    ge.as_ref(),
+                    m,
+                    ne,
+                    nff,
+                );
+                rec_linear_expert(
+                    &rec2,
+                    &st.up,
+                    e,
+                    st.stride,
+                    xe.as_ref(),
+                    ue.as_ref(),
+                    m,
+                    ne,
+                    nff,
+                );
                 rec2.silu_mul(ge.as_ref(), ue.as_ref(), ae.as_ref(), m * nff);
-                rec_linear(&rec2, ew.down.gpu(), ae.as_ref(), ye.as_ref(), m, nff, ne);
+                rec_linear_expert(
+                    &rec2,
+                    &st.down,
+                    e,
+                    st.stride,
+                    ae.as_ref(),
+                    ye.as_ref(),
+                    m,
+                    nff,
+                    ne,
+                );
                 rec2.scatter_add_rows(
                     ye.as_ref(),
                     idxb.as_ref(),
@@ -3862,10 +3958,10 @@ impl Llama {
     /// cache (so decode steps process only the new token, not the whole sequence). Returns logits
     /// (`vocab`) for the last token. Same math as [`forward_moe`] but cached.
     pub fn forward_moe_chunk(&self, tokens: &[u32], kv: &mut MoeKv) -> Result<Vec<f32>> {
-        // All experts GPU-resident → fully GPU-resident path (no per-matmul host round-trip):
-        // single-token decode, or grouped-by-expert prefill for a multi-token chunk. Offloaded-expert
-        // layers (host/stream) use the eager path.
-        if !self.layers[0].moe().1[0].gate.is_cpu() {
+        // Stacked GPU expert bank → fully GPU-resident path (no per-matmul host round-trip):
+        // single-token decode, or grouped-by-expert prefill for a multi-token chunk. Offloaded /
+        // per-expert layers use the eager path.
+        if self.layers[0].moe_stacked().is_some() {
             return if tokens.len() == 1 {
                 self.forward_moe_chunk_gpu(tokens[0], kv)
             } else {
@@ -4344,6 +4440,35 @@ fn silu(x: f32) -> f32 {
 }
 
 /// Dispatch a [`Wt`] linear (`y = x·Wᵀ`) into a recorder, picking the f16 / quant / native op.
+/// Dispatch a stacked MoE expert's linear (`y = x·W_eᵀ`): the weight is `expert * stride` elements
+/// into the role's stacked Native buffer. Stacked experts are native-only (see [`load_moe`]).
+#[allow(clippy::too_many_arguments)]
+fn rec_linear_expert(
+    rec: &infr_vulkan::Recorder,
+    w: &Wt,
+    expert: usize,
+    stride: usize,
+    x: &dyn Buffer,
+    y: &dyn Buffer,
+    rows: usize,
+    in_f: usize,
+    out_f: usize,
+) {
+    match w {
+        Wt::Native { buf, dtype } => rec.linear_native_off(
+            *dtype,
+            buf.as_ref(),
+            expert * stride,
+            x,
+            y,
+            rows,
+            in_f,
+            out_f,
+        ),
+        _ => unreachable!("stacked MoE experts are native-only"),
+    }
+}
+
 fn rec_linear(
     rec: &infr_vulkan::Recorder,
     w: &Wt,

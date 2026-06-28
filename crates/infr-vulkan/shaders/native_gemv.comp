@@ -6,7 +6,8 @@
 // residual. Build-compiled by build.rs into one .spv per (format, residual).
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-layout(push_constant) uniform PC { uint rows; uint in_f; uint out_f; } pc;
+// w_base: element offset into the weight grid (for stacked MoE experts: expert_id * out_f * in_f).
+layout(push_constant) uniform PC { uint rows; uint in_f; uint out_f; uint w_base; } pc;
 layout(binding = 0) readonly buffer WB { uint nw[]; };
 layout(binding = 1) readonly buffer XB { float x_buf[]; };
 #ifdef USE_RES
@@ -34,7 +35,7 @@ void main() {
     uint o = unit % pc.out_f;
     uint r = unit / pc.out_f;
     uint t = gl_LocalInvocationID.x;
-    uint wbase = o * pc.in_f;
+    uint wbase = pc.w_base + o * pc.in_f;
     uint xbase = r * pc.in_f;
     uint nsub = pc.in_f / 32u;
     float acc = 0.0;
