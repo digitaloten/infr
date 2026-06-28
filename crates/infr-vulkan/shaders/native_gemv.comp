@@ -316,19 +316,18 @@ float dq(uint g) {
     return d * float(sc) * (float(q) - 32.0);
 }
 #define HAVE_DQSUB
-float dqsub(uint gstart, uint xoff) {  // 32-elem run: hf/og/d constant; hoist them, sc per 16.
+float dqsub(uint gstart, uint xoff) {  // 32-elem run: hf/og/d constant; hoist branch, one ql byte/elem.
     uint bd = (gstart / 256u) * 210u; uint p0 = gstart % 256u;
     float d = f16tof32(ru16(bd + 208u));
     uint hf = p0 / 128u; uint og = (p0 % 128u) / 32u;
-    uint qlo = hf * 64u; uint qho = hf * 32u; uint scbase = bd + 192u + hf * 8u + 2u * og;
+    uint qho = hf * 32u; uint scbase = bd + 192u + hf * 8u + 2u * og;
+    bool useB = (og & 1u) == 1u; bool high = og >= 2u; uint qshift = og * 2u;
+    uint qoff = bd + hf * 64u + (useB ? 32u : 0u);  // pick qa/qb half once
     float a = 0.0;
     for (uint w = 0u; w < 32u; w++) {
-        uint qa = rb(bd + qlo + w); uint qb = rb(bd + qlo + w + 32u); uint qh = rb(bd + 128u + qho + w);
-        uint q;
-        if (og == 0u) { q = (qa & 0xFu) | ((qh & 3u) << 4u); }
-        else if (og == 1u) { q = (qb & 0xFu) | (((qh >> 2u) & 3u) << 4u); }
-        else if (og == 2u) { q = (qa >> 4u) | (((qh >> 4u) & 3u) << 4u); }
-        else { q = (qb >> 4u) | (((qh >> 6u) & 3u) << 4u); }
+        uint base = rb(qoff + w); uint qh = rb(bd + 128u + qho + w);
+        uint nib = high ? (base >> 4u) : (base & 0xFu);
+        uint q = nib | (((qh >> qshift) & 3u) << 4u);
         int sc = sgn8(rb(scbase + w / 16u));
         a += d * float(sc) * (float(q) - 32.0) * x_buf[xoff + w];
     }
