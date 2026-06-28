@@ -135,6 +135,12 @@ pub(crate) fn native_idm_build_spv(dtype: infr_core::DType) -> Option<&'static [
         _ => return None,
     })
 }
+/// SPIR-V for the multi-slot id-indexed Q4_K dp4a (mmq) GEMV.
+pub(crate) fn native_mmv_id_q4k_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_mmv_id_q4k.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for the MoE weighted-accumulate (sum of selected experts' down outputs into hidden).
 pub(crate) fn moe_accumulate_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_accumulate.spv"));

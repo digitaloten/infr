@@ -208,6 +208,7 @@ fn main() {
         ("native_gemv_id_multi", "native_idm_q5k", &["-DFMT_Q5K"]),
         ("native_gemv_id_multi", "native_idm_q6k", &["-DFMT_Q6K"]),
         ("moe_accumulate", "moe_accumulate", &[]),
+        ("native_mmv_id_q4k", "native_mmv_id_q4k", &[]),
         ("moe_topk", "moe_topk", &[]),
         ("argmax", "argmax", &[]),
         ("moe_sample", "moe_sample", &[]),

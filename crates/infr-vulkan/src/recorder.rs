@@ -1769,6 +1769,84 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Quantize f32 activations `a` [m,k] → int8 `qa` [m,k] + per-32-block f16 `dact`/`sact`
+    /// ([m, k/32]) for the dp4a mmq matmul. (Pass 1 of mmq, reusable standalone.)
+    pub fn quant_q8(
+        &self,
+        a: &dyn Buffer,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: &dyn Buffer,
+        m: usize,
+        k: usize,
+    ) {
+        self.stamp("quant_q8");
+        let kq = self
+            .be
+            .kernel_sg("quant_q8", crate::gemm::quant_q8_spv(), 4, 12, 32);
+        let mut p = [0u8; 12];
+        p[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        p[4..8].copy_from_slice(&(k as u32).to_ne_bytes());
+        p[8..12].copy_from_slice(&32u32.to_ne_bytes());
+        self.dispatch(
+            kq,
+            &[
+                Self::vkb(a),
+                Self::vkb(qa),
+                Self::vkb(dact),
+                Self::vkb(sact),
+            ],
+            3,
+            &p,
+            (m * (k / 32)) as u32,
+        );
+    }
+
+    /// Multi-slot id-indexed Q4_K dp4a (mmq) GEMV: like `linear_native_id_multi` but using hardware
+    /// int8 dot-product against pre-quantized activations (`qa`/`dact`/`sact` from `quant_q8`, shared
+    /// across slots). Q4_K weights only. `y` is [n_used, out_f].
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_mmv_id_multi_q4k(
+        &self,
+        w: &dyn Buffer,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: &dyn Buffer,
+        ids: &dyn Buffer,
+        n_used: usize,
+        stride: usize,
+        y: &dyn Buffer,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.stamp("mmq_expert");
+        let k = self.be.kernel(
+            "native_mmv_id_q4k",
+            crate::gemm::native_mmv_id_q4k_spv(),
+            6,
+            16,
+        );
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(n_used as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(stride as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[
+                Self::vkb(w),
+                Self::vkb(qa),
+                Self::vkb(dact),
+                Self::vkb(sact),
+                Self::vkb(ids),
+                Self::vkb(y),
+            ],
+            1,
+            &push,
+            (n_used * out_f) as u32,
+        );
+    }
+
     /// Weighted accumulate of all selected experts' down outputs into hidden:
     /// `hidden[i] += Σ_slot wts[slot] * down[slot*ne + i]`. Folds the per-expert axpys into one op.
     pub fn moe_accumulate(

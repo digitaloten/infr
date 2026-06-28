@@ -3598,6 +3598,19 @@ impl Llama {
         } else {
             (None, None)
         };
+        // Q4_K experts → mmq (dp4a): quantize the ffn-normed row to int8 once (shared by gate+up).
+        let ab = |bytes: usize| {
+            self.be
+                .alloc(bytes.max(4), BufferUsage::Activations)
+                .map_err(|e| anyhow!("{e}"))
+        };
+        let mmq = gpu_route && matches!(gate_dtype, infr_core::DType::Q4K);
+        let nblk = ne / 32;
+        let (qa, dact, sact) = if mmq {
+            (Some(ab(ne)?), Some(ab(nblk * 2)?), Some(ab(nblk * 2)?))
+        } else {
+            (None, None, None)
+        };
         // split-K decode attention scratch (parallelize the KV reduction at depth)
         let chunk = (kv_len / 32).clamp(64, 512);
         let use_split = kv_len > chunk;
@@ -3727,30 +3740,59 @@ impl Llama {
                 let (ud, ub) = native_parts(&st.up);
                 let (dd, db) = native_parts(&st.down);
                 let nu = mc.n_used;
-                rec.linear_native_id_multi(
-                    gd,
-                    gb,
-                    ids.as_ref(),
-                    nu,
-                    st.stride,
-                    hn2.as_ref(),
-                    false,
-                    g.as_ref(),
-                    ne,
-                    mc.n_ff_exp,
-                );
-                rec.linear_native_id_multi(
-                    ud,
-                    ub,
-                    ids.as_ref(),
-                    nu,
-                    st.stride,
-                    hn2.as_ref(),
-                    false,
-                    u.as_ref(),
-                    ne,
-                    mc.n_ff_exp,
-                );
+                if let (Some(qa), Some(da), Some(sa)) = (&qa, &dact, &sact) {
+                    // Q4_K gate/up via dp4a (mmq): quantize the ffn-normed row to int8 once, shared.
+                    rec.quant_q8(hn2.as_ref(), qa.as_ref(), da.as_ref(), sa.as_ref(), 1, ne);
+                    rec.linear_mmv_id_multi_q4k(
+                        gb,
+                        qa.as_ref(),
+                        da.as_ref(),
+                        sa.as_ref(),
+                        ids.as_ref(),
+                        nu,
+                        st.stride,
+                        g.as_ref(),
+                        ne,
+                        mc.n_ff_exp,
+                    );
+                    rec.linear_mmv_id_multi_q4k(
+                        ub,
+                        qa.as_ref(),
+                        da.as_ref(),
+                        sa.as_ref(),
+                        ids.as_ref(),
+                        nu,
+                        st.stride,
+                        u.as_ref(),
+                        ne,
+                        mc.n_ff_exp,
+                    );
+                } else {
+                    rec.linear_native_id_multi(
+                        gd,
+                        gb,
+                        ids.as_ref(),
+                        nu,
+                        st.stride,
+                        hn2.as_ref(),
+                        false,
+                        g.as_ref(),
+                        ne,
+                        mc.n_ff_exp,
+                    );
+                    rec.linear_native_id_multi(
+                        ud,
+                        ub,
+                        ids.as_ref(),
+                        nu,
+                        st.stride,
+                        hn2.as_ref(),
+                        false,
+                        u.as_ref(),
+                        ne,
+                        mc.n_ff_exp,
+                    );
+                }
                 rec.silu_mul(g.as_ref(), u.as_ref(), act.as_ref(), nu * mc.n_ff_exp);
                 rec.linear_native_id_multi(
                     dd,
