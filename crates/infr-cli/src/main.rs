@@ -584,6 +584,9 @@ fn cmd_compare(
     use std::process::Command;
     let exe = std::env::current_exe().context("locating the infr binary")?;
     let reps_s = reps.to_string();
+    // llama-bench can't resolve infr's `hf:`/`ollama:` refs — give it the local GGUF blob path.
+    let model_path = resolve(model)?.0;
+    let model_path = model_path.to_string_lossy().into_owned();
 
     // Run `infr bench` (this binary) and read its single-row [{"avg_ts":X}].
     let infr_b = |args: &[&str]| -> anyhow::Result<f64> {
@@ -609,14 +612,34 @@ fn cmd_compare(
     let llama_b = |np: usize, ng: usize, args: &[&str]| -> Option<f64> {
         let mut c = Command::new(llama_bench);
         c.args([
-            "-m", model, "-ngl", "99", "-dev", dev, "-fa", "auto", "-r", &reps_s, "-o", "json",
+            "-m",
+            &model_path,
+            "-ngl",
+            "99",
+            "-dev",
+            dev,
+            "-fa",
+            "auto",
+            "-r",
+            &reps_s,
+            "-o",
+            "json",
         ]);
         if ubatch > 0 {
             c.args(["-ub", &ubatch.to_string()]);
         }
         c.args(args);
         let out = c.output().ok()?;
-        let rows: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+        let rows: serde_json::Value = match serde_json::from_slice(&out.stdout) {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!(
+                    "llama-bench failed (np={np} ng={ng}): {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                return None;
+            }
+        };
         rows.as_array()?.iter().find_map(|r| {
             let p = r["n_prompt"].as_u64()? as usize;
             let g = r["n_gen"].as_u64()? as usize;
