@@ -89,10 +89,10 @@ attn_output.
 
 ## GPU situation (corrected)
 
-ggml's **Vulkan** backend does NOT implement the SSM ops (gated_delta_net,
+ggml's **Vulkan** backend does NOT implement the SSM ops (gated*delta_net,
 ssm_conv), but ggml's scheduler **falls back to CPU per-unsupported-op**, so
 `llama-cli -ngl 99 -dev Vulkan0` RUNS qwen35 as a CPU+GPU **hybrid** (not an
-error). (ggml's CUDA backend _does_ implement them → full GPU on NVIDIA.)
+error). (ggml's CUDA backend \_does* implement them → full GPU on NVIDIA.)
 Benchmark (Qwen3.5-0.8B-Q4, 7900 XTX, llama.cpp):
 
 | test  | pure CPU `-ngl 0` | Vulkan hybrid `-ngl 99` | speedup |

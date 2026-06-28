@@ -73,14 +73,10 @@ recurrent conv/SSM state + KV cache), `generate()`. Two ignored tests
 (`loads_and_dims` passes; `greedy_generate`). Registered `pub mod qwen35;` in
 lib.rs.
 
-**STATUS: forward compiles + runs end-to-end but output is GARBAGE.** Per-layer
-hidden RMS is healthy and finite (0.04→0.6, no blow-up) → a SUBTLE
-layout/numeric bug, not instability. Linear path re-verified on paper (matvec
-orientation, q/k/v split, recurrence indexing, gated norm all match refs). Prime
-suspect: **conv tap order / `ggml_ssm_conv` weight convention** (corrupts all 18
-linear layers without blowing norms = exact symptom). UNCOMMITTED debug toggles
-in forward: `Q35_DBG` (per-layer norms), `Q35_NOLIN`, `Q35_NOATTN` (zero a mixer
-type to bisect linear vs attention).
+**STATUS: CPU reference correct & wired into `infr run`** (see top section). The
+bug that was fixed: attention q/gate interleaved-per-head split. Debug toggles
+(committed, env-gated): `Q35_DBG` (per-layer norms), `Q35_NOLIN`/`Q35_NOATTN`
+(zero a mixer to bisect — how the bug was localized).
 
 **Next steps (CPU reference is DONE + wired into `infr run`):**
 

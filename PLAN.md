@@ -50,9 +50,9 @@ infr serve <model-ref>        # start the OpenAI-compatible HTTP API
   cache. References:
   - `hf:org/repo[:file.gguf]` — HuggingFace (resolve repo, pick/verify the
     GGUF).
-  - `ollama:name[:tag]` — Ollama registry pull (or reuse an already-pulled local
-    model).
+  - `ollama:`/`ol:` `name[:tag]` — standalone Ollama registry pull (HTTP).
   - a plain filesystem path to a `.gguf`.
+  - (also: `infr bench` and `infr compare` for tok/s benchmarking vs llama.cpp.)
 - **`infr run`** — load the model on the backend and drop into a simple REPL
   chat in the terminal (streams tokens, shows reasoning vs answer). Auto-pulls
   if not cached.
@@ -251,28 +251,27 @@ infr/
 
 - Resolve a model reference to a concrete local GGUF path, downloading + caching
   if needed.
-- **The Ollama store is infr's primary cache — same dir + same on-disk format.**
-  So a user who already has Ollama models keeps using them with zero
-  re-download, and anything `infr pull`s is also visible to `ollama` (and vice
-  versa). One shared model library, not two.
-  - Location: `$OLLAMA_MODELS` if set, else `~/.ollama/models` (override with
-    `INFR_MODELS`). Layout: `manifests/<registry>/<ns>/<name>/<tag>` (OCI-style
-    JSON) + `blobs/sha256-<digest>`.
+- **infr has its OWN store** (we do NOT touch the system Ollama dirs — the
+  root-owned `/var/lib/ollama` caused permission failures). The on-disk layout
+  is still OCI/Ollama-style (content-addressed blobs dedup naturally), just
+  under our own root.
+  - Location: `$INFR_MODELS` if set, else `$XDG_CACHE_HOME/infr/models`
+    (`~/.cache/infr/models`). Layout:
+    `manifests/registry.ollama.ai/<ns>/<name>/<tag>` (ollama) +
+    `manifests/huggingface.co/<org>/<repo>/<file>` (hf) +
+    `blobs/sha256-<digest>`.
   - Resolve a tag: read its manifest, find the layer with mediaType
-    `application/vnd.ollama.image.model` → that blob **is** the GGUF; `mmap` it
-    in place (no copy). Optionally read the `template` / `params` / `system`
-    layers too (handy chat-template/defaults source).
-  - `infr pull ollama:name[:tag]` fetches via the Ollama registry pull protocol
-    (`registry.ollama.ai`) and writes blobs + manifest in this exact format, so
-    the result is a normal Ollama model.
-- **HuggingFace** (`hf:org/repo[:file]`): hub HTTP API — resolve repo, list
-  siblings, pick/verify the `.gguf`, download via `resolve/main/...` with
-  resume, honor `HF_TOKEN` for gated repos. Imported into the same store as a
-  synthesized manifest + the GGUF blob (so HF and Ollama pulls live side by
-  side).
+    `application/vnd.ollama.image.model` → that blob **is** the GGUF.
+- **Ollama** (`ollama:`/`ol:` `name[:tag]`): standalone registry pull over plain
+  HTTP (`registry.ollama.ai/v2/...` manifest + blobs) — no `ollama` CLI invoked.
+  Writes blobs + manifest into our store; digest-verified.
+- **HuggingFace** (`hf:`/`huggingface:` `org/repo[:file]`): hub HTTP API —
+  resolve repo, list siblings, pick/verify the `.gguf`, download via
+  `resolve/main/...` with resume, honor `HF_TOKEN`. Writes a synthesized
+  manifest + the GGUF blob.
 - A plain filesystem path to a `.gguf` is used as-is (no copy into the store).
-- Streaming download with progress; checksum/digest verification. `infr pull` is
-  just this step; `run`/`serve` call it lazily.
+- Both pulls: streaming with resume (HTTP Range), idempotent (skip if blob
+  present), digest-verified, shared auto-width progress bar. No external CLI.
 
 ### loader / GGUF (`infr-gguf`)
 
@@ -466,7 +465,7 @@ so the implementer knows the shape up front.
 | --- | ------------ | -------------------------------------------------------------------- |
 | 1   | smoke        | f16 coop-matrix matmul on the GPU matches CPU within tolerance       |
 | 2   | core         | `Tensor`/`Graph`/`Op`/`Backend` compile; a 2-op graph runs on Vulkan |
-| 3   | `infr pull`  | `ollama:` reuses `~/.ollama` with no re-download; `hf:` downloads    |
+| 3   | `infr pull`  | `hf:`/`ollama:` standalone HTTP pull into our own store; resumable   |
 | 4   | vk backend   | matmul/dequant/rmsnorm/rope/softmax each validated vs CPU            |
 | 5   | gguf load    | DiffusionGemma weights upload; tokenizer + template exposed          |
 | 6   | forward      | final logits match llama.cpp top-k on a fixed prompt                 |
