@@ -109,6 +109,38 @@ pub(crate) fn native_id_build_spv(dtype: infr_core::DType) -> Option<&'static [u
         _ => return None,
     })
 }
+/// SPIR-V for the multi-slot id-indexed native GEMV (all n_used experts in one dispatch).
+pub(crate) fn native_idm_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            S.get_or_init(|| {
+                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+            })
+            .as_slice()
+        }};
+    }
+    Some(match dtype {
+        Q8_0 => v!("native_idm_q8_0"),
+        Q4_0 => v!("native_idm_q4_0"),
+        Q4_1 => v!("native_idm_q4_1"),
+        Q5_0 => v!("native_idm_q5_0"),
+        Q5_1 => v!("native_idm_q5_1"),
+        Q2K => v!("native_idm_q2k"),
+        Q3K => v!("native_idm_q3k"),
+        Q4K => v!("native_idm_q4k"),
+        Q5K => v!("native_idm_q5k"),
+        Q6K => v!("native_idm_q6k"),
+        _ => return None,
+    })
+}
+/// SPIR-V for the MoE weighted-accumulate (sum of selected experts' down outputs into hidden).
+pub(crate) fn moe_accumulate_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_accumulate.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for the GPU MoE router top-k.
 pub(crate) fn moe_topk_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_topk.spv"));

@@ -46,6 +46,24 @@ pub fn native_id_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
     })
 }
 
+/// Kernel cache name for the multi-slot id-indexed native GEMV; `None` for formats without it.
+pub fn native_idm_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
+    use infr_core::DType::*;
+    Some(match dtype {
+        Q8_0 => "native_idm_q8_0",
+        Q4_0 => "native_idm_q4_0",
+        Q4_1 => "native_idm_q4_1",
+        Q5_0 => "native_idm_q5_0",
+        Q5_1 => "native_idm_q5_1",
+        Q2K => "native_idm_q2k",
+        Q3K => "native_idm_q3k",
+        Q4K => "native_idm_q4k",
+        Q5K => "native_idm_q5k",
+        Q6K => "native_idm_q6k",
+        _ => return None,
+    })
+}
+
 pub fn native_kernel_name(dtype: infr_core::DType, residual: bool) -> &'static str {
     use infr_core::DType::*;
     match (dtype, residual) {

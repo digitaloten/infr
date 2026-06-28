@@ -3579,11 +3579,13 @@ impl Llama {
             .alloc(nh * hd * 2, BufferUsage::Activations)
             .map_err(|e| anyhow!("{e}"))?;
         let attn = al(nh * hd)?;
+        // Sized for the fused multi-slot FFN ([n_used, n_ff] gate/up/act, [n_used, ne] down); the
+        // host-fallback per-expert path uses the [0..] prefix of each.
         let (g, u, act, y) = (
-            al(mc.n_ff_exp)?,
-            al(mc.n_ff_exp)?,
-            al(mc.n_ff_exp)?,
-            al(ne)?,
+            al(mc.n_used * mc.n_ff_exp)?,
+            al(mc.n_used * mc.n_ff_exp)?,
+            al(mc.n_used * mc.n_ff_exp)?,
+            al(mc.n_used * ne)?,
         );
         let logits = al(mc.n_expert)?;
         // GPU-resident routing when the expert format has an id-indexed GEMV: top-k + expert ids and
@@ -3719,49 +3721,50 @@ impl Llama {
                     mc.n_used,
                     mc.scale,
                 );
+                // Fused: all n_used experts per role in ONE dispatch (concurrent, no inter-expert
+                // barrier). gate/up read the shared ffn-normed row; down reads each slot's activation.
                 let (gd, gb) = native_parts(&st.gate);
                 let (ud, ub) = native_parts(&st.up);
                 let (dd, db) = native_parts(&st.down);
-                for slot in 0..mc.n_used {
-                    rec.linear_native_id(
-                        gd,
-                        gb,
-                        ids.as_ref(),
-                        slot,
-                        st.stride,
-                        hn2.as_ref(),
-                        g.as_ref(),
-                        1,
-                        ne,
-                        mc.n_ff_exp,
-                    );
-                    rec.linear_native_id(
-                        ud,
-                        ub,
-                        ids.as_ref(),
-                        slot,
-                        st.stride,
-                        hn2.as_ref(),
-                        u.as_ref(),
-                        1,
-                        ne,
-                        mc.n_ff_exp,
-                    );
-                    rec.silu_mul(g.as_ref(), u.as_ref(), act.as_ref(), mc.n_ff_exp);
-                    rec.linear_native_id(
-                        dd,
-                        db,
-                        ids.as_ref(),
-                        slot,
-                        st.stride,
-                        act.as_ref(),
-                        y.as_ref(),
-                        1,
-                        mc.n_ff_exp,
-                        ne,
-                    );
-                    rec.add_scaled_id(y.as_ref(), wts.as_ref(), slot, hidden.as_ref(), ne);
-                }
+                let nu = mc.n_used;
+                rec.linear_native_id_multi(
+                    gd,
+                    gb,
+                    ids.as_ref(),
+                    nu,
+                    st.stride,
+                    hn2.as_ref(),
+                    false,
+                    g.as_ref(),
+                    ne,
+                    mc.n_ff_exp,
+                );
+                rec.linear_native_id_multi(
+                    ud,
+                    ub,
+                    ids.as_ref(),
+                    nu,
+                    st.stride,
+                    hn2.as_ref(),
+                    false,
+                    u.as_ref(),
+                    ne,
+                    mc.n_ff_exp,
+                );
+                rec.silu_mul(g.as_ref(), u.as_ref(), act.as_ref(), nu * mc.n_ff_exp);
+                rec.linear_native_id_multi(
+                    dd,
+                    db,
+                    ids.as_ref(),
+                    nu,
+                    st.stride,
+                    act.as_ref(),
+                    true,
+                    y.as_ref(),
+                    mc.n_ff_exp,
+                    ne,
+                );
+                rec.moe_accumulate(y.as_ref(), wts.as_ref(), hidden.as_ref(), ne, nu);
                 rec.finish().map_err(|e| anyhow!("{e}"))?;
             } else {
                 // Fallback (non-id-capable expert format): host top-k between two recorders.

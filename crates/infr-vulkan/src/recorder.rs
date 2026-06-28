@@ -1733,6 +1733,67 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Multi-slot id GEMV: all `n_used` experts in ONE dispatch → `y` is [n_used, out_f]. The experts
+    /// run concurrently (no inter-expert barrier). `x_per_slot`: false → all slots read the same row
+    /// `x` (gate/up); true → slot reads `x[slot*in_f..]` (down). Decode FFN fusion.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_native_id_multi(
+        &self,
+        dtype: infr_core::DType,
+        w: &dyn Buffer,
+        ids: &dyn Buffer,
+        n_used: usize,
+        stride: usize,
+        x: &dyn Buffer,
+        x_per_slot: bool,
+        y: &dyn Buffer,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.stamp("lm_head");
+        let name = crate::linear::native_idm_kernel_name(dtype).expect("native idm kernel");
+        let spv = crate::gemm::native_idm_build_spv(dtype).expect("native idm spv");
+        let k = self.be.kernel(name, spv, 4, 20);
+        let mut push = [0u8; 20];
+        push[0..4].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(n_used as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(stride as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(x_per_slot as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(w), Self::vkb(x), Self::vkb(ids), Self::vkb(y)],
+            1,
+            &push,
+            (n_used * out_f) as u32,
+        );
+    }
+
+    /// Weighted accumulate of all selected experts' down outputs into hidden:
+    /// `hidden[i] += Σ_slot wts[slot] * down[slot*ne + i]`. Folds the per-expert axpys into one op.
+    pub fn moe_accumulate(
+        &self,
+        down: &dyn Buffer,
+        wts: &dyn Buffer,
+        hidden: &dyn Buffer,
+        ne: usize,
+        n_used: usize,
+    ) {
+        let k = self
+            .be
+            .kernel("moe_accumulate", crate::gemm::moe_accumulate_spv(), 3, 8);
+        let mut push = [0u8; 8];
+        push[0..4].copy_from_slice(&(ne as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n_used as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(down), Self::vkb(wts), Self::vkb(hidden)],
+            1,
+            &push,
+            (ne as u32).div_ceil(64),
+        );
+    }
+
     /// `acc += wts[slot] * x` (indexed axpy) — the scale is read from a GPU buffer (the on-GPU router
     /// weights), so the weighted MoE expert accumulate needs no host scale.
     pub fn add_scaled_id(

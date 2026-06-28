@@ -1,0 +1,46 @@
+#version 460
+// Multi-slot id-indexed native GEMV: computes ALL n_used selected experts in one dispatch, so the
+// experts run concurrently (n_used*out_f workgroups) instead of serially with a barrier between each
+// (the decode FFN bottleneck). Workgroup `unit` → slot = unit / out_f, output row o = unit % out_f;
+// the expert is ids[slot], weight base = ids[slot]*stride + o*in_f. `x_per_slot` selects shared input
+// (gate/up read the single ffn-normed row) vs per-slot input (down reads each expert's activation).
+// Output y is [n_used, out_f]. Same cooperative-over-K dequant as native_gemv (-DFMT_* per format).
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC { uint in_f; uint out_f; uint n_used; uint stride; uint x_per_slot; } pc;
+layout(binding = 0) readonly buffer WB { uint nw[]; };
+layout(binding = 1) readonly buffer XB { float x_buf[]; };
+layout(binding = 2) readonly buffer IDB { uint ids[]; };
+layout(binding = 3) buffer YB { float y_buf[]; };
+
+shared float red[64];
+
+#include "native_decode.glsl"
+
+float dqsub(uint gstart, uint xoff) {
+    float v[32];
+    dqblk(gstart, v);
+    float a = 0.0;
+    for (uint w = 0u; w < 32u; w++) { a += v[w] * x_buf[xoff + w]; }
+    return a;
+}
+
+void main() {
+    uint unit = gl_WorkGroupID.x;
+    uint slot = unit / pc.out_f;
+    uint o = unit - slot * pc.out_f;
+    uint t = gl_LocalInvocationID.x;
+    uint wbase = ids[slot] * pc.stride + o * pc.in_f;
+    uint xbase = (pc.x_per_slot != 0u ? slot * pc.in_f : 0u);
+    uint nsub = pc.in_f / 32u;
+    float acc = 0.0;
+    for (uint s = t; s < nsub; s += 64u) {
+        acc += dqsub(wbase + s * 32u, xbase + s * 32u);
+    }
+    red[t] = acc;
+    barrier();
+    for (uint rs = 32u; rs > 0u; rs /= 2u) {
+        if (t < rs) { red[t] += red[t + rs]; }
+        barrier();
+    }
+    if (t == 0u) { y_buf[unit] = red[0]; }
+}
