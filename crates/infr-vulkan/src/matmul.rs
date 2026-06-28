@@ -15,61 +15,18 @@ use infr_core::{backend::BufferUsage, error::Result, Backend};
 
 use super::{as_vk_buf, be, VulkanBackend};
 
-// ── WGSL source ───────────────────────────────────────────────────────────────
-
-const MATMUL_WGSL: &str = r#"
-struct PushConstants {
-    m: u32,
-    n: u32,
-    k: u32,
-}
-
-var<immediate> pc: PushConstants;
-
-@group(0) @binding(0) var<storage, read>       a_buf: array<f32>;
-@group(0) @binding(1) var<storage, read>       b_buf: array<f32>;
-@group(0) @binding(2) var<storage, read_write> c_buf: array<f32>;
-
-@compute @workgroup_size(16, 16, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let row = gid.x;
-    let col = gid.y;
-    if row >= pc.m || col >= pc.n {
-        return;
-    }
-    var acc: f32 = 0.0;
-    for (var ki: u32 = 0u; ki < pc.k; ki = ki + 1u) {
-        acc = acc + a_buf[row * pc.k + ki] * b_buf[ki * pc.n + col];
-    }
-    c_buf[row * pc.n + col] = acc;
-}
-"#;
-
 // ── SPIR-V compilation (once) ─────────────────────────────────────────────────
 
 static MATMUL_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 
 fn matmul_spv() -> &'static [u32] {
-    MATMUL_SPV.get_or_init(compile_matmul_spv)
-}
-
-fn compile_matmul_spv() -> Vec<u32> {
-    use naga::back::spv;
-    use naga::front::wgsl;
-    use naga::valid::{Capabilities, ValidationFlags, Validator};
-
-    let module = wgsl::parse_str(MATMUL_WGSL).expect("matmul WGSL parse failed");
-
-    let info = Validator::new(ValidationFlags::all(), Capabilities::IMMEDIATES)
-        .validate(&module)
-        .expect("matmul WGSL validation failed");
-
-    let options = spv::Options {
-        lang_version: (1, 3),
-        ..Default::default()
-    };
-
-    spv::write_vec(&module, &info, &options, None).expect("matmul SPIR-V write failed")
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32.spv"));
+    MATMUL_SPV.get_or_init(|| {
+        BYTES
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    })
 }
 
 // ── workgroup tile size ───────────────────────────────────────────────────────
