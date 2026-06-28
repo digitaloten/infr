@@ -183,10 +183,24 @@ replaces direct `.allocation` (arena bufs are device-local, staging-filled).
 loader note
 
 - per-tensor fallback. `load_opt` reserves after the fit check. Test
-  `weight_arena_roundtrip` (reserved+overflow+coexistence). Perf unchanged. MoE
-  follow-on (still open): expert streaming/offload = a SECOND arena/pool evicted
-  into independently of the dense arena, for when all-resident experts exceed
-  VRAM.
+  `weight_arena_roundtrip` (reserved+overflow+coexistence). Perf unchanged.
+
+EXPERT POOL (done): `infr_vulkan::ExpertPool` (src/expert_pool.rs) = host-backed
+LRU VRAM cache for MoE experts — n_slots fixed slots; `resident(be, id, bytes)`
+returns the slot buffer (hit = cached, miss = evict LRU + upload). Weight VRAM =
+dense + n_slots·stride regardless of expert count. Backend-agnostic (public
+Backend API). `WeightFootprint::streaming_total(n_slots, stride)` = streaming
+plan vs `total()` (all-resident). Tested standalone
+(residency/hit/LRU-evict/round- trip); the MoE FORWARD that consumes it is NOT
+wired yet. MoE REMAINING (the real consumer): (1) arch support — infr-llama
+bails on non-llama|qwen3; add an MoE arch (qwen3moe/gemma3moe) reading n_expert/
+n_expert_used/`*_exps` tensors; (2) router = ffn_gate_inp → top-k
+experts+weights; (3) expert-dispatch FFN forward: ExpertPool.resident per routed
+expert → matmul vs the slot → weighted-accumulate; (4) loader picks all-resident
+vs streaming via the footprint. No in-store MoE model runs today
+(diffusiongemma-26B is MoE but unsupported arch). PCIe caveat: per-token
+streaming only pays off if the working set fits the pool (LRU hit-rate); else
+load all-resident when it fits VRAM.
 
 Infra:
 
