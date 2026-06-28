@@ -2169,7 +2169,7 @@ impl Llama {
             qk_norm,
             moe,
         };
-        Ok(Self {
+        let llama = Self {
             be,
             cfg,
             token_embd,
@@ -2182,7 +2182,44 @@ impl Llama {
             sampler: std::cell::Cell::new(Sampler::default()),
             moe_stream,
             gguf: g,
-        })
+        };
+        // Compile all GPU pipelines / first-touch state up front so any later timing (run / bench /
+        // serve) measures compute, not one-time setup. Failures here would also fail real inference.
+        llama.warmup()?;
+        Ok(llama)
+    }
+
+    /// Run a tiny prefill + decode (+ both sampler paths) through the real forward to compile every
+    /// VkPipeline and first-touch GPU state. The first use of each compute kernel lazily builds its
+    /// pipeline (seconds across the whole MoE kernel set); doing it here keeps it out of timed paths.
+    pub fn warmup(&self) -> Result<()> {
+        let prompt: Vec<u32> = (0..64).map(|i| (i % 64) as u32).collect();
+        if self.cfg.moe.is_some() {
+            let mut kv = self.new_moe_kv(96)?;
+            self.forward_moe_chunk(&[1u32], &mut kv)?; // shallow decode → non-split attention
+            self.forward_moe_chunk(&prompt, &mut kv)?; // prefill: flash attn, routing, gather/scatter, mmq/gemv, accumulate
+            self.forward_moe_chunk(&[1u32], &mut kv)?; // deep decode → split-K attn, multi-slot FFN, top-k
+            let greedy = SampleParams {
+                temp: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                u: 0.0,
+            };
+            self.forward_moe_chunk_g(&[1u32], &mut kv, Some(greedy))?; // argmax
+            let stoch = SampleParams {
+                temp: 0.6,
+                top_k: 20,
+                top_p: 0.95,
+                u: 0.5,
+            };
+            self.forward_moe_chunk_g(&[1u32], &mut kv, Some(stoch))?; // moe_sample (radix top-k)
+        } else {
+            let mut kv = self.new_kv(96)?;
+            self.forward_resident_kv(&[1u32], &mut kv)?;
+            self.forward_resident_kv(&prompt, &mut kv)?;
+            self.forward_resident_kv(&[1u32], &mut kv)?;
+        }
+        Ok(())
     }
 
     /// Encode one chat turn: ChatML markers as real special tokens, USER content as literal text
