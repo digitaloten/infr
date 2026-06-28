@@ -409,6 +409,50 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Tiled Q4_K dp4a (mmq) GEMM for a stacked expert: `c = qa·W[w_base]ᵀ` using hardware int8
+    /// dot-product (activations pre-quantized via `quant_q8`). `c` is `ceil(m/64)*64` rows. Faster
+    /// than the coopmat-f16 `matmul_native` for u4 weights (the dense path's default for u4).
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_mmq_q4k(
+        &self,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: &dyn Buffer,
+        w: &dyn Buffer,
+        w_base: usize,
+        c: &dyn Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        self.stamp("matmul_proj");
+        let kern = self.be.kernel(
+            "native_gemm_mmq_q4k",
+            crate::gemm::native_gemm_mmq_q4k_spv(),
+            5,
+            16,
+        );
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        let groups = (m.div_ceil(64) * (n / 64)) as u32;
+        self.dispatch(
+            kern,
+            &[
+                Self::vkb(qa),
+                Self::vkb(dact),
+                Self::vkb(sact),
+                Self::vkb(w),
+                Self::vkb(c),
+            ],
+            1,
+            &push,
+            groups,
+        );
+    }
+
     /// Integer (dp4a) u4 projection GEMM — the mmq path. Quantizes activations to int8 (Q8 per
     /// 32-block) via `quant_q8`, then runs the dp4a matmul keeping weights quantized (no per-GEMM
     /// dequant). Scratch (caller-allocated): `qa` = m*k bytes (int8), `dact`/`sact` = m*(k/32)*2

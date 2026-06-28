@@ -3926,6 +3926,11 @@ impl Llama {
                 .alloc((n * 4).max(4), BufferUsage::Activations)
                 .map_err(|e| anyhow!("{e}"))
         };
+        let ab = |bytes: usize| {
+            self.be
+                .alloc(bytes.max(4), BufferUsage::Activations)
+                .map_err(|e| anyhow!("{e}"))
+        };
 
         // resident scratch (reused across all layers)
         let hidden = al(t * ne)?;
@@ -4198,28 +4203,62 @@ impl Llama {
                     al(mpad * ne)?,
                 );
                 rec2.gather_rows(hn2.as_ref(), bucket_rows.as_ref(), off, xe.as_ref(), m, ne);
-                rec_gemm_expert(
-                    &rec2,
-                    &st.gate,
-                    e,
-                    st.stride,
-                    xe.as_ref(),
-                    ge.as_ref(),
-                    m,
-                    ne,
-                    nff,
-                );
-                rec_gemm_expert(
-                    &rec2,
-                    &st.up,
-                    e,
-                    st.stride,
-                    xe.as_ref(),
-                    ue.as_ref(),
-                    m,
-                    ne,
-                    nff,
-                );
+                // gate/up: Q4_K → dp4a (mmq) GEMM (int8 dot, faster than coopmat-f16); quantize the
+                // gathered batch to int8 once, shared by both. down (Q6_K) stays on the coopmat GEMM.
+                if matches!(native_parts(&st.gate).0, infr_core::DType::Q4K) {
+                    let nblk = ne / 32;
+                    let (qa, da, sa) = (ab(mpad * ne)?, ab(mpad * nblk * 2)?, ab(mpad * nblk * 2)?);
+                    rec2.quant_q8(xe.as_ref(), qa.as_ref(), da.as_ref(), sa.as_ref(), m, ne);
+                    let (_, gb) = native_parts(&st.gate);
+                    let (_, ub) = native_parts(&st.up);
+                    let base = e * st.stride;
+                    rec2.matmul_mmq_q4k(
+                        qa.as_ref(),
+                        da.as_ref(),
+                        sa.as_ref(),
+                        gb,
+                        base,
+                        ge.as_ref(),
+                        m,
+                        ne,
+                        nff,
+                    );
+                    rec2.matmul_mmq_q4k(
+                        qa.as_ref(),
+                        da.as_ref(),
+                        sa.as_ref(),
+                        ub,
+                        base,
+                        ue.as_ref(),
+                        m,
+                        ne,
+                        nff,
+                    );
+                    keep.extend([qa, da, sa]);
+                } else {
+                    rec_gemm_expert(
+                        &rec2,
+                        &st.gate,
+                        e,
+                        st.stride,
+                        xe.as_ref(),
+                        ge.as_ref(),
+                        m,
+                        ne,
+                        nff,
+                    );
+                    rec_gemm_expert(
+                        &rec2,
+                        &st.up,
+                        e,
+                        st.stride,
+                        xe.as_ref(),
+                        ue.as_ref(),
+                        m,
+                        ne,
+                        nff,
+                    );
+                }
                 rec2.silu_mul(ge.as_ref(), ue.as_ref(), ae.as_ref(), m * nff);
                 rec_gemm_expert(
                     &rec2,
