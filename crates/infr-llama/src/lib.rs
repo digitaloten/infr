@@ -3942,8 +3942,11 @@ impl Llama {
         self.be
             .upload(hidden.as_ref(), bytemuck::cast_slice(&emb))
             .map_err(|e| anyhow!("{e}"))?;
-        let (hn, hn2, ao) = (al(t * ne)?, al(t * ne)?, al(t * ne)?);
-        let (qr, kr, vr) = (al(t * nh * hd)?, al(t * nkv * hd)?, al(t * nkv * hd)?);
+        // Projections (QKV/O) run as tiled GEMMs → outputs are M-padded to gmp = ceil(t/64)*64.
+        let gmp = t.div_ceil(64) * 64;
+        let (hn, hn2) = (al(t * ne)?, al(t * ne)?);
+        let ao = al(gmp * ne)?;
+        let (qr, kr, vr) = (al(gmp * nh * hd)?, al(gmp * nkv * hd)?, al(gmp * nkv * hd)?);
         // Flash prefill attention (split-K, register-blocked, never materializes the score matrix) is
         // hd=128-specialized and wants 64-row tiles → pad q/attn to mpad rows. Small chunks (t<64) or
         // other head dims fall back to the basic per-query attention_kv. INFR_NO_FLASH forces fallback.
@@ -4000,9 +4003,9 @@ impl Llama {
                 ne,
                 c.rms_eps,
             );
-            rec_linear(&rec, &layer.wq, hn.as_ref(), qr.as_ref(), t, ne, nh * hd);
-            rec_linear(&rec, &layer.wk, hn.as_ref(), kr.as_ref(), t, ne, nkv * hd);
-            rec_linear(&rec, &layer.wv, hn.as_ref(), vr.as_ref(), t, ne, nkv * hd);
+            rec_proj(&rec, &layer.wq, hn.as_ref(), qr.as_ref(), t, ne, nh * hd);
+            rec_proj(&rec, &layer.wk, hn.as_ref(), kr.as_ref(), t, ne, nkv * hd);
+            rec_proj(&rec, &layer.wv, hn.as_ref(), vr.as_ref(), t, ne, nkv * hd);
             let (qn, kn) = (
                 layer.q_norm_buf.as_ref().unwrap().as_ref(),
                 layer.k_norm_buf.as_ref().unwrap().as_ref(),
@@ -4064,7 +4067,7 @@ impl Llama {
                     pos,
                 );
             }
-            rec_linear(&rec, &layer.wo, attn.as_ref(), ao.as_ref(), t, nh * hd, ne);
+            rec_proj(&rec, &layer.wo, attn.as_ref(), ao.as_ref(), t, nh * hd, ne);
             rec.add(hidden.as_ref(), ao.as_ref(), hidden.as_ref(), t * ne); // residual
             rec.rmsnorm(
                 hidden.as_ref(),
@@ -4828,6 +4831,26 @@ fn native_parts(w: &Wt) -> (infr_core::DType, &dyn Buffer) {
     match w {
         Wt::Native { buf, dtype } => (*dtype, buf.as_ref()),
         _ => unreachable!("stacked MoE experts are native-only"),
+    }
+}
+
+/// Prefill projection (`y = X·Wᵀ`, X = [m,in_f], m≥64): tiled coopmat GEMM for native-quant weights
+/// (decode-once, reused across the 64-row tile) instead of the per-row GEMV that re-reads the weight
+/// m times. `y` is allocated `ceil(m/64)*64` rows. Non-native weights (the small f16 router) fall
+/// back to the GEMV.
+#[allow(clippy::too_many_arguments)]
+fn rec_proj(
+    rec: &infr_vulkan::Recorder,
+    w: &Wt,
+    x: &dyn Buffer,
+    y: &dyn Buffer,
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+) {
+    match w {
+        Wt::Native { buf, dtype } => rec.matmul_native(*dtype, x, buf.as_ref(), y, m, in_f, out_f),
+        _ => rec_linear(rec, w, x, y, m, in_f, out_f),
     }
 }
 
