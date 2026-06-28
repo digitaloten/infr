@@ -1031,19 +1031,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
 /// Cast-copy f32 → f16 into `dst` at element offset `off` (for writing f32 activations into the
 /// f16 KV cache). One thread per element.
-pub(crate) const STORE_F16_WGSL: &str = r#"
-enable f16;
-struct PC { n: u32, off: u32 }
-var<immediate> pc: PC;
-@group(0) @binding(0) var<storage, read>       src: array<f32>;
-@group(0) @binding(1) var<storage, read_write> dst: array<f16>;
-@compute @workgroup_size(64, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if gid.x >= pc.n { return; }
-    dst[pc.off + gid.x] = f16(src[gid.x]);
-}
-"#;
-
 /// Qwen3 QK-norm + RoPE: ONE workgroup per (token, head). RMS-normalizes the head's `hd`-vector
 /// (weight `nw`) then applies ggml-NORM-interleaved RoPE. Reads raw projections `x[rows,nheads,hd]`,
 /// writes to `y` at row `out_base + r` (q→0, k→cache pos). `hd<=128`.

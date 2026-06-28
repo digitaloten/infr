@@ -1284,7 +1284,9 @@ impl<'a> Recorder<'a> {
     /// Cast-copy f32 `src[0..n]` → f16 `dst[off..off+n]` (write f32 activations into the f16 cache).
     pub fn store_f16(&self, src: &dyn Buffer, dst: &dyn Buffer, n: usize, off: usize) {
         self.stamp("store_f16");
-        let k = self.be.kernel("store_f16", ops::STORE_F16_WGSL, 2, 8);
+        let k = self
+            .be
+            .kernel_spv("store_f16", crate::gemm::store_f16_spv(), 2, 8);
         let mut push = [0u8; 8];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
