@@ -223,6 +223,377 @@ impl Model {
     }
 }
 
+// ── math helpers (CPU, f32) ─────────────────────────────────────────────────
+
+/// `y[o] = Σ_j W[o*in+j] * x[j]`  (W is row-major [out, in], the ggml weight layout).
+fn matvec(w: &[f32], in_f: usize, out_f: usize, x: &[f32]) -> Vec<f32> {
+    (0..out_f)
+        .map(|o| {
+            let row = &w[o * in_f..o * in_f + in_f];
+            row.iter().zip(x).map(|(a, b)| a * b).sum()
+        })
+        .collect()
+}
+fn rmsnorm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
+    let ms = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+    let s = 1.0 / (ms + eps).sqrt();
+    x.iter().zip(w).map(|(v, g)| v * s * g).collect()
+}
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+fn silu(x: f32) -> f32 {
+    x * sigmoid(x)
+}
+fn softplus(x: f32) -> f32 {
+    // numerically stable ln(1+e^x)
+    x.max(0.0) + (-x.abs()).exp().ln_1p()
+}
+fn l2norm(v: &mut [f32], eps: f32) {
+    let n = (v.iter().map(|x| x * x).sum::<f32>() + eps).sqrt();
+    for x in v.iter_mut() {
+        *x /= n;
+    }
+}
+
+/// Per-layer recurrent state for the CPU reference.
+enum LayerState {
+    Linear {
+        conv: Vec<f32>, // [d_conv-1, conv_channels] rolling history (oldest first)
+        s: Vec<f32>,    // [num_v_heads, head_k_dim, head_v_dim]
+    },
+    Attn {
+        k: Vec<f32>, // [pos, n_kv*head_dim]
+        v: Vec<f32>,
+    },
+}
+
+pub struct State {
+    layers: Vec<LayerState>,
+    pos: usize,
+}
+
+impl Model {
+    pub fn new_state(&self) -> State {
+        let c = &self.cfg;
+        let layers = (0..c.n_layer)
+            .map(|i| {
+                if c.is_attn_layer(i) {
+                    LayerState::Attn {
+                        k: vec![],
+                        v: vec![],
+                    }
+                } else {
+                    LayerState::Linear {
+                        conv: vec![0.0; (c.d_conv - 1) * c.conv_channels()],
+                        s: vec![0.0; c.num_v_heads() * c.head_k_dim() * c.head_v_dim()],
+                    }
+                }
+            })
+            .collect();
+        State { layers, pos: 0 }
+    }
+
+    /// One token through the whole stack; returns logits over the vocab. `st` carries the recurrent
+    /// conv/SSM state and the attention KV cache across calls.
+    pub fn forward(&self, token: u32, st: &mut State) -> Vec<f32> {
+        let c = &self.cfg;
+        let ne = c.n_embd;
+        let mut hidden = self.token_embd[token as usize * ne..(token as usize + 1) * ne].to_vec();
+        let pos = st.pos;
+        for (li, layer) in self.layers.iter().enumerate() {
+            match (layer, &mut st.layers[li]) {
+                (Layer::Linear(w), LayerState::Linear { conv, s }) => {
+                    let y = self.linear_mixer(w, &hidden, conv, s);
+                    for (h, yi) in hidden.iter_mut().zip(&y) {
+                        *h += yi;
+                    }
+                    let d = self.ffn(
+                        &hidden,
+                        &w.post_norm,
+                        &w.ffn_gate,
+                        &w.ffn_up,
+                        &w.ffn_down,
+                        w.n_ff,
+                    );
+                    for (h, di) in hidden.iter_mut().zip(&d) {
+                        *h += di;
+                    }
+                }
+                (Layer::Attn(w), LayerState::Attn { k, v }) => {
+                    let y = self.attn_mixer(w, &hidden, k, v, pos);
+                    for (h, yi) in hidden.iter_mut().zip(&y) {
+                        *h += yi;
+                    }
+                    let d = self.ffn(
+                        &hidden,
+                        &w.post_norm,
+                        &w.ffn_gate,
+                        &w.ffn_up,
+                        &w.ffn_down,
+                        w.n_ff,
+                    );
+                    for (h, di) in hidden.iter_mut().zip(&d) {
+                        *h += di;
+                    }
+                }
+                _ => unreachable!("layer/state kind mismatch"),
+            }
+        }
+        st.pos += 1;
+        // final norm + lm head (only this token)
+        let hn = rmsnorm(&hidden, &self.output_norm, c.eps);
+        matvec(&self.lm_head, ne, c.vocab, &hn)
+    }
+
+    fn ffn(
+        &self,
+        hidden: &[f32],
+        norm: &[f32],
+        gate: &[f32],
+        up: &[f32],
+        down: &[f32],
+        n_ff: usize,
+    ) -> Vec<f32> {
+        let ne = self.cfg.n_embd;
+        let h2 = rmsnorm(hidden, norm, self.cfg.eps);
+        let g = matvec(gate, ne, n_ff, &h2);
+        let u = matvec(up, ne, n_ff, &h2);
+        let act: Vec<f32> = g.iter().zip(&u).map(|(a, b)| silu(*a) * b).collect();
+        matvec(down, n_ff, ne, &act)
+    }
+
+    /// Gated DeltaNet linear-attention mixer (one token).
+    fn linear_mixer(
+        &self,
+        w: &LinearLayer,
+        hidden: &[f32],
+        conv: &mut [f32],
+        s: &mut [f32],
+    ) -> Vec<f32> {
+        let c = &self.cfg;
+        let (ne, kd, vd) = (c.n_embd, c.head_k_dim(), c.head_v_dim());
+        let (nk, nv) = (c.num_k_heads(), c.num_v_heads());
+        let cc = c.conv_channels();
+        let xn = rmsnorm(hidden, &w.attn_norm, c.eps);
+        let qkv = matvec(&w.qkv, ne, cc, &xn); // [6144]
+        let z = matvec(&w.gate, ne, c.d_inner, &xn); // [2048]
+
+        // causal depthwise conv over the cc channels: out[ch] = Σ_k tap_k[ch]*weight[ch*d_conv+k]
+        // taps oldest→newest; window = [conv history.., current]
+        let k_conv = c.d_conv;
+        let mut conv_out = vec![0.0f32; cc];
+        for ch in 0..cc {
+            let mut acc = 0.0;
+            for k in 0..k_conv - 1 {
+                acc += conv[k * cc + ch] * w.conv1d[ch * k_conv + k];
+            }
+            acc += qkv[ch] * w.conv1d[ch * k_conv + (k_conv - 1)];
+            conv_out[ch] = silu(acc);
+        }
+        // shift conv history (drop oldest, append current raw qkv)
+        for k in 0..k_conv - 2 {
+            for ch in 0..cc {
+                conv[k * cc + ch] = conv[(k + 1) * cc + ch];
+            }
+        }
+        for ch in 0..cc {
+            conv[(k_conv - 2) * cc + ch] = qkv[ch];
+        }
+
+        // split conv_out → q,k,v
+        let key_dim = nk * kd;
+        let (q_all, rest) = conv_out.split_at(key_dim);
+        let (k_all, v_all) = rest.split_at(key_dim);
+
+        // beta / decay gates (per v-head)
+        let b = matvec(&w.beta, ne, nv, &xn);
+        let a = matvec(&w.alpha, ne, nv, &xn);
+
+        let mut out = vec![0.0f32; nv * vd];
+        let qscale = 1.0 / (kd as f32).sqrt();
+        for h in 0..nv {
+            // num_v_heads == num_k_heads here (1:1)
+            let mut qh = q_all[h * kd..h * kd + kd].to_vec();
+            let mut kh = k_all[h * kd..h * kd + kd].to_vec();
+            let vh = &v_all[h * vd..h * vd + vd];
+            l2norm(&mut qh, 1e-6);
+            l2norm(&mut kh, 1e-6);
+            for x in qh.iter_mut() {
+                *x *= qscale;
+            }
+            let beta = sigmoid(b[h]);
+            let g = w.a[h] * softplus(a[h] + w.dt_bias[h]); // ≤ 0
+            let decay = g.exp();
+            let sh = &mut s[h * kd * vd..(h + 1) * kd * vd]; // [kd, vd]
+                                                             // S *= decay
+            for x in sh.iter_mut() {
+                *x *= decay;
+            }
+            // kv = kᵀS  [vd]
+            let mut kv = vec![0.0f32; vd];
+            for kk in 0..kd {
+                let kkv = kh[kk];
+                let row = &sh[kk * vd..kk * vd + vd];
+                for d in 0..vd {
+                    kv[d] += kkv * row[d];
+                }
+            }
+            // delta = (v - kv)*beta ; S += k ⊗ delta
+            let delta: Vec<f32> = (0..vd).map(|d| (vh[d] - kv[d]) * beta).collect();
+            for kk in 0..kd {
+                let kkv = kh[kk];
+                let row = &mut sh[kk * vd..kk * vd + vd];
+                for d in 0..vd {
+                    row[d] += kkv * delta[d];
+                }
+            }
+            // out = qᵀS  [vd]
+            let oh = &mut out[h * vd..h * vd + vd];
+            for kk in 0..kd {
+                let qv = qh[kk];
+                let row = &sh[kk * vd..kk * vd + vd];
+                for d in 0..vd {
+                    oh[d] += qv * row[d];
+                }
+            }
+        }
+
+        // silu-gated RMSNorm per v-head, gate = z
+        for h in 0..nv {
+            let oh = &mut out[h * vd..h * vd + vd];
+            let n = rmsnorm(oh, &w.ssm_norm, c.eps);
+            let zh = &z[h * vd..h * vd + vd];
+            for d in 0..vd {
+                oh[d] = n[d] * silu(zh[d]);
+            }
+        }
+        matvec(&w.out, c.d_inner, ne, &out)
+    }
+
+    /// Gated full attention (one token), GQA, head_dim 256, partial sectioned RoPE, sigmoid out-gate.
+    fn attn_mixer(
+        &self,
+        w: &AttnLayer,
+        hidden: &[f32],
+        kc: &mut Vec<f32>,
+        vc: &mut Vec<f32>,
+        pos: usize,
+    ) -> Vec<f32> {
+        let c = &self.cfg;
+        let (ne, hd) = (c.n_embd, c.head_dim);
+        let (nh, nkv) = (c.n_head, c.n_kv);
+        let xn = rmsnorm(hidden, &w.attn_norm, c.eps);
+        let qg = matvec(&w.q, ne, nh * hd + c.d_inner, &xn);
+        let (q_all, gate) = qg.split_at(nh * hd);
+        let mut q = q_all.to_vec();
+        let mut k = matvec(&w.k, ne, nkv * hd, &xn);
+        let v = matvec(&w.v, ne, nkv * hd, &xn);
+        // per-head q/k norm then RoPE
+        for h in 0..nh {
+            let qh = &mut q[h * hd..h * hd + hd];
+            let nq = rmsnorm(qh, &w.q_norm, c.eps);
+            qh.copy_from_slice(&nq);
+            rope(qh, pos, c.rope_dim, c.rope_theta);
+        }
+        for h in 0..nkv {
+            let kh = &mut k[h * hd..h * hd + hd];
+            let nk = rmsnorm(kh, &w.k_norm, c.eps);
+            kh.copy_from_slice(&nk);
+            rope(kh, pos, c.rope_dim, c.rope_theta);
+        }
+        kc.extend_from_slice(&k);
+        vc.extend_from_slice(&v);
+        let t = pos + 1; // cached length
+        let scale = 1.0 / (hd as f32).sqrt();
+        let g = nh / nkv;
+        let mut out = vec![0.0f32; nh * hd];
+        for h in 0..nh {
+            let kvh = h / g;
+            let qh = &q[h * hd..h * hd + hd];
+            let mut scores = vec![0.0f32; t];
+            for j in 0..t {
+                let kj = &kc[j * nkv * hd + kvh * hd..j * nkv * hd + kvh * hd + hd];
+                scores[j] = qh.iter().zip(kj).map(|(a, b)| a * b).sum::<f32>() * scale;
+            }
+            let m = scores.iter().cloned().fold(f32::MIN, f32::max);
+            let mut den = 0.0;
+            for sj in scores.iter_mut() {
+                *sj = (*sj - m).exp();
+                den += *sj;
+            }
+            let oh = &mut out[h * hd..h * hd + hd];
+            for j in 0..t {
+                let p = scores[j] / den;
+                let vj = &vc[j * nkv * hd + kvh * hd..j * nkv * hd + kvh * hd + hd];
+                for d in 0..hd {
+                    oh[d] += p * vj[d];
+                }
+            }
+            // per-head sigmoid output gate
+            let gh = &gate[h * hd..h * hd + hd];
+            for d in 0..hd {
+                oh[d] *= sigmoid(gh[d]);
+            }
+        }
+        matvec(&w.out, nh * hd, ne, &out)
+    }
+}
+
+/// Partial NEOX-style RoPE over the first `rope_dim` dims (rest pass through). Text-only sectioned
+/// RoPE reduces to standard RoPE since all position components equal the token position.
+fn rope(x: &mut [f32], pos: usize, rope_dim: usize, theta: f32) {
+    let half = rope_dim / 2;
+    for i in 0..half {
+        let freq = theta.powf(-2.0 * i as f32 / rope_dim as f32);
+        let ang = pos as f32 * freq;
+        let (s, co) = (ang.sin(), ang.cos());
+        let a = x[i];
+        let b = x[i + half];
+        x[i] = a * co - b * s;
+        x[i + half] = a * s + b * co;
+    }
+}
+
+/// Greedy-generate `n` tokens from `prompt` (raw, no chat template) for CPU-reference validation.
+pub fn generate(g: &Gguf, prompt: &str, n: usize) -> Result<String> {
+    let m = Model::load(g)?;
+    let tok = crate::build_tokenizer(g)?;
+    let enc = tok
+        .encode(prompt, false)
+        .map_err(|e| anyhow!("encode: {e}"))?;
+    let ids = enc.get_ids();
+    let mut st = m.new_state();
+    let mut last = 0u32;
+    for (i, &id) in ids.iter().enumerate() {
+        let logits = m.forward(id, &mut st);
+        if i == ids.len() - 1 {
+            last = argmax(&logits);
+        }
+    }
+    let mut outs = vec![last];
+    for _ in 1..n {
+        let logits = m.forward(last, &mut st);
+        last = argmax(&logits);
+        outs.push(last);
+    }
+    Ok(tok
+        .decode(&outs, false)
+        .map_err(|e| anyhow!("decode: {e}"))?)
+}
+
+fn argmax(v: &[f32]) -> u32 {
+    let mut bi = 0usize;
+    let mut bv = f32::MIN;
+    for (i, &x) in v.iter().enumerate() {
+        if x > bv {
+            bv = x;
+            bi = i;
+        }
+    }
+    bi as u32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,5 +631,13 @@ mod tests {
         let n_attn = (0..c.n_layer).filter(|&i| c.is_attn_layer(i)).count();
         assert_eq!(n_attn, 6, "expected 6 full-attention layers");
         assert_eq!(m.layers.len(), 24);
+    }
+
+    #[test]
+    #[ignore = "needs the Qwen3.5-0.8B gguf in the local store"]
+    fn greedy_generate() {
+        let g = Gguf::open(&model_path()).unwrap();
+        let out = generate(&g, "The capital of France is", 12).unwrap();
+        println!("=== qwen35 CPU greedy ===\n{out}");
     }
 }
