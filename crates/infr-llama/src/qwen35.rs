@@ -305,8 +305,10 @@ impl Model {
             match (layer, &mut st.layers[li]) {
                 (Layer::Linear(w), LayerState::Linear { conv, s }) => {
                     let y = self.linear_mixer(w, &hidden, conv, s);
-                    for (h, yi) in hidden.iter_mut().zip(&y) {
-                        *h += yi;
+                    if std::env::var("Q35_NOLIN").is_err() {
+                        for (h, yi) in hidden.iter_mut().zip(&y) {
+                            *h += yi;
+                        }
                     }
                     let d = self.ffn(
                         &hidden,
@@ -322,8 +324,10 @@ impl Model {
                 }
                 (Layer::Attn(w), LayerState::Attn { k, v }) => {
                     let y = self.attn_mixer(w, &hidden, k, v, pos);
-                    for (h, yi) in hidden.iter_mut().zip(&y) {
-                        *h += yi;
+                    if std::env::var("Q35_NOATTN").is_err() {
+                        for (h, yi) in hidden.iter_mut().zip(&y) {
+                            *h += yi;
+                        }
                     }
                     let d = self.ffn(
                         &hidden,
@@ -338,6 +342,12 @@ impl Model {
                     }
                 }
                 _ => unreachable!("layer/state kind mismatch"),
+            }
+            if std::env::var("Q35_DBG").is_ok() {
+                let kind = if c.is_attn_layer(li) { "attn" } else { "lin " };
+                let nrm = (hidden.iter().map(|x| x * x).sum::<f32>() / ne as f32).sqrt();
+                let fin = hidden.iter().all(|x| x.is_finite());
+                eprintln!("  L{li:02} {kind} rms={nrm:.4} finite={fin}");
             }
         }
         st.pos += 1;
