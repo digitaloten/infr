@@ -163,6 +163,18 @@ chunks complete (387 t/s), 8192 doesn't. So the 32M-budget taper (→~960 tok @
 removal of chunking. ⇒ chunk size is NOT the deep-prefill lever (bigger barely
 helps + eventually trips TDR); the flash kernel is.
 
+VRAM pre-flight (load): weights upload incrementally per-tensor (gpu-allocator:
+dedicated VkDeviceMemory ≥32MB, else 256MB pooled blocks) — NO arena. Added a
+pre-flight sizing+fit check in `Model::load_opt`: `weight_footprint(gguf)` sums
+each tensor's RESIDENT bytes (mirrors `upload_wt`: native raw-blocks / unified
+repack / f16; excludes token_embd=host unless tied lm head), split dense vs
+MoE-expert (`*_exps`); `VulkanBackend::vram()` (VK_EXT_memory_budget) gives
+total+live-free; bail early if weights+384MB > free. Estimates verified vs
+actual: Q4_K 0.57 / Q8_0 0.78 / BF16 1.19 GB. MoE-READY = expert bytes tracked
+separately + all tensors enumerated (correct once an MoE arch is added). MoE
+follow-on (not done): real arena/pool allocation + expert streaming/offload when
+all-resident experts exceed VRAM; current code still per-tensor allocs.
+
 Infra:
 
 - Pull/store refactor: own store `$INFR_MODELS` or `$XDG_CACHE_HOME/infr/models`
