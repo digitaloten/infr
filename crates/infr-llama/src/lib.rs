@@ -63,6 +63,14 @@ pub struct MoeConfig {
     pub scale: f32,
 }
 
+/// Host K/V cache for the eager MoE forward — per-layer keys/values appended each chunk so decode
+/// only processes the new token (the dense path's GPU KV cache isn't wired for MoE yet).
+pub struct MoeKv {
+    k: Vec<Vec<f32>>, // [n_layer] of [pos * nkv*hd]
+    v: Vec<Vec<f32>>,
+    pos: usize,
+}
+
 /// Token sampling: greedy when `temp <= 0`, else temperature + top-k + top-p (nucleus). Qwen3
 /// recommends temp 0.6 / top_k 20 / top_p 0.95 — pure greedy makes thinking models degenerate
 /// (fail to close `</think>`, repeat, or stop without answering).
@@ -2118,84 +2126,11 @@ impl Llama {
         Ok(bytemuck::cast_slice(&out).to_vec())
     }
 
-    /// Eager forward for MoE models (qwen3moe). No KV cache (recomputes attention each call) — a
-    /// correctness-first path: all matmuls on GPU via `gemv_wt`; qk-norm / RoPE / attention / router
-    /// softmax+top-k / expert combine on host. Returns logits (`vocab`) for the last position.
+    /// One-shot MoE forward over `tokens` (fresh cache) — returns last-position logits. Thin wrapper
+    /// over [`forward_moe_chunk`](Self::forward_moe_chunk); used for tests / single-logit checks.
     pub fn forward_moe(&self, tokens: &[u32]) -> Result<Vec<f32>> {
-        let c = &self.cfg;
-        let mc = c.moe.expect("forward_moe requires a MoE model");
-        let t = tokens.len();
-        let (ne, nh, nkv, hd) = (c.n_embd, c.n_head, c.n_kv, c.head_dim);
-
-        let mut hidden = vec![0f32; t * ne];
-        for (i, &tok) in tokens.iter().enumerate() {
-            hidden[i * ne..(i + 1) * ne]
-                .copy_from_slice(&self.token_embd[tok as usize * ne..(tok as usize + 1) * ne]);
-        }
-
-        for layer in &self.layers {
-            // --- attention (identical to dense qwen3: QK-norm → RoPE → causal GQA) ---
-            let hn = rmsnorm_rows(&hidden, &layer.attn_norm, t, ne, c.rms_eps);
-            let mut q = self.gemv_wt(&layer.wq, &hn, t, ne, nh * hd)?;
-            let mut k = self.gemv_wt(&layer.wk, &hn, t, ne, nkv * hd)?;
-            let v = self.gemv_wt(&layer.wv, &hn, t, ne, nkv * hd)?;
-            qk_norm_rows(&mut q, t, nh, hd, layer.q_norm.as_ref().unwrap(), c.rms_eps);
-            qk_norm_rows(
-                &mut k,
-                t,
-                nkv,
-                hd,
-                layer.k_norm.as_ref().unwrap(),
-                c.rms_eps,
-            );
-            rope_rows(&mut q, t, nh, hd, c.rope_dim, c.rope_theta);
-            rope_rows(&mut k, t, nkv, hd, c.rope_dim, c.rope_theta);
-            let attn = attention(&q, &k, &v, t, nh, nkv, hd);
-            let ao = self.gemv_wt(&layer.wo, &attn, t, nh * hd, ne)?;
-            for i in 0..t * ne {
-                hidden[i] += ao[i];
-            }
-
-            // --- MoE FFN: route each token to top-k experts, weighted SwiGLU sum ---
-            let hn2 = rmsnorm_rows(&hidden, &layer.ffn_norm, t, ne, c.rms_eps);
-            let (gate_inp, experts) = layer.moe();
-            let logits = self.gemv_wt(gate_inp, &hn2, t, ne, mc.n_expert)?;
-            for r in 0..t {
-                let rl = &logits[r * mc.n_expert..(r + 1) * mc.n_expert];
-                let maxl = rl.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let mut probs: Vec<f32> = rl.iter().map(|&x| (x - maxl).exp()).collect();
-                let sum: f32 = probs.iter().sum();
-                for pr in probs.iter_mut() {
-                    *pr /= sum;
-                }
-                let mut idx: Vec<usize> = (0..mc.n_expert).collect();
-                idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
-                idx.truncate(mc.n_used);
-                let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
-                let xr = hn2[r * ne..(r + 1) * ne].to_vec();
-                let mut out_row = vec![0f32; ne];
-                for &e in &idx {
-                    let w_e = probs[e] / wsum * mc.scale;
-                    let gate_e = self.gemv_wt(&experts[e].gate, &xr, 1, ne, mc.n_ff_exp)?;
-                    let up_e = self.gemv_wt(&experts[e].up, &xr, 1, ne, mc.n_ff_exp)?;
-                    let mut act = vec![0f32; mc.n_ff_exp];
-                    for i in 0..mc.n_ff_exp {
-                        act[i] = silu(gate_e[i]) * up_e[i];
-                    }
-                    let y_e = self.gemv_wt(&experts[e].down, &act, 1, mc.n_ff_exp, ne)?;
-                    for i in 0..ne {
-                        out_row[i] += w_e * y_e[i];
-                    }
-                }
-                for i in 0..ne {
-                    hidden[r * ne + i] += out_row[i];
-                }
-            }
-        }
-
-        let last = &hidden[(t - 1) * ne..t * ne];
-        let normed = rmsnorm_rows(last, &self.output_norm, 1, ne, c.rms_eps);
-        self.gemv_wt(&self.lm_head, &normed, 1, ne, c.vocab)
+        let mut kv = self.new_moe_kv();
+        self.forward_moe_chunk(tokens, &mut kv)
     }
 
     /// GPU-resident forward: records the whole stack into one command buffer (one submit),
@@ -3107,9 +3042,118 @@ impl Llama {
         self.cfg.moe.is_some()
     }
 
-    /// One-shot MoE generation (qwen3moe). No KV cache: re-runs `forward_moe` over the growing token
-    /// sequence each step (O(n²) — correctness-first). `prompt` is the chat-formatted string;
-    /// `on_token` fires once per generated token. Returns the decoded reply.
+    /// Fresh host KV cache for the eager MoE forward.
+    pub fn new_moe_kv(&self) -> MoeKv {
+        MoeKv {
+            k: vec![Vec::new(); self.cfg.n_layer],
+            v: vec![Vec::new(); self.cfg.n_layer],
+            pos: 0,
+        }
+    }
+
+    /// Eager MoE forward for one chunk of `tokens` at positions `kv.pos..`, appending K/V to the
+    /// cache (so decode steps process only the new token, not the whole sequence). Returns logits
+    /// (`vocab`) for the last token. Same math as [`forward_moe`] but cached.
+    pub fn forward_moe_chunk(&self, tokens: &[u32], kv: &mut MoeKv) -> Result<Vec<f32>> {
+        let c = &self.cfg;
+        let mc = c.moe.expect("forward_moe_chunk requires a MoE model");
+        let t = tokens.len();
+        let (ne, nh, nkv, hd) = (c.n_embd, c.n_head, c.n_kv, c.head_dim);
+        let pos0 = kv.pos;
+
+        let mut hidden = vec![0f32; t * ne];
+        for (i, &tok) in tokens.iter().enumerate() {
+            hidden[i * ne..(i + 1) * ne]
+                .copy_from_slice(&self.token_embd[tok as usize * ne..(tok as usize + 1) * ne]);
+        }
+
+        for (li, layer) in self.layers.iter().enumerate() {
+            // attention with KV cache
+            let hn = rmsnorm_rows(&hidden, &layer.attn_norm, t, ne, c.rms_eps);
+            let mut q = self.gemv_wt(&layer.wq, &hn, t, ne, nh * hd)?;
+            let mut knew = self.gemv_wt(&layer.wk, &hn, t, ne, nkv * hd)?;
+            let vnew = self.gemv_wt(&layer.wv, &hn, t, ne, nkv * hd)?;
+            qk_norm_rows(&mut q, t, nh, hd, layer.q_norm.as_ref().unwrap(), c.rms_eps);
+            qk_norm_rows(
+                &mut knew,
+                t,
+                nkv,
+                hd,
+                layer.k_norm.as_ref().unwrap(),
+                c.rms_eps,
+            );
+            rope_rows_at(&mut q, t, nh, hd, c.rope_dim, c.rope_theta, pos0);
+            rope_rows_at(&mut knew, t, nkv, hd, c.rope_dim, c.rope_theta, pos0);
+            kv.k[li].extend_from_slice(&knew);
+            kv.v[li].extend_from_slice(&vnew);
+            let attn = attention_kv(&q, &kv.k[li], &kv.v[li], t, pos0, nh, nkv, hd);
+            let ao = self.gemv_wt(&layer.wo, &attn, t, nh * hd, ne)?;
+            for i in 0..t * ne {
+                hidden[i] += ao[i];
+            }
+
+            // MoE FFN: route each token to top-k experts, weighted SwiGLU sum
+            let hn2 = rmsnorm_rows(&hidden, &layer.ffn_norm, t, ne, c.rms_eps);
+            let (gate_inp, experts) = layer.moe();
+            let logits = self.gemv_wt(gate_inp, &hn2, t, ne, mc.n_expert)?;
+            for r in 0..t {
+                let out_row = self.moe_ffn_token(
+                    &hn2[r * ne..(r + 1) * ne],
+                    &logits[r * mc.n_expert..(r + 1) * mc.n_expert],
+                    experts,
+                    &mc,
+                )?;
+                for i in 0..ne {
+                    hidden[r * ne + i] += out_row[i];
+                }
+            }
+        }
+        kv.pos += t;
+
+        let last = &hidden[(t - 1) * ne..t * ne];
+        let normed = rmsnorm_rows(last, &self.output_norm, 1, ne, c.rms_eps);
+        self.gemv_wt(&self.lm_head, &normed, 1, ne, c.vocab)
+    }
+
+    /// One token's MoE FFN: softmax router → renormalized top-k → weighted SwiGLU sum over the
+    /// selected experts. `x` is the (already ffn-normed) token `[n_embd]`, `rl` its router logits.
+    fn moe_ffn_token(
+        &self,
+        x: &[f32],
+        rl: &[f32],
+        experts: &[ExpertWt],
+        mc: &MoeConfig,
+    ) -> Result<Vec<f32>> {
+        let ne = self.cfg.n_embd;
+        let maxl = rl.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut probs: Vec<f32> = rl.iter().map(|&v| (v - maxl).exp()).collect();
+        let sum: f32 = probs.iter().sum();
+        for pr in probs.iter_mut() {
+            *pr /= sum;
+        }
+        let mut idx: Vec<usize> = (0..mc.n_expert).collect();
+        idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+        idx.truncate(mc.n_used);
+        let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
+        let mut out = vec![0f32; ne];
+        for &e in &idx {
+            let w_e = probs[e] / wsum * mc.scale;
+            let gate_e = self.gemv_wt(&experts[e].gate, x, 1, ne, mc.n_ff_exp)?;
+            let up_e = self.gemv_wt(&experts[e].up, x, 1, ne, mc.n_ff_exp)?;
+            let mut act = vec![0f32; mc.n_ff_exp];
+            for i in 0..mc.n_ff_exp {
+                act[i] = silu(gate_e[i]) * up_e[i];
+            }
+            let y_e = self.gemv_wt(&experts[e].down, &act, 1, mc.n_ff_exp, ne)?;
+            for i in 0..ne {
+                out[i] += w_e * y_e[i];
+            }
+        }
+        Ok(out)
+    }
+
+    /// MoE generation (qwen3moe) with a host KV cache — prefill the prompt once, then decode one
+    /// token per step (no O(n²) recompute). `prompt` is chat-formatted; `on_token` fires per token.
     pub fn generate_moe(
         &self,
         prompt: &str,
@@ -3120,25 +3164,26 @@ impl Llama {
             .tokenizer
             .encode(prompt, false)
             .map_err(|e| anyhow!("encode: {e}"))?;
-        let mut tokens: Vec<u32> = enc.get_ids().to_vec();
+        let tokens: Vec<u32> = enc.get_ids().to_vec();
         let sampler = self.sampler.get();
         let mut rng = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0x9e3779b97f4a7c15)
             | 1;
+        let mut kv = self.new_moe_kv();
+        let mut logits = self.forward_moe_chunk(&tokens, &mut kv)?; // prefill
         let mut stream = StreamDecoder::default();
         let mut generated: Vec<u32> = Vec::new();
         for _ in 0..max_new {
-            let logits = self.forward_moe(&tokens)?;
             let next = sample_logits(&logits, sampler, &mut rng);
             if self.cfg.eos_ids.contains(&next) {
                 break;
             }
             generated.push(next);
-            tokens.push(next);
             let full = self.tokenizer.decode(&generated, true).unwrap_or_default();
             on_token(&stream.step(&full));
+            logits = self.forward_moe_chunk(&[next], &mut kv)?; // 1-token decode
         }
         self.tokenizer
             .decode(&generated, true)
@@ -3353,6 +3398,85 @@ fn rmsnorm_rows(x: &[f32], w: &[f32], rows: usize, dim: usize, eps: f32) -> Vec<
         }
     }
     y
+}
+
+/// ggml NORM rope at an absolute position offset `pos0` (token `i` is at position `pos0+i`) — the
+/// KV-cache variant of [`rope_rows`] (which assumes positions `0..t`).
+fn rope_rows_at(
+    x: &mut [f32],
+    t: usize,
+    n_heads: usize,
+    hd: usize,
+    rope_dim: usize,
+    theta: f32,
+    pos0: usize,
+) {
+    for ti in 0..t {
+        let pos = (pos0 + ti) as f32;
+        for h in 0..n_heads {
+            let base = (ti * n_heads + h) * hd;
+            for i in 0..rope_dim / 2 {
+                let freq = (theta as f64).powf(-2.0 * i as f64 / rope_dim as f64) as f32;
+                let ang = pos * freq;
+                let (s, co) = ang.sin_cos();
+                let a = x[base + 2 * i];
+                let b = x[base + 2 * i + 1];
+                x[base + 2 * i] = a * co - b * s;
+                x[base + 2 * i + 1] = a * s + b * co;
+            }
+        }
+    }
+}
+
+/// Causal GQA attention with a KV cache. `q` holds `t` new queries at positions `pos0..pos0+t`;
+/// `kc`/`vc` are the full caches (new keys already appended). Returns `[t, nh*hd]`. Query `ti`
+/// attends to all keys `0..=pos0+ti` (causal).
+#[allow(clippy::too_many_arguments)]
+fn attention_kv(
+    q: &[f32],
+    kc: &[f32],
+    vc: &[f32],
+    t: usize,
+    pos0: usize,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+) -> Vec<f32> {
+    let scale = 1.0 / (hd as f32).sqrt();
+    let group = nh / nkv;
+    let mut out = vec![0f32; t * nh * hd];
+    for ti in 0..t {
+        let qpos = pos0 + ti;
+        for h in 0..nh {
+            let kvh = h / group;
+            let qv = &q[(ti * nh + h) * hd..(ti * nh + h) * hd + hd];
+            let mut scores = vec![0f32; qpos + 1];
+            let mut maxs = f32::NEG_INFINITY;
+            for (j, sc) in scores.iter_mut().enumerate() {
+                let kv = &kc[(j * nkv + kvh) * hd..(j * nkv + kvh) * hd + hd];
+                let mut dot = 0f32;
+                for d in 0..hd {
+                    dot += qv[d] * kv[d];
+                }
+                *sc = dot * scale;
+                maxs = maxs.max(*sc);
+            }
+            let mut sum = 0f32;
+            for sc in scores.iter_mut() {
+                *sc = (*sc - maxs).exp();
+                sum += *sc;
+            }
+            let ob = (ti * nh + h) * hd;
+            for (j, &sc) in scores.iter().enumerate() {
+                let p = sc / sum;
+                let vv = &vc[(j * nkv + kvh) * hd..(j * nkv + kvh) * hd + hd];
+                for d in 0..hd {
+                    out[ob + d] += p * vv[d];
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Qwen3 per-head RMSNorm (QK-norm): normalize each head's `hd`-vector by its RMS, scaled by `w[hd]`.

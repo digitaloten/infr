@@ -329,7 +329,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         let Some(m) = message else {
             anyhow::bail!("qwen3moe currently supports one-shot only: pass a message");
         };
-        eprintln!("[qwen3moe — eager MoE forward: GPU matmuls + CPU router/top-k, no KV cache]");
+        eprintln!("[qwen3moe — eager MoE forward: GPU matmuls + CPU router/top-k + host KV cache]");
         let prompt = llama.chatml(m);
         let t0 = std::time::Instant::now();
         let mut n = 0usize;
