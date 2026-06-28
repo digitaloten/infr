@@ -10,14 +10,34 @@ pub enum DType {
     Bf16,
     I32,
     U32,
-    // legacy scalar quants (needed to parse DiffusionGemma rope_freqs + scale tensors)
+    // legacy round quants
+    Q4_0,
+    Q4_1,
     Q5_0,
     Q5_1,
-    // GGUF k-quants we care about for the MVP (extend as needed).
+    Q8_0,
+    // GGUF k-quants
+    Q2K,
+    Q3K,
     Q4K,
     Q5K,
     Q6K,
-    Q8_0,
+    // i-quants (codebook)
+    Iq1S,
+    Iq1M,
+    Iq2Xxs,
+    Iq2Xs,
+    Iq2S,
+    Iq3Xxs,
+    Iq3S,
+    Iq4Nl,
+    Iq4Xs,
+    // ternary quants
+    Tq1_0,
+    Tq2_0,
+    // fp4 quants
+    Mxfp4,
+    Nvfp4,
 }
 
 impl DType {
@@ -25,7 +45,29 @@ impl DType {
     pub fn is_quant(self) -> bool {
         matches!(
             self,
-            DType::Q5_0 | DType::Q5_1 | DType::Q4K | DType::Q5K | DType::Q6K | DType::Q8_0
+            DType::Q4_0
+                | DType::Q4_1
+                | DType::Q5_0
+                | DType::Q5_1
+                | DType::Q8_0
+                | DType::Q2K
+                | DType::Q3K
+                | DType::Q4K
+                | DType::Q5K
+                | DType::Q6K
+                | DType::Iq1S
+                | DType::Iq1M
+                | DType::Iq2Xxs
+                | DType::Iq2Xs
+                | DType::Iq2S
+                | DType::Iq3Xxs
+                | DType::Iq3S
+                | DType::Iq4Nl
+                | DType::Iq4Xs
+                | DType::Tq1_0
+                | DType::Tq2_0
+                | DType::Mxfp4
+                | DType::Nvfp4
         )
     }
 
