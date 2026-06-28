@@ -127,10 +127,33 @@ impl Wt {
 }
 
 /// One routed expert's SwiGLU weights (gate/up [n_embd→n_ff_exp], down [n_ff_exp→n_embd]).
+/// One expert weight: resident on the GPU (`Gpu`) or kept quantized in host RAM and computed on the
+/// CPU (`Cpu`) — the CPU side is the `INFR_NCMOE` offload, trading speed for VRAM so an MoE model
+/// that doesn't fit the GPU can still run (cf. llama.cpp `--n-cpu-moe`).
+enum ExpertW {
+    Gpu(Wt),
+    Cpu {
+        dtype: infr_core::DType,
+        bytes: Vec<u8>,
+    },
+}
+impl ExpertW {
+    fn is_cpu(&self) -> bool {
+        matches!(self, ExpertW::Cpu { .. })
+    }
+    /// The GPU weight (panics for CPU experts — callers branch on [`is_cpu`] first).
+    fn gpu(&self) -> &Wt {
+        match self {
+            ExpertW::Gpu(w) => w,
+            ExpertW::Cpu { .. } => panic!("expected GPU expert"),
+        }
+    }
+}
+
 struct ExpertWt {
-    gate: Wt,
-    up: Wt,
-    down: Wt,
+    gate: ExpertW,
+    up: ExpertW,
+    down: ExpertW,
 }
 
 /// A layer's FFN: dense fused gate‖up + down, or a routed MoE bank (router + per-expert weights).
@@ -1685,7 +1708,13 @@ fn build_wgateup(be: &VulkanBackend, g: &Gguf, prefix: &str) -> Result<Wt> {
 /// Load a layer's MoE expert bank: the router `ffn_gate_inp` + the `n_expert` per-expert SwiGLU
 /// weights sliced from the stacked `ffn_{gate,up,down}_exps` tensors (each expert is one contiguous
 /// `1/n_expert` block of the stacked tensor — quant blocks never cross expert boundaries).
-fn load_moe(be: &VulkanBackend, g: &Gguf, prefix: &str, n_expert: usize) -> Result<FfnWt> {
+fn load_moe(
+    be: &VulkanBackend,
+    g: &Gguf,
+    prefix: &str,
+    n_expert: usize,
+    on_cpu: bool,
+) -> Result<FfnWt> {
     let gate_inp = upload_wt(be, g, &format!("{prefix}ffn_gate_inp.weight"))?;
     let stacked = |role: &str| -> Result<(infr_core::DType, &[u8])> {
         let name = format!("{prefix}ffn_{role}_exps.weight");
@@ -1706,12 +1735,24 @@ fn load_moe(be: &VulkanBackend, g: &Gguf, prefix: &str, n_expert: usize) -> Resu
         ubytes.len() / n_expert,
         dbytes.len() / n_expert,
     );
+    // GPU experts upload to VRAM; CPU experts keep their quantized bytes in host RAM (computed on
+    // the CPU at forward time) — saving the VRAM their slab would take.
+    let place = |dt: infr_core::DType, b: &[u8]| -> Result<ExpertW> {
+        if on_cpu {
+            Ok(ExpertW::Cpu {
+                dtype: dt,
+                bytes: b.to_vec(),
+            })
+        } else {
+            Ok(ExpertW::Gpu(upload_wt_bytes(be, dt, b)?))
+        }
+    };
     let mut experts = Vec::with_capacity(n_expert);
     for e in 0..n_expert {
         experts.push(ExpertWt {
-            gate: upload_wt_bytes(be, gdt, &gbytes[e * gstride..(e + 1) * gstride])?,
-            up: upload_wt_bytes(be, udt, &ubytes[e * ustride..(e + 1) * ustride])?,
-            down: upload_wt_bytes(be, ddt, &dbytes[e * dstride..(e + 1) * dstride])?,
+            gate: place(gdt, &gbytes[e * gstride..(e + 1) * gstride])?,
+            up: place(udt, &ubytes[e * ustride..(e + 1) * ustride])?,
+            down: place(ddt, &dbytes[e * dstride..(e + 1) * dstride])?,
         });
     }
     Ok(FfnWt::Moe { gate_inp, experts })
@@ -1774,6 +1815,13 @@ impl Llama {
         } else {
             None
         };
+        // INFR_NCMOE=N: keep the experts of the first N layers in host RAM (computed on CPU), saving
+        // their VRAM so a too-big MoE still fits (cf. llama.cpp --n-cpu-moe). Clamped to n_layer.
+        let n_cpu_moe = std::env::var("INFR_NCMOE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(n_layer);
         // head_dim: explicit (qwen3 key_length) or n_embd/n_head (llama). Note q_dim = n_head*head_dim
         // may differ from n_embd (qwen3-0.6B: 16*128=2048 vs embd 1024).
         let head_dim =
@@ -1805,16 +1853,32 @@ impl Llama {
         // uploading any tensor — turns a cryptic mid-load allocator OOM into a clear early error.
         // (KV cache + activation scratch are allocated later by `new_kv`/the forward, not here.)
         let fp = weight_footprint(&g);
+        // Experts of the first `n_cpu_moe` layers live in host RAM (INFR_NCMOE) → subtract their
+        // (uniform-per-layer) share from the VRAM total. The router/dense weights stay on GPU.
+        let cpu_expert_bytes = if n_layer > 0 {
+            fp.expert * n_cpu_moe as u64 / n_layer as u64
+        } else {
+            0
+        };
+        let gpu_total = fp.total() - cpu_expert_bytes;
         let vram = be.vram();
         let gb = |b: u64| b as f64 / 1e9;
         let experts = if fp.expert > 0 {
-            format!(", experts {:.2} GB", gb(fp.expert))
+            let cpu = if n_cpu_moe > 0 {
+                format!(
+                    ", {n_cpu_moe} layers' experts on CPU = -{:.2} GB",
+                    gb(cpu_expert_bytes)
+                )
+            } else {
+                String::new()
+            };
+            format!(", experts {:.2} GB{cpu}", gb(fp.expert))
         } else {
             String::new()
         };
         eprintln!(
-            "weights {:.2} GB (dense {:.2} GB{}) | VRAM {:.2} GB {} / {:.2} GB total",
-            gb(fp.total()),
+            "weights {:.2} GB on GPU (dense {:.2} GB{}) | VRAM {:.2} GB {} / {:.2} GB total",
+            gb(gpu_total),
             gb(fp.dense),
             experts,
             gb(vram.available),
@@ -1822,20 +1886,20 @@ impl Llama {
             gb(vram.total),
         );
         const WEIGHT_HEADROOM: u64 = 384 * 1024 * 1024; // activation/scratch slack beyond weights
-        if fp.total() + WEIGHT_HEADROOM > vram.available {
+        if gpu_total + WEIGHT_HEADROOM > vram.available {
             bail!(
                 "weights need {:.2} GB + {:.0} MB scratch but only {:.2} GB VRAM is available \
-                 (total {:.2} GB) — use a smaller quant or free GPU memory",
-                gb(fp.total()),
+                 (total {:.2} GB) — use a smaller quant, free GPU memory, or raise INFR_NCMOE",
+                gb(gpu_total),
                 WEIGHT_HEADROOM as f64 / 1e6,
                 gb(vram.available),
                 gb(vram.total),
             );
         }
-        // Reserve the model's weight VRAM up front as one contiguous bump arena (frees in one shot,
-        // no per-tensor fragmentation). Best-effort: if the contiguous block can't be obtained, fall
-        // back to per-tensor allocation rather than failing the load.
-        if let Err(e) = be.reserve_weights(fp.total()) {
+        // Reserve the GPU-resident weight VRAM up front as one contiguous bump arena (frees in one
+        // shot, no per-tensor fragmentation). Best-effort: if the contiguous block can't be obtained,
+        // fall back to per-tensor allocation rather than failing the load.
+        if let Err(e) = be.reserve_weights(gpu_total) {
             eprintln!("note: weight arena reservation failed ({e}); using per-tensor allocation");
         }
 
@@ -1888,7 +1952,7 @@ impl Llama {
                 .map_err(|e| anyhow!("upload ffn_norm {l}: {e}"))?;
             // MoE layer: router + per-expert bank. Dense layer: fused gate‖up + down.
             let ffn = if let Some(mc) = moe {
-                load_moe(&be, &g, &format!("blk.{l}."), mc.n_expert)?
+                load_moe(&be, &g, &format!("blk.{l}."), mc.n_expert, l < n_cpu_moe)?
             } else {
                 FfnWt::Dense {
                     wgateup: build_wgateup(&be, &g, &format!("blk.{l}."))?,
@@ -3205,28 +3269,51 @@ impl Llama {
         idx.truncate(mc.n_used);
         let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
 
-        // Phase 1: all selected experts' gate+up matmuls in ONE submit (they all read `x`).
-        let mut gu_ops: Vec<(&Wt, &[f32], usize, usize, usize)> = Vec::with_capacity(idx.len() * 2);
-        for &e in &idx {
-            gu_ops.push((&experts[e].gate, x, 1, ne, mc.n_ff_exp));
-            gu_ops.push((&experts[e].up, x, 1, ne, mc.n_ff_exp));
-        }
-        let gu = self.gemv_wt_many(&gu_ops)?;
-        // Host SwiGLU per expert → activation inputs for the down matmuls.
-        let acts: Vec<Vec<f32>> = (0..idx.len())
-            .map(|ki| {
-                let (gate, up) = (&gu[2 * ki], &gu[2 * ki + 1]);
-                (0..mc.n_ff_exp).map(|i| silu(gate[i]) * up[i]).collect()
-            })
-            .collect();
-        // Phase 2: all down matmuls in ONE submit.
-        let down_ops: Vec<(&Wt, &[f32], usize, usize, usize)> = idx
-            .iter()
-            .enumerate()
-            .map(|(ki, &e)| (&experts[e].down, acts[ki].as_slice(), 1, mc.n_ff_exp, ne))
-            .collect();
-        let ys = self.gemv_wt_many(&down_ops)?;
-        // Host weighted accumulate.
+        // Each expert's SwiGLU → `ys[ki]` (down output). Expert placement is per-layer uniform, so
+        // either run all on the CPU (INFR_NCMOE-offloaded layer) or batch all on the GPU.
+        let cpu_layer = !idx.is_empty() && experts[idx[0]].gate.is_cpu();
+        let ys: Vec<Vec<f32>> = if cpu_layer {
+            idx.iter()
+                .map(|&e| {
+                    let gate = cpu_expert_matvec(&experts[e].gate, x, ne, mc.n_ff_exp)?;
+                    let up = cpu_expert_matvec(&experts[e].up, x, ne, mc.n_ff_exp)?;
+                    let act: Vec<f32> = (0..mc.n_ff_exp).map(|i| silu(gate[i]) * up[i]).collect();
+                    cpu_expert_matvec(&experts[e].down, &act, mc.n_ff_exp, ne)
+                })
+                .collect::<Result<_>>()?
+        } else {
+            // Phase 1: all gate+up matmuls in ONE submit (they all read `x`).
+            let mut gu_ops: Vec<(&Wt, &[f32], usize, usize, usize)> =
+                Vec::with_capacity(idx.len() * 2);
+            for &e in &idx {
+                gu_ops.push((experts[e].gate.gpu(), x, 1, ne, mc.n_ff_exp));
+                gu_ops.push((experts[e].up.gpu(), x, 1, ne, mc.n_ff_exp));
+            }
+            let gu = self.gemv_wt_many(&gu_ops)?;
+            let acts: Vec<Vec<f32>> = (0..idx.len())
+                .map(|ki| {
+                    let (gate, up) = (&gu[2 * ki], &gu[2 * ki + 1]);
+                    (0..mc.n_ff_exp).map(|i| silu(gate[i]) * up[i]).collect()
+                })
+                .collect();
+            // Phase 2: all down matmuls in ONE submit.
+            let down_ops: Vec<(&Wt, &[f32], usize, usize, usize)> = idx
+                .iter()
+                .enumerate()
+                .map(|(ki, &e)| {
+                    (
+                        experts[e].down.gpu(),
+                        acts[ki].as_slice(),
+                        1,
+                        mc.n_ff_exp,
+                        ne,
+                    )
+                })
+                .collect();
+            self.gemv_wt_many(&down_ops)?
+        };
+
+        // Host weighted accumulate over the renormalized top-k softmax weights.
         let mut out = vec![0f32; ne];
         for (ki, &e) in idx.iter().enumerate() {
             let w_e = probs[e] / wsum * mc.scale;
@@ -3562,6 +3649,22 @@ fn attention_kv(
         }
     }
     out
+}
+
+/// Host matvec `y = x·Wᵀ` for a CPU-offloaded expert weight (INFR_NCMOE): dequant the quantized
+/// `[out_f, in_f]` weight to f32, then dot each row with `x`. Correctness-first — the CPU path is
+/// the VRAM/speed tradeoff; not micro-optimized (full dequant per call).
+fn cpu_expert_matvec(e: &ExpertW, x: &[f32], in_f: usize, out_f: usize) -> Result<Vec<f32>> {
+    let ExpertW::Cpu { dtype, bytes } = e else {
+        unreachable!("cpu_expert_matvec on a GPU expert");
+    };
+    let w = dequant_block(*dtype, bytes)?; // [out_f * in_f] row-major (out rows)
+    let mut y = vec![0f32; out_f];
+    for o in 0..out_f {
+        let row = &w[o * in_f..(o + 1) * in_f];
+        y[o] = row.iter().zip(x).map(|(a, b)| a * b).sum();
+    }
+    Ok(y)
 }
 
 /// Qwen3 per-head RMSNorm (QK-norm): normalize each head's `hd`-vector by its RMS, scaled by `w[hd]`.
