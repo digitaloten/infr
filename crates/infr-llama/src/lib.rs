@@ -2126,6 +2126,70 @@ impl Llama {
         Ok(bytemuck::cast_slice(&out).to_vec())
     }
 
+    /// Batched eager GEMV: record many independent `y = x·Wᵀ` into ONE command buffer / submit and
+    /// read them all back. Cuts per-op submit+wait latency (the MoE bottleneck — ~1400 tiny matmuls
+    /// per token). Each op is `(weight, x, rows, in_f, out_f)`; returns one output vec per op.
+    fn gemv_wt_many(&self, ops: &[(&Wt, &[f32], usize, usize, usize)]) -> Result<Vec<Vec<f32>>> {
+        let mut xbufs = Vec::with_capacity(ops.len());
+        let mut ybufs = Vec::with_capacity(ops.len());
+        for &(_, x, rows, in_f, _) in ops {
+            debug_assert_eq!(x.len(), rows * in_f);
+            let xb = self
+                .be
+                .alloc((x.len()).max(1) * 4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?;
+            self.be
+                .upload(xb.as_ref(), bytemuck::cast_slice(x))
+                .map_err(|e| anyhow!("{e}"))?;
+            xbufs.push(xb);
+        }
+        for &(_, _, rows, _, out_f) in ops {
+            let yb = self
+                .be
+                .alloc((rows * out_f).max(1) * 4, BufferUsage::Readback)
+                .map_err(|e| anyhow!("{e}"))?;
+            ybufs.push(yb);
+        }
+        let rec = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
+        for (i, &(w, _, rows, in_f, out_f)) in ops.iter().enumerate() {
+            let (xb, yb) = (xbufs[i].as_ref(), ybufs[i].as_ref());
+            match w {
+                Wt::F16(b) => rec.linear(b.as_ref(), xb, yb, rows, in_f, out_f),
+                Wt::Q {
+                    q,
+                    s,
+                    m,
+                    bits,
+                    blk_shift,
+                } => rec.linear_q(
+                    q.as_ref(),
+                    s.as_ref(),
+                    m.as_ref(),
+                    xb,
+                    yb,
+                    rows,
+                    in_f,
+                    out_f,
+                    *bits,
+                    *blk_shift,
+                ),
+                Wt::Native { buf, dtype } => {
+                    rec.linear_native(*dtype, buf.as_ref(), xb, yb, rows, in_f, out_f)
+                }
+            }
+        }
+        rec.finish().map_err(|e| anyhow!("{e}"))?;
+        let mut outs = Vec::with_capacity(ops.len());
+        for (i, &(_, _, rows, _, out_f)) in ops.iter().enumerate() {
+            let mut o = vec![0u8; rows * out_f * 4];
+            self.be
+                .download(ybufs[i].as_ref(), &mut o)
+                .map_err(|e| anyhow!("{e}"))?;
+            outs.push(bytemuck::cast_slice(&o).to_vec());
+        }
+        Ok(outs)
+    }
+
     /// One-shot MoE forward over `tokens` (fresh cache) — returns last-position logits. Thin wrapper
     /// over [`forward_moe_chunk`](Self::forward_moe_chunk); used for tests / single-logit checks.
     pub fn forward_moe(&self, tokens: &[u32]) -> Result<Vec<f32>> {
@@ -3068,11 +3132,16 @@ impl Llama {
         }
 
         for (li, layer) in self.layers.iter().enumerate() {
-            // attention with KV cache
+            // attention with KV cache — Q/K/V projections batched into one submit
             let hn = rmsnorm_rows(&hidden, &layer.attn_norm, t, ne, c.rms_eps);
-            let mut q = self.gemv_wt(&layer.wq, &hn, t, ne, nh * hd)?;
-            let mut knew = self.gemv_wt(&layer.wk, &hn, t, ne, nkv * hd)?;
-            let vnew = self.gemv_wt(&layer.wv, &hn, t, ne, nkv * hd)?;
+            let mut qkv = self.gemv_wt_many(&[
+                (&layer.wq, hn.as_slice(), t, ne, nh * hd),
+                (&layer.wk, hn.as_slice(), t, ne, nkv * hd),
+                (&layer.wv, hn.as_slice(), t, ne, nkv * hd),
+            ])?;
+            let vnew = qkv.pop().unwrap();
+            let mut knew = qkv.pop().unwrap();
+            let mut q = qkv.pop().unwrap();
             qk_norm_rows(&mut q, t, nh, hd, layer.q_norm.as_ref().unwrap(), c.rms_eps);
             qk_norm_rows(
                 &mut knew,
@@ -3135,18 +3204,34 @@ impl Llama {
         idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
         idx.truncate(mc.n_used);
         let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
-        let mut out = vec![0f32; ne];
+
+        // Phase 1: all selected experts' gate+up matmuls in ONE submit (they all read `x`).
+        let mut gu_ops: Vec<(&Wt, &[f32], usize, usize, usize)> = Vec::with_capacity(idx.len() * 2);
         for &e in &idx {
+            gu_ops.push((&experts[e].gate, x, 1, ne, mc.n_ff_exp));
+            gu_ops.push((&experts[e].up, x, 1, ne, mc.n_ff_exp));
+        }
+        let gu = self.gemv_wt_many(&gu_ops)?;
+        // Host SwiGLU per expert → activation inputs for the down matmuls.
+        let acts: Vec<Vec<f32>> = (0..idx.len())
+            .map(|ki| {
+                let (gate, up) = (&gu[2 * ki], &gu[2 * ki + 1]);
+                (0..mc.n_ff_exp).map(|i| silu(gate[i]) * up[i]).collect()
+            })
+            .collect();
+        // Phase 2: all down matmuls in ONE submit.
+        let down_ops: Vec<(&Wt, &[f32], usize, usize, usize)> = idx
+            .iter()
+            .enumerate()
+            .map(|(ki, &e)| (&experts[e].down, acts[ki].as_slice(), 1, mc.n_ff_exp, ne))
+            .collect();
+        let ys = self.gemv_wt_many(&down_ops)?;
+        // Host weighted accumulate.
+        let mut out = vec![0f32; ne];
+        for (ki, &e) in idx.iter().enumerate() {
             let w_e = probs[e] / wsum * mc.scale;
-            let gate_e = self.gemv_wt(&experts[e].gate, x, 1, ne, mc.n_ff_exp)?;
-            let up_e = self.gemv_wt(&experts[e].up, x, 1, ne, mc.n_ff_exp)?;
-            let mut act = vec![0f32; mc.n_ff_exp];
-            for i in 0..mc.n_ff_exp {
-                act[i] = silu(gate_e[i]) * up_e[i];
-            }
-            let y_e = self.gemv_wt(&experts[e].down, &act, 1, mc.n_ff_exp, ne)?;
             for i in 0..ne {
-                out[i] += w_e * y_e[i];
+                out[i] += w_e * ys[ki][i];
             }
         }
         Ok(out)
