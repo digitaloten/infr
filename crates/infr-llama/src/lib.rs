@@ -3646,17 +3646,27 @@ impl Llama {
             let hn2 = rmsnorm_rows(&hidden, &layer.ffn_norm, t, ne, c.rms_eps);
             let (gate_inp, experts) = layer.moe();
             let logits = self.gemv_wt(gate_inp, &hn2, t, ne, mc.n_expert)?;
-            for r in 0..t {
-                let out_row = self.moe_ffn_token(
-                    &hn2[r * ne..(r + 1) * ne],
-                    &logits[r * mc.n_expert..(r + 1) * mc.n_expert],
-                    experts,
-                    &mc,
-                    li,
-                    &mut kv.pool,
-                )?;
-                for i in 0..ne {
-                    hidden[r * ne + i] += out_row[i];
+            if !experts[0].gate.is_cpu() {
+                // All experts GPU-resident → group tokens by expert and run one SwiGLU GEMM per
+                // expert (tiled coopmat) instead of `t × n_used` per-token GEMVs.
+                let ffn = self.moe_ffn_grouped(&hn2, &logits, experts, &mc, t)?;
+                for i in 0..t * ne {
+                    hidden[i] += ffn[i];
+                }
+            } else {
+                // Host-offloaded / streamed experts: per-token path (CPU or VRAM pool).
+                for r in 0..t {
+                    let out_row = self.moe_ffn_token(
+                        &hn2[r * ne..(r + 1) * ne],
+                        &logits[r * mc.n_expert..(r + 1) * mc.n_expert],
+                        experts,
+                        &mc,
+                        li,
+                        &mut kv.pool,
+                    )?;
+                    for i in 0..ne {
+                        hidden[r * ne + i] += out_row[i];
+                    }
                 }
             }
         }
@@ -3779,6 +3789,95 @@ impl Llama {
             let w_e = probs[e] / wsum * mc.scale;
             for i in 0..ne {
                 out[i] += w_e * ys[ki][i];
+            }
+        }
+        Ok(out)
+    }
+
+    /// Group-by-expert MoE FFN over a whole chunk of `t` tokens (all experts GPU-resident — the
+    /// prefill path). Routes every token to its top-k experts on the host, then for each expert
+    /// gathers all of its assigned token rows into one contiguous batch and runs **one** SwiGLU
+    /// per expert as a tiled GEMM (`[m_e×ne]·Wᵀ`) — gate+up batched into a single submit, down into
+    /// a second — instead of `t × n_used` per-token GEMVs. Scatter-adds the weighted expert outputs
+    /// back to each token's row. Returns the `[t*ne]` FFN output to add into the residual stream.
+    fn moe_ffn_grouped(
+        &self,
+        hn2: &[f32],    // [t*ne], ffn-normed token rows
+        logits: &[f32], // [t*n_expert], router logits
+        experts: &[ExpertWt],
+        mc: &MoeConfig,
+        t: usize,
+    ) -> Result<Vec<f32>> {
+        let ne = self.cfg.n_embd;
+        let nff = mc.n_ff_exp;
+
+        // Route: per expert, the token rows it must process and their renormalized weights.
+        let mut rows_of: Vec<Vec<usize>> = vec![Vec::new(); mc.n_expert];
+        let mut wts_of: Vec<Vec<f32>> = vec![Vec::new(); mc.n_expert];
+        for r in 0..t {
+            let (idx, weights) = moe_topk(&logits[r * mc.n_expert..(r + 1) * mc.n_expert], mc);
+            for (ki, &e) in idx.iter().enumerate() {
+                rows_of[e].push(r);
+                wts_of[e].push(weights[ki]);
+            }
+        }
+        let active: Vec<usize> = (0..mc.n_expert)
+            .filter(|&e| !rows_of[e].is_empty())
+            .collect();
+
+        // Gather each active expert's token rows into a contiguous [m_e*ne] batch.
+        let xs: Vec<Vec<f32>> = active
+            .iter()
+            .map(|&e| {
+                let mut x = vec![0f32; rows_of[e].len() * ne];
+                for (j, &r) in rows_of[e].iter().enumerate() {
+                    x[j * ne..(j + 1) * ne].copy_from_slice(&hn2[r * ne..(r + 1) * ne]);
+                }
+                x
+            })
+            .collect();
+
+        // Phase 1: every active expert's gate+up GEMM in ONE submit (both read its batch `xs[ai]`).
+        let mut gu_ops: Vec<(&Wt, &[f32], usize, usize, usize)> =
+            Vec::with_capacity(active.len() * 2);
+        for (ai, &e) in active.iter().enumerate() {
+            let m = rows_of[e].len();
+            gu_ops.push((experts[e].gate.gpu(), xs[ai].as_slice(), m, ne, nff));
+            gu_ops.push((experts[e].up.gpu(), xs[ai].as_slice(), m, ne, nff));
+        }
+        let gu = self.gemv_wt_many(&gu_ops)?;
+
+        // SwiGLU on host, then Phase 2: every active expert's down GEMM in ONE submit.
+        let acts: Vec<Vec<f32>> = (0..active.len())
+            .map(|ai| {
+                let (g, u) = (&gu[2 * ai], &gu[2 * ai + 1]);
+                (0..g.len()).map(|i| silu(g[i]) * u[i]).collect()
+            })
+            .collect();
+        let down_ops: Vec<(&Wt, &[f32], usize, usize, usize)> = active
+            .iter()
+            .enumerate()
+            .map(|(ai, &e)| {
+                (
+                    experts[e].down.gpu(),
+                    acts[ai].as_slice(),
+                    rows_of[e].len(),
+                    nff,
+                    ne,
+                )
+            })
+            .collect();
+        let ys = self.gemv_wt_many(&down_ops)?;
+
+        // Scatter-add each expert's weighted down output back to its token rows.
+        let mut out = vec![0f32; t * ne];
+        for (ai, &e) in active.iter().enumerate() {
+            let y = &ys[ai];
+            for (j, &r) in rows_of[e].iter().enumerate() {
+                let w = wts_of[e][j];
+                for i in 0..ne {
+                    out[r * ne + i] += w * y[j * ne + i];
+                }
             }
         }
         Ok(out)
