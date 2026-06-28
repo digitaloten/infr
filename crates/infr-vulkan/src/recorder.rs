@@ -1516,6 +1516,24 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// `acc += scale * x` (axpy), in place into `acc`. Accumulates weighted MoE expert outputs into
+    /// the resident hidden state on the GPU (chained across experts via WAW barriers on `acc`).
+    pub fn add_scaled(&self, x: &dyn Buffer, acc: &dyn Buffer, scale: f32, n: usize) {
+        let k = self
+            .be
+            .kernel("add_scaled", crate::gemm::add_scaled_spv(), 2, 8);
+        let mut push = [0u8; 8];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&scale.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(acc)],
+            1,
+            &push,
+            (n as u32).div_ceil(64),
+        );
+    }
+
     /// Elementwise add; in place allowed (`a` may equal `y`).
     pub fn add(&self, a: &dyn Buffer, b: &dyn Buffer, y: &dyn Buffer, n: usize) {
         let k = self.be.kernel("add", crate::gemm::add_spv(), 3, 4);

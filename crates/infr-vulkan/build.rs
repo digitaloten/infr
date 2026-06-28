@@ -30,6 +30,7 @@ fn main() {
         ("attn_pv_reduce", "attn_pv_reduce", &[]),
         ("rmsnorm", "rmsnorm", &[]),
         ("add", "add", &[]),
+        ("add_scaled", "add_scaled", &[]),
         ("silu_mul", "silu_mul", &[]),
         ("silu_mul_fused", "silu_mul_fused", &[]),
         ("store_f16", "store_f16", &[]),

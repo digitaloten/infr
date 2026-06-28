@@ -289,6 +289,12 @@ pub(crate) fn add_spv() -> &'static [u32] {
     static ADD_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     ADD_SPV.get_or_init(|| spv_words(ADD_SPV_BYTES))
 }
+/// SPIR-V for the scaled add / axpy (`acc += scale*x`).
+pub(crate) fn add_scaled_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/add_scaled.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for the SwiGLU activation (`y=silu(gate)*up`).
 pub(crate) fn silu_mul_spv() -> &'static [u32] {
     static SILU_MUL_SPV: OnceLock<Vec<u32>> = OnceLock::new();

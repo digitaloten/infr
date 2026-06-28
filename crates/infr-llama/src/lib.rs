@@ -3374,10 +3374,244 @@ impl Llama {
         Ok(bytemuck::cast_slice(&out).to_vec())
     }
 
+    /// GPU-resident single-token decode (qwen3moe, all experts on GPU): the residual stream stays in
+    /// VRAM the whole layer — rmsnorm / QKV / attention / O / residual / ffn-norm / router are one
+    /// recorder, then (after reading back only the router logits for top-k) the selected experts'
+    /// gate/up/SiLU/down + weighted accumulate (`hidden += w_e·y_e`) are a second recorder. Only the
+    /// `n_expert` logits cross the PCIe bus per layer — no per-matmul host round-trip. Returns logits.
+    fn forward_moe_chunk_gpu(&self, token: u32, kv: &mut MoeKv) -> Result<Vec<f32>> {
+        let c = &self.cfg;
+        let mc = c.moe.expect("moe");
+        let (ne, nh, nkv, hd) = (c.n_embd, c.n_head, c.n_kv, c.head_dim);
+        let kvrow = nkv * hd;
+        let pos = kv.kv.len;
+        let kv_len = pos + 1;
+        let al = |n: usize| {
+            self.be
+                .alloc((n * 4).max(4), BufferUsage::Activations)
+                .map_err(|e| anyhow!("{e}"))
+        };
+
+        // resident scratch (reused across all 48 layers)
+        let hidden = al(ne)?;
+        let emb = &self.token_embd[token as usize * ne..(token as usize + 1) * ne];
+        self.be
+            .upload(hidden.as_ref(), bytemuck::cast_slice(emb))
+            .map_err(|e| anyhow!("{e}"))?;
+        let (hn, hn2, ao) = (al(ne)?, al(ne)?, al(ne)?);
+        let (qr, kr, vr) = (al(nh * hd)?, al(nkv * hd)?, al(nkv * hd)?);
+        let q_f16 = self
+            .be
+            .alloc(nh * hd * 2, BufferUsage::Activations)
+            .map_err(|e| anyhow!("{e}"))?;
+        let attn = al(nh * hd)?;
+        let (g, u, act, y) = (
+            al(mc.n_ff_exp)?,
+            al(mc.n_ff_exp)?,
+            al(mc.n_ff_exp)?,
+            al(ne)?,
+        );
+        let logits = self
+            .be
+            .alloc(mc.n_expert * 4, BufferUsage::Readback)
+            .map_err(|e| anyhow!("{e}"))?;
+        // split-K decode attention scratch (parallelize the KV reduction at depth)
+        let chunk = (kv_len / 32).clamp(64, 512);
+        let use_split = kv_len > chunk;
+        let n_chunks = if use_split { kv_len.div_ceil(chunk) } else { 0 };
+        let (pm, pl, pacc) = if use_split {
+            (
+                Some(al(nh * n_chunks)?),
+                Some(al(nh * n_chunks)?),
+                Some(al(nh * n_chunks * hd)?),
+            )
+        } else {
+            (None, None, None)
+        };
+
+        for (li, layer) in self.layers.iter().enumerate() {
+            // recorder 1: attention + router, all on the GPU.
+            let rec = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
+            rec.rmsnorm(
+                hidden.as_ref(),
+                layer.attn_norm_buf.as_ref(),
+                hn.as_ref(),
+                1,
+                ne,
+                c.rms_eps,
+            );
+            rec_linear(&rec, &layer.wq, hn.as_ref(), qr.as_ref(), 1, ne, nh * hd);
+            rec_linear(&rec, &layer.wk, hn.as_ref(), kr.as_ref(), 1, ne, nkv * hd);
+            rec_linear(&rec, &layer.wv, hn.as_ref(), vr.as_ref(), 1, ne, nkv * hd);
+            let (qn, kn) = (
+                layer.q_norm_buf.as_ref().unwrap().as_ref(),
+                layer.k_norm_buf.as_ref().unwrap().as_ref(),
+            );
+            rec.qk_norm_rope(
+                qr.as_ref(),
+                qn,
+                q_f16.as_ref(),
+                1,
+                nh,
+                hd,
+                c.rope_dim,
+                c.rope_theta,
+                pos,
+                0,
+                c.rms_eps,
+            );
+            rec.qk_norm_rope(
+                kr.as_ref(),
+                kn,
+                kv.kv.k[li].as_ref(),
+                1,
+                nkv,
+                hd,
+                c.rope_dim,
+                c.rope_theta,
+                pos,
+                pos,
+                c.rms_eps,
+            );
+            rec.store_f16(vr.as_ref(), kv.kv.v[li].as_ref(), kvrow, pos * kvrow);
+            if use_split {
+                rec.attention_kv_split(
+                    q_f16.as_ref(),
+                    kv.kv.k[li].as_ref(),
+                    kv.kv.v[li].as_ref(),
+                    attn.as_ref(),
+                    pm.as_ref().unwrap().as_ref(),
+                    pl.as_ref().unwrap().as_ref(),
+                    pacc.as_ref().unwrap().as_ref(),
+                    kv_len,
+                    nh,
+                    nkv,
+                    hd,
+                    chunk,
+                    n_chunks,
+                );
+            } else {
+                rec.attention_kv(
+                    q_f16.as_ref(),
+                    kv.kv.k[li].as_ref(),
+                    kv.kv.v[li].as_ref(),
+                    attn.as_ref(),
+                    1,
+                    kv_len,
+                    nh,
+                    nkv,
+                    hd,
+                    pos,
+                );
+            }
+            rec_linear(&rec, &layer.wo, attn.as_ref(), ao.as_ref(), 1, nh * hd, ne);
+            rec.add(hidden.as_ref(), ao.as_ref(), hidden.as_ref(), ne); // residual
+            rec.rmsnorm(
+                hidden.as_ref(),
+                layer.ffn_norm_buf.as_ref(),
+                hn2.as_ref(),
+                1,
+                ne,
+                c.rms_eps,
+            );
+            let (gate_inp, experts) = layer.moe();
+            rec_linear(
+                &rec,
+                gate_inp,
+                hn2.as_ref(),
+                logits.as_ref(),
+                1,
+                ne,
+                mc.n_expert,
+            );
+            rec.finish().map_err(|e| anyhow!("{e}"))?;
+
+            // top-k expert selection on host (the one unavoidable readback: n_expert floats).
+            let mut lb = vec![0u8; mc.n_expert * 4];
+            self.be
+                .download(logits.as_ref(), &mut lb)
+                .map_err(|e| anyhow!("{e}"))?;
+            let (idx, weights) = moe_topk(bytemuck::cast_slice(&lb), &mc);
+
+            // recorder 2: selected experts' FFN, accumulated into the resident hidden on the GPU.
+            let rec2 = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
+            for (ki, &e) in idx.iter().enumerate() {
+                let ew = &experts[e];
+                rec_linear(
+                    &rec2,
+                    ew.gate.gpu(),
+                    hn2.as_ref(),
+                    g.as_ref(),
+                    1,
+                    ne,
+                    mc.n_ff_exp,
+                );
+                rec_linear(
+                    &rec2,
+                    ew.up.gpu(),
+                    hn2.as_ref(),
+                    u.as_ref(),
+                    1,
+                    ne,
+                    mc.n_ff_exp,
+                );
+                rec2.silu_mul(g.as_ref(), u.as_ref(), act.as_ref(), mc.n_ff_exp);
+                rec_linear(
+                    &rec2,
+                    ew.down.gpu(),
+                    act.as_ref(),
+                    y.as_ref(),
+                    1,
+                    mc.n_ff_exp,
+                    ne,
+                );
+                rec2.add_scaled(y.as_ref(), hidden.as_ref(), weights[ki], ne);
+            }
+            rec2.finish().map_err(|e| anyhow!("{e}"))?;
+        }
+        kv.kv.len += 1;
+
+        // final norm + lm head (on the GPU; only the vocab logits come back).
+        let normed = al(ne)?;
+        let final_logits = self
+            .be
+            .alloc(c.vocab * 4, BufferUsage::Readback)
+            .map_err(|e| anyhow!("{e}"))?;
+        let rec = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
+        rec.rmsnorm(
+            hidden.as_ref(),
+            self.output_norm_buf.as_ref(),
+            normed.as_ref(),
+            1,
+            ne,
+            c.rms_eps,
+        );
+        rec_linear(
+            &rec,
+            &self.lm_head,
+            normed.as_ref(),
+            final_logits.as_ref(),
+            1,
+            ne,
+            c.vocab,
+        );
+        rec.finish().map_err(|e| anyhow!("{e}"))?;
+        let mut out = vec![0u8; c.vocab * 4];
+        self.be
+            .download(final_logits.as_ref(), &mut out)
+            .map_err(|e| anyhow!("{e}"))?;
+        Ok(bytemuck::cast_slice(&out).to_vec())
+    }
+
     /// Eager MoE forward for one chunk of `tokens` at positions `kv.pos..`, appending K/V to the
     /// cache (so decode steps process only the new token, not the whole sequence). Returns logits
     /// (`vocab`) for the last token. Same math as [`forward_moe`] but cached.
     pub fn forward_moe_chunk(&self, tokens: &[u32], kv: &mut MoeKv) -> Result<Vec<f32>> {
+        // Single-token decode with all experts GPU-resident → the fully GPU-resident path (no
+        // per-matmul host round-trip). Prefill (t>1) and offloaded-expert layers use the eager path.
+        if tokens.len() == 1 && !self.layers[0].moe().1[0].gate.is_cpu() {
+            return self.forward_moe_chunk_gpu(tokens[0], kv);
+        }
         let c = &self.cfg;
         let mc = c.moe.expect("forward_moe_chunk requires a MoE model");
         let t = tokens.len();
@@ -3748,6 +3982,55 @@ impl ChatSession<'_> {
 
 fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
+}
+
+/// Dispatch a [`Wt`] linear (`y = x·Wᵀ`) into a recorder, picking the f16 / quant / native op.
+fn rec_linear(
+    rec: &infr_vulkan::Recorder,
+    w: &Wt,
+    x: &dyn Buffer,
+    y: &dyn Buffer,
+    rows: usize,
+    in_f: usize,
+    out_f: usize,
+) {
+    match w {
+        Wt::F16(b) => rec.linear(b.as_ref(), x, y, rows, in_f, out_f),
+        Wt::Q {
+            q,
+            s,
+            m,
+            bits,
+            blk_shift,
+        } => rec.linear_q(
+            q.as_ref(),
+            s.as_ref(),
+            m.as_ref(),
+            x,
+            y,
+            rows,
+            in_f,
+            out_f,
+            *bits,
+            *blk_shift,
+        ),
+        Wt::Native { buf, dtype } => {
+            rec.linear_native(*dtype, buf.as_ref(), x, y, rows, in_f, out_f)
+        }
+    }
+}
+
+/// MoE router top-k on host: softmax the `n_expert` logits, take the `n_used` highest, renormalize
+/// their probs and apply the routing `scale`. Returns (expert indices, per-expert weights).
+fn moe_topk(rl: &[f32], mc: &MoeConfig) -> (Vec<usize>, Vec<f32>) {
+    let maxl = rl.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let probs: Vec<f32> = rl.iter().map(|&v| (v - maxl).exp()).collect();
+    let mut idx: Vec<usize> = (0..mc.n_expert).collect();
+    idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+    idx.truncate(mc.n_used);
+    let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
+    let weights: Vec<f32> = idx.iter().map(|&e| probs[e] / wsum * mc.scale).collect();
+    (idx, weights)
 }
 
 /// Incremental UTF-8-safe detokenizer: fed the FULL decoded text each step, returns the newly
