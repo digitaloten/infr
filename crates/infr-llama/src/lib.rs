@@ -63,13 +63,10 @@ pub struct MoeConfig {
     pub scale: f32,
 }
 
-/// Host K/V cache for the eager MoE forward — per-layer keys/values appended each chunk so decode
-/// only processes the new token (the dense path's GPU KV cache isn't wired for MoE yet). Also holds
-/// the streaming `ExpertPool` for `INFR_MOE_STREAM` (lazily created on first streamed layer).
+/// State for the eager MoE generation: a GPU KV cache (so context competes for VRAM, like the dense
+/// path) + the streaming `ExpertPool` for `INFR_MOE_STREAM` (lazily created on first streamed layer).
 pub struct MoeKv {
-    k: Vec<Vec<f32>>, // [n_layer] of [pos * nkv*hd]
-    v: Vec<Vec<f32>>,
-    pos: usize,
+    kv: KvCache,
     pool: Option<infr_vulkan::ExpertPool>,
 }
 
@@ -182,9 +179,6 @@ struct LayerWeights {
     ffn: FfnWt,
     q_norm_buf: Option<Box<dyn Buffer>>, // qwen3 QK-norm weights [head_dim]
     k_norm_buf: Option<Box<dyn Buffer>>,
-    // Host f32 QK-norm weights [head_dim] for the eager MoE forward (qk_norm applied on CPU).
-    q_norm: Option<Vec<f32>>,
-    k_norm: Option<Vec<f32>>,
 }
 
 impl LayerWeights {
@@ -1820,13 +1814,13 @@ impl Llama {
         } else {
             None
         };
-        // INFR_NCMOE=N: keep the experts of the first N layers in host RAM (computed on CPU), saving
-        // their VRAM so a too-big MoE still fits (cf. llama.cpp --n-cpu-moe). Clamped to n_layer.
-        let n_cpu_moe = std::env::var("INFR_NCMOE")
+        // INFR_NCMOE=N: keep the experts of the first N layers in host RAM, saving their VRAM so a
+        // too-big MoE still fits (cf. llama.cpp --n-cpu-moe). Explicit value disables auto-fit below.
+        let ncmoe_explicit = std::env::var("INFR_NCMOE")
             .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0)
-            .min(n_layer);
+            .and_then(|v| v.parse::<usize>().ok());
+        let mut n_cpu_moe = ncmoe_explicit.unwrap_or(0).min(n_layer);
+        let mut moe_stream = std::env::var("INFR_MOE_STREAM").is_ok();
         // head_dim: explicit (qwen3 key_length) or n_embd/n_head (llama). Note q_dim = n_head*head_dim
         // may differ from n_embd (qwen3-0.6B: 16*128=2048 vs embd 1024).
         let head_dim =
@@ -1858,7 +1852,44 @@ impl Llama {
         // uploading any tensor — turns a cryptic mid-load allocator OOM into a clear early error.
         // (KV cache + activation scratch are allocated later by `new_kv`/the forward, not here.)
         let fp = weight_footprint(&g);
-        // Experts of the first `n_cpu_moe` layers live in host RAM (INFR_NCMOE) → subtract their
+        let vram = be.vram();
+        let gb = |b: u64| b as f64 / 1e9;
+        // GPU KV cache footprint at the target context (`INFR_MAX_CTX`, default 8192): f16 K+V per
+        // layer. MoE attention now stores KV in VRAM, so it competes with experts for space.
+        let target_ctx = std::env::var("INFR_MAX_CTX")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(8192);
+        let kv_bytes =
+            (n_kv * head_dim * 2/*K+V*/ * 2/*f16*/ * n_layer) as u64 * (target_ctx + 64) as u64;
+        const ACT_HEADROOM: u64 = 512 * 1024 * 1024; // activation scratch + streaming pool slack
+                                                     // MoE auto-fit (default; skipped if INFR_NCMOE is set): keep as many whole expert-layers on
+                                                     // the GPU as fit alongside the dense weights, the ctx KV cache, and scratch — offload the
+                                                     // overflow. Forced offload defaults to streaming (GPU-via-pool, ~10x the CPU path).
+        if moe.is_some() && ncmoe_explicit.is_none() {
+            let per_layer = (fp.expert / n_layer.max(1) as u64).max(1);
+            let budget = vram
+                .available
+                .saturating_sub(fp.dense + kv_bytes + ACT_HEADROOM);
+            let gpu_layers = (budget / per_layer).min(n_layer as u64) as usize;
+            n_cpu_moe = n_layer - gpu_layers;
+            if n_cpu_moe > 0 {
+                moe_stream = true;
+            }
+            eprintln!(
+                "MoE auto-fit: {gpu_layers}/{n_layer} expert layers on GPU, {n_cpu_moe} {} \
+                 (ctx={target_ctx} → KV {:.2} GB)",
+                if n_cpu_moe == 0 {
+                    "all resident"
+                } else if moe_stream {
+                    "streamed"
+                } else {
+                    "on CPU"
+                },
+                gb(kv_bytes),
+            );
+        }
+        // Experts of the first `n_cpu_moe` layers live in host RAM → subtract their
         // (uniform-per-layer) share from the VRAM total. The router/dense weights stay on GPU.
         let cpu_expert_bytes = if n_layer > 0 {
             fp.expert * n_cpu_moe as u64 / n_layer as u64
@@ -1866,8 +1897,6 @@ impl Llama {
             0
         };
         let gpu_total = fp.total() - cpu_expert_bytes;
-        let vram = be.vram();
-        let gb = |b: u64| b as f64 / 1e9;
         let experts = if fp.expert > 0 {
             let cpu = if n_cpu_moe > 0 {
                 format!(
@@ -1881,22 +1910,27 @@ impl Llama {
         } else {
             String::new()
         };
+        // KV reservation only applies once the model has a GPU KV cache (MoE here; dense uses its own
+        // path). Reserve it so the later `new_kv` allocation fits alongside the weights.
+        let kv_reserve = if moe.is_some() { kv_bytes } else { 0 };
         eprintln!(
-            "weights {:.2} GB on GPU (dense {:.2} GB{}) | VRAM {:.2} GB {} / {:.2} GB total",
+            "weights {:.2} GB on GPU (dense {:.2} GB{}) + KV {:.2} GB (ctx={target_ctx}) | \
+             VRAM {:.2} GB {} / {:.2} GB total",
             gb(gpu_total),
             gb(fp.dense),
             experts,
+            gb(kv_reserve),
             gb(vram.available),
             if vram.live { "free" } else { "total*" },
             gb(vram.total),
         );
-        const WEIGHT_HEADROOM: u64 = 384 * 1024 * 1024; // activation/scratch slack beyond weights
-        if gpu_total + WEIGHT_HEADROOM > vram.available {
+        if gpu_total + kv_reserve + ACT_HEADROOM > vram.available {
             bail!(
-                "weights need {:.2} GB + {:.0} MB scratch but only {:.2} GB VRAM is available \
-                 (total {:.2} GB) — use a smaller quant, free GPU memory, or raise INFR_NCMOE",
+                "weights {:.2} GB + KV {:.2} GB + {:.0} MB scratch exceed the {:.2} GB VRAM available \
+                 (total {:.2} GB) — use a smaller quant/ctx, free GPU memory, or set INFR_NCMOE",
                 gb(gpu_total),
-                WEIGHT_HEADROOM as f64 / 1e6,
+                gb(kv_reserve),
+                ACT_HEADROOM as f64 / 1e6,
                 gb(vram.available),
                 gb(vram.total),
             );
@@ -1964,22 +1998,14 @@ impl Llama {
                     wdown: up(&be, p("ffn_down.weight"))?,
                 }
             };
-            let (q_norm_host, k_norm_host) = if qk_norm {
-                (
-                    Some(load_tensor_dequant(&g, &p("attn_q_norm.weight"))?.0),
-                    Some(load_tensor_dequant(&g, &p("attn_k_norm.weight"))?.0),
-                )
-            } else {
-                (None, None)
-            };
             let (q_norm_buf, k_norm_buf) = if qk_norm {
                 (
                     Some(
-                        be.upload_weight(q_norm_host.as_ref().unwrap())
+                        be.upload_weight(&load_tensor_dequant(&g, &p("attn_q_norm.weight"))?.0)
                             .map_err(|e| anyhow!("upload q_norm {l}: {e}"))?,
                     ),
                     Some(
-                        be.upload_weight(k_norm_host.as_ref().unwrap())
+                        be.upload_weight(&load_tensor_dequant(&g, &p("attn_k_norm.weight"))?.0)
                             .map_err(|e| anyhow!("upload k_norm {l}: {e}"))?,
                     ),
                 )
@@ -1998,8 +2024,6 @@ impl Llama {
                 ffn,
                 q_norm_buf,
                 k_norm_buf,
-                q_norm: q_norm_host,
-                k_norm: k_norm_host,
             });
             pb.inc(layer_bytes(l));
         }
@@ -2051,7 +2075,7 @@ impl Llama {
             tokenizer,
             user_tokenizer,
             sampler: std::cell::Cell::new(Sampler::default()),
-            moe_stream: std::env::var("INFR_MOE_STREAM").is_ok(),
+            moe_stream,
         })
     }
 
@@ -2263,7 +2287,7 @@ impl Llama {
     /// One-shot MoE forward over `tokens` (fresh cache) — returns last-position logits. Thin wrapper
     /// over [`forward_moe_chunk`](Self::forward_moe_chunk); used for tests / single-logit checks.
     pub fn forward_moe(&self, tokens: &[u32]) -> Result<Vec<f32>> {
-        let mut kv = self.new_moe_kv();
+        let mut kv = self.new_moe_kv(tokens.len() + 8)?;
         self.forward_moe_chunk(tokens, &mut kv)
     }
 
@@ -3176,14 +3200,103 @@ impl Llama {
         self.cfg.moe.is_some()
     }
 
-    /// Fresh host KV cache for the eager MoE forward.
-    pub fn new_moe_kv(&self) -> MoeKv {
-        MoeKv {
-            k: vec![Vec::new(); self.cfg.n_layer],
-            v: vec![Vec::new(); self.cfg.n_layer],
-            pos: 0,
+    /// Fresh MoE generation state with a GPU KV cache sized for `max_ctx` tokens.
+    pub fn new_moe_kv(&self, max_ctx: usize) -> Result<MoeKv> {
+        Ok(MoeKv {
+            kv: self.new_kv(max_ctx)?,
             pool: None,
-        }
+        })
+    }
+
+    /// GPU attention for one MoE layer: upload the raw Q/K/V projections, then record QK-norm + RoPE
+    /// (Q → f16, K → the f16 KV cache at `pos`), V → cache, and causal GQA over the cache — reusing
+    /// the dense path's kernels. Returns the attention output `[n, nh*hd]` (host f32).
+    #[allow(clippy::too_many_arguments)]
+    fn moe_attention(
+        &self,
+        layer: &LayerWeights,
+        q_raw: &[f32],
+        k_raw: &[f32],
+        v_raw: &[f32],
+        kv: &KvCache,
+        li: usize,
+        n: usize,
+        pos: usize,
+    ) -> Result<Vec<f32>> {
+        let c = &self.cfg;
+        let (nh, nkv, hd) = (c.n_head, c.n_kv, c.head_dim);
+        let kvrow = nkv * hd;
+        let up = |data: &[f32]| -> Result<Box<dyn Buffer>> {
+            let b = self
+                .be
+                .alloc(data.len() * 4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?;
+            self.be
+                .upload(b.as_ref(), bytemuck::cast_slice(data))
+                .map_err(|e| anyhow!("{e}"))?;
+            Ok(b)
+        };
+        let qr = up(q_raw)?;
+        let kr = up(k_raw)?;
+        let vr = up(v_raw)?;
+        let q_f16 = self
+            .be
+            .alloc(n * nh * hd * 2, BufferUsage::Activations)
+            .map_err(|e| anyhow!("{e}"))?;
+        let attn = self
+            .be
+            .alloc(n * nh * hd * 4, BufferUsage::Readback)
+            .map_err(|e| anyhow!("{e}"))?;
+        let rec = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
+        let (qn, kn) = (
+            layer.q_norm_buf.as_ref().unwrap().as_ref(),
+            layer.k_norm_buf.as_ref().unwrap().as_ref(),
+        );
+        rec.qk_norm_rope(
+            qr.as_ref(),
+            qn,
+            q_f16.as_ref(),
+            n,
+            nh,
+            hd,
+            c.rope_dim,
+            c.rope_theta,
+            pos,
+            0,
+            c.rms_eps,
+        );
+        rec.qk_norm_rope(
+            kr.as_ref(),
+            kn,
+            kv.k[li].as_ref(),
+            n,
+            nkv,
+            hd,
+            c.rope_dim,
+            c.rope_theta,
+            pos,
+            pos,
+            c.rms_eps,
+        );
+        rec.store_f16(vr.as_ref(), kv.v[li].as_ref(), n * kvrow, pos * kvrow);
+        rec.attention_kv(
+            q_f16.as_ref(),
+            kv.k[li].as_ref(),
+            kv.v[li].as_ref(),
+            attn.as_ref(),
+            n,
+            pos + n,
+            nh,
+            nkv,
+            hd,
+            pos,
+        );
+        rec.finish().map_err(|e| anyhow!("{e}"))?;
+        let mut out = vec![0u8; n * nh * hd * 4];
+        self.be
+            .download(attn.as_ref(), &mut out)
+            .map_err(|e| anyhow!("{e}"))?;
+        Ok(bytemuck::cast_slice(&out).to_vec())
     }
 
     /// Eager native GEMV `y = x·Wᵀ` against an already-resident GPU weight buffer (a streaming
@@ -3227,7 +3340,7 @@ impl Llama {
         let mc = c.moe.expect("forward_moe_chunk requires a MoE model");
         let t = tokens.len();
         let (ne, nh, nkv, hd) = (c.n_embd, c.n_head, c.n_kv, c.head_dim);
-        let pos0 = kv.pos;
+        let pos0 = kv.kv.len;
 
         let mut hidden = vec![0f32; t * ne];
         for (i, &tok) in tokens.iter().enumerate() {
@@ -3236,7 +3349,8 @@ impl Llama {
         }
 
         for (li, layer) in self.layers.iter().enumerate() {
-            // attention with KV cache — Q/K/V projections batched into one submit
+            // attention with GPU KV cache — Q/K/V projections batched into one submit, then QK-norm /
+            // RoPE / KV-append / attention on the GPU (reusing the dense kernels via moe_attention).
             let hn = rmsnorm_rows(&hidden, &layer.attn_norm, t, ne, c.rms_eps);
             let mut qkv = self.gemv_wt_many(&[
                 (&layer.wq, hn.as_slice(), t, ne, nh * hd),
@@ -3244,22 +3358,9 @@ impl Llama {
                 (&layer.wv, hn.as_slice(), t, ne, nkv * hd),
             ])?;
             let vnew = qkv.pop().unwrap();
-            let mut knew = qkv.pop().unwrap();
-            let mut q = qkv.pop().unwrap();
-            qk_norm_rows(&mut q, t, nh, hd, layer.q_norm.as_ref().unwrap(), c.rms_eps);
-            qk_norm_rows(
-                &mut knew,
-                t,
-                nkv,
-                hd,
-                layer.k_norm.as_ref().unwrap(),
-                c.rms_eps,
-            );
-            rope_rows_at(&mut q, t, nh, hd, c.rope_dim, c.rope_theta, pos0);
-            rope_rows_at(&mut knew, t, nkv, hd, c.rope_dim, c.rope_theta, pos0);
-            kv.k[li].extend_from_slice(&knew);
-            kv.v[li].extend_from_slice(&vnew);
-            let attn = attention_kv(&q, &kv.k[li], &kv.v[li], t, pos0, nh, nkv, hd);
+            let knew = qkv.pop().unwrap();
+            let q = qkv.pop().unwrap();
+            let attn = self.moe_attention(layer, &q, &knew, &vnew, &kv.kv, li, t, pos0)?;
             let ao = self.gemv_wt(&layer.wo, &attn, t, nh * hd, ne)?;
             for i in 0..t * ne {
                 hidden[i] += ao[i];
@@ -3283,7 +3384,7 @@ impl Llama {
                 }
             }
         }
-        kv.pos += t;
+        kv.kv.len += t;
 
         let last = &hidden[(t - 1) * ne..t * ne];
         let normed = rmsnorm_rows(last, &self.output_norm, 1, ne, c.rms_eps);
@@ -3453,7 +3554,7 @@ impl Llama {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0x9e3779b97f4a7c15)
             | 1;
-        let mut kv = self.new_moe_kv();
+        let mut kv = self.new_moe_kv(tokens.len() + max_new + 8)?;
         let mut logits = self.forward_moe_chunk(&tokens, &mut kv)?; // prefill
         let mut stream = StreamDecoder::default();
         let mut generated: Vec<u32> = Vec::new();
@@ -3682,85 +3783,6 @@ fn rmsnorm_rows(x: &[f32], w: &[f32], rows: usize, dim: usize, eps: f32) -> Vec<
     y
 }
 
-/// ggml NORM rope at an absolute position offset `pos0` (token `i` is at position `pos0+i`) — the
-/// KV-cache variant of [`rope_rows`] (which assumes positions `0..t`).
-fn rope_rows_at(
-    x: &mut [f32],
-    t: usize,
-    n_heads: usize,
-    hd: usize,
-    rope_dim: usize,
-    theta: f32,
-    pos0: usize,
-) {
-    for ti in 0..t {
-        let pos = (pos0 + ti) as f32;
-        for h in 0..n_heads {
-            let base = (ti * n_heads + h) * hd;
-            for i in 0..rope_dim / 2 {
-                let freq = (theta as f64).powf(-2.0 * i as f64 / rope_dim as f64) as f32;
-                let ang = pos * freq;
-                let (s, co) = ang.sin_cos();
-                let a = x[base + 2 * i];
-                let b = x[base + 2 * i + 1];
-                x[base + 2 * i] = a * co - b * s;
-                x[base + 2 * i + 1] = a * s + b * co;
-            }
-        }
-    }
-}
-
-/// Causal GQA attention with a KV cache. `q` holds `t` new queries at positions `pos0..pos0+t`;
-/// `kc`/`vc` are the full caches (new keys already appended). Returns `[t, nh*hd]`. Query `ti`
-/// attends to all keys `0..=pos0+ti` (causal).
-#[allow(clippy::too_many_arguments)]
-fn attention_kv(
-    q: &[f32],
-    kc: &[f32],
-    vc: &[f32],
-    t: usize,
-    pos0: usize,
-    nh: usize,
-    nkv: usize,
-    hd: usize,
-) -> Vec<f32> {
-    let scale = 1.0 / (hd as f32).sqrt();
-    let group = nh / nkv;
-    let mut out = vec![0f32; t * nh * hd];
-    for ti in 0..t {
-        let qpos = pos0 + ti;
-        for h in 0..nh {
-            let kvh = h / group;
-            let qv = &q[(ti * nh + h) * hd..(ti * nh + h) * hd + hd];
-            let mut scores = vec![0f32; qpos + 1];
-            let mut maxs = f32::NEG_INFINITY;
-            for (j, sc) in scores.iter_mut().enumerate() {
-                let kv = &kc[(j * nkv + kvh) * hd..(j * nkv + kvh) * hd + hd];
-                let mut dot = 0f32;
-                for d in 0..hd {
-                    dot += qv[d] * kv[d];
-                }
-                *sc = dot * scale;
-                maxs = maxs.max(*sc);
-            }
-            let mut sum = 0f32;
-            for sc in scores.iter_mut() {
-                *sc = (*sc - maxs).exp();
-                sum += *sc;
-            }
-            let ob = (ti * nh + h) * hd;
-            for (j, &sc) in scores.iter().enumerate() {
-                let p = sc / sum;
-                let vv = &vc[(j * nkv + kvh) * hd..(j * nkv + kvh) * hd + hd];
-                for d in 0..hd {
-                    out[ob + d] += p * vv[d];
-                }
-            }
-        }
-    }
-    out
-}
-
 /// Host matvec `y = x·Wᵀ` for a CPU-offloaded expert weight (INFR_NCMOE): dequant the quantized
 /// `[out_f, in_f]` weight to f32, then dot each row with `x`. Correctness-first — the CPU path is
 /// the VRAM/speed tradeoff; not micro-optimized (full dequant per call).
@@ -3775,18 +3797,6 @@ fn cpu_expert_matvec(e: &ExpertW, x: &[f32], in_f: usize, out_f: usize) -> Resul
         y[o] = row.iter().zip(x).map(|(a, b)| a * b).sum();
     }
     Ok(y)
-}
-
-/// Qwen3 per-head RMSNorm (QK-norm): normalize each head's `hd`-vector by its RMS, scaled by `w[hd]`.
-fn qk_norm_rows(x: &mut [f32], t: usize, n_heads: usize, hd: usize, w: &[f32], eps: f32) {
-    for i in 0..t * n_heads {
-        let row = &mut x[i * hd..(i + 1) * hd];
-        let ms: f32 = row.iter().map(|v| v * v).sum::<f32>() / hd as f32;
-        let scale = 1.0 / (ms + eps).sqrt();
-        for d in 0..hd {
-            row[d] = row[d] * scale * w[d];
-        }
-    }
 }
 
 /// ggml NORM rope (interleaved pairs (2i, 2i+1)), applied per head over the first `rope_dim` dims.
