@@ -8,6 +8,7 @@
 //! TODO(next): move host ops to GPU; add a KV cache; fold into the `Model`/`Backend` seams.
 #![allow(clippy::needless_range_loop)]
 
+mod iquant_grids;
 pub mod qwen35;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -707,6 +708,289 @@ fn dequant_codebook(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
                     }
                     qoff += 16;
                     outoff += 32;
+                }
+            }
+            out
+        }
+        // ── IQ2_XXS: block = [half d][uint16 qs[32]], 66 bytes, QK_K=256 ────────
+        // Each super-block has 8 sub-blocks of 32 elements.  For each sub-block:
+        //   aux32[0] = 4 grid indices (one byte each, into iq2xxs_grid[256])
+        //   aux32[1] = sign pack: bits[6:0]*4 = four 7-bit sign indices + bits[31:28] = scale
+        //   db = d * (0.5 + (aux32[1] >> 28)) * 0.25
+        //   grid[j] = ((iq2xxs_grid[idx] >> (8*j)) & 0xFF) as i8  (for j in 0..8)
+        //   y[j] = db * grid[j] * (if ksigns[sign_idx] & (1<<j) { -1 } else { 1 })
+        // Ref: llama.cpp dequantize_row_iq2_xxs (ggml-quants.c l.2416)
+        Iq2Xxs => {
+            use iquant_grids::{IQ2XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
+            let bpb = 66usize; // 2 + 32*2
+            let nblk = bytes.len() / bpb;
+            let mut out = vec![0.0f32; nblk * 256];
+            for b in 0..nblk {
+                let blk = &bytes[b * bpb..(b + 1) * bpb];
+                let d = rdf16(blk);
+                // qs as raw bytes (64 bytes = 32 uint16s)
+                let qs = &blk[2..66];
+                let base = b * 256;
+                let mut outoff = 0usize;
+                for ib32 in 0..8usize {
+                    // read 8 bytes at offset 8*ib32 within qs
+                    let off = ib32 * 8;
+                    let aux0 = u32::from_le_bytes(qs[off..off + 4].try_into().unwrap());
+                    let aux1 = u32::from_le_bytes(qs[off + 4..off + 8].try_into().unwrap());
+                    let scale_mag = aux1 >> 28;
+                    let db = d * (0.5 + scale_mag as f32) * 0.25;
+                    let aux0_bytes = aux0.to_le_bytes();
+                    for l in 0..4usize {
+                        let grid_idx = aux0_bytes[l] as usize;
+                        let sign_idx = ((aux1 >> (7 * l)) & 127) as usize;
+                        let grid_u64 = IQ2XXS_GRID[grid_idx];
+                        let signs = KSIGNS_IQ2XS[sign_idx];
+                        for j in 0..8usize {
+                            let gv = ((grid_u64 >> (8 * j)) & 0xFF) as i8;
+                            let sign = if signs & KMASK_IQ2XS[j] != 0 {
+                                -1.0
+                            } else {
+                                1.0
+                            };
+                            out[base + outoff + j] = db * gv as f32 * sign;
+                        }
+                        outoff += 8;
+                    }
+                }
+            }
+            out
+        }
+        // ── IQ2_XS: block = [half d][uint16 qs[32]][uint8 scales[8]], 74 bytes ──
+        // 8 sub-blocks of 32 elements each (4 groups of 8 per sub-block).
+        //   db[0] = d * (0.5 + (scales[ib32] & 0xf)) * 0.25
+        //   db[1] = d * (0.5 + (scales[ib32] >> 4)) * 0.25
+        //   For l in 0..4: grid = iq2xs_grid[qs16[l] & 511]  (9-bit index)
+        //                  signs = ksigns[qs16[l] >> 9]        (7-bit sign)
+        //                  dl = db[l/2]
+        // Ref: llama.cpp dequantize_row_iq2_xs (ggml-quants.c l.2444)
+        Iq2Xs => {
+            use iquant_grids::{IQ2XS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
+            let bpb = 74usize; // 2 + 32*2 + 8
+            let nblk = bytes.len() / bpb;
+            let mut out = vec![0.0f32; nblk * 256];
+            for b in 0..nblk {
+                let blk = &bytes[b * bpb..(b + 1) * bpb];
+                let d = rdf16(blk);
+                // qs as uint16 array (64 bytes = 32 entries)
+                let qs_raw = &blk[2..66];
+                let scales = &blk[66..74];
+                let base = b * 256;
+                let mut outoff = 0usize;
+                for ib32 in 0..8usize {
+                    let sc = scales[ib32];
+                    let db0 = d * (0.5 + (sc & 0xf) as f32) * 0.25;
+                    let db1 = d * (0.5 + (sc >> 4) as f32) * 0.25;
+                    for l in 0..4usize {
+                        let qoff = (ib32 * 4 + l) * 2;
+                        let qs16 = u16::from_le_bytes(qs_raw[qoff..qoff + 2].try_into().unwrap());
+                        let grid_idx = (qs16 & 511) as usize;
+                        let sign_idx = (qs16 >> 9) as usize;
+                        let grid_u64 = IQ2XS_GRID[grid_idx];
+                        let signs = KSIGNS_IQ2XS[sign_idx];
+                        let dl = if l < 2 { db0 } else { db1 };
+                        for j in 0..8usize {
+                            let gv = ((grid_u64 >> (8 * j)) & 0xFF) as i8;
+                            let sign = if signs & KMASK_IQ2XS[j] != 0 {
+                                -1.0
+                            } else {
+                                1.0
+                            };
+                            out[base + outoff + j] = dl * gv as f32 * sign;
+                        }
+                        outoff += 8;
+                    }
+                }
+            }
+            out
+        }
+        // ── IQ2_S: block = [half d][u8 qs[64]][u8 qh[8]][u8 scales[8]], 82 bytes ─
+        // First 32 bytes of qs = 8-bit grid indices (low bits);
+        // next 32 bytes = per-group sign bytes. qh = 2-bit high bits per entry.
+        //   grid_idx = qs[l] | ((qh[ib32] << (8-2*l)) & 0x300)  (10-bit → iq2s_grid[1024])
+        // Ref: llama.cpp dequantize_row_iq2_s (ggml-quants.c l.2471)
+        Iq2S => {
+            use iquant_grids::{IQ2S_GRID, KMASK_IQ2XS};
+            let bpb = 82usize; // 2 + 64 + 8 + 8
+            let nblk = bytes.len() / bpb;
+            let mut out = vec![0.0f32; nblk * 256];
+            for b in 0..nblk {
+                let blk = &bytes[b * bpb..(b + 1) * bpb];
+                let d = rdf16(blk);
+                let qs_all = &blk[2..66]; // 64 bytes
+                let qh = &blk[66..74]; // 8 bytes
+                let scales = &blk[74..82]; // 8 bytes
+                let base = b * 256;
+                let mut outoff = 0usize;
+                for ib32 in 0..8usize {
+                    let sc = scales[ib32];
+                    let db0 = d * (0.5 + (sc & 0xf) as f32) * 0.25;
+                    let db1 = d * (0.5 + (sc >> 4) as f32) * 0.25;
+                    let qh_byte = qh[ib32];
+                    for l in 0..4usize {
+                        let qs_idx = ib32 * 4 + l;
+                        let sgn_idx = ib32 * 4 + l + 32; // signs start at qs_all[32]
+                        let qs_byte = qs_all[qs_idx];
+                        let sign_byte = qs_all[sgn_idx];
+                        // high 2 bits: shift = 8 - 2*l; mask 0x300
+                        let hi = ((qh_byte as u32).wrapping_shl((8 - 2 * l) as u32)) & 0x300;
+                        let grid_idx = (qs_byte as usize) | (hi as usize);
+                        let grid_u64 = IQ2S_GRID[grid_idx];
+                        let dl = if l < 2 { db0 } else { db1 };
+                        for j in 0..8usize {
+                            let gv = ((grid_u64 >> (8 * j)) & 0xFF) as i8;
+                            let sign = if sign_byte & KMASK_IQ2XS[j] != 0 {
+                                -1.0
+                            } else {
+                                1.0
+                            };
+                            out[base + outoff + j] = dl * gv as f32 * sign;
+                        }
+                        outoff += 8;
+                    }
+                }
+            }
+            out
+        }
+        // ── IQ3_XXS: block = [half d][u8 qs[96]], 98 bytes, QK_K=256 ─────────────
+        // qs[0..64] = 8-bit indices (two per group of 8: grid1, grid2)
+        // qs[64..96] = scales_and_signs: 4 bytes per sub-block (aux32)
+        //   db = d * (0.5 + (aux32 >> 28)) * 0.5
+        //   For l in 0..4: signs = ksigns[(aux32 >> 7*l) & 127]
+        //     grid1 = iq3xxs_grid[qs[2*l+0]];  grid2 = iq3xxs_grid[qs[2*l+1]]
+        //     y[j+0] = db * grid1[j] * sign;  y[j+4] = db * grid2[j] * sign
+        // Ref: llama.cpp dequantize_row_iq3_xxs (ggml-quants.c l.2503)
+        Iq3Xxs => {
+            use iquant_grids::{IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
+            let bpb = 98usize; // 2 + 96
+            let nblk = bytes.len() / bpb;
+            let mut out = vec![0.0f32; nblk * 256];
+            for b in 0..nblk {
+                let blk = &bytes[b * bpb..(b + 1) * bpb];
+                let d = rdf16(blk);
+                let qs = &blk[2..66]; // first 64 bytes = grid indices
+                let sas = &blk[66..98]; // scales_and_signs (32 bytes = 8 × u32)
+                let base = b * 256;
+                let mut outoff = 0usize;
+                let mut qs_off = 0usize;
+                for ib32 in 0..8usize {
+                    let aux32 = u32::from_le_bytes(sas[4 * ib32..4 * ib32 + 4].try_into().unwrap());
+                    let db = d * (0.5 + (aux32 >> 28) as f32) * 0.5;
+                    for l in 0..4usize {
+                        let sign_idx = ((aux32 >> (7 * l)) & 127) as usize;
+                        let signs = KSIGNS_IQ2XS[sign_idx];
+                        let g1 = IQ3XXS_GRID[qs[qs_off + 2 * l] as usize];
+                        let g2 = IQ3XXS_GRID[qs[qs_off + 2 * l + 1] as usize];
+                        for j in 0..4usize {
+                            let s1 = if signs & KMASK_IQ2XS[j] != 0 {
+                                -1.0
+                            } else {
+                                1.0
+                            };
+                            let s2 = if signs & KMASK_IQ2XS[j + 4] != 0 {
+                                -1.0
+                            } else {
+                                1.0
+                            };
+                            let gv1 = ((g1 >> (8 * j)) & 0xFF) as i8;
+                            let gv2 = ((g2 >> (8 * j)) & 0xFF) as i8;
+                            out[base + outoff + j] = db * gv1 as f32 * s1;
+                            out[base + outoff + j + 4] = db * gv2 as f32 * s2;
+                        }
+                        outoff += 8;
+                    }
+                    qs_off += 8;
+                }
+            }
+            out
+        }
+        // ── IQ3_S: block = [half d][u8 qs[64]][u8 qh[8]][u8 signs[32]][u8 scales[4]], 110 bytes
+        // Outer loop steps ib32 in 0,2,4,6 (pairs → two groups of 32 each = 64 elements/iter).
+        //   db1 = d * (1 + 2*(scales[ib32/2] & 0xf))
+        //   db2 = d * (1 + 2*(scales[ib32/2] >> 4))
+        //   For first group (l in 0..4, using qh[0], db1):
+        //     grid1 = iq3s_grid[qs[2*l+0] | ((qh[0] << (8-2*l)) & 256)]
+        //     grid2 = iq3s_grid[qs[2*l+1] | ((qh[0] << (7-2*l)) & 256)]
+        //   For second group (l in 0..4, using qh[1], db2): similarly
+        // Ref: llama.cpp dequantize_row_iq3_s (ggml-quants.c l.2535)
+        Iq3S => {
+            use iquant_grids::{IQ3S_GRID, KMASK_IQ2XS};
+            let bpb = 110usize; // 2 + 64 + 8 + 32 + 4
+            let nblk = bytes.len() / bpb;
+            let mut out = vec![0.0f32; nblk * 256];
+            for b in 0..nblk {
+                let blk = &bytes[b * bpb..(b + 1) * bpb];
+                let d = rdf16(blk);
+                let qs_arr = &blk[2..66]; // 64 bytes
+                let qh_arr = &blk[66..74]; // 8 bytes
+                let signs_arr = &blk[74..106]; // 32 bytes
+                let scales = &blk[106..110]; // 4 bytes
+                let base = b * 256;
+                let mut outoff = 0usize;
+                let mut qs_off = 0usize;
+                let mut signs_off = 0usize;
+                let mut qh_off = 0usize;
+                // outer loop: ib32 steps 0,2,4,6 → 4 pairs
+                for pair in 0..4usize {
+                    let db1 = d * (1.0 + 2.0 * (scales[pair] & 0xf) as f32);
+                    let db2 = d * (1.0 + 2.0 * (scales[pair] >> 4) as f32);
+                    // first group of 32 elements (using qh[qh_off], db1)
+                    let qh0 = qh_arr[qh_off];
+                    for l in 0..4usize {
+                        let g1_idx = qs_arr[qs_off + 2 * l] as usize
+                            | (((qh0 as u32).wrapping_shl((8 - 2 * l) as u32)) & 256) as usize;
+                        let g2_idx = qs_arr[qs_off + 2 * l + 1] as usize
+                            | (((qh0 as u32).wrapping_shl((7 - 2 * l) as u32)) & 256) as usize;
+                        let g1 = IQ3S_GRID[g1_idx];
+                        let g2 = IQ3S_GRID[g2_idx];
+                        let sb = signs_arr[signs_off + l];
+                        for j in 0..4usize {
+                            let s1 = if sb & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
+                            let s2 = if sb & KMASK_IQ2XS[j + 4] != 0 {
+                                -1.0
+                            } else {
+                                1.0
+                            };
+                            out[base + outoff + j] =
+                                db1 * ((g1 >> (8 * j)) & 0xFF) as i8 as f32 * s1;
+                            out[base + outoff + j + 4] =
+                                db1 * ((g2 >> (8 * j)) & 0xFF) as i8 as f32 * s2;
+                        }
+                        outoff += 8;
+                    }
+                    qs_off += 8;
+                    signs_off += 4;
+                    // second group of 32 elements (using qh[qh_off+1], db2)
+                    let qh1 = qh_arr[qh_off + 1];
+                    for l in 0..4usize {
+                        let g1_idx = qs_arr[qs_off + 2 * l] as usize
+                            | (((qh1 as u32).wrapping_shl((8 - 2 * l) as u32)) & 256) as usize;
+                        let g2_idx = qs_arr[qs_off + 2 * l + 1] as usize
+                            | (((qh1 as u32).wrapping_shl((7 - 2 * l) as u32)) & 256) as usize;
+                        let g1 = IQ3S_GRID[g1_idx];
+                        let g2 = IQ3S_GRID[g2_idx];
+                        let sb = signs_arr[signs_off + l];
+                        for j in 0..4usize {
+                            let s1 = if sb & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
+                            let s2 = if sb & KMASK_IQ2XS[j + 4] != 0 {
+                                -1.0
+                            } else {
+                                1.0
+                            };
+                            out[base + outoff + j] =
+                                db2 * ((g1 >> (8 * j)) & 0xFF) as i8 as f32 * s1;
+                            out[base + outoff + j + 4] =
+                                db2 * ((g2 >> (8 * j)) & 0xFF) as i8 as f32 * s2;
+                        }
+                        outoff += 8;
+                    }
+                    qh_off += 2;
+                    qs_off += 8;
+                    signs_off += 4;
                 }
             }
             out
@@ -2366,6 +2650,134 @@ mod dequant_tests {
             assert!(
                 (y[i] - expected).abs() < 0.5,
                 "iq4xs y[{i}] expected {expected}, got {}",
+                y[i]
+            );
+        }
+    }
+
+    // ── IQ2_XXS ─────────────────────────────────────────────────────────────────
+    // Block: [half d][uint16 qs[32]], 66 bytes, QK_K=256
+    // Sub-block 0: aux0=0 → 4 grid indices all 0; aux1=0 → scale_mag=0, sign_idx=0
+    //   IQ2XXS_GRID[0] = 0x0808080808080808 → 8 bytes all 0x08
+    //   KSIGNS_IQ2XS[0] = 0 → no negations
+    //   db = 1.0*(0.5+0)*0.25 = 0.125
+    //   y = 0.125 * 8 = 1.0 for each of 8 elements × 4 groups = 32 elements
+    // Ref: llama.cpp dequantize_row_iq2_xxs (ggml-quants.c l.2416)
+    #[test]
+    fn iq2xxs_single_block() {
+        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 66];
+        block[0..2].copy_from_slice(&d_bytes);
+        // all qs = 0: aux0=0 (grid_idx=0), aux1=0 (scale_mag=0, sign_idx=0)
+        let y = dequant_codebook(infr_core::DType::Iq2Xxs, &block);
+        assert_eq!(y.len(), 256);
+        // first sub-block, first element
+        let expected = 0.125 * 8.0_f32;
+        for i in 0..32 {
+            assert!(
+                (y[i] - expected).abs() < 1e-4,
+                "iq2xxs y[{i}] expected {expected}, got {}",
+                y[i]
+            );
+        }
+        // remaining sub-blocks: same pattern (all zeros)
+        for i in 32..256 {
+            assert!(
+                (y[i] - expected).abs() < 1e-4,
+                "iq2xxs y[{i}] expected {expected}, got {}",
+                y[i]
+            );
+        }
+    }
+
+    // ── IQ2_XS ──────────────────────────────────────────────────────────────────
+    // Block: [half d][uint16 qs[32]][uint8 scales[8]], 74 bytes, QK_K=256
+    // All zeros: scales[0]=0 → db0=db1=0.125; qs16=0 → grid_idx=0, sign_idx=0
+    //   IQ2XS_GRID[0] = 0x0808080808080808 → gv=8; KSIGNS[0]=0 → +1
+    //   y = 0.125 * 8 = 1.0 for first 32 elements
+    // Ref: llama.cpp dequantize_row_iq2_xs (ggml-quants.c l.2444)
+    #[test]
+    fn iq2xs_single_block() {
+        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 74];
+        block[0..2].copy_from_slice(&d_bytes);
+        let y = dequant_codebook(infr_core::DType::Iq2Xs, &block);
+        assert_eq!(y.len(), 256);
+        let expected = 0.125 * 8.0_f32;
+        for i in 0..256 {
+            assert!(
+                (y[i] - expected).abs() < 1e-4,
+                "iq2xs y[{i}] expected {expected}, got {}",
+                y[i]
+            );
+        }
+    }
+
+    // ── IQ2_S ───────────────────────────────────────────────────────────────────
+    // Block: [half d][u8 qs[64]][u8 qh[8]][u8 scales[8]], 82 bytes, QK_K=256
+    // All zeros: scales=0 → db0=db1=0.125; qs_all[0]=0, qh[0]=0 → grid_idx=0
+    //   IQ2S_GRID[0] = 0x0808080808080808 → gv=8; signs[32]=0 → +1
+    //   y = 0.125 * 8 = 1.0 for all 256 elements
+    // Ref: llama.cpp dequantize_row_iq2_s (ggml-quants.c l.2471)
+    #[test]
+    fn iq2s_single_block() {
+        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 82];
+        block[0..2].copy_from_slice(&d_bytes);
+        let y = dequant_codebook(infr_core::DType::Iq2S, &block);
+        assert_eq!(y.len(), 256);
+        let expected = 0.125 * 8.0_f32;
+        for i in 0..256 {
+            assert!(
+                (y[i] - expected).abs() < 1e-4,
+                "iq2s y[{i}] expected {expected}, got {}",
+                y[i]
+            );
+        }
+    }
+
+    // ── IQ3_XXS ─────────────────────────────────────────────────────────────────
+    // Block: [half d][u8 qs[96]], 98 bytes, QK_K=256
+    // qs[0..64]=0 → grid_idx=0 for all; qs[64..96]=0 → aux32=0 → scale_mag=0, sign_idx=0
+    //   IQ3XXS_GRID[0] = 0x04040404 → gv for j=0..3: 4; KSIGNS[0]=0 → +1
+    //   db = 1.0*(0.5+0)*0.5 = 0.25
+    //   y = 0.25 * 4 = 1.0 for first 32 elements
+    // Ref: llama.cpp dequantize_row_iq3_xxs (ggml-quants.c l.2503)
+    #[test]
+    fn iq3xxs_single_block() {
+        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 98];
+        block[0..2].copy_from_slice(&d_bytes);
+        let y = dequant_codebook(infr_core::DType::Iq3Xxs, &block);
+        assert_eq!(y.len(), 256);
+        let expected = 0.25 * 4.0_f32;
+        for i in 0..256 {
+            assert!(
+                (y[i] - expected).abs() < 1e-4,
+                "iq3xxs y[{i}] expected {expected}, got {}",
+                y[i]
+            );
+        }
+    }
+
+    // ── IQ3_S ───────────────────────────────────────────────────────────────────
+    // Block: [half d][u8 qs[64]][u8 qh[8]][u8 signs[32]][u8 scales[4]], 110 bytes
+    // All zeros: scales=0 → db1=db2=1.0*(1+2*0)=1.0; qs=0, qh=0 → grid_idx=0
+    //   IQ3S_GRID[0] = 0x01010101 → gv for j=0..3: 1; signs[0]=0 → +1
+    //   y = 1.0 * 1 = 1.0 for all 256 elements
+    // Ref: llama.cpp dequantize_row_iq3_s (ggml-quants.c l.2535)
+    #[test]
+    fn iq3s_single_block() {
+        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 110];
+        block[0..2].copy_from_slice(&d_bytes);
+        let y = dequant_codebook(infr_core::DType::Iq3S, &block);
+        assert_eq!(y.len(), 256);
+        let expected = 1.0_f32;
+        for i in 0..256 {
+            assert!(
+                (y[i] - expected).abs() < 1e-4,
+                "iq3s y[{i}] expected {expected}, got {}",
                 y[i]
             );
         }
