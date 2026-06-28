@@ -372,14 +372,33 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
+        self.matmul_native_off(dtype, a, w, 0, c, m, k, n);
+    }
+
+    /// Native-block tiled coopmat GEMM reading the weight from element offset `w_base` — lets one
+    /// stacked MoE expert tensor serve all experts (`w_base = expert_id * out_f * in_f`), so each
+    /// expert weight is decoded ONCE and reused across the 64-row tile (vs the per-row GEMV re-read).
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_native_off(
+        &self,
+        dtype: infr_core::DType,
+        a: &dyn Buffer,
+        w: &dyn Buffer,
+        w_base: usize,
+        c: &dyn Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
         self.stamp("matmul_proj");
         let name = crate::linear::native_gemm_kernel_name(dtype);
         let spv = crate::gemm::native_gemm_build_spv(dtype).expect("native GEMM spv");
-        let kern = self.be.kernel_sg(name, spv, 3, 12, 32);
-        let mut push = [0u8; 12];
+        let kern = self.be.kernel_sg(name, spv, 3, 16, 32);
+        let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
         let groups = (m.div_ceil(64) * (n / 64)) as u32;
         self.dispatch(
             kern,

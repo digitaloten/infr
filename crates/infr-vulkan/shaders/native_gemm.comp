@@ -15,7 +15,8 @@ const uint BM = 64u;
 const uint BN = 64u;
 const uint BK = 32u;
 
-layout(push_constant) uniform PC { uint m; uint n; uint k; } pc;
+// w_base: element offset into the weight grid (for stacked MoE experts: expert_id * out_f * in_f).
+layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; } pc;
 layout(binding = 0) readonly buffer ABuf { float a[]; };   // [M, K] f32 activations
 layout(binding = 1) readonly buffer WBuf { uint nw[]; };   // weights: raw GGUF blocks (native)
 layout(binding = 2) writeonly buffer CBuf { float c[]; };
@@ -51,7 +52,7 @@ void main() {
         // (k0 % 32 == 0 ⇒ aligned), then scatters them column-major into Bs. Decode-once per column.
         for (uint cc = li; cc < BN; cc += 128u) {
             float v[32];
-            dqblk((wgCol + cc) * pc.k + k0, v);
+            dqblk(pc.w_base + (wgCol + cc) * pc.k + k0, v);
             for (uint r = 0u; r < BK; r++) { Bs[r * BN + cc] = float16_t(v[r]); }
         }
         barrier();

@@ -4186,15 +4186,19 @@ impl Llama {
                     continue;
                 }
                 let off = offs_h[e] as usize;
+                // Tiled GEMM: gate/up/down decode each expert weight ONCE and reuse across the 64-row
+                // tile (vs the per-row GEMV re-reading the weight m times). GEMM outputs are M-padded
+                // to ceil(m/64)*64 rows (extra rows are zero, ignored by silu/scatter on the first m).
+                let mpad = m.div_ceil(64) * 64;
                 let (xe, ge, ue, ae, ye) = (
                     al(m * ne)?,
+                    al(mpad * nff)?,
+                    al(mpad * nff)?,
                     al(m * nff)?,
-                    al(m * nff)?,
-                    al(m * nff)?,
-                    al(m * ne)?,
+                    al(mpad * ne)?,
                 );
                 rec2.gather_rows(hn2.as_ref(), bucket_rows.as_ref(), off, xe.as_ref(), m, ne);
-                rec_linear_expert(
+                rec_gemm_expert(
                     &rec2,
                     &st.gate,
                     e,
@@ -4205,7 +4209,7 @@ impl Llama {
                     ne,
                     nff,
                 );
-                rec_linear_expert(
+                rec_gemm_expert(
                     &rec2,
                     &st.up,
                     e,
@@ -4217,7 +4221,7 @@ impl Llama {
                     nff,
                 );
                 rec2.silu_mul(ge.as_ref(), ue.as_ref(), ae.as_ref(), m * nff);
-                rec_linear_expert(
+                rec_gemm_expert(
                     &rec2,
                     &st.down,
                     e,
@@ -4786,6 +4790,25 @@ fn native_parts(w: &Wt) -> (infr_core::DType, &dyn Buffer) {
         Wt::Native { buf, dtype } => (*dtype, buf.as_ref()),
         _ => unreachable!("stacked MoE experts are native-only"),
     }
+}
+
+/// Dispatch a stacked MoE expert as a tiled coopmat GEMM (`y = X·W_eᵀ`, X = [m,in_f]): the weight is
+/// `expert*stride` elements into the stacked Native buffer, decoded ONCE and reused across the 64-row
+/// tile (vs the per-row GEMV re-read). `y` is allocated `ceil(m/64)*64` rows. Native-only.
+#[allow(clippy::too_many_arguments)]
+fn rec_gemm_expert(
+    rec: &infr_vulkan::Recorder,
+    w: &Wt,
+    expert: usize,
+    stride: usize,
+    x: &dyn Buffer,
+    y: &dyn Buffer,
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+) {
+    let (dtype, buf) = native_parts(w);
+    rec.matmul_native_off(dtype, x, buf, expert * stride, y, m, in_f, out_f);
 }
 
 /// Dispatch a stacked MoE expert's linear (`y = x·W_eᵀ`): the weight is `expert * stride` elements
