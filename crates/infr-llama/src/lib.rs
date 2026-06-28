@@ -341,6 +341,10 @@ fn k4(j: usize, q: &[u8]) -> (u32, u32) {
 fn dequant_unified(dtype: infr_core::DType, bytes: &[u8]) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
     use infr_core::DType::*;
     let (qpb, bpb) = match dtype {
+        Q4_0 => (32, 18),
+        Q4_1 => (32, 20),
+        Q5_0 => (32, 22),
+        Q5_1 => (32, 24),
         Q8_0 => (32, 34),
         Q4K => (256, 144),
         Q5K => (256, 176),
@@ -360,6 +364,68 @@ fn dequant_unified(dtype: infr_core::DType, bytes: &[u8]) -> (Vec<u8>, Vec<f32>,
     for b in 0..nblk {
         let blk = &bytes[b * bpb..(b + 1) * bpb];
         match dtype {
+            // ── Q4_0: y = d*(q4 - 8), q4 ∈ 0..15 ──────────────────────────────
+            // Ref: llama.cpp dequantize_row_q4_0 (ggml-quants.c l.401)
+            // Block: [half d][uint8 qs[16]]
+            // Unified: scale=d, index=q4 (0..15), min=-8*d
+            Q4_0 => {
+                let d = rdf16(blk);
+                let min = -8.0 * d;
+                let qs = &blk[2..18];
+                for j in 0..16 {
+                    set(b * 32 + j, qs[j] & 0x0F, d, min);
+                    set(b * 32 + j + 16, qs[j] >> 4, d, min);
+                }
+            }
+            // ── Q4_1: y = d*q4 + m, q4 ∈ 0..15 ─────────────────────────────────
+            // Ref: llama.cpp dequantize_row_q4_1 (ggml-quants.c l.421)
+            // Block: [half d][half m][uint8 qs[16]]
+            // Unified: scale=d, index=q4 (0..15), min=m
+            Q4_1 => {
+                let d = rdf16(blk);
+                let m = rdf16(&blk[2..4]);
+                let qs = &blk[4..20];
+                for j in 0..16 {
+                    set(b * 32 + j, qs[j] & 0x0F, d, m);
+                    set(b * 32 + j + 16, qs[j] >> 4, d, m);
+                }
+            }
+            // ── Q5_0: y = d*(q5 - 16), q5 ∈ 0..31 ──────────────────────────────
+            // Ref: llama.cpp dequantize_row_q5_0 (ggml-quants.c l.442)
+            // Block: [half d][uint8 qh[4]][uint8 qs[16]]
+            // Unified: scale=d, index=q5 (0..31), min=-16*d
+            Q5_0 => {
+                let d = rdf16(blk);
+                let min = -16.0 * d;
+                let qh = u32::from_le_bytes(blk[2..6].try_into().unwrap());
+                let qs = &blk[6..22];
+                for j in 0..16 {
+                    let xh0 = ((qh >> j) << 4) & 0x10;
+                    let xh1 = (qh >> (j + 12)) & 0x10;
+                    let q0 = (qs[j] as u32 & 0x0F) | xh0;
+                    let q1 = (qs[j] as u32 >> 4) | xh1;
+                    set(b * 32 + j, q0 as u8, d, min);
+                    set(b * 32 + j + 16, q1 as u8, d, min);
+                }
+            }
+            // ── Q5_1: y = d*q5 + m, q5 ∈ 0..31 ─────────────────────────────────
+            // Ref: llama.cpp dequantize_row_q5_1 (ggml-quants.c l.468)
+            // Block: [half d][half m][uint8 qh[4]][uint8 qs[16]]
+            // Unified: scale=d, index=q5 (0..31), min=m
+            Q5_1 => {
+                let d = rdf16(blk);
+                let m = rdf16(&blk[2..4]);
+                let qh = u32::from_le_bytes(blk[4..8].try_into().unwrap());
+                let qs = &blk[8..24];
+                for j in 0..16 {
+                    let xh0 = ((qh >> j) << 4) & 0x10;
+                    let xh1 = (qh >> (j + 12)) & 0x10;
+                    let q0 = (qs[j] as u32 & 0x0F) | xh0;
+                    let q1 = (qs[j] as u32 >> 4) | xh1;
+                    set(b * 32 + j, q0 as u8, d, m);
+                    set(b * 32 + j + 16, q1 as u8, d, m);
+                }
+            }
             Q8_0 => {
                 let d = rdf16(blk);
                 for i in 0..32 {
@@ -441,9 +507,12 @@ fn dequant_unified(dtype: infr_core::DType, bytes: &[u8]) -> (Vec<u8>, Vec<f32>,
     (qv, sc, mn)
 }
 
+/// True for types that go through the GPU in-kernel affine dequant path (`Wt::Q`).
+/// Codebook quants (IQ*/TQ*/fp4) are NOT included here — they go host-dequant → f16.
+/// Q2K and Q3K are added in Phase 2.
 fn is_quant(d: infr_core::DType) -> bool {
     use infr_core::DType::*;
-    matches!(d, Q8_0 | Q4K | Q5K | Q6K)
+    matches!(d, Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | Q4K | Q5K | Q6K)
 }
 
 /// In-VRAM packing per source quant: (bits, scale/min block size). Q4 packs to native 4-bit (8×
@@ -451,10 +520,14 @@ fn is_quant(d: infr_core::DType) -> bool {
 fn quant_params(d: infr_core::DType) -> (u32, usize) {
     use infr_core::DType::*;
     match d {
+        Q4_0 => (4, 32), // 4-bit index (0..15), per-32-elem scale/min
+        Q4_1 => (4, 32), // 4-bit index (0..15), per-32-elem scale/min
+        Q5_0 => (8, 32), // 5-bit index (0..31) stored in 8-bit, per-32-elem scale/min
+        Q5_1 => (8, 32), // 5-bit index (0..31) stored in 8-bit, per-32-elem scale/min
+        Q8_0 => (8, 32), // 8-bit index, per-32-elem scale/min
         Q4K => (4, 32),
         Q5K => (8, 32),
         Q6K => (8, 16),
-        Q8_0 => (8, 32),
         _ => unreachable!(),
     }
 }
@@ -1981,6 +2054,132 @@ fn attention(
         }
     }
     out
+}
+
+/// Helper: dequantize `bytes` for `dtype` and return the f32 result.
+#[cfg(test)]
+fn dequant_to_f32(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
+    let (qv, sc, mn) = dequant_unified(dtype, bytes);
+    (0..qv.len())
+        .map(|g| sc[g] * qv[g] as f32 + mn[g])
+        .collect()
+}
+
+#[cfg(test)]
+mod dequant_tests {
+    use super::*;
+
+    // ── Q4_0 ────────────────────────────────────────────────────────────────────
+    // Block: [half d][uint8 qs[16]]; y = d * (q4 - 8), q4 ∈ 0..15
+    // Reference: llama.cpp dequantize_row_q4_0 (ggml-quants.c l.401)
+    #[test]
+    fn q4_0_single_block() {
+        // d = 2.0 (f16 = 0x4000), qs[0] = 0x89 (lo=9, hi=8), rest = 0x88 (lo=8, hi=8)
+        let d_bytes = half::f16::from_f32(2.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 18];
+        block[0..2].copy_from_slice(&d_bytes);
+        block[2] = 0x89; // qs[0]: lo=9, hi=8
+        for b in &mut block[3..18] {
+            *b = 0x88; // lo=8, hi=8 → y = d*(8-8) = 0
+        }
+        let y = dequant_to_f32(infr_core::DType::Q4_0, &block);
+        assert_eq!(y.len(), 32);
+        // y[0] = 2.0*(9-8) = 2.0
+        assert!(
+            (y[0] - 2.0).abs() < 1e-5,
+            "q4_0 y[0] expected 2.0, got {}",
+            y[0]
+        );
+        // y[16] = 2.0*(8-8) = 0.0
+        assert!(y[16].abs() < 1e-5, "q4_0 y[16] expected 0.0, got {}", y[16]);
+        // y[1] = 2.0*(8-8) = 0.0
+        assert!(y[1].abs() < 1e-5, "q4_0 y[1] expected 0.0, got {}", y[1]);
+    }
+
+    // ── Q4_1 ────────────────────────────────────────────────────────────────────
+    // Block: [half d][half m][uint8 qs[16]]; y = d*q4 + m, q4 ∈ 0..15
+    // Reference: llama.cpp dequantize_row_q4_1 (ggml-quants.c l.421)
+    #[test]
+    fn q4_1_single_block() {
+        // d=1.0, m=0.5, qs[0]=0x30 (lo=0, hi=3), rest=0x00
+        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let m_bytes = half::f16::from_f32(0.5).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 20];
+        block[0..2].copy_from_slice(&d_bytes);
+        block[2..4].copy_from_slice(&m_bytes);
+        block[4] = 0x30; // lo=0, hi=3
+        let y = dequant_to_f32(infr_core::DType::Q4_1, &block);
+        assert_eq!(y.len(), 32);
+        // y[0] = 1.0*0 + 0.5 = 0.5
+        assert!(
+            (y[0] - 0.5).abs() < 1e-4,
+            "q4_1 y[0] expected 0.5, got {}",
+            y[0]
+        );
+        // y[16] = 1.0*3 + 0.5 = 3.5
+        assert!(
+            (y[16] - 3.5).abs() < 1e-4,
+            "q4_1 y[16] expected 3.5, got {}",
+            y[16]
+        );
+    }
+
+    // ── Q5_0 ────────────────────────────────────────────────────────────────────
+    // Block: [half d][uint8 qh[4]][uint8 qs[16]]; y = d*(q5 - 16), q5 ∈ 0..31
+    // Reference: llama.cpp dequantize_row_q5_0 (ggml-quants.c l.442)
+    #[test]
+    fn q5_0_single_block() {
+        // d=1.0, qh=[0x01,0,0,0] (bit 0 → element 0 gets high bit → q5=15|16=31)
+        // qs[0]=0x0F (lo=15, hi=0), rest=0
+        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 22];
+        block[0..2].copy_from_slice(&d_bytes);
+        block[2] = 0x01; // qh[0]: bit 0 set
+        block[6] = 0x0F; // qs[0]: lo=15, hi=0
+        let y = dequant_to_f32(infr_core::DType::Q5_0, &block);
+        assert_eq!(y.len(), 32);
+        // j=0: xh0 = ((1>>0)<<4)&0x10 = 16. q5 = 15|16=31. y[0] = 1.0*(31-16) = 15.0
+        assert!(
+            (y[0] - 15.0).abs() < 1e-5,
+            "q5_0 y[0] expected 15.0, got {}",
+            y[0]
+        );
+        // j=0: xh1 = (1>>12)&0x10 = 0. q5 = 0. y[16] = 1.0*(0-16) = -16.0
+        assert!(
+            (y[16] - (-16.0)).abs() < 1e-5,
+            "q5_0 y[16] expected -16.0, got {}",
+            y[16]
+        );
+    }
+
+    // ── Q5_1 ────────────────────────────────────────────────────────────────────
+    // Block: [half d][half m][uint8 qh[4]][uint8 qs[16]]; y = d*q5 + m, q5 ∈ 0..31
+    // Reference: llama.cpp dequantize_row_q5_1 (ggml-quants.c l.468)
+    #[test]
+    fn q5_1_single_block() {
+        // d=2.0, m=-1.0, qh=[0,0,0,0], qs[0]=0x1F (lo=15, hi=1)
+        let d_bytes = half::f16::from_f32(2.0).to_bits().to_le_bytes();
+        let m_bytes = half::f16::from_f32(-1.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 24];
+        block[0..2].copy_from_slice(&d_bytes);
+        block[2..4].copy_from_slice(&m_bytes);
+        // qh[4] all zero → no high bits
+        block[8] = 0x1F; // qs[0]: lo=15, hi=1
+        let y = dequant_to_f32(infr_core::DType::Q5_1, &block);
+        assert_eq!(y.len(), 32);
+        // y[0] = 2.0*15 + (-1.0) = 29.0
+        assert!(
+            (y[0] - 29.0).abs() < 1e-4,
+            "q5_1 y[0] expected 29.0, got {}",
+            y[0]
+        );
+        // y[16] = 2.0*1 + (-1.0) = 1.0
+        assert!(
+            (y[16] - 1.0).abs() < 1e-4,
+            "q5_1 y[16] expected 1.0, got {}",
+            y[16]
+        );
+    }
 }
 
 #[cfg(test)]
