@@ -484,6 +484,71 @@ impl<'a> Recorder<'a> {
         self.dispatch(k, &bufs, 1, &push, (rows * out_f) as u32);
     }
 
+    /// Native-block dequant GEMV `y = x·Wᵀ`. Raw GGUF block bytes in `w` (padded
+    /// to u32); format identified by `dtype`. Dispatch `rows*out_f` workgroups.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_native(
+        &self,
+        dtype: infr_core::DType,
+        w: &dyn Buffer,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.stamp("lm_head");
+        let name = crate::linear::native_kernel_name(dtype, false);
+        let wgsl = crate::linear::native_gemv_wgsl(dtype, false);
+        let k = self.be.kernel(name, &wgsl, 3, 12);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(w), Self::vkb(x), Self::vkb(y)],
+            1,
+            &push,
+            (rows * out_f) as u32,
+        );
+    }
+
+    /// Native-block dequant GEMV with fused residual add: `y = residual + x·Wᵀ`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_add_native(
+        &self,
+        dtype: infr_core::DType,
+        w: &dyn Buffer,
+        x: &dyn Buffer,
+        residual: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.stamp("o_or_down");
+        let name = crate::linear::native_kernel_name(dtype, true);
+        let wgsl = crate::linear::native_gemv_wgsl(dtype, true);
+        let k = self.be.kernel(name, &wgsl, 4, 12);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[
+                Self::vkb(w),
+                Self::vkb(x),
+                Self::vkb(residual),
+                Self::vkb(y),
+            ],
+            1,
+            &push,
+            (rows * out_f) as u32,
+        );
+    }
+
     /// Quantized dequant GEMV with fused residual add: `y = residual + x·Wᵀ`.
     #[allow(clippy::too_many_arguments)]
     pub fn linear_add_q(

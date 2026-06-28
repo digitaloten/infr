@@ -7,7 +7,7 @@
 #![allow(dead_code)]
 
 mod gemm;
-mod linear;
+pub mod linear;
 mod matmul;
 mod ops;
 mod recorder;
