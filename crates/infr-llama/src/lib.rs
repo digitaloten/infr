@@ -72,10 +72,11 @@ impl Default for Sampler {
 /// A projection weight on the GPU: f16, unified repacked quant, or native raw-block quant.
 ///
 /// - `F16`: f16 weight buffer (float or codebook-quant host-dequanted → f16)
-/// - `Q`: unified repacked affine quant (q/s/m buffers, `dq = s·u8 + m`); the DEFAULT path —
-///   fastest decode/prefill (repack paid once at load).
-/// - `Native`: raw GGUF block bytes, padded to u32 alignment, dequantized in-shader. Opt-in via
-///   `INFR_NATIVE=1` (supported affine quants) — faster load / smaller VRAM, slower per-token.
+/// - `Q`: unified repacked affine quant (q/s/m buffers, `dq = s·u8 + m`); fallback when native is
+///   disabled (`INFR_NONATIVE=1`) or for grid/codebook quants under `INFR_NATIVE=1`.
+/// - `Native`: raw GGUF block bytes, padded to u32 alignment, dequantized in-shader (decode-once
+///   GEMV + tiled coopmat GEMM). The DEFAULT for optimized affine quants — faster decode + prefill
+///   and smaller VRAM (see [`is_native_default`]); `INFR_NATIVE=1` extends it to all formats.
 enum Wt {
     F16(Box<dyn Buffer>),
     Q {
@@ -1390,15 +1391,32 @@ fn pack_unified(
     (quants, scales, mins)
 }
 
-/// True when `INFR_NATIVE=1` opts into the raw-block / in-shader-dequant path (`Wt::Native`).
-///
-/// Default is the unified-repack path (`Wt::Q`): it pays a one-time host dequant at load to get a
-/// GPU-friendly layout, which is ~1.75× faster decode and ~3× faster prefill than re-extracting
-/// native blocks every matmul (measured, qwen3-0.6b Q4_K_M on 7900 XTX). Decode speed is the north
-/// star, so native is opt-in — for its load-time / native-VRAM wins, and as the basis for in-kernel
-/// i-quant support (which the unified path can't do).
-fn use_native() -> bool {
-    std::env::var("INFR_NATIVE").is_ok()
+/// Affine quants with an optimized decode-once native path: sub-block-major GEMV (`dqblk`) +
+/// tiled coopmat GEMM (`native_gemm`). For these, native beats the unified repack (`Wt::Q`) on BOTH
+/// decode (e.g. Q4_K 506 vs 480 t/s) and prefill (Q8_0/Q6_K/Q5_K +27..40%; Q4_K within ~4% of
+/// unified's dp4a mmq) AND uses less VRAM — so native is the DEFAULT here. Grid/codebook i-quants
+/// (IQ2*/IQ3*/IQ1*, IQ4*, fp4, TQ*) only have the per-element fallback `dqblk` and their unified
+/// alternative is fast f16, so they stay opt-in (decode is the north star).
+fn is_native_default(d: infr_core::DType) -> bool {
+    use infr_core::DType::*;
+    matches!(
+        d,
+        Q8_0 | Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q2K | Q3K | Q4K | Q5K | Q6K
+    )
+}
+
+/// Whether to use the raw-block / in-shader-dequant path (`Wt::Native`) for `dtype`.
+/// - `INFR_NONATIVE=1` → never (force unified repack / f16, the pre-GEMM behavior).
+/// - `INFR_NATIVE=1` → always, for every native-supported format (incl. grid/codebook).
+/// - default → only the optimized affine formats ([`is_native_default`]).
+fn use_native_for(d: infr_core::DType) -> bool {
+    if std::env::var("INFR_NONATIVE").is_ok() {
+        return false;
+    }
+    if std::env::var("INFR_NATIVE").is_ok() {
+        return true;
+    }
+    is_native_default(d)
 }
 
 /// True for quant types that have a native-block GEMV shader (affine + codebook formats with no
@@ -1435,15 +1453,12 @@ fn is_native_supported(d: infr_core::DType) -> bool {
 
 /// Upload a projection weight, keeping quantized weights quantized in-VRAM (else convert to f16).
 ///
-/// Default path:
-/// - Affine quants → `Wt::Q` (host dequant + repack, GPU in-kernel via `LINEAR_Q_WGSL`; fastest
-///   decode/prefill — the repack cost is paid once at load)
-/// - Codebook quants (IQ*/TQ*/fp4) → host dequant → f16 → `Wt::F16`
+/// - Optimized affine quants (Q4_K/Q5_K/Q6_K/Q8_0/Q4_0…) → `Wt::Native` by default (raw block
+///   bytes, in-shader decode-once dequant — faster decode + prefill, smaller VRAM; see
+///   [`use_native_for`]). `INFR_NONATIVE=1` falls back to `Wt::Q` (host dequant + repack).
+/// - Other affine quants → `Wt::Q`; `INFR_NATIVE=1` extends native to all supported formats.
+/// - Codebook quants (IQ*/TQ*/fp4) → host dequant → f16 → `Wt::F16` (native via `INFR_NATIVE=1`)
 /// - Float types (F16/F32/BF16) → `Wt::F16` directly
-///
-/// Native path (`INFR_NATIVE=1`, supported affine quants only):
-/// - → `Wt::Native` (raw block bytes, in-shader dequant, no host work — faster load / smaller VRAM,
-///   slower per-token; see [`use_native`])
 fn upload_wt(be: &VulkanBackend, g: &Gguf, name: &str) -> Result<Wt> {
     let info = g
         .tensors()
@@ -1451,8 +1466,9 @@ fn upload_wt(be: &VulkanBackend, g: &Gguf, name: &str) -> Result<Wt> {
         .find(|t| t.name == name)
         .ok_or_else(|| anyhow!("tensor not found: {name}"))?
         .clone();
-    // Native-block path: raw upload + in-shader dequant (opt-in via INFR_NATIVE).
-    if use_native() && is_native_supported(info.dtype) {
+    // Native-block path: raw upload + in-shader dequant. Default for optimized affine quants;
+    // INFR_NATIVE forces all supported formats, INFR_NONATIVE disables (see use_native_for).
+    if use_native_for(info.dtype) && is_native_supported(info.dtype) {
         let bytes = g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?;
         let padded = infr_vulkan::linear::pad_to_u32_align(bytes);
         return Ok(Wt::Native {
