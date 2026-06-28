@@ -8,6 +8,8 @@
 //! TODO(next): move host ops to GPU; add a KV cache; fold into the `Model`/`Backend` seams.
 #![allow(clippy::needless_range_loop)]
 
+pub mod qwen35;
+
 use anyhow::{anyhow, bail, Context, Result};
 use infr_core::backend::{Buffer, BufferUsage};
 use infr_core::loader::MetaValue;
