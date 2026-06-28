@@ -1583,6 +1583,34 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Largest `top_k` the GPU stochastic sampler handles; above this the caller samples on the host.
+    pub const SAMPLE_KMAX: usize = crate::gemm::SAMPLE_KMAX;
+
+    /// GPU stochastic sampling over `n` logits → token id in `out_id[0]`: temperature + top-k +
+    /// top-p (nucleus) via a radix N-ary select, inverse-CDF sampled with the host-drawn uniform `u`.
+    /// Requires `2 ≤ top_k ≤ SAMPLE_KMAX`. Only the token reads back — the vocab logits stay in VRAM.
+    pub fn sample(
+        &self,
+        logits: &dyn Buffer,
+        out_id: &dyn Buffer,
+        n: usize,
+        top_k: usize,
+        temp: f32,
+        top_p: f32,
+        u: f32,
+    ) {
+        let k = self
+            .be
+            .kernel("moe_sample", crate::gemm::moe_sample_spv(), 2, 20);
+        let mut push = [0u8; 20];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(top_k as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&temp.to_ne_bytes());
+        push[12..16].copy_from_slice(&top_p.to_ne_bytes());
+        push[16..20].copy_from_slice(&u.to_ne_bytes());
+        self.dispatch(k, &[Self::vkb(logits), Self::vkb(out_id)], 1, &push, 1);
+    }
+
     /// Zero a buffer's first `n` 4-byte elements (cmd_fill_buffer) — clears the bucket counters.
     pub fn zero(&self, buf: &dyn Buffer, n: usize) {
         self.sync(&[], &[Self::vkb(buf)], true);

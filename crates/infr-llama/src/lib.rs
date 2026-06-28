@@ -236,11 +236,40 @@ impl LayerWeights {
     }
 }
 
-/// A forward step's output: the sampled token (greedy GPU argmax — only 4 bytes cross the bus) or
-/// the full vocab logits (host samples them, for stochastic sampling / logit inspection).
+/// A forward step's output: the sampled token (chosen on the GPU — only 4 bytes cross the bus) or
+/// the full vocab logits (host samples them, when GPU sampling can't handle the config).
 enum GenOut {
     Token(u32),
     Logits(Vec<f32>),
+}
+
+/// Per-step sampling config for on-GPU token selection. `u` is the host-drawn uniform in [0,1).
+#[derive(Clone, Copy)]
+struct SampleParams {
+    temp: f32,
+    top_k: usize,
+    top_p: f32,
+    u: f32,
+}
+impl SampleParams {
+    /// Greedy (argmax) when temperature is off or only one candidate is kept.
+    fn greedy(&self) -> bool {
+        self.temp <= 0.0 || self.top_k == 1
+    }
+    /// The GPU sampler handles temp/top-k/top-p only for a bounded top_k; else host samples logits.
+    fn gpu_capable(&self) -> bool {
+        !self.greedy() && self.top_k >= 2 && self.top_k <= infr_vulkan::Recorder::SAMPLE_KMAX
+    }
+}
+
+/// Advance an xorshift64 RNG and return a uniform in [0,1) — the per-step random draw for sampling.
+fn draw_u(rng: &mut u64) -> f32 {
+    let mut x = *rng;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *rng = x;
+    (x >> 40) as f32 / (1u64 << 24) as f32
 }
 
 pub struct Llama {
@@ -3442,10 +3471,11 @@ impl Llama {
         Ok(bytemuck::cast_slice(&out).to_vec())
     }
 
-    /// Final norm + lm head from a single resident hidden row `src` [n_embd]. When `greedy`, also
-    /// runs the GPU argmax and reads back only the 4-byte token id; otherwise reads back the full
-    /// vocab logits for host sampling.
-    fn lm_head_out(&self, src: &dyn Buffer, greedy: bool) -> Result<GenOut> {
+    /// Final norm + lm head from a single resident hidden row `src` [n_embd]. With a sampling spec
+    /// the token is chosen on the GPU — argmax for greedy, or temp/top-k/top-p sampling — and only
+    /// the 4-byte token id reads back; without one (or for an unsupported top_k) the full vocab
+    /// logits read back for host sampling.
+    fn lm_head_out(&self, src: &dyn Buffer, sample: Option<SampleParams>) -> Result<GenOut> {
         let c = &self.cfg;
         let al = |n: usize| {
             self.be
@@ -3471,12 +3501,31 @@ impl Llama {
             c.n_embd,
             c.vocab,
         );
-        if greedy {
-            let tok = self
-                .be
-                .alloc(4, BufferUsage::Readback)
-                .map_err(|e| anyhow!("{e}"))?;
-            rec.argmax(final_logits.as_ref(), tok.as_ref(), c.vocab);
+        let tok = self
+            .be
+            .alloc(4, BufferUsage::Readback)
+            .map_err(|e| anyhow!("{e}"))?;
+        // GPU-sample when possible: greedy → argmax; temp/top-k/top-p (2 ≤ top_k ≤ KMAX) → sample.
+        let gpu_tok = match sample {
+            Some(sp) if sp.greedy() => {
+                rec.argmax(final_logits.as_ref(), tok.as_ref(), c.vocab);
+                true
+            }
+            Some(sp) if sp.gpu_capable() => {
+                rec.sample(
+                    final_logits.as_ref(),
+                    tok.as_ref(),
+                    c.vocab,
+                    sp.top_k,
+                    sp.temp,
+                    sp.top_p,
+                    sp.u,
+                );
+                true
+            }
+            _ => false,
+        };
+        if gpu_tok {
             rec.finish().map_err(|e| anyhow!("{e}"))?;
             let mut tb = [0u8; 4];
             self.be
@@ -3499,7 +3548,12 @@ impl Llama {
     /// gate/up/SiLU/down + weighted accumulate (`hidden += w_e·y_e`) are a second recorder. Only the
     /// `n_expert` logits cross the PCIe bus per layer — no per-matmul host round-trip. When `greedy`,
     /// samples on the GPU and returns just the token; else returns the vocab logits.
-    fn forward_moe_chunk_gpu(&self, token: u32, kv: &mut MoeKv, greedy: bool) -> Result<GenOut> {
+    fn forward_moe_chunk_gpu(
+        &self,
+        token: u32,
+        kv: &mut MoeKv,
+        sample: Option<SampleParams>,
+    ) -> Result<GenOut> {
         let c = &self.cfg;
         let mc = c.moe.expect("moe");
         let (ne, nh, nkv, hd) = (c.n_embd, c.n_head, c.n_kv, c.head_dim);
@@ -3761,7 +3815,7 @@ impl Llama {
         kv.kv.len += 1;
 
         // final norm + lm head (on the GPU); greedy → GPU argmax + 4-byte token readback.
-        self.lm_head_out(hidden.as_ref(), greedy)
+        self.lm_head_out(hidden.as_ref(), sample)
     }
 
     /// GPU-resident grouped prefill (qwen3moe, all experts on GPU): like [`forward_moe_chunk_gpu`]
@@ -3775,7 +3829,7 @@ impl Llama {
         &self,
         tokens: &[u32],
         kv: &mut MoeKv,
-        greedy: bool,
+        sample: Option<SampleParams>,
     ) -> Result<GenOut> {
         let c = &self.cfg;
         let mc = c.moe.expect("moe");
@@ -4117,30 +4171,35 @@ impl Llama {
         let rec = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
         rec.gather_rows(hidden.as_ref(), last_idx.as_ref(), 0, hlast.as_ref(), 1, ne);
         rec.finish().map_err(|e| anyhow!("{e}"))?;
-        self.lm_head_out(hlast.as_ref(), greedy)
+        self.lm_head_out(hlast.as_ref(), sample)
     }
 
     /// Eager MoE forward for one chunk of `tokens` at positions `kv.pos..`, appending K/V to the
     /// cache (so decode steps process only the new token, not the whole sequence). Returns logits
     /// (`vocab`) for the last token. Same math as [`forward_moe`] but cached.
     pub fn forward_moe_chunk(&self, tokens: &[u32], kv: &mut MoeKv) -> Result<Vec<f32>> {
-        match self.forward_moe_chunk_g(tokens, kv, false)? {
+        match self.forward_moe_chunk_g(tokens, kv, None)? {
             GenOut::Logits(l) => Ok(l),
-            GenOut::Token(_) => unreachable!("greedy=false always returns logits"),
+            GenOut::Token(_) => unreachable!("no sampler always returns logits"),
         }
     }
 
     /// As [`forward_moe_chunk`] but with on-GPU greedy sampling: when `greedy`, the GPU argmaxes the
     /// vocab logits and only the 4-byte token id crosses the bus (no vocab-logits download).
-    fn forward_moe_chunk_g(&self, tokens: &[u32], kv: &mut MoeKv, greedy: bool) -> Result<GenOut> {
+    fn forward_moe_chunk_g(
+        &self,
+        tokens: &[u32],
+        kv: &mut MoeKv,
+        sample: Option<SampleParams>,
+    ) -> Result<GenOut> {
         // Stacked GPU expert bank → fully GPU-resident path (no per-matmul host round-trip):
         // single-token decode, or grouped-by-expert prefill for a multi-token chunk. Offloaded /
         // per-expert layers use the eager path.
         if self.layers[0].moe_stacked().is_some() {
             return if tokens.len() == 1 {
-                self.forward_moe_chunk_gpu(tokens[0], kv, greedy)
+                self.forward_moe_chunk_gpu(tokens[0], kv, sample)
             } else {
-                self.forward_moe_chunk_gpu_prefill(tokens, kv, greedy)
+                self.forward_moe_chunk_gpu_prefill(tokens, kv, sample)
             };
         }
         let c = &self.cfg;
@@ -4204,7 +4263,7 @@ impl Llama {
         kv.kv.len += t;
 
         // Eager (offloaded) path always returns logits; the caller samples on the host.
-        let _ = greedy;
+        let _ = sample;
         let last = &hidden[(t - 1) * ne..t * ne];
         let normed = rmsnorm_rows(last, &self.output_norm, 1, ne, c.rms_eps);
         Ok(GenOut::Logits(self.gemv_wt(
@@ -4498,26 +4557,35 @@ impl Llama {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0x9e3779b97f4a7c15)
             | 1;
-        // Greedy → sample on the GPU (only the token id reads back). Stochastic → host samples the
-        // returned vocab logits.
-        let greedy = sampler.temp <= 0.0 || sampler.top_k == 1;
-        let sample = |out: GenOut, rng: &mut u64| match out {
+        // Sample on the GPU when possible (only the 4-byte token id reads back); the forward falls
+        // back to returning logits for configs the GPU sampler can't handle, which we sample here.
+        let sp = |rng: &mut u64| {
+            Some(SampleParams {
+                temp: sampler.temp,
+                top_k: sampler.top_k,
+                top_p: sampler.top_p,
+                u: draw_u(rng),
+            })
+        };
+        let resolve = |out: GenOut, rng: &mut u64| match out {
             GenOut::Token(t) => t,
             GenOut::Logits(l) => sample_logits(&l, sampler, rng),
         };
         let mut kv = self.new_moe_kv(tokens.len() + max_new + 8)?;
-        let mut out = self.forward_moe_chunk_g(&tokens, &mut kv, greedy)?; // prefill
+        let s = sp(&mut rng);
+        let mut out = self.forward_moe_chunk_g(&tokens, &mut kv, s)?; // prefill
         let mut stream = StreamDecoder::default();
         let mut generated: Vec<u32> = Vec::new();
         for _ in 0..max_new {
-            let next = sample(out, &mut rng);
+            let next = resolve(out, &mut rng);
             if self.cfg.eos_ids.contains(&next) {
                 break;
             }
             generated.push(next);
             let full = self.tokenizer.decode(&generated, true).unwrap_or_default();
             on_token(&stream.step(&full));
-            out = self.forward_moe_chunk_g(&[next], &mut kv, greedy)?; // 1-token decode
+            let s = sp(&mut rng);
+            out = self.forward_moe_chunk_g(&[next], &mut kv, s)?; // 1-token decode
         }
         self.tokenizer
             .decode(&generated, true)
