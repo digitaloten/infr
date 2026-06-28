@@ -1485,7 +1485,7 @@ impl<'a> Recorder<'a> {
 
     /// Elementwise add; in place allowed (`a` may equal `y`).
     pub fn add(&self, a: &dyn Buffer, b: &dyn Buffer, y: &dyn Buffer, n: usize) {
-        let k = self.be.kernel("add", ops::ADD_WGSL, 3, 4);
+        let k = self.be.kernel_spv("add", crate::gemm::add_spv(), 3, 4);
         self.dispatch(
             k,
             &[Self::vkb(a), Self::vkb(b), Self::vkb(y)],

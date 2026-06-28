@@ -466,7 +466,7 @@ impl VulkanBackend {
 
     /// Elementwise add: `y[i] = a[i] + b[i]`.
     pub fn add(&self, a: &[f32], b: &[f32], n: usize) -> Result<Vec<f32>> {
-        let k = self.kernel("add", ADD_WGSL, 3, 4);
+        let k = self.kernel_spv("add", crate::gemm::add_spv(), 3, 4);
         self.run_kernel(
             k,
             &[a, b],
@@ -568,20 +568,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if i >= pc.n { return; }
     let g = gate[i];
     y[i] = (g / (1.0 + exp(-g))) * up[i];
-}
-"#;
-
-pub(crate) const ADD_WGSL: &str = r#"
-struct PC { n: u32 }
-var<immediate> pc: PC;
-@group(0) @binding(0) var<storage, read>       a: array<f32>;
-@group(0) @binding(1) var<storage, read>       b: array<f32>;
-@group(0) @binding(2) var<storage, read_write> y: array<f32>;
-@compute @workgroup_size(64, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if i >= pc.n { return; }
-    y[i] = a[i] + b[i];
 }
 "#;
 

@@ -46,6 +46,7 @@ const ATTN_PV_WARP_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/
 const ATTN_PV_REDUCE_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_pv_reduce.spv"));
 const RMSNORM_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rmsnorm.spv"));
+const ADD_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/add.spv"));
 const MMV_Q4_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q4.spv"));
 const MMV_Q8_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q8.spv"));
 const MMV_Q4_RES_SPV_BYTES: &[u8] =
@@ -158,6 +159,11 @@ pub(crate) fn attn_pv_reduce_spv() -> &'static [u32] {
 /// SPIR-V for the 256-thread subgroup RMSNorm (`y=rmsnorm(x,w)`). Used by the recorder's `rmsnorm`.
 pub(crate) fn rmsnorm_spv() -> &'static [u32] {
     RMSNORM_SPV.get_or_init(|| spv_words(RMSNORM_SPV_BYTES))
+}
+/// SPIR-V for the elementwise add (`y=a+b`).
+pub(crate) fn add_spv() -> &'static [u32] {
+    static ADD_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+    ADD_SPV.get_or_init(|| spv_words(ADD_SPV_BYTES))
 }
 /// SPIR-V for the subgroup decode GEMV (`y=x·Wᵀ`). `bits`=4/8 picks the quant variant; `res` adds
 /// a fused residual. Used by the recorder's `linear_q` / `linear_add_q`.
