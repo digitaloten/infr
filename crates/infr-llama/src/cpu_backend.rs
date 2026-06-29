@@ -7,7 +7,7 @@
 //! avoid a circular crate dep; it implements the agnostic `infr_core::Backend` trait, so it can be
 //! extracted to an `infr-cpu` crate later without touching callers.
 
-use crate::{dequant_block, load_tensor_dequant, Llama};
+use crate::{dequant_block, Llama};
 use anyhow::{anyhow, Result as AResult};
 use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, Plan};
 use infr_core::error::Result;
@@ -513,57 +513,70 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
     };
     let max_ctx = prompt.len() + max_new + 1;
 
-    // ── upload weights (all pre-dequantized to f32 for correctness-first). The order here MUST
-    //    match the `g.weight()` declaration order in `build` below. ───────────────────────────────
+    // ── upload weights in their NATIVE GGUF dtype (no host pre-dequant — the backend dequants
+    //    lazily in `bytes_to_f32`, so a quant weight occupies ~quant size, not 8× f32). `wspecs`
+    //    records each (dtype, numel) so `build` can declare the handle with the matching dtype; its
+    //    order MUST equal the `g.weight()` order in `build` below. ──────────────────────────────────
     let mut wbufs: Vec<Box<dyn Buffer>> = Vec::new();
-    let mut wf32 = |name: &str| -> AResult<()> {
-        let (v, _) = load_tensor_dequant(&llama.gguf, name)?;
+    let mut wspecs: Vec<(DType, usize)> = Vec::new();
+    let mut wraw = |name: &str| -> AResult<()> {
+        let info = llama
+            .gguf
+            .tensors()
+            .iter()
+            .find(|t| t.name == name)
+            .ok_or_else(|| anyhow!("tensor not found: {name}"))?
+            .clone();
+        let bytes = llama.gguf.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?;
+        let numel: usize = info.shape.iter().product();
         let b = be
-            .alloc(v.len() * 4, BufferUsage::Weights)
+            .alloc(bytes.len(), BufferUsage::Weights)
             .map_err(|e| anyhow!("{e}"))?;
-        be.upload(b.as_ref(), bytemuck::cast_slice(&v))
-            .map_err(|e| anyhow!("{e}"))?;
+        be.upload(b.as_ref(), bytes).map_err(|e| anyhow!("{e}"))?;
         wbufs.push(b);
+        wspecs.push((info.dtype, numel));
         Ok(())
     };
     for l in 0..c.n_layer {
         let p = |s: &str| format!("blk.{l}.{s}");
-        wf32(&p("attn_norm.weight"))?;
-        wf32(&p("attn_q.weight"))?;
-        wf32(&p("attn_k.weight"))?;
-        wf32(&p("attn_v.weight"))?;
+        wraw(&p("attn_norm.weight"))?;
+        wraw(&p("attn_q.weight"))?;
+        wraw(&p("attn_k.weight"))?;
+        wraw(&p("attn_v.weight"))?;
         if qk_norm {
-            wf32(&p("attn_q_norm.weight"))?;
-            wf32(&p("attn_k_norm.weight"))?;
+            wraw(&p("attn_q_norm.weight"))?;
+            wraw(&p("attn_k_norm.weight"))?;
         }
-        wf32(&p("attn_output.weight"))?;
+        wraw(&p("attn_output.weight"))?;
         if gemma {
-            wf32(&p("post_attention_norm.weight"))?;
+            wraw(&p("post_attention_norm.weight"))?;
         }
-        wf32(&p("ffn_norm.weight"))?;
-        wf32(&p("ffn_gate.weight"))?;
-        wf32(&p("ffn_up.weight"))?;
-        wf32(&p("ffn_down.weight"))?;
+        wraw(&p("ffn_norm.weight"))?;
+        wraw(&p("ffn_gate.weight"))?;
+        wraw(&p("ffn_up.weight"))?;
+        wraw(&p("ffn_down.weight"))?;
         if gemma {
-            wf32(&p("post_ffw_norm.weight"))?;
+            wraw(&p("post_ffw_norm.weight"))?;
         }
     }
     // Globals: output_norm, lm_head (output.weight, or tied to token_embd f32).
-    wf32("output_norm.weight")?;
+    wraw("output_norm.weight")?;
     if llama
         .gguf
         .tensors()
         .iter()
         .any(|t| t.name == "output.weight")
     {
-        wf32("output.weight")?;
+        wraw("output.weight")?;
     } else {
+        // tied lm head: the host f32 token_embd (already dequantized for the embedding gather).
         let b = be
             .alloc(llama.token_embd.len() * 4, BufferUsage::Weights)
             .map_err(|e| anyhow!("{e}"))?;
         be.upload(b.as_ref(), bytemuck::cast_slice(&llama.token_embd))
             .map_err(|e| anyhow!("{e}"))?;
         wbufs.push(b);
+        wspecs.push((DType::F32, llama.token_embd.len()));
     }
 
     // ── persistent KV cache buffers (f32) ──────────────────────────────────────────
@@ -604,32 +617,47 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
             v_cache.push(g.input(f32d(max_ctx * kvrow)));
         }
 
-        // Weights — declared in the SAME order as the upload loop. `wpush` records each handle in
-        // the flat `weights` list (for binding) while we also keep the named handle.
+        // Weights — declared in the SAME order as the upload loop, pulling (dtype, numel) from
+        // `wspecs` so each handle carries its native GGUF dtype (the backend dequants on read).
+        // `wpush` records the handle in the flat `weights` list (for binding) and returns it.
         let mut weights: Vec<TensorId> = Vec::new();
+        let mut wi = 0usize;
+        let mut wpush = |g: &mut Graph, weights: &mut Vec<TensorId>| -> TensorId {
+            let (dt, n) = wspecs[wi];
+            wi += 1;
+            let id = g.weight(TensorDesc::new(vec![n], dt));
+            weights.push(id);
+            id
+        };
         let mut lw: Vec<LayerW> = Vec::new();
         for _ in 0..c.n_layer {
-            let mut wpush = |g: &mut Graph, n: usize| {
-                let id = g.weight(f32d(n));
-                weights.push(id);
-                id
-            };
-            let attn_norm = wpush(&mut g, ne);
-            let wq = wpush(&mut g, qrow * ne);
-            let wk = wpush(&mut g, kvrow * ne);
-            let wv = wpush(&mut g, kvrow * ne);
+            let attn_norm = wpush(&mut g, &mut weights);
+            let wq = wpush(&mut g, &mut weights);
+            let wk = wpush(&mut g, &mut weights);
+            let wv = wpush(&mut g, &mut weights);
             let (q_norm, k_norm) = if qk_norm {
-                (Some(wpush(&mut g, hd)), Some(wpush(&mut g, hd)))
+                (
+                    Some(wpush(&mut g, &mut weights)),
+                    Some(wpush(&mut g, &mut weights)),
+                )
             } else {
                 (None, None)
             };
-            let wo = wpush(&mut g, ne * qrow);
-            let post_attn = if gemma { Some(wpush(&mut g, ne)) } else { None };
-            let ffn_norm = wpush(&mut g, ne);
-            let wgate = wpush(&mut g, nff * ne);
-            let wup = wpush(&mut g, nff * ne);
-            let wdown = wpush(&mut g, ne * nff);
-            let post_ffw = if gemma { Some(wpush(&mut g, ne)) } else { None };
+            let wo = wpush(&mut g, &mut weights);
+            let post_attn = if gemma {
+                Some(wpush(&mut g, &mut weights))
+            } else {
+                None
+            };
+            let ffn_norm = wpush(&mut g, &mut weights);
+            let wgate = wpush(&mut g, &mut weights);
+            let wup = wpush(&mut g, &mut weights);
+            let wdown = wpush(&mut g, &mut weights);
+            let post_ffw = if gemma {
+                Some(wpush(&mut g, &mut weights))
+            } else {
+                None
+            };
             lw.push(LayerW {
                 attn_norm,
                 wq,
@@ -646,16 +674,8 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
                 post_ffw,
             });
         }
-        let w_out_norm = {
-            let id = g.weight(f32d(ne));
-            weights.push(id);
-            id
-        };
-        let w_lm = {
-            let id = g.weight(f32d(c.vocab * ne));
-            weights.push(id);
-            id
-        };
+        let w_out_norm = wpush(&mut g, &mut weights);
+        let w_lm = wpush(&mut g, &mut weights);
         let logits = g.output(f32d(c.vocab));
 
         // scratch
