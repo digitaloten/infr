@@ -1,10 +1,21 @@
-//! The GPU backend seam — the ONLY GPU-aware trait. Everything above is generic over it.
+//! The compute backend seam — the ONLY device-aware trait. Everything above is generic over it.
 //!
-//! Object-safe on purpose so the engine can hold `Arc<dyn Backend>` and stay blind to
-//! whether Vulkan / CUDA / ROCm / Metal is underneath. See PLAN.md "backend abstraction".
+//! Object-safe on purpose so the engine can hold `Arc<dyn Backend>` and stay blind to whether
+//! Vulkan / CPU / CUDA / ROCm / Metal / MLX is underneath. See PLAN.md "backend abstraction".
+//!
+//! ## Execution model
+//!
+//! 1. The model builds a [`Graph`] (op-list) once per forward *shape* and `compile`s it to a
+//!    [`Plan`] (pipelines, buffer-size planning, recorded command buffer for Vulkan).
+//! 2. The model owns long-lived buffers (weights, KV cache) and per-step input/output buffers,
+//!    and binds them to the graph's `Input`/`Weight`/`Output` handles via [`Bindings`].
+//! 3. `execute(plan, bindings)` allocates the graph's `Internal` scratch, runs the ops, and
+//!    writes results into the bound `Output` buffers. `Internal`/`Output` scratch is transient.
 
 use crate::error::Result;
-use crate::graph::{Bindings, Graph};
+use crate::graph::Graph;
+use crate::tensor::TensorId;
+use std::collections::HashMap;
 
 /// Device capabilities the graph compiler queries to pick fast vs fallback kernels.
 #[derive(Clone, Debug, Default)]
@@ -31,10 +42,37 @@ pub trait Buffer: Send + Sync {
     fn len_bytes(&self) -> usize;
 }
 
-/// A compiled, ready-to-run graph (pipelines + command buffers for Vulkan, etc.).
+/// A compiled, ready-to-run graph (pipelines + command buffers for Vulkan, an op schedule for CPU).
 pub trait Plan: Send + Sync {}
 
-/// A compute device. Implementations: `infr-vulkan` (MVP), later CUDA / ROCm / Metal.
+/// Binds a [`Graph`]'s `Input`/`Weight`/`Output` handles to concrete backend buffers for one
+/// `execute`. The model holds the buffers; this only borrows them, so re-binding per step is cheap
+/// and the graph/plan is reused across steps without recompilation.
+#[derive(Default)]
+pub struct Bindings<'a> {
+    map: HashMap<TensorId, &'a dyn Buffer>,
+}
+
+impl<'a> Bindings<'a> {
+    pub fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+        }
+    }
+
+    /// Bind a graph handle to a buffer the model owns.
+    pub fn bind(&mut self, id: TensorId, buf: &'a dyn Buffer) -> &mut Self {
+        self.map.insert(id, buf);
+        self
+    }
+
+    /// Look up a bound buffer (backend uses this while executing).
+    pub fn get(&self, id: TensorId) -> Option<&'a dyn Buffer> {
+        self.map.get(&id).copied()
+    }
+}
+
+/// A compute device. Implementations: `infr-vulkan`, `infr-cpu`, later CUDA / ROCm / Metal / MLX.
 pub trait Backend: Send + Sync {
     fn name(&self) -> &str;
     fn capabilities(&self) -> Capabilities;
@@ -44,8 +82,8 @@ pub trait Backend: Send + Sync {
     fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()>;
     fn download(&self, src: &dyn Buffer, dst: &mut [u8]) -> Result<()>;
 
-    // ---- execution (compile once, execute per token/step) ----
+    // ---- execution (compile once per shape, execute per token/step) ----
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>>;
-    fn execute(&self, plan: &dyn Plan, bindings: &mut Bindings) -> Result<()>;
+    fn execute(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()>;
     fn sync(&self) -> Result<()>;
 }

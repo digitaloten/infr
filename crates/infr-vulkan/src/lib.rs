@@ -31,9 +31,9 @@ use gpu_allocator::vulkan::{
 use gpu_allocator::MemoryLocation;
 
 use infr_core::{
-    backend::{Buffer, BufferUsage, Capabilities, Plan},
+    backend::{Bindings, Buffer, BufferUsage, Capabilities, Plan},
     error::{Error, Result},
-    graph::{Bindings, Graph},
+    graph::Graph,
     Backend,
 };
 
@@ -803,7 +803,7 @@ impl Backend for VulkanBackend {
         todo!("lower Graph ops to SPIR-V pipelines + record command buffers")
     }
 
-    fn execute(&self, _plan: &dyn Plan, _bindings: &mut Bindings) -> Result<()> {
+    fn execute(&self, _plan: &dyn Plan, _bindings: &Bindings) -> Result<()> {
         todo!("bind buffers, submit command buffer")
     }
 
