@@ -17,11 +17,16 @@ layout(binding = 1) readonly buffer NB { float nw[]; };
 // recorder's reads|writes split stays output-last.
 layout(binding = 2) readonly buffer PB { uint p_pos; uint p_kvlen; };
 layout(binding = 3) buffer YB { float16_t y[]; };
+#elif defined(FREQ_FACTORS)
+// gemma4 full-attention layers use proportional RoPE: per-pair frequency divisors (most are huge →
+// those dims are left unrotated). `ff` takes binding 2 (read), `y` shifts to binding 3 (write).
+layout(binding = 2) readonly buffer FF { float ff[]; };
+layout(binding = 3) buffer YB { float16_t y[]; };
 #else
 layout(binding = 2) buffer YB { float16_t y[]; };
 #endif
 
-shared float xs[256]; // hd up to 256 (gemma); 64 threads each handle hd/64 elements
+shared float xs[512]; // hd up to 512 (gemma4 full layers); 64 threads each handle hd/64 elements
 shared float red[64];
 
 void main() {
@@ -58,6 +63,9 @@ void main() {
         float b = xs[i1] * scale * nw[i1];
         float freq = pow(pc.theta, -2.0 * float(p) / float(pc.rope_dim));
         float ang = float(absp) * freq;
+#ifdef FREQ_FACTORS
+        ang /= ff[p]; // proportional rope: ff[p] huge → ang≈0 → this dim left unrotated
+#endif
         float s = sin(ang);
         float co = cos(ang);
         y[out_base_idx + i0] = float16_t(a * co - b * s);

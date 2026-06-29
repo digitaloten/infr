@@ -53,6 +53,7 @@ fn main() {
         ("attention_kv", "attention_kv_dyn", &["-DUSE_PARAMS"]),
         ("qk_norm_rope", "qk_norm_rope", &[]),
         ("qk_norm_rope", "qk_norm_rope_dyn", &["-DUSE_PARAMS"]),
+        ("qk_norm_rope", "qk_norm_rope_ff", &["-DFREQ_FACTORS"]),
         ("attn_in", "attn_in", &[]),
         ("attn_in", "attn_in_dyn", &["-DUSE_PARAMS"]),
         ("ffn_in", "ffn_in", &[]),

@@ -938,6 +938,8 @@ dependencies = [
  "infr-core",
  "infr-gguf",
  "infr-vulkan",
+ "minijinja",
+ "serde_json",
  "tokenizers",
  "tracing",
 ]

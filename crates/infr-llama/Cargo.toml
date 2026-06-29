@@ -14,3 +14,5 @@ bytemuck.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tokenizers = { workspace = true }
+minijinja = { workspace = true }
+serde_json = { workspace = true }

@@ -1153,12 +1153,14 @@ impl<'a> Recorder<'a> {
         // Sliding-window attention: a query at abs pos `p` attends only keys `j > p - window`.
         // `0` = full causal (llama/qwen3 + gemma full-attention layers).
         window: usize,
+        // QK scale: `> 0` overrides the default 1/√hd (gemma4 passes 1.0). `0.0` = default.
+        scale: f32,
     ) {
         self.stamp("attention_kv");
         let kern = self
             .be
-            .kernel("attention_kv", crate::gemm::attention_kv_spv(), 4, 28);
-        let mut push = [0u8; 28];
+            .kernel("attention_kv", crate::gemm::attention_kv_spv(), 4, 32);
+        let mut push = [0u8; 32];
         push[0..4].copy_from_slice(&(q_len as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(nh as u32).to_ne_bytes());
@@ -1166,6 +1168,7 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&(hd as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&(pos_offset as u32).to_ne_bytes());
         push[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&scale.to_ne_bytes());
         self.dispatch(
             kern,
             &[Self::vkb(q), Self::vkb(kc), Self::vkb(vc), Self::vkb(o)],
@@ -1561,11 +1564,11 @@ impl<'a> Recorder<'a> {
         rope_pos: usize,
         out_base: usize,
         eps: f32,
+        // gemma4 full-attention layers: per-pair RoPE frequency divisors (`Some`); `None` = normal
+        // RoPE (qwen3 / gemma3 / gemma4 SWA layers).
+        freq_factors: Option<&dyn Buffer>,
     ) {
         self.stamp("qk_norm_rope");
-        let k = self
-            .be
-            .kernel("qk_norm_rope", crate::gemm::qk_norm_rope_spv(), 3, 32);
         let mut push = [0u8; 32];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(nheads as u32).to_ne_bytes());
@@ -1575,13 +1578,32 @@ impl<'a> Recorder<'a> {
         push[20..24].copy_from_slice(&(rope_pos as u32).to_ne_bytes());
         push[24..28].copy_from_slice(&(out_base as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&eps.to_ne_bytes());
-        self.dispatch(
-            k,
-            &[Self::vkb(x), Self::vkb(nw), Self::vkb(y)],
-            1,
-            &push,
-            (rows * nheads) as u32,
-        );
+        match freq_factors {
+            Some(ff) => {
+                let k =
+                    self.be
+                        .kernel("qk_norm_rope_ff", crate::gemm::qk_norm_rope_ff_spv(), 4, 32);
+                self.dispatch(
+                    k,
+                    &[Self::vkb(x), Self::vkb(nw), Self::vkb(ff), Self::vkb(y)],
+                    1,
+                    &push,
+                    (rows * nheads) as u32,
+                );
+            }
+            None => {
+                let k = self
+                    .be
+                    .kernel("qk_norm_rope", crate::gemm::qk_norm_rope_spv(), 3, 32);
+                self.dispatch(
+                    k,
+                    &[Self::vkb(x), Self::vkb(nw), Self::vkb(y)],
+                    1,
+                    &push,
+                    (rows * nheads) as u32,
+                );
+            }
+        }
     }
 
     /// Flash-decoding attention (q_len==1): split the KV range into `n_chunks` chunks of `chunk`,
@@ -1736,9 +1758,9 @@ impl<'a> Recorder<'a> {
             "attention_kv_dyn",
             crate::gemm::attention_kv_dyn_spv(),
             5,
-            28,
+            32,
         );
-        let mut push = [0u8; 28];
+        let mut push = [0u8; 32];
         push[0..4].copy_from_slice(&(q_len as u32).to_ne_bytes());
         // [4..8] kv_len: unused
         push[8..12].copy_from_slice(&(nh as u32).to_ne_bytes());
@@ -1746,6 +1768,7 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&(hd as u32).to_ne_bytes());
         // [20..24] pos_offset: unused (from params)
         // [24..28] window: 0 (record-once decode is gemma-disabled, so always full causal)
+        // [28..32] scale: 0.0 → default 1/√hd (record-once decode is gemma-disabled)
         self.dispatch(
             kern,
             &[
@@ -2664,7 +2687,8 @@ mod tests {
             nkv,
             hd,
             pos_offset,
-            0, // full causal (no sliding window)
+            0,   // full causal (no sliding window)
+            0.0, // default 1/√hd scale
         );
         rec.finish().unwrap();
         let mut bytes = vec![0u8; q_len * nh * hd * 4];

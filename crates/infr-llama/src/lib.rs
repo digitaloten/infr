@@ -55,6 +55,17 @@ pub struct Config {
     /// gemma family: scale input embeddings by √n_embd, sandwich norms (post-attn / post-ffw RMSNorm
     /// before the residual add), and a GeGLU (GELU) FFN instead of SwiGLU.
     pub gemma: bool,
+    /// gemma4: adds per-layer heterogeneous head dims (the `*_swa` fields), a weightless RMSNorm on V,
+    /// attention scale 1.0 (no 1/√d — QK-norm handles magnitude), a final logit softcap, and
+    /// proportional RoPE (freq_factors) on the full-attention layers.
+    pub gemma4: bool,
+    /// Per-layer dims for the SWA (local) layers when they differ from the full (global) layers
+    /// (gemma4). Equal to `head_dim` / `n_kv` / `rope_dim` for uniform-dim models.
+    pub head_dim_swa: usize,
+    pub n_kv_swa: usize,
+    pub rope_dim_swa: usize,
+    /// Final logit softcap (gemma2/gemma4): `logits = cap * tanh(logits / cap)`. `0` = no softcap.
+    pub final_softcap: f32,
     /// Sliding-window attention size (gemma); `0` = full causal attention everywhere. SWA layers
     /// only attend to the last `swa_window` keys.
     pub swa_window: usize,
@@ -84,6 +95,42 @@ impl Config {
         } else {
             self.rope_theta
         }
+    }
+
+    /// Head dim for layer `il`. gemma4 SWA layers are narrower than full layers; uniform elsewhere.
+    pub fn layer_head_dim(&self, il: usize) -> usize {
+        if self.is_swa_layer(il) {
+            self.head_dim_swa
+        } else {
+            self.head_dim
+        }
+    }
+
+    /// KV-head count for layer `il` (gemma4 SWA vs full GQA grouping; uniform elsewhere).
+    pub fn layer_n_kv(&self, il: usize) -> usize {
+        if self.is_swa_layer(il) {
+            self.n_kv_swa
+        } else {
+            self.n_kv
+        }
+    }
+
+    /// RoPE rotation dim for layer `il` (gemma4 SWA vs full; uniform elsewhere).
+    pub fn layer_rope_dim(&self, il: usize) -> usize {
+        if self.is_swa_layer(il) {
+            self.rope_dim_swa
+        } else {
+            self.rope_dim
+        }
+    }
+
+    /// The largest per-layer head_dim / n_kv across all layers — used to size shared activation and
+    /// KV scratch that's reused across layers of differing width (gemma4).
+    pub fn max_head_dim(&self) -> usize {
+        self.head_dim.max(self.head_dim_swa)
+    }
+    pub fn max_n_kv(&self) -> usize {
+        self.n_kv.max(self.n_kv_swa)
     }
 }
 
@@ -301,7 +348,9 @@ struct LayerWeights {
     ffn_norm_buf: Box<dyn Buffer>,
     wq: Wt,
     wk: Wt,
-    wv: Wt,
+    /// V projection. `None` on gemma4's full-attention layers, which reuse the raw K projection as V
+    /// (then a weightless RMSNorm, no RoPE). Always `Some` for every other model/layer.
+    wv: Option<Wt>,
     wo: Wt,
     ffn: FfnWt,
     q_norm_buf: Option<Box<dyn Buffer>>, // qwen3 QK-norm weights [head_dim]
@@ -313,6 +362,13 @@ struct LayerWeights {
 }
 
 impl LayerWeights {
+    /// The V-projection weight, panicking if absent — valid for every layer except gemma4's full
+    /// layers (the gemma4 path checks `self.wv.is_none()` and reuses K instead).
+    fn wv(&self) -> &Wt {
+        self.wv
+            .as_ref()
+            .expect("layer has no V projection (gemma4 full layer)")
+    }
     fn wgateup(&self) -> &Wt {
         match &self.ffn {
             FfnWt::Dense { wgateup, .. } => wgateup,
@@ -390,6 +446,9 @@ pub struct Llama {
     lm_head: Wt,          // [vocab, n_embd] on GPU (tied to token_embd unless output.weight)
     output_norm: Vec<f32>,
     output_norm_buf: Box<dyn Buffer>,
+    /// gemma4 proportional-rope frequency divisors (`rope_freqs.weight`, `[rope_dim/2]`), used by the
+    /// full-attention layers only. `None` for models without proportional rope.
+    rope_freqs: Option<Box<dyn Buffer>>,
     layers: Vec<LayerWeights>,
     tokenizer: Tokenizer,
     /// Same vocab as `tokenizer` but with `encode_special_tokens(true)` → special-token strings in
@@ -463,9 +522,9 @@ fn build_tokenizer(g: &Gguf) -> Result<Tokenizer> {
     let model = md.str("tokenizer.ggml.model").unwrap_or("");
     match model {
         "gpt2" => {}
-        // SentencePiece (llama/gemma): a Unigram model over the GGUF tokens+scores, with byte
-        // fallback for the `<0xXX>` tokens and a Metaspace (▁) word-boundary scheme.
-        "llama" => return build_spm_tokenizer(g),
+        // SentencePiece (llama/gemma3/gemma4): a byte-fallback BPE with a Metaspace (▁) word-boundary
+        // scheme. gemma4 ships explicit merges; llama/gemma3 reconstruct them from the token scores.
+        "llama" | "gemma4" => return build_spm_tokenizer(g),
         other => bail!(
             "can't derive a tokenizer from tokenizer.ggml.model={other:?} \
              (only gpt2 BPE / llama SPM); pass a tokenizer.json sidecar instead"
@@ -559,23 +618,6 @@ fn build_spm_tokenizer(g: &Gguf) -> Result<Tokenizer> {
         .get("tokenizer.ggml.tokens")
         .and_then(MetaValue::as_arr)
         .context("gguf missing tokenizer.ggml.tokens")?;
-    let scores = md
-        .get("tokenizer.ggml.scores")
-        .and_then(MetaValue::as_arr)
-        .context("gguf missing tokenizer.ggml.scores (SPM needs token scores)")?;
-    if scores.len() != toks.len() {
-        bail!(
-            "tokenizer scores/tokens length mismatch ({} vs {})",
-            scores.len(),
-            toks.len()
-        );
-    }
-    // gemma/llama SPM is greedy-bigram-merge BPE (the GGUF `scores` are negative merge RANKS, NOT
-    // unigram log-probs — Unigram Viterbi would maximize their sum and wrongly prefer splitting
-    // common words). Represent it as a BPE model whose merges are reconstructed from the vocab, the
-    // same way HF's SpmConverter builds `LlamaTokenizerFast`: for every vocab piece, each split into
-    // two existing pieces is a candidate merge, ordered globally by the merged piece's score
-    // (descending = earliest), ties broken by the pieces' ids. Fed to greedy BPE this reproduces SPM.
     let token_strs: Vec<String> = toks
         .iter()
         .map(|t| t.as_str().unwrap_or("").to_string())
@@ -585,30 +627,49 @@ fn build_spm_tokenizer(g: &Gguf) -> Result<Tokenizer> {
         .enumerate()
         .map(|(i, s)| (s.clone(), i as u32))
         .collect();
-    // (score, id_l, id_r, l, r) per candidate merge — global sort by score desc, then (id_l, id_r).
-    let mut cand: Vec<(f64, u32, u32, &str, &str)> = Vec::new();
-    for (i, piece) in token_strs.iter().enumerate() {
-        if piece.len() < 2 {
-            continue;
-        }
-        let score = scores[i].as_f64().unwrap_or(0.0);
-        for (b, _) in piece.char_indices().skip(1) {
-            let (l, r) = piece.split_at(b);
-            if let (Some(&il), Some(&ir)) = (vocab.get(l), vocab.get(r)) {
-                cand.push((score, il, ir, l, r));
+    // Merge list for the greedy BPE. gemma4 ships explicit `merges` ("left right", ▁ for spaces);
+    // llama/gemma3 don't, so reconstruct them from the token scores the same way HF's SpmConverter
+    // builds `LlamaTokenizerFast` (the GGUF scores are negative merge RANKS, not unigram log-probs —
+    // a Unigram model would maximize their sum and wrongly split common words). For every piece, each
+    // split into two existing pieces is a candidate merge, globally ordered by the merged piece's
+    // score (descending = earliest), ties broken by piece ids; greedy BPE over these reproduces SPM.
+    let merges: Vec<(String, String)> =
+        if let Some(arr) = md.get("tokenizer.ggml.merges").and_then(MetaValue::as_arr) {
+            arr.iter()
+                .filter_map(|m| {
+                    let s = m.as_str()?;
+                    let mut it = s.splitn(2, ' ');
+                    Some((it.next()?.to_string(), it.next()?.to_string()))
+                })
+                .collect()
+        } else {
+            let scores = md
+                .get("tokenizer.ggml.scores")
+                .and_then(MetaValue::as_arr)
+                .context("gguf needs tokenizer.ggml.merges or .scores for the SPM tokenizer")?;
+            // (score, id_l, id_r, l, r) per candidate — global sort by score desc, then (id_l, id_r).
+            let mut cand: Vec<(f64, u32, u32, &str, &str)> = Vec::new();
+            for (i, piece) in token_strs.iter().enumerate() {
+                if piece.len() < 2 {
+                    continue;
+                }
+                let score = scores.get(i).and_then(MetaValue::as_f64).unwrap_or(0.0);
+                for (b, _) in piece.char_indices().skip(1) {
+                    let (l, r) = piece.split_at(b);
+                    if let (Some(&il), Some(&ir)) = (vocab.get(l), vocab.get(r)) {
+                        cand.push((score, il, ir, l, r));
+                    }
+                }
             }
-        }
-    }
-    // Higher score = earlier merge (rank ascending); stable tie-break on (id_l, id_r).
-    cand.sort_by(|a, b| {
-        b.0.partial_cmp(&a.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then((a.1, a.2).cmp(&(b.1, b.2)))
-    });
-    let merges: Vec<(String, String)> = cand
-        .into_iter()
-        .map(|(_, _, _, l, r)| (l.to_string(), r.to_string()))
-        .collect();
+            cand.sort_by(|a, b| {
+                b.0.partial_cmp(&a.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then((a.1, a.2).cmp(&(b.1, b.2)))
+            });
+            cand.into_iter()
+                .map(|(_, _, _, l, r)| (l.to_string(), r.to_string()))
+                .collect()
+        };
     let unk = md
         .get("tokenizer.ggml.unknown_token_id")
         .and_then(MetaValue::as_u64)
@@ -2145,12 +2206,14 @@ impl Llama {
         // embedding scale, sandwich norms (post-attn / post-ffw), GeGLU FFN, and sliding-window attn.
         let qk_norm = match arch.as_str() {
             "llama" => false,
-            "qwen3" | "qwen3moe" | "gemma3" => true,
-            other => {
-                bail!("infr-llama supports architecture=llama|qwen3|qwen3moe|gemma3, got {other:?}")
-            }
+            "qwen3" | "qwen3moe" | "gemma3" | "gemma4" => true,
+            other => bail!(
+                "infr-llama supports architecture=llama|qwen3|qwen3moe|gemma3|gemma4, got {other:?}"
+            ),
         };
-        let gemma = arch == "gemma3";
+        let gemma4 = arch == "gemma4";
+        // gemma3 and gemma4 share: √n_embd embd scale, sandwich norms, GeGLU, dual-rope, SWA.
+        let gemma = arch == "gemma3" || gemma4;
         let mk = |k: &str| format!("{arch}.{k}");
         let n_layer = meta_u64(&g, &mk("block_count")).context("block_count")? as usize;
         let n_embd = meta_u64(&g, &mk("embedding_length")).context("embedding_length")? as usize;
@@ -2213,10 +2276,21 @@ impl Llama {
         } else {
             0
         };
-        let swa_pattern = if swa_window > 0 {
-            meta_u64(&g, &mk("attention.sliding_window_pattern")).unwrap_or(6) as usize
-        } else {
+        // SWA period: gemma3 stores it as a scalar (default 6); gemma4 as a per-layer BOOL array
+        // (true = SWA, false = full) — derive the period as (index of first full layer + 1).
+        let swa_pattern = if swa_window == 0 {
             0
+        } else if let Some(arr) = g
+            .metadata()
+            .get(&mk("attention.sliding_window_pattern"))
+            .and_then(MetaValue::as_arr)
+        {
+            arr.iter()
+                .position(|v| matches!(v, MetaValue::Bool(false)))
+                .map(|i| i + 1)
+                .unwrap_or(6)
+        } else {
+            meta_u64(&g, &mk("attention.sliding_window_pattern")).unwrap_or(6) as usize
         };
         // gemma3 dual-rope: the SWA (local) layers use a smaller rope base than the global layers.
         // The GGUF usually omits it; llama.cpp's `rope_freq_base_train_swa` default is 10000.
@@ -2231,6 +2305,49 @@ impl Llama {
                 .unwrap_or(10000.0)
         } else {
             rope_theta
+        };
+        // gemma4 per-layer heterogeneous dims: SWA (local) and full (global) layers differ in head_dim,
+        // KV-head count, and rope dim. The main `head_dim`/`n_kv`/`rope_dim` hold the FULL-layer values
+        // (also the max, used to size shared scratch); the `*_swa` fields hold the SWA-layer values.
+        // For non-gemma4 models the two are identical. (`head_count_kv` is a per-layer array in gemma4.)
+        let (head_dim, n_kv, rope_dim, head_dim_swa, n_kv_swa, rope_dim_swa) = if gemma4 {
+            let hk = g
+                .metadata()
+                .get(&mk("attention.head_count_kv"))
+                .and_then(MetaValue::as_arr);
+            let kv_at = |i: usize| {
+                hk.and_then(|a| a.get(i))
+                    .and_then(MetaValue::as_u64)
+                    .map(|v| v as usize)
+            };
+            let full_idx = swa_pattern.saturating_sub(1); // first full-attention layer
+            let hd_full =
+                meta_u64(&g, &mk("attention.key_length")).unwrap_or(head_dim as u64) as usize;
+            let hd_swa =
+                meta_u64(&g, &mk("attention.key_length_swa")).unwrap_or(hd_full as u64) as usize;
+            let rd_full =
+                meta_u64(&g, &mk("rope.dimension_count")).unwrap_or(hd_full as u64) as usize;
+            let rd_swa =
+                meta_u64(&g, &mk("rope.dimension_count_swa")).unwrap_or(hd_swa as u64) as usize;
+            (
+                hd_full,
+                kv_at(full_idx).unwrap_or(n_kv),
+                rd_full,
+                hd_swa,
+                kv_at(0).unwrap_or(n_kv),
+                rd_swa,
+            )
+        } else {
+            (head_dim, n_kv, rope_dim, head_dim, n_kv, rope_dim)
+        };
+        // gemma4 caps the output logits: `logits = cap * tanh(logits / cap)`.
+        let final_softcap = if gemma4 {
+            g.metadata()
+                .get(&mk("final_logit_softcapping"))
+                .and_then(MetaValue::as_f64)
+                .unwrap_or(0.0) as f32
+        } else {
+            0.0
         };
         let eos = meta_u64(&g, "tokenizer.ggml.eos_token_id").unwrap_or(2) as u32;
 
@@ -2347,6 +2464,15 @@ impl Llama {
         let output_norm_buf = be
             .upload_weight(&output_norm)
             .map_err(|e| anyhow!("upload output_norm: {e}"))?;
+        // gemma4 proportional-rope freq divisors (used by full-attention layers); absent otherwise.
+        let rope_freqs = if g.tensors().iter().any(|t| t.name == "rope_freqs.weight") {
+            Some(
+                be.upload_weight(&load_tensor_dequant(&g, "rope_freqs.weight")?.0)
+                    .map_err(|e| anyhow!("upload rope_freqs: {e}"))?,
+            )
+        } else {
+            None
+        };
 
         // Loading the per-layer weights (dequant + GPU upload) dominates startup, especially for
         // big models — show a byte-progress bar so it reports copy speed + ETA (same shared style as
@@ -2432,7 +2558,12 @@ impl Llama {
                 ffn_norm_buf,
                 wq: up(&be, p("attn_q.weight"))?,
                 wk: up(&be, p("attn_k.weight"))?,
-                wv: up(&be, p("attn_v.weight"))?,
+                // gemma4 full-attention layers omit the V projection (V = raw K). Optional load.
+                wv: if g.tensors().iter().any(|t| t.name == p("attn_v.weight")) {
+                    Some(up(&be, p("attn_v.weight"))?)
+                } else {
+                    None
+                },
                 wo: up(&be, p("attn_output.weight"))?,
                 ffn,
                 q_norm_buf,
@@ -2478,6 +2609,11 @@ impl Llama {
             eos_ids,
             qk_norm,
             gemma,
+            gemma4,
+            head_dim_swa,
+            n_kv_swa,
+            rope_dim_swa,
+            final_softcap,
             swa_window,
             swa_pattern,
             swa_rope_theta,
@@ -2490,6 +2626,7 @@ impl Llama {
             lm_head,
             output_norm,
             output_norm_buf,
+            rope_freqs,
             layers,
             tokenizer,
             user_tokenizer,
@@ -2555,8 +2692,18 @@ impl Llama {
     /// (so a user typing `<|im_end|>`/`<think>`/etc. can't inject or break the turn structure).
     /// `started` closes the previous assistant turn first.
     fn turn_tokens(&self, user: &str, started: bool) -> Result<Vec<u32>> {
-        // gemma uses <start_of_turn>/<end_of_turn> turns with a leading <bos>; everyone else ChatML.
-        let (pre, post) = if self.cfg.gemma {
+        // gemma4 turns use <|turn>role / <turn|> markers (eos = <turn|>); gemma3 uses
+        // <start_of_turn>/<end_of_turn>; everyone else ChatML. All gemmas lead with <bos>.
+        let (pre, post) = if self.cfg.gemma4 {
+            (
+                if started {
+                    "<turn|>\n<|turn>user\n"
+                } else {
+                    "<bos><|turn>user\n"
+                },
+                "<turn|>\n<|turn>model\n",
+            )
+        } else if self.cfg.gemma {
             (
                 if started {
                     "<end_of_turn>\n<start_of_turn>user\n"
@@ -2591,6 +2738,64 @@ impl Llama {
         Ok(ids)
     }
 
+    /// Render a conversation with the model's OWN embedded chat template (`tokenizer.chat_template`,
+    /// a Jinja2 string) via minijinja — the source of truth for turn markers, system handling, etc.
+    /// Returns `None` if the GGUF has no template or it fails to render, so the caller can fall back
+    /// to the hardcoded [`turn_tokens`]. `messages` are `(role, content)`; `bos_token`/`eos_token`
+    /// come from the GGUF special-token ids.
+    fn render_chat(
+        &self,
+        messages: &[(&str, &str)],
+        add_generation_prompt: bool,
+    ) -> Option<String> {
+        let template = self.gguf.metadata().str("tokenizer.chat_template")?;
+        let bos_id = self
+            .gguf
+            .metadata()
+            .get("tokenizer.ggml.bos_token_id")
+            .and_then(MetaValue::as_u64)
+            .unwrap_or(2) as u32;
+        let bos = self.tokenizer.id_to_token(bos_id).unwrap_or_default();
+        let eos = self.tokenizer.id_to_token(self.cfg.eos).unwrap_or_default();
+
+        let mut env = minijinja::Environment::new();
+        env.add_function(
+            "raise_exception",
+            |msg: String| -> std::result::Result<String, minijinja::Error> {
+                Err(minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    msg,
+                ))
+            },
+        );
+        env.add_filter("tojson", |v: minijinja::Value| {
+            serde_json::to_string(&v).unwrap_or_else(|_| "null".to_owned())
+        });
+        env.add_template("chat", template).ok()?;
+        let tmpl = env.get_template("chat").ok()?;
+        let msgs: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|(r, c)| serde_json::json!({ "role": r, "content": c }))
+            .collect();
+        let ctx = minijinja::context! {
+            messages => msgs,
+            tools => serde_json::Value::Null,
+            add_generation_prompt => add_generation_prompt,
+            bos_token => bos,
+            eos_token => eos,
+        };
+        tmpl.render(ctx).ok()
+    }
+
+    /// Encode a chat-template-rendered string to token ids (special markers parsed atomically; no
+    /// extra auto-BOS — the template already emits `<bos>`).
+    fn encode_special(&self, s: &str) -> Result<Vec<u32>> {
+        self.tokenizer
+            .encode(s, false)
+            .map(|e| e.get_ids().to_vec())
+            .map_err(|e| anyhow!("encode: {e}"))
+    }
+
     /// Set token sampling (temp ≤ 0 → greedy). Applies to subsequent `generate`/`ChatSession::turn`.
     pub fn set_sampling(&self, temp: f32, top_k: usize, top_p: f32) {
         self.sampler.set(Sampler { temp, top_k, top_p });
@@ -2618,7 +2823,7 @@ impl Llama {
             let hn = rmsnorm_rows(&hidden, &layer.attn_norm, t, ne, c.rms_eps);
             let mut q = self.lin(layer.wq.f16(), &hn, t, ne, nh * hd);
             let mut k = self.lin(layer.wk.f16(), &hn, t, ne, nkv * hd);
-            let v = self.lin(layer.wv.f16(), &hn, t, ne, nkv * hd);
+            let v = self.lin(layer.wv().f16(), &hn, t, ne, nkv * hd);
             rope_rows(&mut q, t, nh, hd, c.rope_dim, c.rope_theta);
             rope_rows(&mut k, t, nkv, hd, c.rope_dim, c.rope_theta);
             let attn = attention(&q, &k, &v, t, nh, nkv, hd);
@@ -2831,7 +3036,7 @@ impl Llama {
             );
             rec.linear(layer.wq.f16(), hn.as_ref(), q.as_ref(), t, ne, nh * hd);
             rec.linear(layer.wk.f16(), hn.as_ref(), k.as_ref(), t, ne, nkv * hd);
-            rec.linear(layer.wv.f16(), hn.as_ref(), v.as_ref(), t, ne, nkv * hd);
+            rec.linear(layer.wv().f16(), hn.as_ref(), v.as_ref(), t, ne, nkv * hd);
             rec.rope(
                 q.as_ref(),
                 q.as_ref(),
@@ -2919,11 +3124,12 @@ impl Llama {
     /// Allocate a KV cache with room for `max_ctx` tokens.
     pub fn new_kv(&self, max_ctx: usize) -> Result<KvCache> {
         let c = &self.cfg;
-        let row = c.n_kv * c.head_dim;
         let mut k = Vec::with_capacity(c.n_layer);
         let mut v = Vec::with_capacity(c.n_layer);
-        for _ in 0..c.n_layer {
-            // f16 KV cache: 2 bytes/elem (half the f32 footprint that grows with context).
+        for li in 0..c.n_layer {
+            // f16 KV cache: 2 bytes/elem (half the f32 footprint that grows with context). gemma4's
+            // SWA and full layers have different KV row widths, so size each layer independently.
+            let row = c.layer_n_kv(li) * c.layer_head_dim(li);
             k.push(
                 self.be
                     .alloc((max_ctx + 64) * row * 2, BufferUsage::Activations)
@@ -2997,7 +3203,9 @@ impl Llama {
         let c = &self.cfg;
         let n = new_tokens.len();
         let pos = kv.len;
-        let (ne, nh, nkv, hd, nff) = (c.n_embd, c.n_head, c.n_kv, c.head_dim, c.n_ff);
+        // Outer dims used only for sizing the shared scratch (gemma4 `head_dim`/`n_kv` are the FULL/max
+        // values). Per-layer dims are re-derived inside the layer loop.
+        let (ne, nh, hd, nff) = (c.n_embd, c.n_head, c.head_dim, c.n_ff);
         if pos + n > kv.max_ctx {
             bail!("KV cache overflow: {} > {}", pos + n, kv.max_ctx);
         }
@@ -3027,7 +3235,10 @@ impl Llama {
         // beats the per-row GEMV and lets one submit cover a big chunk without tripping the GPU
         // watchdog. Decode (n==1) and Llama stay on the fused GEMV path. GEMM writes ceil(n/64)*64
         // rows (extra rows are 0), so its output buffers are M-padded to mpad.
-        let use_gemm = c.qk_norm && n >= 64 && std::env::var("INFR_NOGEMM").is_err();
+        // gemma4 has per-layer heterogeneous head dims (256 SWA / 512 full); route it entirely
+        // through the hd-general GEMV + attention_kv path (the GEMM/flash/nonfa prefill kernels
+        // assume a uniform head dim). Correctness-first; prefill is slower but right.
+        let use_gemm = c.qk_norm && n >= 64 && !c.gemma4 && std::env::var("INFR_NOGEMM").is_err();
         // Register-O flash (FlashAttention-2 layout, Br=128) is opt-in (INFR_FLASH_REG) while it's
         // A/B'd vs the BM=64 flash; it needs mpad padded to 128 (q/attn/scratch).
         let use_flash_reg = use_gemm && hd == 128 && std::env::var("INFR_FLASH_REG").is_ok();
@@ -3081,14 +3292,29 @@ impl Llama {
         // watchdog and lose the device.)
         let hlast = alloc(ne, BufferUsage::Activations)?;
         let logits = alloc(c.vocab, BufferUsage::Readback)?;
-        let kvrow = nkv * hd;
+        // gemma4 V-norm: a unit-weight RMSNorm buffer (= x/rms) sized to the largest head dim. Built
+        // once and reused for every layer's V normalization.
+        let v_ones = if c.gemma4 {
+            let ones = vec![1.0f32; c.max_head_dim()];
+            let b = alloc(c.max_head_dim(), BufferUsage::Activations)?;
+            self.be
+                .upload(b.as_ref(), bytemuck::cast_slice(&ones))
+                .map_err(|e| anyhow!("{e}"))?;
+            Some(b)
+        } else {
+            None
+        };
+        // gemma4's SWA layers have a wider KV row (8*256=2048) than its full layers (1*512=512), so
+        // the shared Q/K/V scratch is sized for the per-layer maxima (`nh*hd` already = the max since
+        // `hd` is the full/largest head dim). For uniform models these equal `nkv*hd`.
+        let kvrow_max = (c.n_kv * c.head_dim).max(c.n_kv_swa * c.head_dim_swa);
         // qwen3 (QK-norm) uses an un-fused attention input: raw Q/K/V projections then a separate
         // per-head RMSNorm+RoPE. (Llama uses the single fused attn_in instead.)
         let qkv_raw = if c.qk_norm {
             Some((
                 alloc(mpad * nh * hd, BufferUsage::Activations)?,
-                alloc(mpad * kvrow, BufferUsage::Activations)?,
-                alloc(mpad * kvrow, BufferUsage::Activations)?,
+                alloc(mpad * kvrow_max, BufferUsage::Activations)?,
+                alloc(mpad * kvrow_max, BufferUsage::Activations)?,
             ))
         } else {
             None
@@ -3340,7 +3566,29 @@ impl Llama {
                 }
             }
         };
+        let dbg_maxl: Option<usize> = std::env::var("INFR_G4_MAXLAYERS")
+            .ok()
+            .and_then(|v| v.parse().ok());
         for (li, layer) in self.layers.iter().enumerate() {
+            if dbg_maxl.is_some_and(|ml| li >= ml) {
+                break; // debug: truncate the stack to localize a bad layer
+            }
+            // Per-layer dims (gemma4: SWA vs full differ in head_dim / KV-heads / rope dim+base;
+            // uniform for every other model, so these shadow the outer values with the same numbers).
+            let hd = c.layer_head_dim(li);
+            let nkv = c.layer_n_kv(li);
+            let kvrow = nkv * hd;
+            let rope_dim = c.layer_rope_dim(li);
+            let rope_theta = c.layer_rope_theta(li);
+            // gemma4 attends with scale 1.0 (QK-norm controls the magnitude); everyone else 1/√hd.
+            let attn_scale = if c.gemma4 {
+                std::env::var("INFR_G4_SCALE")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1.0)
+            } else {
+                1.0 / (hd as f32).sqrt()
+            };
             if let Some((qr, kr, vr)) = &qkv_raw {
                 // qwen3: rmsnorm → Q/K/V projections → per-head QK-norm+RoPE (K/V into the cache)
                 let rmsnorm_qkv = || {
@@ -3358,14 +3606,14 @@ impl Llama {
                 // GEMV is the fast subgroup mul_mat_vec_q. Opt back into fusion with INFR_FUSE.
                 let fuse_qkv = std::env::var("INFR_FUSE").is_ok()
                     && matches!(
-                        (&layer.wq, &layer.wk, &layer.wv),
-                        (Wt::Q { .. }, Wt::Q { .. }, Wt::Q { .. })
+                        (&layer.wq, &layer.wk, layer.wv.as_ref()),
+                        (Wt::Q { .. }, Wt::Q { .. }, Some(Wt::Q { .. }))
                     );
                 if use_gemm {
                     rmsnorm_qkv();
                     mm(&layer.wq, hn.as_ref(), qr.as_ref(), n, ne, nh * hd);
                     mm(&layer.wk, hn.as_ref(), kr.as_ref(), n, ne, kvrow);
-                    mm(&layer.wv, hn.as_ref(), vr.as_ref(), n, ne, kvrow);
+                    mm(layer.wv(), hn.as_ref(), vr.as_ref(), n, ne, kvrow);
                 } else if fuse_qkv {
                     // decode: fuse rmsnorm + Q/K/V quant projections into one dispatch.
                     let (
@@ -3390,7 +3638,7 @@ impl Llama {
                             bits: vb,
                             blk_shift: vbs,
                         },
-                    ) = (&layer.wq, &layer.wk, &layer.wv)
+                    ) = (&layer.wq, &layer.wk, layer.wv())
                     else {
                         unreachable!()
                     };
@@ -3416,11 +3664,20 @@ impl Llama {
                     rmsnorm_qkv();
                     lin(&layer.wq, hn.as_ref(), qr.as_ref(), n, ne, nh * hd);
                     lin(&layer.wk, hn.as_ref(), kr.as_ref(), n, ne, kvrow);
-                    lin(&layer.wv, hn.as_ref(), vr.as_ref(), n, ne, kvrow);
+                    match &layer.wv {
+                        Some(wv) => lin(wv, hn.as_ref(), vr.as_ref(), n, ne, kvrow),
+                        // gemma4 full layers: V = the raw K projection (kr), copied before K gets
+                        // QK-norm+RoPE (V instead gets a weightless RMSNorm, no rope, just below).
+                        None => rec.copy(kr.as_ref(), 0, vr.as_ref(), 0, n * kvrow * 4),
+                    }
                 }
-                // gemma3 dual-rope: SWA layers rope at `swa_rope_theta`, full layers at `rope_theta`
-                // (qwen3 returns `rope_theta` for every layer).
-                let layer_theta = c.layer_rope_theta(li);
+                // QK-norm + RoPE with the layer's rope dim and base (gemma dual-rope; uniform else).
+                // gemma4 full-attention layers also apply proportional-rope freq_factors.
+                let layer_ff = if c.gemma4 && !c.is_swa_layer(li) {
+                    self.rope_freqs.as_deref()
+                } else {
+                    None
+                };
                 rec.qk_norm_rope(
                     qr.as_ref(),
                     layer.q_norm_buf.as_ref().unwrap().as_ref(),
@@ -3428,11 +3685,12 @@ impl Llama {
                     n,
                     nh,
                     hd,
-                    c.rope_dim,
-                    layer_theta,
+                    rope_dim,
+                    rope_theta,
                     pos,
                     0,
                     c.rms_eps,
+                    layer_ff,
                 );
                 rec.qk_norm_rope(
                     kr.as_ref(),
@@ -3441,12 +3699,27 @@ impl Llama {
                     n,
                     nkv,
                     hd,
-                    c.rope_dim,
-                    layer_theta,
+                    rope_dim,
+                    rope_theta,
                     pos,
                     pos,
                     c.rms_eps,
+                    layer_ff,
                 );
+                // gemma4 applies a weightless per-head RMSNorm to V before caching (rmsnorm with a
+                // unit weight = x/rms). Done in place on the f32 `vr` prior to the f16 cast-store.
+                if let Some(ones) = &v_ones {
+                    if std::env::var("INFR_G4_NOVNORM").is_err() {
+                        rec.rmsnorm(
+                            vr.as_ref(),
+                            ones.as_ref(),
+                            vr.as_ref(),
+                            n * nkv,
+                            hd,
+                            c.rms_eps,
+                        );
+                    }
+                }
                 // v_raw is f32; cast into the f16 V cache at row offset `pos`.
                 rec.store_f16(vr.as_ref(), kv.v[li].as_ref(), n * kvrow, pos * kvrow);
             } else {
@@ -3455,7 +3728,7 @@ impl Llama {
                     layer.attn_norm_buf.as_ref(),
                     layer.wq.f16(),
                     layer.wk.f16(),
-                    layer.wv.f16(),
+                    layer.wv().f16(),
                     q.as_ref(),
                     kv.k[li].as_ref(),
                     kv.v[li].as_ref(),
@@ -3551,6 +3824,7 @@ impl Llama {
                     hd,
                     pos,
                     if c.is_swa_layer(li) { c.swa_window } else { 0 },
+                    attn_scale,
                 );
             }
             if use_gemm {
@@ -3703,7 +3977,22 @@ impl Llama {
             .download(logits.as_ref(), &mut bytes)
             .map_err(|e| anyhow!("{e}"))?;
         kv.len += n;
-        Ok(bytemuck::cast_slice(&bytes).to_vec())
+        let mut out: Vec<f32> = bytemuck::cast_slice(&bytes).to_vec();
+        if std::env::var("INFR_DUMP_LOGITS").is_ok() {
+            let mut idx: Vec<usize> = (0..out.len()).collect();
+            idx.sort_by(|&a, &b| out[b].partial_cmp(&out[a]).unwrap());
+            let top: Vec<(usize, f32)> = idx.iter().take(6).map(|&i| (i, out[i])).collect();
+            eprintln!("[logits] pos={} top6={top:?}", kv.len);
+        }
+        // gemma4 final logit softcap: `logits = cap * tanh(logits / cap)`. Cheap host-side pass over
+        // the single returned row (no shader needed).
+        if c.final_softcap > 0.0 {
+            let cap = c.final_softcap;
+            for x in out.iter_mut() {
+                *x = cap * (*x / cap).tanh();
+            }
+        }
+        Ok(out)
     }
 
     /// Record-once single-token decode for a dense Qwen3 model — mirrors `forward_moe_chunk_gpu`: the
@@ -3777,7 +4066,7 @@ impl Llama {
                     );
                     rec_linear(&rec, &layer.wq, hn.as_ref(), qr.as_ref(), 1, ne, nh * hd);
                     rec_linear(&rec, &layer.wk, hn.as_ref(), kr.as_ref(), 1, ne, kvrow);
-                    rec_linear(&rec, &layer.wv, hn.as_ref(), vr.as_ref(), 1, ne, kvrow);
+                    rec_linear(&rec, layer.wv(), hn.as_ref(), vr.as_ref(), 1, ne, kvrow);
                     rec.qk_norm_rope_dyn(
                         qr.as_ref(),
                         layer.q_norm_buf.as_ref().unwrap().as_ref(),
@@ -3812,7 +4101,7 @@ impl Llama {
                         layer.attn_norm_buf.as_ref(),
                         layer.wq.f16(),
                         layer.wk.f16(),
-                        layer.wv.f16(),
+                        layer.wv().f16(),
                         params.as_ref(),
                         q_f16.as_ref(),
                         kv.k[li].as_ref(),
@@ -4212,6 +4501,7 @@ impl Llama {
             pos,
             0,
             c.rms_eps,
+            None,
         );
         rec.qk_norm_rope(
             kr.as_ref(),
@@ -4225,6 +4515,7 @@ impl Llama {
             pos,
             pos,
             c.rms_eps,
+            None,
         );
         rec.store_f16(vr.as_ref(), kv.v[li].as_ref(), n * kvrow, pos * kvrow);
         // Single-token decode (n==1) at depth: split each head's KV range across many workgroups
@@ -4270,7 +4561,8 @@ impl Llama {
                 nkv,
                 hd,
                 pos,
-                0, // full causal (llama/qwen3)
+                0,   // full causal (llama/qwen3)
+                0.0, // default 1/√hd scale
             );
         }
         rec.finish().map_err(|e| anyhow!("{e}"))?;
@@ -4496,7 +4788,7 @@ impl Llama {
                 );
                 rec_linear(&rec, &layer.wq, hn.as_ref(), qr.as_ref(), 1, ne, nh * hd);
                 rec_linear(&rec, &layer.wk, hn.as_ref(), kr.as_ref(), 1, ne, nkv * hd);
-                rec_linear(&rec, &layer.wv, hn.as_ref(), vr.as_ref(), 1, ne, nkv * hd);
+                rec_linear(&rec, layer.wv(), hn.as_ref(), vr.as_ref(), 1, ne, nkv * hd);
                 let (qn, kn) = (
                     layer.q_norm_buf.as_ref().unwrap().as_ref(),
                     layer.k_norm_buf.as_ref().unwrap().as_ref(),
@@ -4930,7 +5222,7 @@ impl Llama {
                 rec_proj(&rec, &layer.wq, hn.as_ref(), qr.as_ref(), t, ne, nh * hd);
                 rec_proj(&rec, &layer.wk, hn.as_ref(), kr.as_ref(), t, ne, nkv * hd);
             }
-            rec_proj(&rec, &layer.wv, hn.as_ref(), vr.as_ref(), t, ne, nkv * hd);
+            rec_proj(&rec, layer.wv(), hn.as_ref(), vr.as_ref(), t, ne, nkv * hd);
             let (qn, kn) = (
                 layer.q_norm_buf.as_ref().unwrap().as_ref(),
                 layer.k_norm_buf.as_ref().unwrap().as_ref(),
@@ -4947,6 +5239,7 @@ impl Llama {
                 pos,
                 0,
                 c.rms_eps,
+                None,
             );
             rec.qk_norm_rope(
                 kr.as_ref(),
@@ -4960,6 +5253,7 @@ impl Llama {
                 pos,
                 pos,
                 c.rms_eps,
+                None,
             );
             rec.store_f16(vr.as_ref(), kv.kv.v[li].as_ref(), t * kvrow, pos * kvrow);
             if let Some((po, pm, pl)) = &flash {
@@ -4990,7 +5284,8 @@ impl Llama {
                     nkv,
                     hd,
                     pos,
-                    0, // full causal (MoE attention)
+                    0,   // full causal (MoE attention)
+                    0.0, // default 1/√hd scale
                 );
             }
             if let (Some(qa), Some(da), Some(sa)) = (&qa_o, &da_o, &sa_o) {
@@ -5324,7 +5619,7 @@ impl Llama {
             let mut qkv = self.gemv_wt_many(&[
                 (&layer.wq, hn.as_slice(), t, ne, nh * hd),
                 (&layer.wk, hn.as_slice(), t, ne, nkv * hd),
-                (&layer.wv, hn.as_slice(), t, ne, nkv * hd),
+                (layer.wv(), hn.as_slice(), t, ne, nkv * hd),
             ])?;
             let vnew = qkv.pop().unwrap();
             let knew = qkv.pop().unwrap();
@@ -5703,6 +5998,8 @@ impl Llama {
             kv: self.new_kv(max_ctx)?,
             started: false,
             last_prompt_tokens: 0,
+            messages: Vec::new(),
+            cached: Vec::new(),
         })
     }
 
@@ -5719,6 +6016,12 @@ pub struct ChatSession<'a> {
     kv: KvCache,
     started: bool,
     last_prompt_tokens: usize,
+    /// Conversation history `(role, content)`, re-rendered through the model's embedded chat
+    /// template every turn. Empty when the GGUF has no template (the hardcoded fallback is used).
+    messages: Vec<(String, String)>,
+    /// The token sequence currently materialized in the KV cache, so each turn can prefill only the
+    /// new suffix (common-prefix diff vs the freshly-rendered prompt).
+    cached: Vec<u32>,
 }
 
 impl ChatSession<'_> {
@@ -5738,19 +6041,87 @@ impl ChatSession<'_> {
         self.kv.max_ctx
     }
 
-    /// Run one user turn: append the message in ChatML, decode the assistant reply (streamed to
-    /// `on_token`), and keep it all in the cache for the next turn. Returns the reply text.
+    /// Run one user turn: append the message, decode the assistant reply (streamed to `on_token`),
+    /// and keep it all in the cache for the next turn. Returns the reply text. The prompt is built
+    /// from the model's OWN embedded chat template (re-rendered over the full history each turn);
+    /// only the new token suffix vs the cached prefix is prefilled. Falls back to the hardcoded
+    /// per-arch template ([`turn_tokens`]) for GGUFs without an embedded one.
     pub fn turn(
         &mut self,
         user: &str,
         max_new: usize,
         on_token: impl FnMut(&str),
     ) -> Result<String> {
-        // Open this user turn (closing the prior assistant turn first if started); user content is
-        // encoded as literal text so it can't inject ChatML markers.
+        self.messages.push(("user".into(), user.to_string()));
+        let refs: Vec<(&str, &str)> = self
+            .messages
+            .iter()
+            .map(|(r, c)| (r.as_str(), c.as_str()))
+            .collect();
+        let Some(rendered) = self.llama.render_chat(&refs, true) else {
+            // No embedded template → hardcoded fallback (no history / prefix-diff).
+            self.messages.pop();
+            return self.turn_hardcoded(user, max_new, on_token);
+        };
+        let ids = self.llama.encode_special(&rendered)?;
+        if std::env::var("INFR_DEBUG_TOKENS").is_ok() {
+            let dump: Vec<(u32, String)> = ids
+                .iter()
+                .map(|&id| (id, self.llama.tokenizer.id_to_token(id).unwrap_or_default()))
+                .collect();
+            eprintln!("[tokens] {dump:?}");
+        }
+        // Prefill only the suffix that differs from what's already in the cache.
+        let p = common_prefix_len(&self.cached, &ids);
+        let new = &ids[p..];
+        let room = self.kv.max_ctx.saturating_sub(p + new.len() + 1);
+        if room == 0 {
+            bail!(
+                "context full: {} prompt vs {} cap — start a new session",
+                ids.len(),
+                self.kv.max_ctx
+            );
+        }
+        let max_new = max_new.min(room);
+        self.started = true;
+        self.kv.len = p; // rewind the cache to the shared prefix
+        self.last_prompt_tokens = new.len();
+        let logits = self.llama.prefill(new, &mut self.kv)?;
+        let generated = self
+            .llama
+            .decode_loop(logits, &mut self.kv, max_new, on_token)?;
+        // The cache now holds the rendered prompt + the raw generation.
+        self.cached = ids;
+        self.cached.extend_from_slice(&generated);
+
+        // History keeps only the ANSWER, not the model's <think>…</think> reasoning (Qwen3 excludes
+        // prior-turn thinking; keeping it degrades the model). On the next turn the re-render omits
+        // the think, and the prefix-diff naturally re-prefills the think-free answer. Answer = tokens
+        // after the last </think>; unterminated-think → keep none; no <think> → keep everything.
+        let tk = &self.llama.tokenizer;
+        let close = tk.token_to_id("</think>");
+        let open = tk.token_to_id("<think>");
+        let answer: &[u32] = match close.and_then(|c| generated.iter().rposition(|&t| t == c)) {
+            Some(pos) => &generated[pos + 1..],
+            None if open.is_some_and(|o| generated.contains(&o)) => &[],
+            None => &generated,
+        };
+        let answer_text = tk.decode(answer, true).unwrap_or_default();
+        self.messages.push(("assistant".into(), answer_text));
+        tk.decode(&generated, true)
+            .map_err(|e| anyhow!("decode: {e}"))
+    }
+
+    /// Hardcoded-template turn (GGUF lacks an embedded chat template). Mirrors the historical path:
+    /// per-arch markers via [`turn_tokens`], with prior-turn think dropped from the cache.
+    fn turn_hardcoded(
+        &mut self,
+        user: &str,
+        max_new: usize,
+        on_token: impl FnMut(&str),
+    ) -> Result<String> {
         let toks = self.llama.turn_tokens(user, self.started)?;
         self.last_prompt_tokens = toks.len();
-        // Cap generation by whatever context room remains (don't bail) — `max_new` is just a ceiling.
         let room = self.kv.max_ctx.saturating_sub(self.kv.len + toks.len() + 1);
         if room == 0 {
             bail!(
@@ -5762,19 +6133,11 @@ impl ChatSession<'_> {
         }
         let max_new = max_new.min(room);
         self.started = true;
-        // Prefill the user turn; remember where the assistant's generation begins.
         let logits = self.llama.prefill(&toks, &mut self.kv)?;
         let answer_start = self.kv.len;
         let generated = self
             .llama
             .decode_loop(logits, &mut self.kv, max_new, on_token)?;
-
-        // Keep only the ANSWER in history, not the model's <think>…</think> reasoning: Qwen3
-        // explicitly excludes prior-turn thinking from context, and keeping it accumulates and
-        // degrades the model (it starts emitting only-think then stopping). Rewind the cache to
-        // before this generation and re-prefill just the answer (recomputed without the think in
-        // context). Answer = tokens after the last </think>; only-think (unterminated) → keep none;
-        // no <think> at all → keep everything (a direct answer).
         let tk = &self.llama.tokenizer;
         let close = tk.token_to_id("</think>");
         let open = tk.token_to_id("<think>");
@@ -5783,15 +6146,18 @@ impl ChatSession<'_> {
             None if open.is_some_and(|o| generated.contains(&o)) => Vec::new(),
             None => generated.clone(),
         };
-        self.kv.len = answer_start; // drop the just-generated think+answer from the cache
+        self.kv.len = answer_start;
         if !answer.is_empty() {
             self.llama.prefill(&answer, &mut self.kv)?;
         }
-        self.llama
-            .tokenizer
-            .decode(&generated, true)
+        tk.decode(&generated, true)
             .map_err(|e| anyhow!("decode: {e}"))
     }
+}
+
+/// Length of the shared leading run of two token sequences (for incremental prefill).
+fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
 // ---- host ops ----

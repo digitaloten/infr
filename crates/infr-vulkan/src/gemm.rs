@@ -289,6 +289,8 @@ const ATTENTION_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/att
 const ATTN_COMBINE_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_combine.spv"));
 const ATTENTION_KV_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attention_kv.spv"));
 const QK_NORM_ROPE_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/qk_norm_rope.spv"));
+const QK_NORM_ROPE_FF_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/qk_norm_rope_ff.spv"));
 const ATTN_IN_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_in.spv"));
 const FFN_IN_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ffn_in.spv"));
 const FFN_IN_Q_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ffn_in_q.spv"));
@@ -498,6 +500,11 @@ pub(crate) fn attention_kv_spv() -> &'static [u32] {
 pub(crate) fn qk_norm_rope_spv() -> &'static [u32] {
     static QK_NORM_ROPE_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     QK_NORM_ROPE_SPV.get_or_init(|| spv_words(QK_NORM_ROPE_SPV_BYTES))
+}
+/// SPIR-V for QK-norm + RoPE with proportional-rope freq_factors (gemma4 full-attention layers).
+pub(crate) fn qk_norm_rope_ff_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(QK_NORM_ROPE_FF_SPV_BYTES))
 }
 // Record-once decode variants (`-DUSE_PARAMS`): read the per-token pos/kv_len from a host-updated
 // params SSBO instead of push constants, so the decode command buffer can be replayed across tokens.

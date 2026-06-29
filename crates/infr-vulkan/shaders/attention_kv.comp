@@ -1,11 +1,11 @@
 #version 460
 // Causal GQA attention over an f16 KV cache, tiled online softmax. One workgroup per (token, head).
-// q/k/v f16, o f32. hd <= 256 (thread t owns output dims t, t+64, t+128, t+192 that fall < hd).
+// q/k/v f16, o f32. hd <= 512 (thread t owns output dims t, t+64, …, t+7*64 that fall < hd).
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-layout(push_constant) uniform PC { uint q_len; uint kv_len; uint nh; uint nkv; uint hd; uint pos_offset; uint window; } pc;
+layout(push_constant) uniform PC { uint q_len; uint kv_len; uint nh; uint nkv; uint hd; uint pos_offset; uint window; float scale; } pc;
 layout(binding = 0) readonly buffer QB { float16_t q[]; };
 layout(binding = 1) readonly buffer KB { float16_t k[]; };
 layout(binding = 2) readonly buffer VB { float16_t v[]; };
@@ -19,7 +19,7 @@ layout(binding = 3) buffer OB { float o[]; };
 #endif
 
 const uint TILE = 1024u;
-shared float q_sh[256];
+shared float q_sh[512];
 shared float sc[1024];
 shared float red[64];
 
@@ -40,7 +40,8 @@ void main() {
     uint lo = (pc.window > 0u && qpos + 1u > pc.window) ? (qpos + 1u - pc.window) : 0u;
     uint kvh = h / (pc.nh / pc.nkv);
     uint hd = pc.hd;
-    float scale = 1.0 / sqrt(float(hd));
+    // scale > 0 → caller-supplied (gemma4 uses 1.0, QK-norm controls magnitude); else 1/√hd default.
+    float scale = pc.scale > 0.0 ? pc.scale : 1.0 / sqrt(float(hd));
 
     uint qbase = (ti * pc.nh + h) * hd;
     for (uint d = t; d < hd; d += 64u) { q_sh[d] = float(q[qbase + d]); }
@@ -48,9 +49,9 @@ void main() {
 
     float m = -3.0e38;
     float l = 0.0;
-    // Up to 4 output dims per thread (t + c*64), covering hd up to 256.
-    float acc[4];
-    for (uint c = 0u; c < 4u; c++) { acc[c] = 0.0; }
+    // Up to 8 output dims per thread (t + c*64), covering hd up to 512 (gemma4 full layers).
+    float acc[8];
+    for (uint c = 0u; c < 8u; c++) { acc[c] = 0.0; }
 
     // Start at the window's tile: skip tiles entirely below `lo` (fully masked). This guarantees
     // every processed tile has ≥1 in-window key, so `mnew` is finite and masked keys get exp→0
@@ -97,7 +98,7 @@ void main() {
         float corr = exp(m - mnew);
         l = l * corr + tsum;
         m = mnew;
-        for (uint c = 0u; c < 4u; c++) {
+        for (uint c = 0u; c < 8u; c++) {
             uint d = t + c * 64u;
             if (d < hd) {
                 float a = 0.0;
@@ -110,7 +111,7 @@ void main() {
 
     uint obase = (ti * pc.nh + h) * hd;
     float inv = 1.0 / l;
-    for (uint c = 0u; c < 4u; c++) {
+    for (uint c = 0u; c < 8u; c++) {
         uint d = t + c * 64u;
         if (d < hd) { o[obase + d] = acc[c] * inv; }
     }
