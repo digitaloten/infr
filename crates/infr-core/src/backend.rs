@@ -40,10 +40,16 @@ pub enum BufferUsage {
 /// Opaque device-memory handle owned by a backend.
 pub trait Buffer: Send + Sync {
     fn len_bytes(&self) -> usize;
+    /// Downcast hook so a backend can recover its concrete buffer type from a `&dyn Buffer`
+    /// bound by the model (every buffer a backend sees was allocated by itself).
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 /// A compiled, ready-to-run graph (pipelines + command buffers for Vulkan, an op schedule for CPU).
-pub trait Plan: Send + Sync {}
+pub trait Plan: Send + Sync {
+    /// Downcast hook so a backend can recover its concrete plan type from a `&dyn Plan`.
+    fn as_any(&self) -> &dyn std::any::Any;
+}
 
 /// Binds a [`Graph`]'s `Input`/`Weight`/`Output` handles to concrete backend buffers for one
 /// `execute`. The model holds the buffers; this only borrows them, so re-binding per step is cheap

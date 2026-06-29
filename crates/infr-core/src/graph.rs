@@ -140,11 +140,13 @@ pub enum Op {
         mask: AttnMask,
         pos: u32,
     },
-    /// Gated FFN activation over a fused `gate||up` buffer (`rows × 2*nff`): `dst = act(gate)*up`
-    /// (`rows × nff`). `up_off` shifts the `up` read by a whole-element offset (Gemma per-layer
-    /// embedding consumes a layer-major slice of a bigger buffer); 0 for the normal fused case.
+    /// Gated FFN activation: `dst[r,i] = act(gate[r,i]) * up[r, i + up_off]` (`rows × nff`). `gate`
+    /// and `up` are separate handles (a backend may fuse them into one buffer internally). `up_off`
+    /// shifts the `up` read by a whole-element offset so a layer-major slice of a bigger buffer can
+    /// be consumed in place (Gemma E2B per-layer embedding); 0 for the normal case.
     GatedAct {
-        gate_up: TensorId,
+        gate: TensorId,
+        up: TensorId,
         dst: TensorId,
         rows: u32,
         nff: u32,
@@ -183,7 +185,7 @@ pub enum Op {
 }
 
 /// An ordered op-list over declared tensor handles. Node index in `tensors` == [`TensorId`].
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Graph {
     pub tensors: Vec<TensorDecl>,
     pub ops: Vec<Op>,

@@ -8,6 +8,7 @@
 //! TODO(next): move host ops to GPU; add a KV cache; fold into the `Model`/`Backend` seams.
 #![allow(clippy::needless_range_loop)]
 
+pub mod cpu_backend;
 pub mod qwen35;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -4559,6 +4560,21 @@ impl Llama {
         // Size the KV cache to exactly what this run needs — bounded only by VRAM, not a fixed cap.
         let mut kv = self.new_kv(prompt_tokens.len() + max_new + 8)?;
         let generated = self.run_in_cache(&prompt_tokens, &mut kv, max_new, on_token)?;
+        self.tokenizer
+            .decode(&generated, true)
+            .map_err(|e| anyhow!("decode: {e}"))
+    }
+
+    /// Greedy generation on the backend-agnostic CPU reference path (no GPU). Mirrors
+    /// [`generate`](Self::generate)'s tokenize/decode exactly so the two are directly comparable.
+    /// Dense Qwen3/Llama only for now (see [`crate::cpu_backend::generate_qwen3_cpu`]).
+    pub fn generate_cpu(&self, prompt: &str, max_new: usize) -> Result<String> {
+        let enc = self
+            .tokenizer
+            .encode(prompt, false)
+            .map_err(|e| anyhow!("encode: {e}"))?;
+        let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
+        let generated = crate::cpu_backend::generate_qwen3_cpu(self, &prompt_tokens, max_new)?;
         self.tokenizer
             .decode(&generated, true)
             .map_err(|e| anyhow!("decode: {e}"))

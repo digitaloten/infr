@@ -174,6 +174,9 @@ impl Buffer for VkBuffer {
     fn len_bytes(&self) -> usize {
         self.size
     }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 // ── weight arena ────────────────────────────────────────────────────────────────
@@ -252,7 +255,11 @@ impl WeightArena {
 // ── VkPlan (stub) ─────────────────────────────────────────────────────────────
 
 struct VkPlan;
-impl Plan for VkPlan {}
+impl Plan for VkPlan {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
 
 // ── VulkanBackend ─────────────────────────────────────────────────────────────
 
