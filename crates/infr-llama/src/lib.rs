@@ -4352,18 +4352,40 @@ impl Llama {
                     );
                 }
                 rec2.silu_mul(ge.as_ref(), ue.as_ref(), ae.as_ref(), m * nff);
-                rec2.label_next("expert_down");
-                rec_gemm_expert(
-                    &rec2,
-                    &st.down,
-                    e,
-                    st.stride,
-                    ae.as_ref(),
-                    ye.as_ref(),
-                    m,
-                    nff,
-                    ne,
-                );
+                // down: Q6_K → dp4a (mmq) GEMM (int8 dot, faster than coopmat-f16); quantize the
+                // SwiGLU activations to int8 per 32-block first. Else coopmat-f16 fallback.
+                if matches!(native_parts(&st.down).0, infr_core::DType::Q6K) {
+                    let nblk = nff / 32;
+                    let (qa, da, sa) =
+                        (ab(mpad * nff)?, ab(mpad * nblk * 2)?, ab(mpad * nblk * 2)?);
+                    rec2.quant_q8(ae.as_ref(), qa.as_ref(), da.as_ref(), sa.as_ref(), m, nff);
+                    let (_, db) = native_parts(&st.down);
+                    rec2.label_next("expert_down");
+                    rec2.matmul_mmq_q6k(
+                        qa.as_ref(),
+                        da.as_ref(),
+                        db,
+                        e * st.stride,
+                        ye.as_ref(),
+                        m,
+                        nff,
+                        ne,
+                    );
+                    keep.extend([qa, da, sa]);
+                } else {
+                    rec2.label_next("expert_down");
+                    rec_gemm_expert(
+                        &rec2,
+                        &st.down,
+                        e,
+                        st.stride,
+                        ae.as_ref(),
+                        ye.as_ref(),
+                        m,
+                        nff,
+                        ne,
+                    );
+                }
                 rec2.scatter_add_rows(
                     ye.as_ref(),
                     bucket_rows.as_ref(),
