@@ -57,7 +57,11 @@ plain loop. Current op set:
 - `RmsNorm`, `QkNorm` (per-head), `Linear` (dtype-dispatched matmul)
 - `Rope` (split-half NEOX, optional `freq_factors`), `WriteKv`
 - `Attention` (GQA + causal / sliding-window, per-call scale)
-- `GatedAct` (SiLU / GELU, separate gate/up, `up_off` for E2B)
+- `GatedAct` (SiLU / GELU / Sigmoid, separate gate/up, `up_off` for E2B)
+- `MoeFfn` (router → top-k → renormalized per-expert SwiGLU sum)
+- `Conv1dSilu` (depthwise causal conv + SiLU, rolling state — Qwen3-Next)
+- `DeltaNet` (gated-DeltaNet linear-attention recurrence, persistent state —
+  Qwen3-Next)
 - `Add`, `Scale`, `Softcap`, `Copy`
 
 Grow this set as models need; a future backend either implements the composites
@@ -97,21 +101,21 @@ weight dtype and to keep q / KV in f16.
 
 ## Status (2026-06-29)
 
-| Piece                                                                        | State              |
-| ---------------------------------------------------------------------------- | ------------------ |
-| IR + Backend/Bindings seam (`infr-core`)                                     | ✅ `b6ef784`       |
-| CPU reference backend (`infr-llama::cpu_backend`)                            | ✅ `4f3ba7b`       |
-| Qwen3 / Llama dense on CPU, validated vs GPU                                 | ✅                 |
-| Gemma 3 on CPU (sandwich norms, GeGLU, dual-RoPE, SWA, embed scale, softcap) | ✅ `c4d9a78`       |
-| CLI `INFR_CPU=1` one-shot                                                    | ✅ `39ada38`       |
-| Dtype-aware native-dtype weights                                             | ✅ `9964451`       |
-| Streaming Linear (row-by-row dequant, no full-model f32 cache)               | ✅ `a736876`       |
-| gemma4 dense on the seam (per-layer dims, V-norm, V=K reuse, freq_factors)   | ✅ `e591060`       |
-| qwen3moe routed-expert FFN on the seam (`Op::MoeFfn`)                        | ✅ `4390621`       |
-| gemma4 E2B on the seam (per-layer input embeds + KV-layer sharing)           | ✅ `a716bfb`       |
-| qwen35 (Qwen3-Next) on CPU — dedicated module, validated CPU≡GPU-hybrid      | ✅ `38f7674`       |
-| **All supported formats + quant types run on CPU**                           | ✅                 |
-| Vulkan adapter (`compile`/`execute`)                                         | ⬜ still `todo!()` |
+| Piece                                                                           | State              |
+| ------------------------------------------------------------------------------- | ------------------ |
+| IR + Backend/Bindings seam (`infr-core`)                                        | ✅ `b6ef784`       |
+| CPU reference backend (`infr-llama::cpu_backend`)                               | ✅ `4f3ba7b`       |
+| Qwen3 / Llama dense on CPU, validated vs GPU                                    | ✅                 |
+| Gemma 3 on CPU (sandwich norms, GeGLU, dual-RoPE, SWA, embed scale, softcap)    | ✅ `c4d9a78`       |
+| CLI `INFR_CPU=1` one-shot                                                       | ✅ `39ada38`       |
+| Dtype-aware native-dtype weights                                                | ✅ `9964451`       |
+| Streaming Linear (row-by-row dequant, no full-model f32 cache)                  | ✅ `a736876`       |
+| gemma4 dense on the seam (per-layer dims, V-norm, V=K reuse, freq_factors)      | ✅ `e591060`       |
+| qwen3moe routed-expert FFN on the seam (`Op::MoeFfn`)                           | ✅ `4390621`       |
+| gemma4 E2B on the seam (per-layer input embeds + KV-layer sharing)              | ✅ `a716bfb`       |
+| qwen35 (Qwen3-Next) on the seam — pure CPU, no Vulkan (`Conv1dSilu`/`DeltaNet`) | ✅ `db5b344`       |
+| **All supported formats + quant types run on CPU via the seam**                 | ✅                 |
+| Vulkan adapter (`compile`/`execute`)                                            | ⬜ still `todo!()` |
 
 **Validation:** `Llama::generate_cpu` mirrors `generate` (same tokenize/decode);
 the CPU output must match the GPU greedy path **token-for-token**. Gated tests
@@ -165,12 +169,15 @@ attention scale `1/√hd` (gemma4 uses `1.0`); fused gate‖up is
    input embeddings (host-computed, mixed via `GatedAct` `up_off`) + KV-layer
    sharing. All validated token-for-token vs the reference (MoE vs host-f32,
    since the GPU f16 expert kernels flip top-k selection on near-ties).
-3. ~~**qwen35 (Qwen3-Next).**~~ ✅ `38f7674`. Already runs fully on CPU via its
-   dedicated `qwen35` module (`Q35_CPU=1`) — the gated-DeltaNet recurrence,
-   depthwise conv, and gated full-attention have no generic-seam ops yet, so it
-   stays a bespoke runner. Validated pure-CPU ≡ GPU-hybrid token-for-token.
-   **Porting onto the unified seam** (new stateful conv / DeltaNet-recurrence /
-   sectioned-RoPE / gated-attention ops) is the remaining unification work.
+3. ~~**qwen35 (Qwen3-Next) on the seam.**~~ ✅ `db5b344`. Added `Op::Conv1dSilu`
+   (depthwise causal conv + SiLU, rolling conv-state), `Op::DeltaNet`
+   (gated-DeltaNet recurrence, persistent S state), and `Activation::Sigmoid`
+   (attention out-gate); sectioned RoPE reduces to standard split-half `Rope`
+   for text. `qwen35::generate_cpu` builds the hybrid decode graph and runs it
+   through `CpuBackend` with **zero Vulkan** (conv / recurrent / KV state are
+   model-owned `Input` buffers mutated in place). Validated token-for-token vs
+   the bespoke CPU oracle (exact, both f32). The bespoke `Model` (GPU-hybrid)
+   path is unchanged.
 4. **f16 KV cache + activations on CPU.** Match the GPU's f16 representation —
    halves KV memory and tightens parity.
 5. **Vulkan adapter (`compile`/`execute`).** Map the dtype-aware graph onto the
