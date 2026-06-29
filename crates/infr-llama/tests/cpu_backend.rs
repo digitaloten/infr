@@ -162,6 +162,56 @@ fn cpu_golden_qwen3() {
     check_golden(&model, QWEN3_GOLDEN);
 }
 
+/// Path to a specific Qwen3-0.6B quantization in the HF cache (for the quant-coverage sweep).
+fn qwen3_quant(quant: &str) -> Option<PathBuf> {
+    let hub = std::env::var("HOME").unwrap() + "/.cache/huggingface/hub";
+    let base = format!("{hub}/models--unsloth--Qwen3-0.6B-GGUF/snapshots");
+    std::fs::read_dir(&base).ok()?.find_map(|e| {
+        let f = e.ok()?.path().join(format!("Qwen3-0.6B-{quant}.gguf"));
+        f.exists().then_some(f)
+    })
+}
+
+/// CPU-only quant coverage: the SAME prompt through every available quantization of Qwen3-0.6B —
+/// legacy round (Q4_0), k-quants (Q2_K/Q4_K/Q5_K/Q6_K), high-bit (Q8_0), i-quant codebook (IQ4_XS),
+/// and float (BF16). Each exercises a different dequant/dot path; the per-quant golden hash is locked
+/// (each verified coherent at capture). Missing quants are skipped. Refresh with `INFR_BLESS=1`.
+// All verified coherent at capture — every quant recalls "France's capital is Paris" (Q2_K is a
+// touch repetitive, as expected for 2-bit; higher-precision quants converge: Q4_K==Q6_K,
+// Q5_K==Q8_0==BF16).
+const QWEN3_QUANT_GOLDEN: &[(&str, usize, u64)] = &[
+    ("IQ4_XS", 32, 0xd028ff03b524cb28),
+    ("Q2_K", 32, 0x6442c2818c12ca56),
+    ("Q4_0", 32, 0x88221dcfca820246),
+    ("Q4_K_M", 32, 0xfd63781ea3bfa785),
+    ("Q5_K_M", 32, 0xb68f96c3aa8d22fe),
+    ("Q6_K", 32, 0xfd63781ea3bfa785),
+    ("Q8_0", 32, 0xb68f96c3aa8d22fe),
+    ("BF16", 32, 0xb68f96c3aa8d22fe),
+];
+
+#[test]
+#[ignore = "needs the Qwen3-0.6B GGUFs in several quants (no GPU)"]
+fn cpu_golden_qwen3_quants() {
+    std::env::set_var("INFR_TEMP", "0");
+    let bless = std::env::var("INFR_BLESS").is_ok();
+    let prompt = "The capital of France is";
+    for (quant, n, want) in QWEN3_QUANT_GOLDEN {
+        let Some(path) = qwen3_quant(quant) else {
+            eprintln!("(skip {quant}: not downloaded)");
+            continue;
+        };
+        let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+        let out = cpu_gen(&model, prompt, *n);
+        let h = fnv1a(&out);
+        if bless {
+            println!("    ({quant:?}, {n}, 0x{h:016x}),  // {out:?}");
+        } else {
+            assert_eq!(h, *want, "quant {quant} golden changed\n  out: {out:?}");
+        }
+    }
+}
+
 /// CPU-only (no GPU): Gemma 3 (sandwich norms, GeGLU, dual-RoPE, SWA) golden-hash lock.
 #[test]
 #[ignore = "needs the gemma-3-1b GGUF (no GPU)"]
@@ -228,6 +278,20 @@ fn qwen3moe_30b() -> PathBuf {
         }
     }
     panic!("Qwen3-30B-A3B gguf not found");
+}
+
+// Captured + verified coherent (qwen3moe: routed-expert FFN, ~3B active of 30B).
+const QWEN3MOE_GOLDEN: &[(&str, usize, u64)] =
+    &[("The capital of France is", 24, 0xdac3e0eea1da12ed)];
+
+/// CPU-only (no GPU): qwen3moe golden-hash lock (the Op::MoeFfn routed-expert path). 30B but only
+/// `n_used` experts run per token; still slow on CPU, so a single short case.
+#[test]
+#[ignore = "needs the Qwen3-30B-A3B GGUF (no GPU); slow"]
+fn cpu_golden_qwen3moe() {
+    std::env::set_var("INFR_TEMP", "0");
+    let model = infr_llama::CpuModel::load(&qwen3moe_30b(), None).expect("cpu load");
+    check_golden(&model, QWEN3MOE_GOLDEN);
 }
 
 /// qwen3moe (routed-expert FFN: softmax router → top-k → renormalized weighted SwiGLU sum) on the
