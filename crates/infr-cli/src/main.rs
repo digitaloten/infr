@@ -323,6 +323,24 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         envf("INFR_TOP_P", 0.95),
     );
 
+    // CPU reference backend (INFR_CPU=1): run the dense forward through the backend-agnostic compute
+    // Graph on the CPU — no GPU compute. One-shot, dense Qwen3/Llama only for now. (Weights still
+    // load via the GPU loader; a no-GPU load path is a follow-up.)
+    if std::env::var("INFR_CPU").is_ok() {
+        let Some(m) = message else {
+            anyhow::bail!("INFR_CPU currently supports one-shot only: pass a message");
+        };
+        eprintln!("[cpu reference backend — dense forward on CPU via the agnostic compute graph]");
+        let prompt = llama.chatml(m);
+        let t0 = std::time::Instant::now();
+        let text = llama.generate_cpu(&prompt, max_new)?;
+        let mut render = ThinkRender::new();
+        render.feed(&text);
+        render.finish();
+        print_run_stats(t0, None, 0, prompt.len(), None);
+        return Ok(());
+    }
+
     // MoE (qwen3moe): eager CPU-orchestrated forward (router top-k + per-expert FFN), no KV cache.
     // One-shot only for now.
     if llama.is_moe() {
