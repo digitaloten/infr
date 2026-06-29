@@ -112,6 +112,34 @@ fn cpu_matches_gpu_qwen3moe() {
     );
 }
 
+fn gemma4_e2b() -> PathBuf {
+    let hub = std::env::var("HOME").unwrap() + "/.cache/huggingface/hub";
+    let base = format!("{hub}/models--unsloth--gemma-4-E2B-it-GGUF/snapshots");
+    for e in std::fs::read_dir(&base).expect("snapshots dir") {
+        let f = e.unwrap().path().join("gemma-4-E2B-it-Q4_K_M.gguf");
+        if f.exists() {
+            return f;
+        }
+    }
+    panic!("gemma-4-E2B gguf not found");
+}
+
+/// Gemma 4 E2B (gemma3n): per-layer input embeddings + KV-layer sharing, on top of the gemma4 dense
+/// path. CPU backend must match the GPU greedy path token-for-token.
+#[test]
+#[ignore = "needs a Vulkan GPU + the gemma-4-E2B GGUF; run with INFR_TEMP=0"]
+fn cpu_matches_gpu_gemma4_e2b() {
+    std::env::set_var("INFR_TEMP", "0");
+    let llama = infr_llama::Llama::load_opt(&gemma4_e2b(), None).expect("load");
+    let prompt = "The capital of France is";
+    let n = 16;
+    let gpu = llama.generate(prompt, n, |_| {}).expect("gpu generate");
+    let cpu = llama.generate_cpu(prompt, n).expect("cpu generate");
+    println!("GPU: {gpu:?}");
+    println!("CPU: {cpu:?}");
+    assert_eq!(cpu, gpu, "gemma4 E2B CPU must match GPU greedy output");
+}
+
 fn gemma4_12b() -> PathBuf {
     let hub = std::env::var("HOME").unwrap() + "/.cache/huggingface/hub";
     let base = format!("{hub}/models--unsloth--gemma-4-12b-it-GGUF/snapshots");

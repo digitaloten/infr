@@ -600,6 +600,10 @@ struct LayerW {
     ffn_norm: TensorId,
     ffn: FfnW,
     post_ffw: Option<TensorId>,
+    // gemma4 E2B per-layer input embedding: inp_gate, proj, post_norm.
+    pl_inp_gate: Option<TensorId>,
+    pl_proj: Option<TensorId>,
+    pl_post_norm: Option<TensorId>,
 }
 
 /// Handles into one freshly-built decode graph that the driver re-binds each step.
@@ -607,23 +611,19 @@ struct DecodeHandles {
     hidden: TensorId,
     positions: TensorId,
     rope_freqs: Option<TensorId>, // gemma4 proportional-RoPE divisors (full-attention layers)
+    per_layer_inp: Option<TensorId>, // gemma4 E2B per-(token,layer) input vector `[n_layer*npl]`
     logits: TensorId,
     k_cache: Vec<TensorId>,
     v_cache: Vec<TensorId>,
     weights: Vec<TensorId>, // flat, in declaration == upload order
 }
 
-/// Greedy CPU generation for a decoder (Qwen3 / Llama / Gemma 3 / Gemma 4 dense / qwen3moe). The
-/// attention block is shared; the FFN is either a dense gated FFN or a routed-expert MoE bank.
-/// `prompt` is the full token prefix; returns the generated continuation. Stops at EOS or `max_new`.
-/// gemma4 E2B (per-layer input embeddings + KV sharing) is not handled yet.
+/// Greedy CPU generation for a decoder (Qwen3 / Llama / Gemma 3 / Gemma 4 dense+E2B / qwen3moe). The
+/// attention block is shared; the FFN is either a dense gated FFN or a routed-expert MoE bank; gemma4
+/// E2B adds per-layer input embeddings + KV-layer sharing. `prompt` is the full token prefix; returns
+/// the generated continuation. Stops at EOS or `max_new`.
 pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> AResult<Vec<u32>> {
     let c = &llama.cfg;
-    if c.n_embd_per_layer > 0 {
-        return Err(anyhow!(
-            "cpu runner: gemma4 E2B (per-layer input embeddings) not on the seam yet"
-        ));
-    }
     let be = CpuBackend::new();
     let (ne, nh) = (c.n_embd, c.n_head);
     // gemma4: per-layer SWA/full dims differ; size shared scratch + KV by the max over layers.
@@ -640,6 +640,9 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
         Activation::Silu
     };
     let max_ctx = prompt.len() + max_new + 1;
+    // gemma4 E2B (gemma3n): per-layer input embeddings + KV-layer sharing.
+    let e2b = c.n_embd_per_layer > 0;
+    let npl = c.n_embd_per_layer;
 
     // Per-layer presence of an explicit V projection. gemma4 full-attention layers omit it (V = the
     // raw K projection); every layer of every other model has one.
@@ -735,6 +738,12 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
         if gemma {
             wraw(&p("post_ffw_norm.weight"))?;
         }
+        if e2b {
+            // gemma4 E2B per-layer input-embedding application weights.
+            wraw(&p("inp_gate.weight"))?;
+            wraw(&p("proj.weight"))?;
+            wraw(&p("post_norm.weight"))?;
+        }
     }
     // Globals: output_norm, lm_head (output.weight, or tied to token_embd f32).
     wraw("output_norm.weight")?;
@@ -801,6 +810,15 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
         }
         None => None,
     };
+    // gemma4 E2B per-(token,layer) input vector `[n_layer*npl]`, recomputed + re-uploaded each step.
+    let ipl_buf = if e2b {
+        Some(
+            be.alloc(c.n_layer * npl * 4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?,
+        )
+    } else {
+        None
+    };
     let logits_buf = be
         .alloc(c.vocab * 4, BufferUsage::Readback)
         .map_err(|e| anyhow!("{e}"))?;
@@ -812,6 +830,12 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
         let hidden = g.input(f32d(ne));
         let positions = g.input(TensorDesc::new(vec![1], DType::I32));
         let rope_freqs = rf_buf.as_ref().map(|(_, n)| g.input(f32d(*n)));
+        // gemma4 E2B per-(token,layer) input vector `[n_layer*npl]` (computed host-side each step).
+        let per_layer_inp = if e2b {
+            Some(g.input(f32d(c.n_layer * npl)))
+        } else {
+            None
+        };
         let mut k_cache = Vec::new();
         let mut v_cache = Vec::new();
         for l in 0..c.n_layer {
@@ -876,6 +900,15 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
             } else {
                 None
             };
+            let (pl_inp_gate, pl_proj, pl_post_norm) = if e2b {
+                (
+                    Some(wpush(&mut g, &mut weights)),
+                    Some(wpush(&mut g, &mut weights)),
+                    Some(wpush(&mut g, &mut weights)),
+                )
+            } else {
+                (None, None, None)
+            };
             lw.push(LayerW {
                 attn_norm,
                 wq,
@@ -888,6 +921,9 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
                 ffn_norm,
                 ffn,
                 post_ffw,
+                pl_inp_gate,
+                pl_proj,
+                pl_post_norm,
             });
         }
         let w_out_norm = wpush(&mut g, &mut weights);
@@ -909,6 +945,9 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
         let ubuf = g.internal(f32d(nff));
         let actbuf = g.internal(f32d(nff));
         let sub = g.internal(f32d(ne));
+        // E2B per-layer embed scratch: gate `[npl]` and projected `[ne]`.
+        let plg = g.internal(f32d(npl.max(1)));
+        let plp = g.internal(f32d(ne));
 
         let eps = c.rms_eps;
         for (l, lw) in lw.iter().enumerate() {
@@ -951,49 +990,95 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
                 in_f: ne as u32,
                 out_f: qrow as u32,
             });
-            g.push(Op::Linear {
-                x: hn,
-                weight: lw.wk,
-                dst: k,
-                m: 1,
-                in_f: ne as u32,
-                out_f: kvrow as u32,
-            });
-            // V projection, or (gemma4 full layers) V = the raw K projection, copied BEFORE K is
-            // QK-normed + RoPE'd.
-            match lw.wv {
-                Some(wv) => g.push(Op::Linear {
+            // gemma4 E2B KV-layer sharing: shared layers compute Q only and attend to an earlier
+            // layer's cache. `own_kv`/`kv_src` are `true`/`l` for every layer of a non-sharing model.
+            let own_kv = c.has_own_kv(l);
+            let kv_src = c.kv_src_layer(l);
+            if own_kv {
+                g.push(Op::Linear {
                     x: hn,
-                    weight: wv,
-                    dst: v,
+                    weight: lw.wk,
+                    dst: k,
                     m: 1,
                     in_f: ne as u32,
                     out_f: kvrow as u32,
-                }),
-                None => g.push(Op::Copy {
+                });
+                // V projection, or (gemma4 full layers) V = the raw K projection, copied BEFORE K is
+                // QK-normed + RoPE'd.
+                match lw.wv {
+                    Some(wv) => g.push(Op::Linear {
+                        x: hn,
+                        weight: wv,
+                        dst: v,
+                        m: 1,
+                        in_f: ne as u32,
+                        out_f: kvrow as u32,
+                    }),
+                    None => g.push(Op::Copy {
+                        src: k,
+                        src_off: 0,
+                        dst: v,
+                        dst_off: 0,
+                        n: kvrow as u32,
+                    }),
+                }
+                if let Some(kn) = lw.k_norm {
+                    g.push(Op::QkNorm {
+                        x: k,
+                        weight: kn,
+                        dst: k,
+                        rows: 1,
+                        n_head: nkv as u32,
+                        head_dim: hd as u32,
+                        eps,
+                    });
+                }
+                g.push(Op::Rope {
+                    x: k,
+                    positions,
+                    dst: k,
+                    rows: 1,
+                    n_head: nkv as u32,
+                    head_dim: hd as u32,
+                    rope_dim: rope_dim as u32,
+                    theta,
+                    freq_factors: layer_ff,
+                });
+                // gemma4 weightless per-head RMSNorm on V (= x/rms) before caching.
+                if let Some(ones) = v_ones {
+                    g.push(Op::QkNorm {
+                        x: v,
+                        weight: ones,
+                        dst: v,
+                        rows: 1,
+                        n_head: nkv as u32,
+                        head_dim: hd as u32,
+                        eps,
+                    });
+                }
+                g.push(Op::WriteKv {
                     src: k,
-                    src_off: 0,
-                    dst: v,
-                    dst_off: 0,
-                    n: kvrow as u32,
-                }),
+                    cache: k_cache[l],
+                    rows: 1,
+                    row_stride: kvrow as u32,
+                    pos: pos as u32,
+                });
+                g.push(Op::WriteKv {
+                    src: v,
+                    cache: v_cache[l],
+                    rows: 1,
+                    row_stride: kvrow as u32,
+                    pos: pos as u32,
+                });
             }
-            if let (Some(qn), Some(kn)) = (lw.q_norm, lw.k_norm) {
+            // Q QK-norm + RoPE (always).
+            if let Some(qn) = lw.q_norm {
                 g.push(Op::QkNorm {
                     x: q,
                     weight: qn,
                     dst: q,
                     rows: 1,
                     n_head: nh as u32,
-                    head_dim: hd as u32,
-                    eps,
-                });
-                g.push(Op::QkNorm {
-                    x: k,
-                    weight: kn,
-                    dst: k,
-                    rows: 1,
-                    n_head: nkv as u32,
                     head_dim: hd as u32,
                     eps,
                 });
@@ -1009,47 +1094,10 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
                 theta,
                 freq_factors: layer_ff,
             });
-            g.push(Op::Rope {
-                x: k,
-                positions,
-                dst: k,
-                rows: 1,
-                n_head: nkv as u32,
-                head_dim: hd as u32,
-                rope_dim: rope_dim as u32,
-                theta,
-                freq_factors: layer_ff,
-            });
-            // gemma4 weightless per-head RMSNorm on V (= x/rms) before caching.
-            if let Some(ones) = v_ones {
-                g.push(Op::QkNorm {
-                    x: v,
-                    weight: ones,
-                    dst: v,
-                    rows: 1,
-                    n_head: nkv as u32,
-                    head_dim: hd as u32,
-                    eps,
-                });
-            }
-            g.push(Op::WriteKv {
-                src: k,
-                cache: k_cache[l],
-                rows: 1,
-                row_stride: kvrow as u32,
-                pos: pos as u32,
-            });
-            g.push(Op::WriteKv {
-                src: v,
-                cache: v_cache[l],
-                rows: 1,
-                row_stride: kvrow as u32,
-                pos: pos as u32,
-            });
             g.push(Op::Attention {
                 q,
-                k_cache: k_cache[l],
-                v_cache: v_cache[l],
+                k_cache: k_cache[kv_src],
+                v_cache: v_cache[kv_src],
                 dst: attn,
                 rows: 1,
                 kv_len: (pos + 1) as u32,
@@ -1169,6 +1217,53 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
                 dst: hidden,
                 n: ne as u32,
             });
+            // gemma4 E2B per-layer input embedding (gemma3n): mix this layer's input vector into
+            // `hidden` after the FFN residual. `g = gelu(inp_gate·hidden) * inp_per_layer[l]`,
+            // `p = post_norm(proj·g)`, `hidden += p`.
+            if let (Some(gate_w), Some(proj_w), Some(post_norm), Some(ipl)) =
+                (lw.pl_inp_gate, lw.pl_proj, lw.pl_post_norm, per_layer_inp)
+            {
+                g.push(Op::Linear {
+                    x: hidden,
+                    weight: gate_w,
+                    dst: plg,
+                    m: 1,
+                    in_f: ne as u32,
+                    out_f: npl as u32,
+                });
+                // gelu(plg) * ipl[l*npl .. l*npl+npl]  (the layer's slice of the input vector).
+                g.push(Op::GatedAct {
+                    gate: plg,
+                    up: ipl,
+                    dst: plg,
+                    rows: 1,
+                    nff: npl as u32,
+                    act: Activation::Gelu,
+                    up_off: (l * npl) as u32,
+                });
+                g.push(Op::Linear {
+                    x: plg,
+                    weight: proj_w,
+                    dst: plp,
+                    m: 1,
+                    in_f: npl as u32,
+                    out_f: ne as u32,
+                });
+                g.push(Op::RmsNorm {
+                    x: plp,
+                    weight: post_norm,
+                    dst: plp,
+                    rows: 1,
+                    dim: ne as u32,
+                    eps,
+                });
+                g.push(Op::Add {
+                    a: hidden,
+                    b: plp,
+                    dst: hidden,
+                    n: ne as u32,
+                });
+            }
             // gemma4: scale the whole layer output by the per-layer scalar before the next layer.
             if let Some(s) = out_scale[l] {
                 g.push(Op::Scale {
@@ -1209,6 +1304,7 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
                 hidden,
                 positions,
                 rope_freqs,
+                per_layer_inp,
                 logits,
                 k_cache,
                 v_cache,
@@ -1234,6 +1330,46 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
         be.upload(pos_buf.as_ref(), bytemuck::cast_slice(&[pos as i32]))
             .map_err(|e| anyhow!("{e}"))?;
 
+        // gemma4 E2B: build this token's per-layer input vector on the host (mirrors the GPU forward):
+        // `ipl[l] = ((model_proj_l·emb)/√n_embd, RMSNorm'd over npl) + (per_layer_tok_embd_row × √npl)) / √2`.
+        if let (Some(ple), Some(ipl_buf)) = (llama.per_layer_embd.as_ref(), &ipl_buf) {
+            let (npl, nl, nem) = (ple.npl, ple.n_layer, ple.n_embd);
+            let inv_sqrt_ne = 1.0 / (nem as f32).sqrt();
+            let sqrt_npl = (npl as f32).sqrt();
+            let inv_sqrt2 = 1.0 / 2f32.sqrt();
+            let te_bytes = llama
+                .gguf
+                .tensor_bytes("per_layer_token_embd.weight")
+                .map_err(|e| anyhow!("{e}"))?;
+            let r0 = tok * ple.tok_embd_row_bytes;
+            let pl_tok = dequant_block(
+                ple.tok_embd_dtype,
+                &te_bytes[r0..r0 + ple.tok_embd_row_bytes],
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+            let mut ipl = vec![0f32; nl * npl];
+            for layer in 0..nl {
+                let mut proj = vec![0f32; npl];
+                let mut ss = 0f32;
+                for (j, pj) in proj.iter_mut().enumerate() {
+                    let wrow =
+                        &ple.model_proj[(layer * npl + j) * nem..(layer * npl + j) * nem + nem];
+                    let acc: f32 = wrow.iter().zip(&emb).map(|(a, b)| a * b).sum();
+                    let v = acc * inv_sqrt_ne;
+                    *pj = v;
+                    ss += v * v;
+                }
+                let rms = 1.0 / (ss / npl as f32 + c.rms_eps).sqrt();
+                for j in 0..npl {
+                    let normed = proj[j] * rms * ple.proj_norm[j];
+                    let tokv = pl_tok[layer * npl + j] * sqrt_npl;
+                    ipl[layer * npl + j] = (normed + tokv) * inv_sqrt2;
+                }
+            }
+            be.upload(ipl_buf.as_ref(), bytemuck::cast_slice(&ipl))
+                .map_err(|e| anyhow!("{e}"))?;
+        }
+
         let (g, h) = build(pos);
         let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
         let mut b = Bindings::new();
@@ -1241,6 +1377,9 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
         b.bind(h.positions, pos_buf.as_ref());
         if let (Some(rid), Some((rb, _))) = (h.rope_freqs, &rf_buf) {
             b.bind(rid, rb.as_ref());
+        }
+        if let (Some(pid), Some(ib)) = (h.per_layer_inp, &ipl_buf) {
+            b.bind(pid, ib.as_ref());
         }
         for l in 0..c.n_layer {
             b.bind(h.k_cache[l], kbufs[l].as_ref());
