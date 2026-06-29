@@ -1,0 +1,4 @@
+# Build for the host CPU so the scalar dequant/matvec loops autovectorize to AVX2/AVX-512
+# (the CPU backend leans on this; the binary is then specific to this machine's ISA).
+[build]
+rustflags = ["-C", "target-cpu=native"]

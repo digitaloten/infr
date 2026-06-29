@@ -19,9 +19,30 @@ use infr_core::graph::{Activation, AttnMask, Graph, Op, TensorKind};
 use infr_core::tensor::{DType, TensorDesc, TensorId};
 use infr_core::WeightSource;
 use infr_gguf::{Gguf, TensorBytes};
+use rayon::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+/// Dot product with 8 independent accumulators so the reduction isn't latency-bound — lets the
+/// autovectorizer (with `target-cpu=native`) keep several AVX FMA lanes in flight. `a`/`b` equal len.
+#[inline]
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    let chunks = n / 8;
+    let mut acc = [0f32; 8];
+    for c in 0..chunks {
+        let base = c * 8;
+        for (j, ac) in acc.iter_mut().enumerate() {
+            *ac += a[base + j] * b[base + j];
+        }
+    }
+    let mut s: f32 = acc.iter().sum();
+    for i in chunks * 8..n {
+        s += a[i] * b[i];
+    }
+    s
+}
 
 /// A host buffer. Weights are **mapped** — a zero-copy [`TensorBytes`] view straight into the GGUF
 /// mmap (read-only, no `memcpy`, no owned RAM). Everything the model writes (KV / conv / recurrent
@@ -285,25 +306,28 @@ impl Backend for CpuBackend {
                 } => {
                     let (m, in_f, out_f) = (m as usize, in_f as usize, out_f as usize);
                     let xs = &vals[x.0 as usize];
-                    // Stream the (row-major [out_f, in_f]) weight one row at a time straight from its
-                    // native bytes, dequantizing inside the dot — never materialize the whole
-                    // (possibly quantized) weight in f32. Peak extra memory is one dequant'd row, so
-                    // big / MoE models fit. GGUF rows are block-aligned, so each row is an equal
-                    // `bytes/out_f` slice. (Re-dequant per step — perf is a later pass, PLAN.md §1.)
+                    // Stream the (row-major [out_f, in_f]) weight one row at a time straight from the
+                    // mmap, dequantizing inside the dot — no full f32 materialization. GGUF rows are
+                    // block-aligned, so each row is an equal `bytes/out_f` slice. Output rows are
+                    // independent → fan out over the 32 cores with rayon.
                     let buf = bindings.get(w).expect("cpu backend: unbound Weight");
                     let bytes = cpu_buf(buf).read();
+                    let wbytes: &[u8] = &bytes;
                     let dt = g.desc(w).dtype;
-                    let bpr = bytes.len() / out_f; // bytes per weight row
+                    let bpr = wbytes.len() / out_f; // bytes per weight row
                     let mut out = vec![0f32; m * out_f];
-                    for o in 0..out_f {
-                        let row = bytes_to_f32(&bytes[o * bpr..o * bpr + bpr], dt);
-                        for r in 0..m {
-                            let xb = r * in_f;
-                            let mut acc = 0f32;
-                            for k in 0..in_f {
-                                acc += row[k] * xs[xb + k];
+                    // One token (decode) is the hot path: parallelize the output rows directly.
+                    if m == 1 {
+                        out.par_iter_mut().enumerate().for_each(|(o, dst_o)| {
+                            let row = bytes_to_f32(&wbytes[o * bpr..o * bpr + bpr], dt);
+                            *dst_o = dot(&row, &xs[..in_f]);
+                        });
+                    } else {
+                        for o in 0..out_f {
+                            let row = bytes_to_f32(&wbytes[o * bpr..o * bpr + bpr], dt);
+                            for r in 0..m {
+                                out[r * out_f + o] = dot(&row, &xs[r * in_f..r * in_f + in_f]);
                             }
-                            out[r * out_f + o] = acc;
                         }
                     }
                     vals[dst.0 as usize] = out;
@@ -516,15 +540,16 @@ impl Backend for CpuBackend {
                     );
                     let xs = vals[x.0 as usize].clone();
                     // Stream a (row-major [out_f, in_f]) weight slice and matvec it against `v` —
-                    // dequant per row, exactly like `Op::Linear` (no full materialization).
+                    // dequant per row, exactly like `Op::Linear`, parallel over rows.
                     let matvec = |bytes: &[u8], dt: DType, v: &[f32], in_f: usize, out_f: usize| {
                         let bpr = bytes.len() / out_f;
-                        let mut o = vec![0f32; out_f];
-                        for (r, oo) in o.iter_mut().enumerate() {
-                            let row = bytes_to_f32(&bytes[r * bpr..r * bpr + bpr], dt);
-                            *oo = (0..in_f).map(|k| row[k] * v[k]).sum();
-                        }
-                        o
+                        (0..out_f)
+                            .into_par_iter()
+                            .map(|r| {
+                                let row = bytes_to_f32(&bytes[r * bpr..r * bpr + bpr], dt);
+                                dot(&row, &v[..in_f])
+                            })
+                            .collect::<Vec<f32>>()
                     };
                     // Router softmax over all experts.
                     let rbuf = bindings.get(router).expect("cpu backend: unbound router");
