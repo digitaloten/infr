@@ -1,21 +1,21 @@
-//! CPU backend validation: the backend-agnostic compute Graph, run on the CPU reference backend,
-//! must produce the same greedy generation as the GPU path for a dense Qwen3 model.
+//! Generation goldens for both backends: a plain-text prompt is rendered through the model's jinja
+//! chat template, generated greedily, and a stable FNV-1a of the output is locked. The CPU goldens
+//! run the backend-agnostic compute Graph on the CPU reference backend (no GPU); the GPU goldens run
+//! the production Vulkan path. Both are captured with `INFR_BLESS=1` and read for coherence.
 //!
-//! Run (needs a Vulkan GPU for the reference side + the Qwen3 GGUF):
+//! Run (CPU goldens need only the GGUF; GPU goldens also need a Vulkan GPU):
 //!   INFR_TEMP=0 cargo test --release -p infr-llama --test cpu_backend -- --ignored --nocapture
 
 use std::path::PathBuf;
 
 // ─── CPU-only correctness (no GPU) ───────────────────────────────────────────────
 //
-// These don't compare against the GPU: the CPU does the math in f32 while the GPU uses f16 + quant
-// kernels, so greedy decode would split on near-ties (precision, not a bug). Instead the CPU path is
-// validated by a **golden hash**: plain-text prompts are rendered through the model's jinja chat
-// template, generated greedily (deterministic), and a stable FNV-1a of the output is locked — each
-// golden was captured with `INFR_BLESS=1` and the text read to confirm it's coherent + correct, so
-// any op regression flips the hash. Kernel-level math (the Q4_K/Q6_K dot vs the f32 reference) is
-// unit-tested in `src/cpu_backend.rs`. The `cpu_matches_gpu_*` tests below remain as one-shot GPU
-// *integration* checks from bring-up.
+// The CPU and GPU goldens use SEPARATE hashes: the CPU does the math in f32 while the GPU uses f16 +
+// native-quant kernels, so greedy decode can split on near-ties (precision, not a bug) — comparing
+// the two token-for-token is brittle. Instead each backend locks its own FNV-1a golden, captured
+// with `INFR_BLESS=1` and read to confirm it's coherent + correct, so any op regression flips the
+// hash. Kernel-level math (the Q4_K/Q6_K dot vs the f32 reference) is unit-tested in
+// `src/cpu_backend.rs`.
 
 /// Stable FNV-1a-64 over a string. (`std::hash::DefaultHasher` is NOT stable across toolchains, so we
 /// roll our own for golden values.)
@@ -101,27 +101,64 @@ fn qwen3_06b() -> PathBuf {
     panic!("Qwen3-0.6B gguf not found; set INFR_TEST_MODEL");
 }
 
-/// CPU greedy generation must match the GPU greedy generation token-for-token (both argmax).
-/// Set INFR_TEMP=0 so the GPU side is greedy too.
+// ─── GPU integration goldens (need a Vulkan GPU) ─────────────────────────────────
+//
+// The GPU path is locked the SAME way as the CPU path: a plain-text prompt is rendered through the
+// model's jinja chat template, generated greedily on the GPU, and a stable FNV-1a of the output is
+// asserted. These hashes are GPU-specific (f16 + native-quant kernels, distinct from the CPU's f32),
+// so they get their own constants — captured with `INFR_BLESS=1` and read to confirm coherence. They
+// replace the old `cpu_matches_gpu_*` token-for-token checks, which were precision-brittle (CPU f32
+// vs GPU f16 split on greedy near-ties — not a bug; see the CPU-only note above).
+
+/// Greedy GPU generation: render the plain-text prompt with the model's chat template, generate on
+/// the GPU dense path, return the text. The production GPU path; mirrors [`cpu_gen`].
+fn gpu_gen(llama: &infr_llama::Llama, prompt: &str, n: usize) -> String {
+    llama
+        .generate(&llama.render_chat(prompt), n, |_| {})
+        .expect("gpu generate")
+}
+
+/// As [`gpu_gen`] but via the routed-expert MoE forward ([`Llama::generate_moe`]).
+fn gpu_gen_moe(llama: &infr_llama::Llama, prompt: &str, n: usize) -> String {
+    llama
+        .generate_moe(&llama.render_chat(prompt), n, |_| {})
+        .expect("gpu moe generate")
+}
+
+/// Assert (or, with `INFR_BLESS=1`, print) the GPU golden hash for each `(prompt, n, fnv1a)` case.
+fn check_gpu_golden(gen: impl Fn(&str, usize) -> String, cases: &[(&str, usize, u64)]) {
+    let bless = std::env::var("INFR_BLESS").is_ok();
+    for (prompt, n, want) in cases {
+        let out = gen(prompt, *n);
+        let h = fnv1a(&out);
+        if bless {
+            println!("    ({prompt:?}, {n}, 0x{h:016x}),  // {out:?}");
+        } else {
+            assert_eq!(
+                h, *want,
+                "GPU golden changed for {prompt:?} (n={n})\n  out: {out:?}\n  got 0x{h:016x} want 0x{want:016x}"
+            );
+        }
+    }
+}
+
+// Captured + verified coherent on the GPU (chat-templated Qwen3-0.6B Q4_K_M).
+const QWEN3_GPU_GOLDEN: &[(&str, usize, u64)] = &[
+    ("The capital of France is", 32, 0xfd63781ea3bfa785),
+    (
+        "Explain how a computer works in simple terms.",
+        48,
+        0xcf56ba8c4bb5c455,
+    ),
+];
+
+/// GPU dense Qwen3-0.6B golden-hash lock (replaces the old CPU-vs-GPU token-match test).
 #[test]
-#[ignore = "needs a Vulkan GPU + the Qwen3-0.6B GGUF; run with INFR_TEMP=0"]
-fn cpu_matches_gpu_greedy() {
+#[ignore = "needs a Vulkan GPU + the Qwen3-0.6B GGUF"]
+fn gpu_golden_qwen3() {
     std::env::set_var("INFR_TEMP", "0");
-    let m = qwen3_06b();
-    let llama = infr_llama::Llama::load_opt(&m, None).expect("load");
-
-    let prompt = "The capital of France is";
-    let n = 24;
-
-    let gpu = llama.generate(prompt, n, |_| {}).expect("gpu generate");
-    let cpu = llama.generate_cpu(prompt, n).expect("cpu generate");
-
-    println!("GPU: {gpu:?}");
-    println!("CPU: {cpu:?}");
-    assert_eq!(
-        cpu, gpu,
-        "CPU reference output must match GPU greedy output"
-    );
+    let llama = infr_llama::Llama::load_opt(&qwen3_06b(), None).expect("load");
+    check_gpu_golden(|p, n| gpu_gen(&llama, p, n), QWEN3_GPU_GOLDEN);
 }
 
 fn gemma3_1b() -> PathBuf {
@@ -136,20 +173,23 @@ fn gemma3_1b() -> PathBuf {
     panic!("gemma-3-1b gguf not found");
 }
 
-/// Gemma 3 (sandwich norms, GeGLU, dual-RoPE, SWA, √n_embd embed scale) on the CPU backend must
-/// match the GPU greedy path token-for-token.
+// Captured + verified coherent on the GPU (gemma-3-1b Q4_K_M: sandwich norms, GeGLU, dual-RoPE, SWA).
+const GEMMA3_GPU_GOLDEN: &[(&str, usize, u64)] = &[
+    ("The capital of France is", 32, 0xe5a37ab078db3a2c),
+    (
+        "Tell me a short story about a brave knight.",
+        48,
+        0x5147de9a0ddfae50,
+    ),
+];
+
+/// GPU dense Gemma 3 golden-hash lock (sandwich norms, GeGLU, dual-RoPE, SWA, √n_embd embed scale).
 #[test]
-#[ignore = "needs a Vulkan GPU + the gemma-3-1b GGUF; run with INFR_TEMP=0"]
-fn cpu_matches_gpu_gemma3() {
+#[ignore = "needs a Vulkan GPU + the gemma-3-1b GGUF"]
+fn gpu_golden_gemma3() {
     std::env::set_var("INFR_TEMP", "0");
     let llama = infr_llama::Llama::load_opt(&gemma3_1b(), None).expect("load");
-    let prompt = "The capital of France is";
-    let n = 24;
-    let gpu = llama.generate(prompt, n, |_| {}).expect("gpu generate");
-    let cpu = llama.generate_cpu(prompt, n).expect("cpu generate");
-    println!("GPU: {gpu:?}");
-    println!("CPU: {cpu:?}");
-    assert_eq!(cpu, gpu, "gemma3 CPU must match GPU greedy output");
+    check_gpu_golden(|p, n| gpu_gen(&llama, p, n), GEMMA3_GPU_GOLDEN);
 }
 
 /// CPU-only (no GPU): the deterministic Qwen3 output (short + long) must match its golden hash. Any
@@ -294,32 +334,18 @@ fn cpu_golden_qwen3moe() {
     check_golden(&model, QWEN3MOE_GOLDEN);
 }
 
-/// qwen3moe (routed-expert FFN: softmax router → top-k → renormalized weighted SwiGLU sum) on the
-/// CPU backend must match the reference greedy path token-for-token. Only `n_used` experts run per
-/// token, so the active params are ~3B (faster than a 12B dense despite the 30B total).
-///
-/// `INFR_NCMOE=999` forces the reference (GPU) side to run the experts on the host in **f32** — the
-/// same precision as the CPU seam. Without it, the GPU's f16/quant expert kernels compute slightly
-/// different router logits and flip the top-k expert *selection* (a near-tie at the 8th/9th of 128
-/// experts), which cascades into a different greedy continuation. That's an inherent precision
-/// difference, not a correctness gap: against the f32 reference the two match exactly.
+// Captured + verified coherent on the GPU (Qwen3-30B-A3B Q4_K_M: routed-expert FFN, ~3B active).
+const QWEN3MOE_GPU_GOLDEN: &[(&str, usize, u64)] =
+    &[("The capital of France is", 24, 0x193c084bdd8c8c48)];
+
+/// GPU qwen3moe golden-hash lock (routed-expert FFN: softmax router → top-k → renormalized weighted
+/// SwiGLU sum). Only `n_used` of 128 experts run per token; uses the dedicated MoE GPU forward.
 #[test]
-#[ignore = "needs a Vulkan GPU + the Qwen3-30B-A3B GGUF; run with INFR_TEMP=0"]
-fn cpu_matches_gpu_qwen3moe() {
+#[ignore = "needs a Vulkan GPU + the Qwen3-30B-A3B GGUF"]
+fn gpu_golden_qwen3moe() {
     std::env::set_var("INFR_TEMP", "0");
-    std::env::set_var("INFR_NCMOE", "999"); // experts on host f32 (clamped to n_layer)
     let llama = infr_llama::Llama::load_opt(&qwen3moe_30b(), None).expect("load");
-    let prompt = "The capital of France is";
-    let n = 16;
-    // MoE uses the dedicated GPU path (routed-expert FFN); INFR_TEMP=0 makes it greedy.
-    let gpu = llama.generate_moe(prompt, n, |_| {}).expect("gpu generate");
-    let cpu = llama.generate_cpu(prompt, n).expect("cpu generate");
-    println!("GPU: {gpu:?}");
-    println!("CPU: {cpu:?}");
-    assert_eq!(
-        cpu, gpu,
-        "qwen3moe CPU must match host-f32 reference greedy output"
-    );
+    check_gpu_golden(|p, n| gpu_gen_moe(&llama, p, n), QWEN3MOE_GPU_GOLDEN);
 }
 
 fn gemma4_e2b() -> PathBuf {
@@ -334,20 +360,18 @@ fn gemma4_e2b() -> PathBuf {
     panic!("gemma-4-E2B gguf not found");
 }
 
-/// Gemma 4 E2B (gemma3n): per-layer input embeddings + KV-layer sharing, on top of the gemma4 dense
-/// path. CPU backend must match the GPU greedy path token-for-token.
+// Captured + verified coherent on the GPU (gemma-4-E2B Q4_K_M: per-layer input embeds + KV sharing).
+const GEMMA4_E2B_GPU_GOLDEN: &[(&str, usize, u64)] =
+    &[("The capital of France is", 32, 0xfd644a0cebde4e73)];
+
+/// GPU Gemma 4 E2B (gemma3n) golden-hash lock: per-layer input embeddings + KV-layer sharing on top
+/// of the gemma4 dense path.
 #[test]
-#[ignore = "needs a Vulkan GPU + the gemma-4-E2B GGUF; run with INFR_TEMP=0"]
-fn cpu_matches_gpu_gemma4_e2b() {
+#[ignore = "needs a Vulkan GPU + the gemma-4-E2B GGUF"]
+fn gpu_golden_gemma4_e2b() {
     std::env::set_var("INFR_TEMP", "0");
     let llama = infr_llama::Llama::load_opt(&gemma4_e2b(), None).expect("load");
-    let prompt = "The capital of France is";
-    let n = 16;
-    let gpu = llama.generate(prompt, n, |_| {}).expect("gpu generate");
-    let cpu = llama.generate_cpu(prompt, n).expect("cpu generate");
-    println!("GPU: {gpu:?}");
-    println!("CPU: {cpu:?}");
-    assert_eq!(cpu, gpu, "gemma4 E2B CPU must match GPU greedy output");
+    check_gpu_golden(|p, n| gpu_gen(&llama, p, n), GEMMA4_E2B_GPU_GOLDEN);
 }
 
 // Captured + verified coherent (gemma4 E2B: per-layer input embeds + KV sharing): "The capital of
@@ -382,19 +406,18 @@ fn gemma4_12b() -> PathBuf {
     panic!("gemma-4-12b gguf not found");
 }
 
-/// Gemma 4 dense (per-layer SWA/full head dims, weightless V-norm, V=K reuse on full layers,
-/// proportional-RoPE freq_factors, attn scale 1.0, per-layer output scale, final softcap) on the CPU
-/// backend must match the GPU greedy path token-for-token. Small `n` — 12B re-dequants per step.
+// Captured + verified coherent on the GPU (gemma-4-12b Q4_K_M: per-layer SWA/full head dims,
+// weightless V-norm, V=K reuse, freq_factors, attn scale 1.0, per-layer output scale, final softcap).
+const GEMMA4_12B_GPU_GOLDEN: &[(&str, usize, u64)] =
+    &[("The capital of France is", 32, 0xfd644a0cebde4e73)];
+
+/// GPU dense Gemma 4 (12b) golden-hash lock: per-layer SWA/full head dims, weightless V-norm, V=K
+/// reuse on full layers, proportional-RoPE freq_factors, attn scale 1.0, per-layer output scale,
+/// final softcap.
 #[test]
-#[ignore = "needs a Vulkan GPU + the gemma-4-12b GGUF; run with INFR_TEMP=0 (slow: 12B on CPU)"]
-fn cpu_matches_gpu_gemma4() {
+#[ignore = "needs a Vulkan GPU + the gemma-4-12b GGUF"]
+fn gpu_golden_gemma4() {
     std::env::set_var("INFR_TEMP", "0");
     let llama = infr_llama::Llama::load_opt(&gemma4_12b(), None).expect("load");
-    let prompt = "The capital of France is";
-    let n = 8;
-    let gpu = llama.generate(prompt, n, |_| {}).expect("gpu generate");
-    let cpu = llama.generate_cpu(prompt, n).expect("cpu generate");
-    println!("GPU: {gpu:?}");
-    println!("CPU: {cpu:?}");
-    assert_eq!(cpu, gpu, "gemma4 CPU must match GPU greedy output");
+    check_gpu_golden(|p, n| gpu_gen(&llama, p, n), GEMMA4_12B_GPU_GOLDEN);
 }

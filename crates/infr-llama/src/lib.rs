@@ -2930,7 +2930,7 @@ impl Llama {
     /// Returns `None` if the GGUF has no template or it fails to render, so the caller can fall back
     /// to the hardcoded [`turn_tokens`]. `messages` are `(role, content)`; `bos_token`/`eos_token`
     /// come from the GGUF special-token ids.
-    fn render_chat(
+    fn render_chat_messages(
         &self,
         messages: &[(&str, &str)],
         add_generation_prompt: bool,
@@ -4351,6 +4351,15 @@ impl Llama {
             logits = self.forward_resident_kv(&[next], kv)?;
         }
         Ok(generated)
+    }
+
+    /// Render a user turn with the model's OWN embedded chat template (so an instruct model answers
+    /// coherently), falling back to ChatML if the GGUF has no template. Mirrors
+    /// [`CpuModel::render_chat`] so the GPU and CPU golden tests feed identical token streams.
+    pub fn render_chat(&self, user: &str) -> String {
+        render_chat_user(&self.gguf, &self.tokenizer, self.cfg.eos, user).unwrap_or_else(|| {
+            format!("<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n")
+        })
     }
 
     /// Greedy generate up to `max_new` tokens after `prompt` (already a chat-formatted string).
@@ -6127,7 +6136,7 @@ impl ChatSession<'_> {
             .iter()
             .map(|(r, c)| (r.as_str(), c.as_str()))
             .collect();
-        let Some(rendered) = self.llama.render_chat(&refs, true) else {
+        let Some(rendered) = self.llama.render_chat_messages(&refs, true) else {
             // No embedded template → hardcoded fallback (no history / prefix-diff).
             self.messages.pop();
             return self.turn_hardcoded(user, max_new, on_token);
