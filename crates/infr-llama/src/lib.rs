@@ -3678,9 +3678,13 @@ impl Llama {
             (None, None, None)
         };
 
+        // Tier 1: the GPU-resident (gpu_route) path records ALL 48 layers into ONE command buffer and
+        // submits once — vs a recorder + `queue_submit`/`queue_wait_idle` (a full GPU drain) per layer.
+        // Inter-layer hazards on the shared scratch are serialized by the recorder's barrier tracking,
+        // so a single submit is correct. The host-topk fallback still finishes per layer (it needs a
+        // mid-layer logits readback), swapping in a fresh recorder via `mem::replace`.
+        let mut rec = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
         for (li, layer) in self.layers.iter().enumerate() {
-            // recorder 1: attention + router, all on the GPU.
-            let rec = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
             rec.rmsnorm(
                 hidden.as_ref(),
                 layer.attn_norm_buf.as_ref(),
@@ -3860,10 +3864,13 @@ impl Llama {
                     ne,
                 );
                 rec.moe_accumulate(y.as_ref(), wts.as_ref(), hidden.as_ref(), ne, nu);
-                rec.finish().map_err(|e| anyhow!("{e}"))?;
+                // Tier 1: do NOT finish — keep recording the next layer into the same buffer.
             } else {
-                // Fallback (non-id-capable expert format): host top-k between two recorders.
-                rec.finish().map_err(|e| anyhow!("{e}"))?;
+                // Fallback (non-id-capable expert format): host top-k needs this layer's logits, so
+                // finish here and continue the next layer in a fresh recorder.
+                let done =
+                    std::mem::replace(&mut rec, self.be.recorder().map_err(|e| anyhow!("{e}"))?);
+                done.finish().map_err(|e| anyhow!("{e}"))?;
                 let mut lb = vec![0u8; mc.n_expert * 4];
                 self.be
                     .download(logits.as_ref(), &mut lb)
@@ -3910,6 +3917,8 @@ impl Llama {
                 rec2.finish().map_err(|e| anyhow!("{e}"))?;
             }
         }
+        // gpu_route: the single submit for all 48 layers. host fallback: a trailing empty recorder.
+        rec.finish().map_err(|e| anyhow!("{e}"))?;
         kv.kv.len += 1;
 
         // final norm + lm head (on the GPU); greedy → GPU argmax + 4-byte token readback.
