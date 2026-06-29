@@ -106,8 +106,12 @@ weight dtype and to keep q / KV in f16.
 | CLI `INFR_CPU=1` one-shot                                                    | ✅ `39ada38`       |
 | Dtype-aware native-dtype weights                                             | ✅ `9964451`       |
 | Streaming Linear (row-by-row dequant, no full-model f32 cache)               | ✅ `a736876`       |
+| gemma4 dense on the seam (per-layer dims, V-norm, V=K reuse, freq_factors)   | ✅ `e591060`       |
+| qwen3moe routed-expert FFN on the seam (`Op::MoeFfn`)                        | ✅ `4390621`       |
+| gemma4 E2B on the seam (per-layer input embeds + KV-layer sharing)           | ✅ `a716bfb`       |
+| qwen35 (Qwen3-Next) on CPU — dedicated module, validated CPU≡GPU-hybrid      | ✅ `38f7674`       |
+| **All supported formats + quant types run on CPU**                           | ✅                 |
 | Vulkan adapter (`compile`/`execute`)                                         | ⬜ still `todo!()` |
-| gemma4 / E2B / MoE on the seam                                               | ⬜                 |
 
 **Validation:** `Llama::generate_cpu` mirrors `generate` (same tokenize/decode);
 the CPU output must match the GPU greedy path **token-for-token**. Gated tests
@@ -152,18 +156,29 @@ attention scale `1/√hd` (gemma4 uses `1.0`); fused gate‖up is
    gone. Only the tiny norm weights stay cached. **Perf is unaddressed**: the
    weight is re-dequantized every step (no SIMD/threading) — a later pass
    (bounded cache for the hot working set, or SIMD/threaded dequant-matvec).
-2. **f16 KV cache + activations on CPU.** Match the GPU's f16 representation —
+2. ~~**gemma4 / E2B / MoE on the seam.**~~ ✅. gemma4 dense (`e591060`):
+   per-layer SWA/full head dims, weightless V-norm (`QkNorm` w/ ones), V=K reuse
+   on full layers, proportional-RoPE `freq_factors`, attn scale 1.0, per-layer
+   output scale, final softcap. qwen3moe (`4390621`): `Op::MoeFfn` (router
+   softmax → top-k → renormalized per-expert SwiGLU sum), experts streamed
+   per-row from the stacked GGUF tensors. gemma4 E2B (`a716bfb`): per-layer
+   input embeddings (host-computed, mixed via `GatedAct` `up_off`) + KV-layer
+   sharing. All validated token-for-token vs the reference (MoE vs host-f32,
+   since the GPU f16 expert kernels flip top-k selection on near-ties).
+3. ~~**qwen35 (Qwen3-Next).**~~ ✅ `38f7674`. Already runs fully on CPU via its
+   dedicated `qwen35` module (`Q35_CPU=1`) — the gated-DeltaNet recurrence,
+   depthwise conv, and gated full-attention have no generic-seam ops yet, so it
+   stays a bespoke runner. Validated pure-CPU ≡ GPU-hybrid token-for-token.
+   **Porting onto the unified seam** (new stateful conv / DeltaNet-recurrence /
+   sectioned-RoPE / gated-attention ops) is the remaining unification work.
+4. **f16 KV cache + activations on CPU.** Match the GPU's f16 representation —
    halves KV memory and tightens parity.
-3. **Vulkan adapter (`compile`/`execute`).** Map the dtype-aware graph onto the
+5. **Vulkan adapter (`compile`/`execute`).** Map the dtype-aware graph onto the
    existing fused Recorder/shader kernels (coopmat / mmq / flash, f16 q+KV) into
    one command buffer, reproducing today's perf. Then **convert the GPU dense
    forward in place** to emit the same `Graph` and retire the parallel path —
    one graph, both backends.
-4. **gemma4 / E2B / MoE on the seam.** gemma4: per-layer head dims, weightless
-   V-norm, proportional-RoPE `freq_factors`, per-layer output scale, V=K on full
-   layers; then E2B's per-layer input embeddings + KV-layer sharing. MoE: a
-   routed-expert op (router softmax → top-k → per-expert FFN → combine).
-5. **Cleanup.** Route all models through the seam, delete dormant
+6. **Cleanup.** Route all models through the seam, delete dormant
    direct-Recorder entry points, refresh `docs/PLAN.md` + `CONTEXT.md`. Extract
    `infr-cpu` crate.
 
