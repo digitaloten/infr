@@ -24,6 +24,15 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+/// Timing/counts from a CPU generation, for the caller's stats line.
+#[derive(Debug, Clone, Copy)]
+pub struct CpuStats {
+    pub n_prompt: usize,
+    pub prompt_secs: f64,
+    pub n_gen: usize,
+    pub decode_secs: f64,
+}
+
 /// Dot product with 8 independent accumulators so the reduction isn't latency-bound — lets the
 /// autovectorizer (with `target-cpu=native`) keep several AVX FMA lanes in flight. `a`/`b` equal len.
 #[inline]
@@ -810,7 +819,7 @@ pub(crate) fn generate_dense_cpu(
     ple: Option<&PerLayerEmbd>,
     prompt: &[u32],
     max_new: usize,
-) -> AResult<Vec<u32>> {
+) -> AResult<(Vec<u32>, CpuStats)> {
     let c = cfg;
     let be = CpuBackend::new();
     let (ne, nh) = (c.n_embd, c.n_head);
@@ -1601,7 +1610,13 @@ pub(crate) fn generate_dense_cpu(
             ts(decode_t, decode_n),
         );
     }
-    Ok(out)
+    let stats = CpuStats {
+        n_prompt: prompt.len(),
+        prompt_secs: prompt_t.as_secs_f64(),
+        n_gen: decode_n,
+        decode_secs: decode_t.as_secs_f64(),
+    };
+    Ok((out, stats))
 }
 
 fn argmax(v: &[f32]) -> usize {

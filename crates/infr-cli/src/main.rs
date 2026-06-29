@@ -294,9 +294,8 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         let Some(m) = message else {
             anyhow::bail!("INFR_CPU currently supports one-shot only: pass a message");
         };
-        let t0 = std::time::Instant::now();
         let mut render = ThinkRender::new();
-        let text = if infr_llama::qwen35::is_qwen35(&gguf) {
+        let (text, stats) = if infr_llama::qwen35::is_qwen35(&gguf) {
             eprintln!("[cpu backend — qwen35/Qwen3-Next on the agnostic seam, no GPU]");
             let prompt = format!("<|im_start|>user\n{m}<|im_end|>\n<|im_start|>assistant\n");
             infr_llama::qwen35::generate_cpu(&gguf, &prompt, max_new)?
@@ -310,7 +309,15 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         };
         render.feed(&text);
         render.finish();
-        print_run_stats(t0, None, 0, 0, None);
+        let rate = |n: usize, s: f64| if s > 0.0 { n as f64 / s } else { 0.0 };
+        eprintln!(
+            "[prefill {} tok @ {:.0} tok/s ({:.0} ms) | decode {} tok @ {:.1} tok/s]",
+            stats.n_prompt,
+            rate(stats.n_prompt, stats.prompt_secs),
+            stats.prompt_secs * 1000.0,
+            stats.n_gen,
+            rate(stats.n_gen, stats.decode_secs),
+        );
         return Ok(());
     }
 

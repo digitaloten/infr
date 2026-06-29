@@ -749,7 +749,11 @@ enum Q35LayerH {
 
 /// Greedy pure-CPU generation for qwen35 / Qwen3-Next on the agnostic seam (no Vulkan). Mirrors
 /// [`generate`] (raw prompt, no chat template); returns the decoded continuation.
-pub fn generate_cpu(path: &std::path::Path, prompt: &str, n: usize) -> Result<String> {
+pub fn generate_cpu(
+    path: &std::path::Path,
+    prompt: &str,
+    n: usize,
+) -> Result<(String, crate::cpu_backend::CpuStats)> {
     let gg = Gguf::open(path).map_err(|e| anyhow!("open gguf: {e}"))?;
     let g = &gg;
     let c = Cfg::from_gguf(g)?;
@@ -1287,7 +1291,11 @@ pub fn generate_cpu(path: &std::path::Path, prompt: &str, n: usize) -> Result<St
     let mut cur = prompt_ids.clone();
     let mut outs: Vec<u32> = Vec::new();
     let mut logits = vec![0f32; vocab];
+    let mut prompt_t = std::time::Duration::ZERO;
+    let mut decode_t = std::time::Duration::ZERO;
+    let mut decode_n = 0usize;
     for pos in 0..(prompt_ids.len() + n) {
+        let step_t0 = std::time::Instant::now();
         let t = cur[pos] as usize;
         be.upload(
             hidden_buf.as_ref(),
@@ -1327,15 +1335,28 @@ pub fn generate_cpu(path: &std::path::Path, prompt: &str, n: usize) -> Result<St
                 .map_err(|e| anyhow!("{e}"))?;
             let next = argmax(&logits);
             outs.push(next);
+            decode_t += step_t0.elapsed();
+            decode_n += 1;
             if outs.len() >= n {
                 break;
             }
             if cur.len() <= pos + 1 {
                 cur.push(next);
             }
+        } else {
+            prompt_t += step_t0.elapsed();
         }
     }
-    tok.decode(&outs, false).map_err(|e| anyhow!("decode: {e}"))
+    let text = tok
+        .decode(&outs, false)
+        .map_err(|e| anyhow!("decode: {e}"))?;
+    let stats = crate::cpu_backend::CpuStats {
+        n_prompt: prompt_ids.len(),
+        prompt_secs: prompt_t.as_secs_f64(),
+        n_gen: decode_n,
+        decode_secs: decode_t.as_secs_f64(),
+    };
+    Ok((text, stats))
 }
 
 /// True if the GGUF at `path` is a `qwen35` (Qwen3-Next) model.
@@ -1478,7 +1499,7 @@ mod tests {
         let n = 16;
         std::env::set_var("Q35_CPU", "1");
         let oracle = generate(&g, prompt, n).unwrap();
-        let seam = generate_cpu(&model_path(), prompt, n).unwrap();
+        let (seam, _stats) = generate_cpu(&model_path(), prompt, n).unwrap();
         println!("ORACLE: {oracle:?}\nSEAM:   {seam:?}");
         assert_eq!(
             seam, oracle,

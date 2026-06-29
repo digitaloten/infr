@@ -448,14 +448,19 @@ impl CpuModel {
         format!("<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n")
     }
 
-    /// Greedy generation on the CPU reference backend (no GPU). Mirrors [`Llama::generate_cpu`].
-    pub fn generate_cpu(&self, prompt: &str, max_new: usize) -> Result<String> {
+    /// Greedy generation on the CPU reference backend (no GPU). Returns the decoded text plus
+    /// timing/counts ([`crate::cpu_backend::CpuStats`]) for the caller's stats line.
+    pub fn generate_cpu(
+        &self,
+        prompt: &str,
+        max_new: usize,
+    ) -> Result<(String, crate::cpu_backend::CpuStats)> {
         let enc = self
             .tokenizer
             .encode(prompt, false)
             .map_err(|e| anyhow!("encode: {e}"))?;
         let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
-        let generated = crate::cpu_backend::generate_dense_cpu(
+        let (generated, stats) = crate::cpu_backend::generate_dense_cpu(
             &self.gguf,
             &self.cfg,
             &self.token_embd,
@@ -463,9 +468,11 @@ impl CpuModel {
             &prompt_tokens,
             max_new,
         )?;
-        self.tokenizer
+        let text = self
+            .tokenizer
             .decode(&generated, true)
-            .map_err(|e| anyhow!("decode: {e}"))
+            .map_err(|e| anyhow!("decode: {e}"))?;
+        Ok((text, stats))
     }
 }
 
@@ -4636,15 +4643,15 @@ impl Llama {
     }
 
     /// Greedy generation on the backend-agnostic CPU reference path (no GPU). Mirrors
-    /// [`generate`](Self::generate)'s tokenize/decode exactly so the two are directly comparable.
-    /// Dense Qwen3/Llama only for now (see [`crate::cpu_backend::generate_qwen3_cpu`]).
+    /// [`generate`](Self::generate)'s tokenize/decode so the two are directly comparable (the
+    /// CPU-vs-GPU parity tests). Returns just the text; for timing use [`CpuModel::generate_cpu`].
     pub fn generate_cpu(&self, prompt: &str, max_new: usize) -> Result<String> {
         let enc = self
             .tokenizer
             .encode(prompt, false)
             .map_err(|e| anyhow!("encode: {e}"))?;
         let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
-        let generated = crate::cpu_backend::generate_dense_cpu(
+        let (generated, _stats) = crate::cpu_backend::generate_dense_cpu(
             &self.gguf,
             &self.cfg,
             &self.token_embd,
