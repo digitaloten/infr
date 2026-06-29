@@ -466,6 +466,44 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Tiled Q6_K dp4a (mmq) GEMM for a stacked expert (the MoE down projection): `c = qa·W[w_base]ᵀ`
+    /// using hardware int8 dot-product (activations pre-quantized via `quant_q8`; the per-block sum is
+    /// unused — Q6_K is symmetric, no min). `c` is `ceil(m/64)*64` rows. Faster than the coopmat-f16
+    /// `matmul_native` for u6 weights. Requires `n%64`, `k%16`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_mmq_q6k(
+        &self,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        w: &dyn Buffer,
+        w_base: usize,
+        c: &dyn Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        self.stamp("matmul_proj");
+        let kern = self.be.kernel(
+            "native_gemm_mmq_q6k",
+            crate::gemm::native_gemm_mmq_q6k_spv(),
+            4,
+            16,
+        );
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        let groups = (m.div_ceil(64) * (n / 64)) as u32;
+        self.dispatch(
+            kern,
+            &[Self::vkb(qa), Self::vkb(dact), Self::vkb(w), Self::vkb(c)],
+            1,
+            &push,
+            groups,
+        );
+    }
+
     /// Integer (dp4a) u4 projection GEMM — the mmq path. Quantizes activations to int8 (Q8 per
     /// 32-block) via `quant_q8`, then runs the dp4a matmul keeping weights quantized (no per-GEMM
     /// dequant). Scratch (caller-allocated): `qa` = m*k bytes (int8), `dact`/`sact` = m*(k/32)*2
@@ -2683,6 +2721,108 @@ mod tests {
         }
         println!("matmul_proj_mmq max_err={e:e}");
         assert!(e < 2e-2, "matmul_proj_mmq mismatch: {e}"); // int8 activation quant tolerance
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn native_gemm_mmq_q6k_matches_cpu() {
+        // Q6_K dp4a GEMM vs a CPU reference: build a synthetic Q6_K weight (q6 ∈ 0..63, i8 sub-scale
+        // per 16, f16 super-scale per 256), pack it into the 210-byte block layout, and check the
+        // int8-dot GEMM matches the dequantized matmul. k must be a multiple of 256 (a Q6_K superblock)
+        // so each column's k packs into whole blocks — exactly the real (down-proj) layout.
+        let be = VulkanBackend::new().unwrap();
+        let (m, k, n) = (70usize, 256usize, 128usize); // m not %64 → padding; k = 1 superblock; n%64
+        let nblk = k / 32;
+        let mpad = m.div_ceil(64) * 64;
+        let nsb = k / 256; // superblocks per column
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i % 23) as f32 - 11.0) * 0.04)
+            .collect();
+        // q6 quants, per-16 i8 scales, per-256 f16 super-scale (weight g = col*k + kk)
+        let q6: Vec<u32> = (0..n * k).map(|i| (i * 13 % 64) as u32).collect();
+        let sc: Vec<i8> = (0..n * k / 16)
+            .map(|b| ((b % 11) as i32 - 5) as i8)
+            .collect();
+        let d: Vec<half::f16> = (0..n * nsb)
+            .map(|b| half::f16::from_f32(0.008 + (b % 5) as f32 * 0.001))
+            .collect();
+        // pack into 210-byte Q6_K blocks: [ql[128]][qh[64]][i8 scales[16]][f16 d]
+        let mut blk = vec![0u8; n * nsb * 210];
+        let sc_index = |g: usize| -> usize {
+            // global i8-scale index for weight g, mirroring the shader's sc_idx within the superblock
+            let p = g % 256;
+            let (hf, ph) = (p / 128, p % 128);
+            let (og, l) = (ph / 32, ph % 32);
+            (g / 256) * 16 + hf * 8 + l / 16 + 2 * og
+        };
+        for (col, _) in (0..n).map(|c| (c, ())) {
+            for sbk in 0..nsb {
+                let base = (col * nsb + sbk) * 210;
+                for p in 0..256usize {
+                    let g = col * k + sbk * 256 + p;
+                    let q = q6[g];
+                    let (hf, ph) = (p / 128, p % 128);
+                    let (og, l) = (ph / 32, ph % 32);
+                    let lo = hf * 64;
+                    let qh_byte = base + 128 + hf * 32 + l;
+                    match og {
+                        0 => blk[base + lo + l] |= (q & 0xF) as u8,
+                        1 => blk[base + lo + l + 32] |= (q & 0xF) as u8,
+                        2 => blk[base + lo + l] |= ((q & 0xF) << 4) as u8,
+                        _ => blk[base + lo + l + 32] |= ((q & 0xF) << 4) as u8,
+                    }
+                    blk[qh_byte] |= (((q >> 4) & 3) << (2 * og)) as u8;
+                }
+                // i8 scales at +192, f16 d at +208
+                for s in 0..16 {
+                    blk[base + 192 + s] = sc[(col * nsb + sbk) * 16 + s] as u8;
+                }
+                let db = d[col * nsb + sbk].to_bits().to_le_bytes();
+                blk[base + 208] = db[0];
+                blk[base + 209] = db[1];
+            }
+        }
+        let dq = |g: usize| -> f32 {
+            d[g / 256].to_f32() * sc[sc_index(g)] as f32 * (q6[g] as f32 - 32.0)
+        };
+
+        let upf = |v: &[f32]| {
+            let b = be.alloc(v.len() * 4, BufferUsage::Staging).unwrap();
+            be.upload(b.as_ref(), bytemuck::cast_slice(v)).unwrap();
+            b
+        };
+        let ba = upf(&a);
+        let bw = be.upload_weight_bytes(&blk).unwrap();
+        let bc = be.alloc(mpad * n * 4, BufferUsage::Readback).unwrap();
+        let qa = be.alloc(mpad * k, BufferUsage::Activations).unwrap();
+        let dact = be.alloc(mpad * nblk * 2, BufferUsage::Activations).unwrap();
+        let sact = be.alloc(mpad * nblk * 2, BufferUsage::Activations).unwrap();
+
+        let rec = be.recorder().unwrap();
+        rec.quant_q8(ba.as_ref(), qa.as_ref(), dact.as_ref(), sact.as_ref(), m, k);
+        rec.matmul_mmq_q6k(
+            qa.as_ref(),
+            dact.as_ref(),
+            bw.as_ref(),
+            0,
+            bc.as_ref(),
+            m,
+            k,
+            n,
+        );
+        rec.finish().unwrap();
+        let mut bytes = vec![0u8; mpad * n * 4];
+        be.download(bc.as_ref(), &mut bytes).unwrap();
+        let got: &[f32] = bytemuck::cast_slice(&bytes);
+        let mut e = 0f32;
+        for r in 0..m {
+            for col in 0..n {
+                let want: f32 = (0..k).map(|x| a[r * k + x] * dq(col * k + x)).sum();
+                e = e.max((got[r * n + col] - want).abs());
+            }
+        }
+        println!("native_gemm_mmq_q6k max_err={e:e}");
+        assert!(e < 2e-2, "native_gemm_mmq_q6k mismatch: {e}"); // int8 activation quant tolerance
     }
 
     #[test]

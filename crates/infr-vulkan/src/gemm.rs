@@ -147,6 +147,12 @@ pub(crate) fn native_gemm_mmq_q4k_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// SPIR-V for the tiled Q6_K dp4a (mmq) GEMM (the MoE down projection).
+pub(crate) fn native_gemm_mmq_q6k_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q6k.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for the MoE weighted-accumulate (sum of selected experts' down outputs into hidden).
 pub(crate) fn moe_accumulate_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_accumulate.spv"));

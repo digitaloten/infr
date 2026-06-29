@@ -210,6 +210,7 @@ fn main() {
         ("moe_accumulate", "moe_accumulate", &[]),
         ("native_mmv_id_q4k", "native_mmv_id_q4k", &[]),
         ("native_gemm_mmq_q4k", "native_gemm_mmq_q4k", &[]),
+        ("native_gemm_mmq_q6k", "native_gemm_mmq_q6k", &[]),
         ("moe_topk", "moe_topk", &[]),
         ("argmax", "argmax", &[]),
         ("moe_sample", "moe_sample", &[]),
