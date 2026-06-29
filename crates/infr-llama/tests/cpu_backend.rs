@@ -72,6 +72,46 @@ fn cpu_matches_gpu_gemma3() {
     assert_eq!(cpu, gpu, "gemma3 CPU must match GPU greedy output");
 }
 
+fn qwen3moe_30b() -> PathBuf {
+    let hub = std::env::var("HOME").unwrap() + "/.cache/huggingface/hub";
+    let base = format!("{hub}/models--unsloth--Qwen3-30B-A3B-GGUF/snapshots");
+    for e in std::fs::read_dir(&base).expect("snapshots dir") {
+        let f = e.unwrap().path().join("Qwen3-30B-A3B-Q4_K_M.gguf");
+        if f.exists() {
+            return f;
+        }
+    }
+    panic!("Qwen3-30B-A3B gguf not found");
+}
+
+/// qwen3moe (routed-expert FFN: softmax router → top-k → renormalized weighted SwiGLU sum) on the
+/// CPU backend must match the reference greedy path token-for-token. Only `n_used` experts run per
+/// token, so the active params are ~3B (faster than a 12B dense despite the 30B total).
+///
+/// `INFR_NCMOE=999` forces the reference (GPU) side to run the experts on the host in **f32** — the
+/// same precision as the CPU seam. Without it, the GPU's f16/quant expert kernels compute slightly
+/// different router logits and flip the top-k expert *selection* (a near-tie at the 8th/9th of 128
+/// experts), which cascades into a different greedy continuation. That's an inherent precision
+/// difference, not a correctness gap: against the f32 reference the two match exactly.
+#[test]
+#[ignore = "needs a Vulkan GPU + the Qwen3-30B-A3B GGUF; run with INFR_TEMP=0"]
+fn cpu_matches_gpu_qwen3moe() {
+    std::env::set_var("INFR_TEMP", "0");
+    std::env::set_var("INFR_NCMOE", "999"); // experts on host f32 (clamped to n_layer)
+    let llama = infr_llama::Llama::load_opt(&qwen3moe_30b(), None).expect("load");
+    let prompt = "The capital of France is";
+    let n = 16;
+    // MoE uses the dedicated GPU path (routed-expert FFN); INFR_TEMP=0 makes it greedy.
+    let gpu = llama.generate_moe(prompt, n, |_| {}).expect("gpu generate");
+    let cpu = llama.generate_cpu(prompt, n).expect("cpu generate");
+    println!("GPU: {gpu:?}");
+    println!("CPU: {cpu:?}");
+    assert_eq!(
+        cpu, gpu,
+        "qwen3moe CPU must match host-f32 reference greedy output"
+    );
+}
+
 fn gemma4_12b() -> PathBuf {
     let hub = std::env::var("HOME").unwrap() + "/.cache/huggingface/hub";
     let base = format!("{hub}/models--unsloth--gemma-4-12b-it-GGUF/snapshots");

@@ -182,6 +182,26 @@ pub enum Op {
         dst_off: u32,
         n: u32,
     },
+    /// Mixture-of-experts FFN for a single token row (qwen3moe). The router (`Linear` of `x[ne] →
+    /// n_expert`) is softmaxed, the top-`n_used` experts selected, their softmax weights renormalized,
+    /// and each runs a gated FFN (`act(gate·x) * (up·x)`, then `down·`); the outputs are summed
+    /// weighted by the renormalized weights × `scale` into `dst[ne]` (the residual contribution).
+    /// `gate_exps`/`up_exps`/`down_exps` are the stacked per-expert weights — expert `e` is the `e`-th
+    /// equal byte slice (gate/up are `[n_ff_exp, ne]`, down is `[ne, n_ff_exp]` row-major).
+    MoeFfn {
+        x: TensorId,
+        router: TensorId,
+        gate_exps: TensorId,
+        up_exps: TensorId,
+        down_exps: TensorId,
+        dst: TensorId,
+        ne: u32,
+        n_expert: u32,
+        n_used: u32,
+        n_ff_exp: u32,
+        scale: f32,
+        act: Activation,
+    },
 }
 
 /// An ordered op-list over declared tensor handles. Node index in `tensors` == [`TensorId`].

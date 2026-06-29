@@ -442,6 +442,102 @@ impl Backend for CpuBackend {
                     let s = vals[src.0 as usize].clone();
                     vals[dst.0 as usize][dof..dof + n].copy_from_slice(&s[so..so + n]);
                 }
+                Op::MoeFfn {
+                    x,
+                    router,
+                    gate_exps,
+                    up_exps,
+                    down_exps,
+                    dst,
+                    ne,
+                    n_expert,
+                    n_used,
+                    n_ff_exp,
+                    scale,
+                    act,
+                } => {
+                    let (ne, n_expert, n_used, nffx) = (
+                        ne as usize,
+                        n_expert as usize,
+                        n_used as usize,
+                        n_ff_exp as usize,
+                    );
+                    let xs = vals[x.0 as usize].clone();
+                    // Stream a (row-major [out_f, in_f]) weight slice and matvec it against `v` —
+                    // dequant per row, exactly like `Op::Linear` (no full materialization).
+                    let matvec = |bytes: &[u8], dt: DType, v: &[f32], in_f: usize, out_f: usize| {
+                        let bpr = bytes.len() / out_f;
+                        let mut o = vec![0f32; out_f];
+                        for (r, oo) in o.iter_mut().enumerate() {
+                            let row = bytes_to_f32(&bytes[r * bpr..r * bpr + bpr], dt);
+                            *oo = (0..in_f).map(|k| row[k] * v[k]).sum();
+                        }
+                        o
+                    };
+                    // Router softmax over all experts.
+                    let rbuf = bindings.get(router).expect("cpu backend: unbound router");
+                    let rbytes = cpu_buf(rbuf).data.lock().unwrap();
+                    let logits = matvec(&rbytes, g.desc(router).dtype, &xs, ne, n_expert);
+                    drop(rbytes);
+                    let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let mut probs: Vec<f32> = logits.iter().map(|&v| (v - maxl).exp()).collect();
+                    let psum: f32 = probs.iter().sum();
+                    for p in probs.iter_mut() {
+                        *p /= psum;
+                    }
+                    // Top-`n_used` experts, renormalized weights.
+                    let mut idx: Vec<usize> = (0..n_expert).collect();
+                    idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+                    idx.truncate(n_used);
+                    let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
+                    // Per-expert stacked-weight byte slices.
+                    let gbuf = bindings
+                        .get(gate_exps)
+                        .expect("cpu backend: unbound gate_exps");
+                    let ubuf = bindings.get(up_exps).expect("cpu backend: unbound up_exps");
+                    let dbuf = bindings
+                        .get(down_exps)
+                        .expect("cpu backend: unbound down_exps");
+                    let gb = cpu_buf(gbuf).data.lock().unwrap();
+                    let ub = cpu_buf(ubuf).data.lock().unwrap();
+                    let db = cpu_buf(dbuf).data.lock().unwrap();
+                    let (gdt, udt, ddt) = (
+                        g.desc(gate_exps).dtype,
+                        g.desc(up_exps).dtype,
+                        g.desc(down_exps).dtype,
+                    );
+                    let (gst, ust, dst_) = (
+                        gb.len() / n_expert,
+                        ub.len() / n_expert,
+                        db.len() / n_expert,
+                    );
+                    let mut out = vec![0f32; ne];
+                    for &e in &idx {
+                        let gate = matvec(&gb[e * gst..(e + 1) * gst], gdt, &xs, ne, nffx);
+                        let up = matvec(&ub[e * ust..(e + 1) * ust], udt, &xs, ne, nffx);
+                        let actv: Vec<f32> = (0..nffx)
+                            .map(|i| {
+                                let gg = gate[i];
+                                let a = match act {
+                                    Activation::Silu => gg / (1.0 + (-gg).exp()),
+                                    Activation::Gelu => {
+                                        0.5 * gg
+                                            * (1.0
+                                                + (0.797_884_6 * (gg + 0.044715 * gg * gg * gg))
+                                                    .tanh())
+                                    }
+                                };
+                                a * up[i]
+                            })
+                            .collect();
+                        let y = matvec(&db[e * dst_..(e + 1) * dst_], ddt, &actv, nffx, ne);
+                        let w_e = probs[e] / wsum * scale;
+                        for i in 0..ne {
+                            out[i] += w_e * y[i];
+                        }
+                    }
+                    vals[dst.0 as usize] = out;
+                }
             }
         }
 
@@ -472,6 +568,22 @@ impl Backend for CpuBackend {
 // prompt ingestion (looped) and generation — so no GEMM/flash prefill kernels are needed on CPU.
 // The KV cache grows one row per step. Validates the agnostic seam end-to-end against the GPU path.
 
+/// FFN weight handles: a dense gated FFN, or a qwen3moe routed-expert bank (router + stacked
+/// per-expert gate/up/down).
+enum FfnW {
+    Dense {
+        wgate: TensorId,
+        wup: TensorId,
+        wdown: TensorId,
+    },
+    Moe {
+        router: TensorId,
+        gate_exps: TensorId,
+        up_exps: TensorId,
+        down_exps: TensorId,
+    },
+}
+
 /// Per-layer weight handles captured while building one decode graph (q/k-norm + the gemma
 /// sandwich norms are optional; `wv` is absent on gemma4 full-attention layers, which reuse the raw
 /// K projection as V). The order they're declared in MUST match the upload order so `weights[i]`
@@ -486,9 +598,7 @@ struct LayerW {
     wo: TensorId,
     post_attn: Option<TensorId>,
     ffn_norm: TensorId,
-    wgate: TensorId,
-    wup: TensorId,
-    wdown: TensorId,
+    ffn: FfnW,
     post_ffw: Option<TensorId>,
 }
 
@@ -503,14 +613,12 @@ struct DecodeHandles {
     weights: Vec<TensorId>, // flat, in declaration == upload order
 }
 
-/// Greedy CPU generation for a dense decoder (Qwen3 / Llama / Gemma 3 / Gemma 4 dense). `prompt` is
-/// the full token prefix; returns the generated continuation. Stops at EOS or `max_new`. gemma4 E2B
-/// (per-layer input embeddings + KV sharing) and MoE are not handled yet.
+/// Greedy CPU generation for a decoder (Qwen3 / Llama / Gemma 3 / Gemma 4 dense / qwen3moe). The
+/// attention block is shared; the FFN is either a dense gated FFN or a routed-expert MoE bank.
+/// `prompt` is the full token prefix; returns the generated continuation. Stops at EOS or `max_new`.
+/// gemma4 E2B (per-layer input embeddings + KV sharing) is not handled yet.
 pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> AResult<Vec<u32>> {
     let c = &llama.cfg;
-    if c.moe.is_some() {
-        return Err(anyhow!("cpu runner: dense only (MoE not on the seam yet)"));
-    }
     if c.n_embd_per_layer > 0 {
         return Err(anyhow!(
             "cpu runner: gemma4 E2B (per-layer input embeddings) not on the seam yet"
@@ -613,9 +721,17 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
             wraw(&p("post_attention_norm.weight"))?;
         }
         wraw(&p("ffn_norm.weight"))?;
-        wraw(&p("ffn_gate.weight"))?;
-        wraw(&p("ffn_up.weight"))?;
-        wraw(&p("ffn_down.weight"))?;
+        if c.moe.is_some() {
+            // qwen3moe: router + stacked per-expert gate/up/down banks.
+            wraw(&p("ffn_gate_inp.weight"))?;
+            wraw(&p("ffn_gate_exps.weight"))?;
+            wraw(&p("ffn_up_exps.weight"))?;
+            wraw(&p("ffn_down_exps.weight"))?;
+        } else {
+            wraw(&p("ffn_gate.weight"))?;
+            wraw(&p("ffn_up.weight"))?;
+            wraw(&p("ffn_down.weight"))?;
+        }
         if gemma {
             wraw(&p("post_ffw_norm.weight"))?;
         }
@@ -741,9 +857,20 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
                 None
             };
             let ffn_norm = wpush(&mut g, &mut weights);
-            let wgate = wpush(&mut g, &mut weights);
-            let wup = wpush(&mut g, &mut weights);
-            let wdown = wpush(&mut g, &mut weights);
+            let ffn = if c.moe.is_some() {
+                FfnW::Moe {
+                    router: wpush(&mut g, &mut weights),
+                    gate_exps: wpush(&mut g, &mut weights),
+                    up_exps: wpush(&mut g, &mut weights),
+                    down_exps: wpush(&mut g, &mut weights),
+                }
+            } else {
+                FfnW::Dense {
+                    wgate: wpush(&mut g, &mut weights),
+                    wup: wpush(&mut g, &mut weights),
+                    wdown: wpush(&mut g, &mut weights),
+                }
+            };
             let post_ffw = if gemma {
                 Some(wpush(&mut g, &mut weights))
             } else {
@@ -759,9 +886,7 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
                 wo,
                 post_attn,
                 ffn_norm,
-                wgate,
-                wup,
-                wdown,
+                ffn,
                 post_ffw,
             });
         }
@@ -969,39 +1094,65 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
                 dim: ne as u32,
                 eps,
             });
-            g.push(Op::Linear {
-                x: hn,
-                weight: lw.wgate,
-                dst: gbuf,
-                m: 1,
-                in_f: ne as u32,
-                out_f: nff_l as u32,
-            });
-            g.push(Op::Linear {
-                x: hn,
-                weight: lw.wup,
-                dst: ubuf,
-                m: 1,
-                in_f: ne as u32,
-                out_f: nff_l as u32,
-            });
-            g.push(Op::GatedAct {
-                gate: gbuf,
-                up: ubuf,
-                dst: actbuf,
-                rows: 1,
-                nff: nff_l as u32,
-                act,
-                up_off: 0,
-            });
-            g.push(Op::Linear {
-                x: actbuf,
-                weight: lw.wdown,
-                dst: sub,
-                m: 1,
-                in_f: nff_l as u32,
-                out_f: ne as u32,
-            });
+            match lw.ffn {
+                FfnW::Dense { wgate, wup, wdown } => {
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: wgate,
+                        dst: gbuf,
+                        m: 1,
+                        in_f: ne as u32,
+                        out_f: nff_l as u32,
+                    });
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: wup,
+                        dst: ubuf,
+                        m: 1,
+                        in_f: ne as u32,
+                        out_f: nff_l as u32,
+                    });
+                    g.push(Op::GatedAct {
+                        gate: gbuf,
+                        up: ubuf,
+                        dst: actbuf,
+                        rows: 1,
+                        nff: nff_l as u32,
+                        act,
+                        up_off: 0,
+                    });
+                    g.push(Op::Linear {
+                        x: actbuf,
+                        weight: wdown,
+                        dst: sub,
+                        m: 1,
+                        in_f: nff_l as u32,
+                        out_f: ne as u32,
+                    });
+                }
+                FfnW::Moe {
+                    router,
+                    gate_exps,
+                    up_exps,
+                    down_exps,
+                } => {
+                    let mc = c.moe.expect("moe layer without MoeConfig");
+                    g.push(Op::MoeFfn {
+                        x: hn,
+                        router,
+                        gate_exps,
+                        up_exps,
+                        down_exps,
+                        dst: sub,
+                        ne: ne as u32,
+                        n_expert: mc.n_expert as u32,
+                        n_used: mc.n_used as u32,
+                        n_ff_exp: mc.n_ff_exp as u32,
+                        scale: mc.scale,
+                        act, // qwen3moe: SwiGLU (act == Silu)
+                    });
+                }
+            }
             if let Some(pf) = lw.post_ffw {
                 g.push(Op::RmsNorm {
                     x: sub,
