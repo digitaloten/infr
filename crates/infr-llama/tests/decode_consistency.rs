@@ -35,7 +35,62 @@ fn argmax(v: &[f32]) -> (usize, f32) {
 }
 
 fn l2(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum::<f32>().sqrt()
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y) * (x - y))
+        .sum::<f32>()
+        .sqrt()
+}
+
+/// Teacher-force infr through llama.cpp's coherent greedy trajectory (ids in INFR_TEST_CONT) and at
+/// each step report (a) whether infr's argmax == llama's actual next token, (b) infr's argmax-logit
+/// magnitude. High disagreement / flattening on a KNOWN-COHERENT path = a real per-step logit bug.
+#[test]
+#[ignore = "needs a Vulkan GPU + the gemma GGUF + INFR_TEST_CONT"]
+fn agreement_with_llama() {
+    let m = model_path();
+    let llama = infr_llama::Llama::load_opt(&m, None).expect("load");
+    let ids = |s: String| -> Vec<u32> {
+        s.trim()
+            .split(',')
+            .filter_map(|x| x.trim().parse().ok())
+            .collect()
+    };
+    let (Ok(pids), Ok(cpath)) = (
+        std::env::var("INFR_TEST_PROMPT"),
+        std::env::var("INFR_TEST_CONT"),
+    ) else {
+        eprintln!("skip: set INFR_TEST_PROMPT (comma ids) + INFR_TEST_CONT (ids file)");
+        return;
+    };
+    let prompt: Vec<u32> = ids(pids);
+    let cont: Vec<u32> = ids(std::fs::read_to_string(cpath).unwrap());
+    let mut kv = llama.new_kv(512).expect("kv");
+    let mut logits = llama
+        .forward_resident_kv(&prompt, &mut kv)
+        .expect("prefill");
+    let mut agree = 0usize;
+    for (i, &t) in cont.iter().enumerate() {
+        let (ai, av) = argmax(&logits);
+        let ll = logits[t as usize];
+        let ok = ai as u32 == t;
+        if ok {
+            agree += 1;
+        }
+        if i % 10 == 0 || !ok {
+            println!(
+                "[agree] step={i} infr_argmax=({ai},{av:.2}) llama_tok={t} (infr_logit={ll:.2}) {}",
+                if ok { "ok" } else { "DISAGREE" }
+            );
+        }
+        logits = llama.forward_resident_kv(&[t], &mut kv).expect("decode");
+    }
+    println!(
+        "[agree] agreement {}/{} = {:.1}%",
+        agree,
+        cont.len(),
+        100.0 * agree as f32 / cont.len() as f32
+    );
 }
 
 #[test]
@@ -47,18 +102,26 @@ fn decode_matches_prefill() {
     // A fixed, deterministic token sequence (teacher-forcing); content is irrelevant — we only test
     // that decode and prefill produce the same logits for the SAME tokens. Stay clear of specials.
     let n = 160usize;
-    let toks: Vec<u32> = (0..n).map(|i| ((i * 977 + 1234) % (vocab - 300) + 200) as u32).collect();
+    let toks: Vec<u32> = (0..n)
+        .map(|i| ((i * 977 + 1234) % (vocab - 300) + 200) as u32)
+        .collect();
 
     // Method A: one-shot prefill of all tokens.
     let mut kv_a = llama.new_kv(512).expect("kv a");
-    let logits_a = llama.forward_resident_kv(&toks, &mut kv_a).expect("prefill all");
+    let logits_a = llama
+        .forward_resident_kv(&toks, &mut kv_a)
+        .expect("prefill all");
 
     // Method B: prefill the first token, then decode the rest one at a time (teacher-forced).
     let mut kv_b = llama.new_kv(512).expect("kv b");
-    let _ = llama.forward_resident_kv(&toks[..1], &mut kv_b).expect("prefill 1");
+    let _ = llama
+        .forward_resident_kv(&toks[..1], &mut kv_b)
+        .expect("prefill 1");
     let mut logits_b = Vec::new();
     for &t in &toks[1..] {
-        logits_b = llama.forward_resident_kv(&[t], &mut kv_b).expect("decode step");
+        logits_b = llama
+            .forward_resident_kv(&[t], &mut kv_b)
+            .expect("decode step");
     }
 
     let (ai, av) = argmax(&logits_a);
@@ -74,6 +137,12 @@ fn decode_matches_prefill() {
          L2={diff:.4} max|Δ|={max_abs:.4}"
     );
     // Prefill and decode should be numerically near-identical (only kernel-order f16 noise).
-    assert_eq!(ai, bi, "decode argmax diverged from prefill — decode-path bug");
-    assert!(max_abs < 0.5, "decode logits drifted from prefill by {max_abs} (>0.5)");
+    assert_eq!(
+        ai, bi,
+        "decode argmax diverged from prefill — decode-path bug"
+    );
+    assert!(
+        max_abs < 0.5,
+        "decode logits drifted from prefill by {max_abs} (>0.5)"
+    );
 }

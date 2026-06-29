@@ -61,6 +61,10 @@ pub struct Config {
     /// SWA layer pattern (gemma): every `swa_pattern`-th layer uses FULL attention, the rest SWA.
     /// `0`/`1` = no pattern. llama.cpp `set_swa_pattern(p)`: layer `il` is full iff `(il+1) % p == 0`.
     pub swa_pattern: usize,
+    /// RoPE base for the SWA (local) layers (gemma3 dual-rope): SWA layers use this, full layers use
+    /// `rope_theta`. Defaults to 10000 (llama.cpp's `rope_freq_base_train_swa` default) when gemma's
+    /// GGUF omits an explicit `rope.freq_base_swa`. Equal to `rope_theta` for non-SWA models.
+    pub swa_rope_theta: f32,
     /// MoE config (qwen3moe): `Some` enables the routed-expert FFN. `None` = dense FFN.
     pub moe: Option<MoeConfig>,
 }
@@ -70,6 +74,16 @@ impl Config {
     /// attention on a fixed period; non-gemma models are always full.
     pub fn is_swa_layer(&self, il: usize) -> bool {
         self.swa_window > 0 && self.swa_pattern > 1 && !(il + 1).is_multiple_of(self.swa_pattern)
+    }
+
+    /// RoPE base for layer `il`: gemma3 SWA (local) layers use the smaller `swa_rope_theta`, full
+    /// (global) layers use `rope_theta`. Non-gemma models return `rope_theta` for every layer.
+    pub fn layer_rope_theta(&self, il: usize) -> f32 {
+        if self.is_swa_layer(il) {
+            self.swa_rope_theta
+        } else {
+            self.rope_theta
+        }
     }
 }
 
@@ -2204,6 +2218,20 @@ impl Llama {
         } else {
             0
         };
+        // gemma3 dual-rope: the SWA (local) layers use a smaller rope base than the global layers.
+        // The GGUF usually omits it; llama.cpp's `rope_freq_base_train_swa` default is 10000.
+        let swa_rope_theta = if swa_window > 0 {
+            g.metadata()
+                .get(&mk("rope.freq_base_swa"))
+                .and_then(|v| match v {
+                    infr_core::MetaValue::F64(f) => Some(*f as f32),
+                    infr_core::MetaValue::U64(u) => Some(*u as f32),
+                    _ => None,
+                })
+                .unwrap_or(10000.0)
+        } else {
+            rope_theta
+        };
         let eos = meta_u64(&g, "tokenizer.ggml.eos_token_id").unwrap_or(2) as u32;
 
         let be = VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
@@ -2452,6 +2480,7 @@ impl Llama {
             gemma,
             swa_window,
             swa_pattern,
+            swa_rope_theta,
             moe,
         };
         let llama = Self {
@@ -3389,6 +3418,9 @@ impl Llama {
                     lin(&layer.wk, hn.as_ref(), kr.as_ref(), n, ne, kvrow);
                     lin(&layer.wv, hn.as_ref(), vr.as_ref(), n, ne, kvrow);
                 }
+                // gemma3 dual-rope: SWA layers rope at `swa_rope_theta`, full layers at `rope_theta`
+                // (qwen3 returns `rope_theta` for every layer).
+                let layer_theta = c.layer_rope_theta(li);
                 rec.qk_norm_rope(
                     qr.as_ref(),
                     layer.q_norm_buf.as_ref().unwrap().as_ref(),
@@ -3397,7 +3429,7 @@ impl Llama {
                     nh,
                     hd,
                     c.rope_dim,
-                    c.rope_theta,
+                    layer_theta,
                     pos,
                     0,
                     c.rms_eps,
@@ -3410,7 +3442,7 @@ impl Llama {
                     nkv,
                     hd,
                     c.rope_dim,
-                    c.rope_theta,
+                    layer_theta,
                     pos,
                     pos,
                     c.rms_eps,
