@@ -38,6 +38,8 @@ pub enum Activation {
     Silu,
     /// GeGLU: `gelu_tanh(gate) * up` (Gemma).
     Gelu,
+    /// `sigmoid(gate) * up` (Qwen3-Next output gate / silu-gated-RMSNorm uses Silu instead).
+    Sigmoid,
 }
 
 /// How a tensor handle is provisioned.
@@ -201,6 +203,39 @@ pub enum Op {
         n_ff_exp: u32,
         scale: f32,
         act: Activation,
+    },
+    /// Depthwise causal 1-D conv over `channels` followed by SiLU (Qwen3-Next gated DeltaNet). `x` is
+    /// the current token's `[channels]`; `weight` is the per-channel kernel `[channels, kernel]`;
+    /// `state` is the rolling `[(kernel-1), channels]` history (oldest row first), updated in place
+    /// (drop oldest, append `x`). `dst[ch] = silu(Σ_{j<kernel-1} state[j,ch]·w[ch,j] + x[ch]·w[ch,K-1])`.
+    Conv1dSilu {
+        x: TensorId,
+        weight: TensorId,
+        state: TensorId,
+        dst: TensorId,
+        channels: u32,
+        kernel: u32,
+    },
+    /// Gated-DeltaNet linear-attention recurrence step (Qwen3-Next), one token. Per head: L2-normalize
+    /// `q`,`k`; scale `q` by `1/√head_k`; `beta = sigmoid(b)`, `decay = exp(a_coef·softplus(a +
+    /// dt_bias))`; update the persistent state `S[head_k, head_v]`: `S *= decay`, `delta = (v − Sᵀk)·
+    /// beta`, `S += k⊗delta`; `dst = Sᵀq`. `q`/`k` are `[n_vhead·head_k]`, `v`/`dst` are
+    /// `[n_vhead·head_v]`, `b`/`a` are `[n_vhead]`, `a_coef`/`dt_bias` are weights `[n_vhead]`,
+    /// `state` is `[n_vhead·head_k·head_v]` (mutated in place; n_k_head == n_v_head).
+    DeltaNet {
+        q: TensorId,
+        k: TensorId,
+        v: TensorId,
+        b: TensorId,
+        a: TensorId,
+        a_coef: TensorId,
+        dt_bias: TensorId,
+        state: TensorId,
+        dst: TensorId,
+        n_vhead: u32,
+        head_k: u32,
+        head_v: u32,
+        eps: f32,
     },
 }
 

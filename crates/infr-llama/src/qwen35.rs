@@ -10,10 +10,13 @@
 //! `Q35_CPU=1` to force the pure-CPU path (the correctness oracle, no Vulkan init).
 #![allow(dead_code)] // forward pass is built up incrementally on this loader
 
+use crate::cpu_backend::CpuBackend;
 use crate::load_tensor_dequant;
 use anyhow::{anyhow, bail, Context, Result};
-use infr_core::backend::Buffer;
-use infr_core::{DType, WeightSource};
+use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage};
+use infr_core::graph::{Activation, AttnMask, Graph, Op};
+use infr_core::tensor::TensorDesc;
+use infr_core::{DType, TensorId, WeightSource};
 use infr_gguf::Gguf;
 use infr_vulkan::VulkanBackend;
 
@@ -695,6 +698,653 @@ pub fn generate(g: &Gguf, prompt: &str, n: usize) -> Result<String> {
     tok.decode(&outs, false).map_err(|e| anyhow!("decode: {e}"))
 }
 
+// ─── qwen35 pure-CPU runner on the backend-agnostic seam ─────────────────────────
+//
+// Builds an n=1 decode `Graph` (composite ops over typed handles) and runs it through `CpuBackend`
+// — no Vulkan, no GPU. The gated-DeltaNet recurrence + depthwise conv state and the attention KV
+// cache are model-owned `Input` buffers, mutated in place each step (exactly like the dense runner's
+// KV cache). Validates the seam's qwen35 ops end-to-end against the bespoke CPU oracle.
+
+/// Per-layer weight + state handles into one decode graph (declared in upload order so each binds to
+/// the matching uploaded buffer).
+struct Q35LinH {
+    attn_norm: TensorId,
+    qkv: TensorId,
+    gate: TensorId,
+    conv1d: TensorId,
+    alpha: TensorId,
+    beta: TensorId,
+    ssm_a: TensorId,
+    dt_bias: TensorId,
+    ssm_norm: TensorId,
+    out: TensorId,
+    post_norm: TensorId,
+    ffn_gate: TensorId,
+    ffn_up: TensorId,
+    ffn_down: TensorId,
+    n_ff: usize,
+    conv_state: TensorId,
+    s_state: TensorId,
+}
+struct Q35AttnH {
+    attn_norm: TensorId,
+    q: TensorId,
+    k: TensorId,
+    v: TensorId,
+    q_norm: TensorId,
+    k_norm: TensorId,
+    out: TensorId,
+    post_norm: TensorId,
+    ffn_gate: TensorId,
+    ffn_up: TensorId,
+    ffn_down: TensorId,
+    n_ff: usize,
+    k_cache: TensorId,
+    v_cache: TensorId,
+}
+enum Q35LayerH {
+    Lin(Q35LinH),
+    Attn(Q35AttnH),
+}
+
+/// Greedy pure-CPU generation for qwen35 / Qwen3-Next on the agnostic seam (no Vulkan). Mirrors
+/// [`generate`] (raw prompt, no chat template); returns the decoded continuation.
+pub fn generate_cpu(g: &Gguf, prompt: &str, n: usize) -> Result<String> {
+    let c = Cfg::from_gguf(g)?;
+    let (token_embd, te_shape) = load_tensor_dequant(g, "token_embd.weight")?;
+    let vocab = te_shape[1];
+    let ne = c.n_embd;
+    let cc = c.conv_channels();
+    let di = c.d_inner;
+    let (nk, kd) = (c.num_k_heads(), c.head_k_dim());
+    let (nv, vd) = (c.num_v_heads(), c.head_v_dim());
+    let key_dim = nk * kd;
+    let (nh, nkv, hd) = (c.n_head, c.n_kv, c.head_dim);
+    let eps = c.eps;
+    let kk = c.d_conv;
+    let tok = crate::build_tokenizer(g)?;
+    let enc = tok
+        .encode(prompt, false)
+        .map_err(|e| anyhow!("encode: {e}"))?;
+    let prompt_ids: Vec<u32> = enc.get_ids().to_vec();
+    let max_ctx = prompt_ids.len() + n + 1;
+
+    let be = CpuBackend::new();
+    let attn = |i: usize| c.is_attn_layer(i);
+    let n_ff_of = |i: usize| -> Result<usize> {
+        Ok(g.tensors()
+            .iter()
+            .find(|t| t.name == format!("blk.{i}.ffn_up.weight"))
+            .context("ffn_up")?
+            .shape[1])
+    };
+
+    // ── upload weights in native GGUF dtype (the backend dequants on read). Order MUST equal the
+    //    `wpush` order in `build`. ──────────────────────────────────────────────────────────────────
+    let mut wbufs: Vec<Box<dyn Buffer>> = Vec::new();
+    let mut wspecs: Vec<(DType, usize)> = Vec::new();
+    let mut wraw = |name: &str| -> Result<()> {
+        let info = g
+            .tensors()
+            .iter()
+            .find(|t| t.name == name)
+            .ok_or_else(|| anyhow!("tensor not found: {name}"))?
+            .clone();
+        let bytes = g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?;
+        let numel: usize = info.shape.iter().product();
+        let b = be
+            .alloc(bytes.len(), BufferUsage::Weights)
+            .map_err(|e| anyhow!("{e}"))?;
+        be.upload(b.as_ref(), bytes).map_err(|e| anyhow!("{e}"))?;
+        wbufs.push(b);
+        wspecs.push((info.dtype, numel));
+        Ok(())
+    };
+    for i in 0..c.n_layer {
+        let p = |s: &str| format!("blk.{i}.{s}");
+        if attn(i) {
+            for nm in [
+                "attn_norm.weight",
+                "attn_q.weight",
+                "attn_k.weight",
+                "attn_v.weight",
+                "attn_q_norm.weight",
+                "attn_k_norm.weight",
+                "attn_output.weight",
+                "post_attention_norm.weight",
+                "ffn_gate.weight",
+                "ffn_up.weight",
+                "ffn_down.weight",
+            ] {
+                wraw(&p(nm))?;
+            }
+        } else {
+            for nm in [
+                "attn_norm.weight",
+                "attn_qkv.weight",
+                "attn_gate.weight",
+                "ssm_conv1d.weight",
+                "ssm_alpha.weight",
+                "ssm_beta.weight",
+                "ssm_a",
+                "ssm_dt.bias",
+                "ssm_norm.weight",
+                "ssm_out.weight",
+                "post_attention_norm.weight",
+                "ffn_gate.weight",
+                "ffn_up.weight",
+                "ffn_down.weight",
+            ] {
+                wraw(&p(nm))?;
+            }
+        }
+    }
+    wraw("output_norm.weight")?;
+    let tied = !g.tensors().iter().any(|t| t.name == "output.weight");
+    if !tied {
+        wraw("output.weight")?;
+    } else {
+        let b = be
+            .alloc(token_embd.len() * 4, BufferUsage::Weights)
+            .map_err(|e| anyhow!("{e}"))?;
+        be.upload(b.as_ref(), bytemuck::cast_slice(&token_embd))
+            .map_err(|e| anyhow!("{e}"))?;
+        wbufs.push(b);
+        wspecs.push((DType::F32, token_embd.len()));
+    }
+
+    // ── persistent state buffers (f32, zero-init), one set per layer by kind ──────────────────────
+    let mut conv_bufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
+    let mut s_bufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
+    let mut k_bufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
+    let mut v_bufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
+    for i in 0..c.n_layer {
+        if attn(i) {
+            k_bufs.push(Some(
+                be.alloc(max_ctx * nkv * hd * 4, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
+            ));
+            v_bufs.push(Some(
+                be.alloc(max_ctx * nkv * hd * 4, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
+            ));
+            conv_bufs.push(None);
+            s_bufs.push(None);
+        } else {
+            conv_bufs.push(Some(
+                be.alloc((kk - 1) * cc * 4, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
+            ));
+            s_bufs.push(Some(
+                be.alloc(nv * kd * vd * 4, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
+            ));
+            k_bufs.push(None);
+            v_bufs.push(None);
+        }
+    }
+
+    // ── per-step IO ───────────────────────────────────────────────────────────────
+    let hidden_buf = be
+        .alloc(ne * 4, BufferUsage::Staging)
+        .map_err(|e| anyhow!("{e}"))?;
+    let pos_buf = be
+        .alloc(4, BufferUsage::Staging)
+        .map_err(|e| anyhow!("{e}"))?;
+    let logits_buf = be
+        .alloc(vocab * 4, BufferUsage::Readback)
+        .map_err(|e| anyhow!("{e}"))?;
+
+    let f32d = |x: usize| TensorDesc::new(vec![x], DType::F32);
+    let scale = 1.0 / (hd as f32).sqrt();
+
+    // Build the decode graph for absolute position `pos` (kv_len = pos+1).
+    let build = |pos: usize| -> Result<(Graph, TensorId, TensorId, Vec<TensorId>, TensorId)> {
+        let mut gr = Graph::new();
+        let hidden = gr.input(f32d(ne));
+        let positions = gr.input(TensorDesc::new(vec![1], DType::I32));
+        // weights in upload order
+        let mut weights: Vec<TensorId> = Vec::new();
+        let mut wi = 0usize;
+        let mut wpush = |gr: &mut Graph, weights: &mut Vec<TensorId>| -> TensorId {
+            let (dt, num) = wspecs[wi];
+            wi += 1;
+            let id = gr.weight(TensorDesc::new(vec![num], dt));
+            weights.push(id);
+            id
+        };
+        let mut layers: Vec<Q35LayerH> = Vec::new();
+        for i in 0..c.n_layer {
+            if attn(i) {
+                let attn_norm = wpush(&mut gr, &mut weights);
+                let q = wpush(&mut gr, &mut weights);
+                let k = wpush(&mut gr, &mut weights);
+                let v = wpush(&mut gr, &mut weights);
+                let q_norm = wpush(&mut gr, &mut weights);
+                let k_norm = wpush(&mut gr, &mut weights);
+                let out = wpush(&mut gr, &mut weights);
+                let post_norm = wpush(&mut gr, &mut weights);
+                let ffn_gate = wpush(&mut gr, &mut weights);
+                let ffn_up = wpush(&mut gr, &mut weights);
+                let ffn_down = wpush(&mut gr, &mut weights);
+                let k_cache = gr.input(f32d(max_ctx * nkv * hd));
+                let v_cache = gr.input(f32d(max_ctx * nkv * hd));
+                layers.push(Q35LayerH::Attn(Q35AttnH {
+                    attn_norm,
+                    q,
+                    k,
+                    v,
+                    q_norm,
+                    k_norm,
+                    out,
+                    post_norm,
+                    ffn_gate,
+                    ffn_up,
+                    ffn_down,
+                    n_ff: n_ff_of(i)?,
+                    k_cache,
+                    v_cache,
+                }));
+            } else {
+                let attn_norm = wpush(&mut gr, &mut weights);
+                let qkv = wpush(&mut gr, &mut weights);
+                let gate = wpush(&mut gr, &mut weights);
+                let conv1d = wpush(&mut gr, &mut weights);
+                let alpha = wpush(&mut gr, &mut weights);
+                let beta = wpush(&mut gr, &mut weights);
+                let ssm_a = wpush(&mut gr, &mut weights);
+                let dt_bias = wpush(&mut gr, &mut weights);
+                let ssm_norm = wpush(&mut gr, &mut weights);
+                let out = wpush(&mut gr, &mut weights);
+                let post_norm = wpush(&mut gr, &mut weights);
+                let ffn_gate = wpush(&mut gr, &mut weights);
+                let ffn_up = wpush(&mut gr, &mut weights);
+                let ffn_down = wpush(&mut gr, &mut weights);
+                let conv_state = gr.input(f32d((kk - 1) * cc));
+                let s_state = gr.input(f32d(nv * kd * vd));
+                layers.push(Q35LayerH::Lin(Q35LinH {
+                    attn_norm,
+                    qkv,
+                    gate,
+                    conv1d,
+                    alpha,
+                    beta,
+                    ssm_a,
+                    dt_bias,
+                    ssm_norm,
+                    out,
+                    post_norm,
+                    ffn_gate,
+                    ffn_up,
+                    ffn_down,
+                    n_ff: n_ff_of(i)?,
+                    conv_state,
+                    s_state,
+                }));
+            }
+        }
+        let w_out_norm = wpush(&mut gr, &mut weights);
+        let w_lm = wpush(&mut gr, &mut weights);
+        let logits = gr.output(f32d(vocab));
+
+        // scratch
+        let xn = gr.internal(f32d(ne));
+        let hn = gr.internal(f32d(ne));
+        let sub = gr.internal(f32d(ne));
+        let max_ff = (0..c.n_layer)
+            .map(|i| n_ff_of(i).unwrap_or(0))
+            .max()
+            .unwrap_or(0);
+        let gbuf = gr.internal(f32d(max_ff));
+        let ubuf = gr.internal(f32d(max_ff));
+        let actbuf = gr.internal(f32d(max_ff));
+        // linear-mixer scratch
+        let qkvbuf = gr.internal(f32d(cc));
+        let zbuf = gr.internal(f32d(di));
+        let convout = gr.internal(f32d(cc));
+        let qbuf = gr.internal(f32d(key_dim));
+        let kbuf = gr.internal(f32d(key_dim));
+        let vbuf = gr.internal(f32d(nv * vd));
+        let bbuf = gr.internal(f32d(nv));
+        let abuf = gr.internal(f32d(nv));
+        let dnout = gr.internal(f32d(nv * vd));
+        // attn scratch
+        let qg = gr.internal(f32d(nh * 2 * hd));
+        let qa = gr.internal(f32d(nh * hd));
+        let gate_a = gr.internal(f32d(nh * hd));
+        let ka = gr.internal(f32d(nkv * hd));
+        let va = gr.internal(f32d(nkv * hd));
+        let attno = gr.internal(f32d(nh * hd));
+
+        let rmsn = |gr: &mut Graph, x: TensorId, w: TensorId, dst: TensorId| {
+            gr.push(Op::RmsNorm {
+                x,
+                weight: w,
+                dst,
+                rows: 1,
+                dim: ne as u32,
+                eps,
+            });
+        };
+        let lin =
+            |gr: &mut Graph, x: TensorId, w: TensorId, dst: TensorId, inf: usize, outf: usize| {
+                gr.push(Op::Linear {
+                    x,
+                    weight: w,
+                    dst,
+                    m: 1,
+                    in_f: inf as u32,
+                    out_f: outf as u32,
+                });
+            };
+
+        for (li, lh) in layers.iter().enumerate() {
+            match lh {
+                Q35LayerH::Lin(w) => {
+                    rmsn(&mut gr, hidden, w.attn_norm, xn);
+                    lin(&mut gr, xn, w.qkv, qkvbuf, ne, cc);
+                    lin(&mut gr, xn, w.gate, zbuf, ne, di);
+                    gr.push(Op::Conv1dSilu {
+                        x: qkvbuf,
+                        weight: w.conv1d,
+                        state: w.conv_state,
+                        dst: convout,
+                        channels: cc as u32,
+                        kernel: kk as u32,
+                    });
+                    // split conv_out → q | k | v
+                    gr.push(Op::Copy {
+                        src: convout,
+                        src_off: 0,
+                        dst: qbuf,
+                        dst_off: 0,
+                        n: key_dim as u32,
+                    });
+                    gr.push(Op::Copy {
+                        src: convout,
+                        src_off: key_dim as u32,
+                        dst: kbuf,
+                        dst_off: 0,
+                        n: key_dim as u32,
+                    });
+                    gr.push(Op::Copy {
+                        src: convout,
+                        src_off: 2 * key_dim as u32,
+                        dst: vbuf,
+                        dst_off: 0,
+                        n: (nv * vd) as u32,
+                    });
+                    lin(&mut gr, xn, w.beta, bbuf, ne, nv);
+                    lin(&mut gr, xn, w.alpha, abuf, ne, nv);
+                    gr.push(Op::DeltaNet {
+                        q: qbuf,
+                        k: kbuf,
+                        v: vbuf,
+                        b: bbuf,
+                        a: abuf,
+                        a_coef: w.ssm_a,
+                        dt_bias: w.dt_bias,
+                        state: w.s_state,
+                        dst: dnout,
+                        n_vhead: nv as u32,
+                        head_k: kd as u32,
+                        head_v: vd as u32,
+                        eps: 1e-6,
+                    });
+                    // silu-gated RMSNorm per v-head: rmsnorm(out, ssm_norm) then * silu(z)
+                    gr.push(Op::QkNorm {
+                        x: dnout,
+                        weight: w.ssm_norm,
+                        dst: dnout,
+                        rows: 1,
+                        n_head: nv as u32,
+                        head_dim: vd as u32,
+                        eps,
+                    });
+                    gr.push(Op::GatedAct {
+                        gate: zbuf,
+                        up: dnout,
+                        dst: dnout,
+                        rows: 1,
+                        nff: (nv * vd) as u32,
+                        act: Activation::Silu,
+                        up_off: 0,
+                    });
+                    lin(&mut gr, dnout, w.out, sub, di, ne);
+                    gr.push(Op::Add {
+                        a: hidden,
+                        b: sub,
+                        dst: hidden,
+                        n: ne as u32,
+                    });
+                    // FFN
+                    rmsn(&mut gr, hidden, w.post_norm, hn);
+                    lin(&mut gr, hn, w.ffn_gate, gbuf, ne, w.n_ff);
+                    lin(&mut gr, hn, w.ffn_up, ubuf, ne, w.n_ff);
+                    gr.push(Op::GatedAct {
+                        gate: gbuf,
+                        up: ubuf,
+                        dst: actbuf,
+                        rows: 1,
+                        nff: w.n_ff as u32,
+                        act: Activation::Silu,
+                        up_off: 0,
+                    });
+                    lin(&mut gr, actbuf, w.ffn_down, sub, w.n_ff, ne);
+                    gr.push(Op::Add {
+                        a: hidden,
+                        b: sub,
+                        dst: hidden,
+                        n: ne as u32,
+                    });
+                }
+                Q35LayerH::Attn(w) => {
+                    rmsn(&mut gr, hidden, w.attn_norm, xn);
+                    // q proj outputs q+gate interleaved per head [h: q(hd), gate(hd)].
+                    lin(&mut gr, xn, w.q, qg, ne, nh * 2 * hd);
+                    for h in 0..nh {
+                        gr.push(Op::Copy {
+                            src: qg,
+                            src_off: (h * 2 * hd) as u32,
+                            dst: qa,
+                            dst_off: (h * hd) as u32,
+                            n: hd as u32,
+                        });
+                        gr.push(Op::Copy {
+                            src: qg,
+                            src_off: (h * 2 * hd + hd) as u32,
+                            dst: gate_a,
+                            dst_off: (h * hd) as u32,
+                            n: hd as u32,
+                        });
+                    }
+                    lin(&mut gr, xn, w.k, ka, ne, nkv * hd);
+                    lin(&mut gr, xn, w.v, va, ne, nkv * hd);
+                    // per-head q/k norm then RoPE
+                    gr.push(Op::QkNorm {
+                        x: qa,
+                        weight: w.q_norm,
+                        dst: qa,
+                        rows: 1,
+                        n_head: nh as u32,
+                        head_dim: hd as u32,
+                        eps,
+                    });
+                    gr.push(Op::QkNorm {
+                        x: ka,
+                        weight: w.k_norm,
+                        dst: ka,
+                        rows: 1,
+                        n_head: nkv as u32,
+                        head_dim: hd as u32,
+                        eps,
+                    });
+                    gr.push(Op::Rope {
+                        x: qa,
+                        positions,
+                        dst: qa,
+                        rows: 1,
+                        n_head: nh as u32,
+                        head_dim: hd as u32,
+                        rope_dim: c.rope_dim as u32,
+                        theta: c.rope_theta,
+                        freq_factors: None,
+                    });
+                    gr.push(Op::Rope {
+                        x: ka,
+                        positions,
+                        dst: ka,
+                        rows: 1,
+                        n_head: nkv as u32,
+                        head_dim: hd as u32,
+                        rope_dim: c.rope_dim as u32,
+                        theta: c.rope_theta,
+                        freq_factors: None,
+                    });
+                    gr.push(Op::WriteKv {
+                        src: ka,
+                        cache: w.k_cache,
+                        rows: 1,
+                        row_stride: (nkv * hd) as u32,
+                        pos: pos as u32,
+                    });
+                    gr.push(Op::WriteKv {
+                        src: va,
+                        cache: w.v_cache,
+                        rows: 1,
+                        row_stride: (nkv * hd) as u32,
+                        pos: pos as u32,
+                    });
+                    gr.push(Op::Attention {
+                        q: qa,
+                        k_cache: w.k_cache,
+                        v_cache: w.v_cache,
+                        dst: attno,
+                        rows: 1,
+                        kv_len: (pos + 1) as u32,
+                        n_head: nh as u32,
+                        n_kv: nkv as u32,
+                        head_dim: hd as u32,
+                        scale,
+                        mask: AttnMask::Causal,
+                        pos: pos as u32,
+                    });
+                    // per-head sigmoid output gate
+                    gr.push(Op::GatedAct {
+                        gate: gate_a,
+                        up: attno,
+                        dst: attno,
+                        rows: 1,
+                        nff: (nh * hd) as u32,
+                        act: Activation::Sigmoid,
+                        up_off: 0,
+                    });
+                    lin(&mut gr, attno, w.out, sub, nh * hd, ne);
+                    gr.push(Op::Add {
+                        a: hidden,
+                        b: sub,
+                        dst: hidden,
+                        n: ne as u32,
+                    });
+                    // FFN
+                    rmsn(&mut gr, hidden, w.post_norm, hn);
+                    lin(&mut gr, hn, w.ffn_gate, gbuf, ne, w.n_ff);
+                    lin(&mut gr, hn, w.ffn_up, ubuf, ne, w.n_ff);
+                    gr.push(Op::GatedAct {
+                        gate: gbuf,
+                        up: ubuf,
+                        dst: actbuf,
+                        rows: 1,
+                        nff: w.n_ff as u32,
+                        act: Activation::Silu,
+                        up_off: 0,
+                    });
+                    lin(&mut gr, actbuf, w.ffn_down, sub, w.n_ff, ne);
+                    gr.push(Op::Add {
+                        a: hidden,
+                        b: sub,
+                        dst: hidden,
+                        n: ne as u32,
+                    });
+                    let _ = li;
+                }
+            }
+        }
+        rmsn(&mut gr, hidden, w_out_norm, hn);
+        lin(&mut gr, hn, w_lm, logits, ne, vocab);
+
+        // collect state-input handles per layer for binding (interleaved by kind)
+        let mut state_ids: Vec<TensorId> = Vec::new();
+        for lh in &layers {
+            match lh {
+                Q35LayerH::Lin(w) => {
+                    state_ids.push(w.conv_state);
+                    state_ids.push(w.s_state);
+                }
+                Q35LayerH::Attn(w) => {
+                    state_ids.push(w.k_cache);
+                    state_ids.push(w.v_cache);
+                }
+            }
+        }
+        Ok((gr, hidden, positions, [weights, state_ids].concat(), logits))
+    };
+
+    // ── drive ───────────────────────────────────────────────────────────────────
+    let mut cur = prompt_ids.clone();
+    let mut outs: Vec<u32> = Vec::new();
+    let mut logits = vec![0f32; vocab];
+    for pos in 0..(prompt_ids.len() + n) {
+        let t = cur[pos] as usize;
+        be.upload(
+            hidden_buf.as_ref(),
+            bytemuck::cast_slice(&token_embd[t * ne..t * ne + ne]),
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+        be.upload(pos_buf.as_ref(), bytemuck::cast_slice(&[pos as i32]))
+            .map_err(|e| anyhow!("{e}"))?;
+
+        let (gr, h_hidden, h_pos, h_bind, h_logits) = build(pos)?;
+        let plan = be.compile(&gr).map_err(|e| anyhow!("{e}"))?;
+        let mut b = Bindings::new();
+        b.bind(h_hidden, hidden_buf.as_ref());
+        b.bind(h_pos, pos_buf.as_ref());
+        b.bind(h_logits, logits_buf.as_ref());
+        // h_bind = [weights.., state_ids..]; bind weights then state in declaration order.
+        let nw = wbufs.len();
+        for (i, id) in h_bind.iter().take(nw).enumerate() {
+            b.bind(*id, wbufs[i].as_ref());
+        }
+        // state handles in layer order: per layer (conv,s) for linear, (k,v) for attn.
+        let mut si = nw;
+        for i in 0..c.n_layer {
+            if attn(i) {
+                b.bind(h_bind[si], k_bufs[i].as_ref().unwrap().as_ref());
+                b.bind(h_bind[si + 1], v_bufs[i].as_ref().unwrap().as_ref());
+            } else {
+                b.bind(h_bind[si], conv_bufs[i].as_ref().unwrap().as_ref());
+                b.bind(h_bind[si + 1], s_bufs[i].as_ref().unwrap().as_ref());
+            }
+            si += 2;
+        }
+        be.execute(plan.as_ref(), &b).map_err(|e| anyhow!("{e}"))?;
+
+        if pos + 1 >= prompt_ids.len() {
+            be.download(logits_buf.as_ref(), bytemuck::cast_slice_mut(&mut logits))
+                .map_err(|e| anyhow!("{e}"))?;
+            let next = argmax(&logits);
+            outs.push(next);
+            if outs.len() >= n {
+                break;
+            }
+            if cur.len() <= pos + 1 {
+                cur.push(next);
+            }
+        }
+    }
+    tok.decode(&outs, false).map_err(|e| anyhow!("decode: {e}"))
+}
+
 /// True if the GGUF at `path` is a `qwen35` (Qwen3-Next) model.
 pub fn is_qwen35(path: &std::path::Path) -> bool {
     Gguf::open(path)
@@ -822,6 +1472,25 @@ mod tests {
             .unwrap_or(16);
         let out = generate(&g, &prompt, n).unwrap();
         println!("=== qwen35 CPU greedy ===\n{out}");
+    }
+
+    /// The seam-based pure-CPU runner (`generate_cpu`, via `CpuBackend` + the new Conv1dSilu/DeltaNet
+    /// ops, no Vulkan) must match the bespoke CPU oracle (`generate` w/ `Q35_CPU=1`) token-for-token —
+    /// both are f32, so the match is exact.
+    #[test]
+    #[ignore = "needs the Qwen3.5-0.8B gguf; run --test-threads=1"]
+    fn seam_cpu_matches_oracle() {
+        let g = Gguf::open(&model_path()).unwrap();
+        let prompt = "The capital of France is";
+        let n = 16;
+        std::env::set_var("Q35_CPU", "1");
+        let oracle = generate(&g, prompt, n).unwrap();
+        let seam = generate_cpu(&g, prompt, n).unwrap();
+        println!("ORACLE: {oracle:?}\nSEAM:   {seam:?}");
+        assert_eq!(
+            seam, oracle,
+            "qwen35 seam CPU must match the bespoke CPU oracle"
+        );
     }
 
     /// qwen35 (Qwen3-Next hybrid: gated DeltaNet + gated full-attention) pure-CPU greedy must match

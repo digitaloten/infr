@@ -79,6 +79,16 @@ fn bytes_to_f32(bytes: &[u8], dtype: DType) -> Vec<f32> {
     }
 }
 
+/// Gated-FFN activation applied to the gate value.
+fn act_fn(act: Activation, g: f32) -> f32 {
+    match act {
+        Activation::Silu => g / (1.0 + (-g).exp()),
+        // gelu_pytorch_tanh: 0.5 g (1 + tanh(√(2/π)·(g + 0.044715 g³)))
+        Activation::Gelu => 0.5 * g * (1.0 + (0.797_884_6 * (g + 0.044715 * g * g * g)).tanh()),
+        Activation::Sigmoid => 1.0 / (1.0 + (-g).exp()),
+    }
+}
+
 fn cpu_buf(b: &dyn Buffer) -> &CpuBuffer {
     b.as_any()
         .downcast_ref::<CpuBuffer>()
@@ -389,16 +399,7 @@ impl Backend for CpuBackend {
                         let gb = r * nff;
                         let ub = r * nff + up_off;
                         for i in 0..nff {
-                            let g = gs[gb + i];
-                            let a = match act {
-                                Activation::Silu => g / (1.0 + (-g).exp()),
-                                // gelu_pytorch_tanh: 0.5 g (1 + tanh(√(2/π)·(g + 0.044715 g³)))
-                                Activation::Gelu => {
-                                    0.5 * g
-                                        * (1.0 + (0.797_884_6 * (g + 0.044715 * g * g * g)).tanh())
-                                }
-                            };
-                            out[gb + i] = a * us[ub + i];
+                            out[gb + i] = act_fn(act, gs[gb + i]) * us[ub + i];
                         }
                     }
                     vals[dst.0 as usize] = out;
@@ -515,25 +516,129 @@ impl Backend for CpuBackend {
                     for &e in &idx {
                         let gate = matvec(&gb[e * gst..(e + 1) * gst], gdt, &xs, ne, nffx);
                         let up = matvec(&ub[e * ust..(e + 1) * ust], udt, &xs, ne, nffx);
-                        let actv: Vec<f32> = (0..nffx)
-                            .map(|i| {
-                                let gg = gate[i];
-                                let a = match act {
-                                    Activation::Silu => gg / (1.0 + (-gg).exp()),
-                                    Activation::Gelu => {
-                                        0.5 * gg
-                                            * (1.0
-                                                + (0.797_884_6 * (gg + 0.044715 * gg * gg * gg))
-                                                    .tanh())
-                                    }
-                                };
-                                a * up[i]
-                            })
-                            .collect();
+                        let actv: Vec<f32> =
+                            (0..nffx).map(|i| act_fn(act, gate[i]) * up[i]).collect();
                         let y = matvec(&db[e * dst_..(e + 1) * dst_], ddt, &actv, nffx, ne);
                         let w_e = probs[e] / wsum * scale;
                         for i in 0..ne {
                             out[i] += w_e * y[i];
+                        }
+                    }
+                    vals[dst.0 as usize] = out;
+                }
+                Op::Conv1dSilu {
+                    x,
+                    weight: w,
+                    state,
+                    dst,
+                    channels,
+                    kernel,
+                } => {
+                    let (cc, kk) = (channels as usize, kernel as usize);
+                    let xs = vals[x.0 as usize].clone();
+                    let ws = weight(w); // [channels, kernel] row-major (per-channel kernel)
+                    let st = &mut vals[state.0 as usize]; // [(kernel-1), channels], oldest row first
+                    let mut out = vec![0f32; cc];
+                    for ch in 0..cc {
+                        // window = [history rows.. , current x]; tap j uses weight[ch*kk + j].
+                        let mut acc = 0f32;
+                        for j in 0..kk - 1 {
+                            acc += st[j * cc + ch] * ws[ch * kk + j];
+                        }
+                        acc += xs[ch] * ws[ch * kk + (kk - 1)];
+                        out[ch] = acc / (1.0 + (-acc).exp()); // silu
+                    }
+                    // shift history (drop oldest, append raw x).
+                    for j in 0..kk.saturating_sub(2) {
+                        for ch in 0..cc {
+                            st[j * cc + ch] = st[(j + 1) * cc + ch];
+                        }
+                    }
+                    if kk >= 2 {
+                        for ch in 0..cc {
+                            st[(kk - 2) * cc + ch] = xs[ch];
+                        }
+                    }
+                    vals[dst.0 as usize] = out;
+                }
+                Op::DeltaNet {
+                    q,
+                    k,
+                    v,
+                    b,
+                    a,
+                    a_coef,
+                    dt_bias,
+                    state,
+                    dst,
+                    n_vhead,
+                    head_k,
+                    head_v,
+                    eps,
+                } => {
+                    let (nv, kd, vd) = (n_vhead as usize, head_k as usize, head_v as usize);
+                    let qf = vals[q.0 as usize].clone();
+                    let kf = vals[k.0 as usize].clone();
+                    let vf = vals[v.0 as usize].clone();
+                    let bf = vals[b.0 as usize].clone();
+                    let af = vals[a.0 as usize].clone();
+                    let acoef = weight(a_coef);
+                    let dtb = weight(dt_bias);
+                    let st = &mut vals[state.0 as usize]; // [nv, kd, vd]
+                    let mut out = vec![0f32; nv * vd];
+                    let qscale = 1.0 / (kd as f32).sqrt();
+                    let l2 = |slice: &[f32]| -> f32 {
+                        (slice.iter().map(|x| x * x).sum::<f32>() + eps).sqrt()
+                    };
+                    for h in 0..nv {
+                        let mut qh = qf[h * kd..h * kd + kd].to_vec();
+                        let mut kh = kf[h * kd..h * kd + kd].to_vec();
+                        let vh = &vf[h * vd..h * vd + vd];
+                        let qn = l2(&qh);
+                        let kn = l2(&kh);
+                        for x in qh.iter_mut() {
+                            *x = *x / qn * qscale;
+                        }
+                        for x in kh.iter_mut() {
+                            *x /= kn;
+                        }
+                        let beta = 1.0 / (1.0 + (-bf[h]).exp());
+                        // softplus(a + dt_bias), then g = a_coef * softplus (≤ 0); decay = exp(g).
+                        let sp = {
+                            let z = af[h] + dtb[h];
+                            z.max(0.0) + (-z.abs()).exp().ln_1p()
+                        };
+                        let decay = (acoef[h] * sp).exp();
+                        let sh = &mut st[h * kd * vd..(h + 1) * kd * vd]; // [kd, vd]
+                        for x in sh.iter_mut() {
+                            *x *= decay;
+                        }
+                        // kv = kᵀS  [vd]
+                        let mut kv = vec![0f32; vd];
+                        for kk in 0..kd {
+                            let kkv = kh[kk];
+                            let row = &sh[kk * vd..kk * vd + vd];
+                            for d in 0..vd {
+                                kv[d] += kkv * row[d];
+                            }
+                        }
+                        // delta = (v - kv)*beta ; S += k ⊗ delta
+                        let delta: Vec<f32> = (0..vd).map(|d| (vh[d] - kv[d]) * beta).collect();
+                        for kk in 0..kd {
+                            let kkv = kh[kk];
+                            let row = &mut sh[kk * vd..kk * vd + vd];
+                            for d in 0..vd {
+                                row[d] += kkv * delta[d];
+                            }
+                        }
+                        // out = qᵀS  [vd]
+                        let oh = &mut out[h * vd..h * vd + vd];
+                        for kk in 0..kd {
+                            let qv = qh[kk];
+                            let row = &sh[kk * vd..kk * vd + vd];
+                            for d in 0..vd {
+                                oh[d] += qv * row[d];
+                            }
                         }
                     }
                     vals[dst.0 as usize] = out;
