@@ -83,6 +83,9 @@ pub struct MoeKv {
     rec_decode: Option<((bool, usize, usize, bool), infr_vulkan::RecordedCmd)>,
 }
 
+/// A `(quants, scales, sums)` int8-activation buffer triple produced by `quant_q8`.
+type QBufs = (Box<dyn Buffer>, Box<dyn Buffer>, Box<dyn Buffer>);
+
 /// One reusable scratch set for a grouped prefill expert's SwiGLU. Sized for `m_pad` row capacity;
 /// an expert with fewer rows uses the leading prefix.
 struct PrefillScratch {
@@ -4503,7 +4506,7 @@ impl Llama {
         // Q4_K Q/K/O projections use dp4a (mmq): quantize the projection inputs (hn for Q/K, attn for
         // O) to int8 once each. q4_proj gates on Q (q/k/o are Q4_K in this model; v is Q6_K → coopmat).
         let q4_proj = matches!(native_parts(&self.layers[0].wq).0, infr_core::DType::Q4K);
-        let qbufs = |in_f: usize| -> Result<(Box<dyn Buffer>, Box<dyn Buffer>, Box<dyn Buffer>)> {
+        let qbufs = |in_f: usize| -> Result<QBufs> {
             Ok((
                 ab(gmp * in_f)?,
                 ab(gmp * (in_f / 32) * 2)?,
