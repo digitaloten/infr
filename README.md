@@ -21,11 +21,16 @@ Qwen3-Next — hybrid gated-DeltaNet + attention) run via a CPU reference
 original target) is future work.
 
 ```bash
-infr pull   <model-ref>        # hf:org/repo[:file] | ollama:name[:tag] | path
+infr pull   <model-ref>        # org/repo[:quant] (HuggingFace) | path to a .gguf
 infr run    <model-ref> [msg]  # terminal chat (auto-pulls)
 infr serve  <model-ref>        # OpenAI-compatible HTTP API
 infr bench / infr compare      # tok/s benchmarks vs llama.cpp
 ```
+
+Model refs match llama.cpp's `-hf`: `org/repo[:quant]` (quant default `Q4_K_M`,
+e.g. `infr run unsloth/Qwen3-14B-GGUF:Q4_K_M`). Models share the standard
+**HuggingFace Hub cache** (`~/.cache/huggingface/hub`) with llama.cpp and
+`huggingface_hub` — one download, used by both.
 
 ## Benchmarking & profiling
 
@@ -35,7 +40,7 @@ model load (`Llama::warmup`), so timing measures compute, not one-time setup.
 **Run benchmarks one at a time** — concurrent GPU work skews results.
 
 ```bash
-M='hf:unsloth/Qwen3-30B-A3B-GGUF:Qwen3-30B-A3B-Q4_K_M.gguf'   # MoE perf target
+M='unsloth/Qwen3-30B-A3B-GGUF:Q4_K_M'   # MoE perf target
 
 # Prefill (pp = n_prompt/time) and decode (tg = n_gen/time):
 infr bench "$M" -p 2048 -n 0 -r 3       # prefill 2048 tokens
