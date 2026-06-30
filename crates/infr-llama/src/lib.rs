@@ -2627,11 +2627,11 @@ impl Llama {
         let lm_head = if g.tensors().iter().any(|t| t.name == "output.weight") {
             upload_wt(&be, &g, "output.weight")?
         } else {
-            // tied; token_embd already dequantized to f32 for the host gather → f16 lm head
-            Wt::F16(
-                be.upload_weight_f16(&token_embd)
-                    .map_err(|e| anyhow!("upload lm_head: {e}"))?,
-            )
+            // tied: the lm head IS token_embd — upload it raw (native blocks for quant, f16 for
+            // float) for an in-shader-dequant projection. No host dequant→f16 copy, and the GPU
+            // tensor stays at the native bit-width (a big VRAM win for large-vocab heads). The host
+            // keeps its own f32 `token_embd` for the input-embedding gather.
+            upload_wt(&be, &g, "token_embd.weight")?
         };
 
         let (output_norm, _) = load_tensor_dequant(&g, "output_norm.weight")?;
