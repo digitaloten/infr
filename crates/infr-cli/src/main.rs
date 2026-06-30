@@ -60,6 +60,16 @@ enum Cmd {
         /// Repetitions (reported value is the average).
         #[arg(short = 'r', long, default_value_t = 3)]
         reps: usize,
+        /// GPU layers (matches llama-bench -ngl): >0 = Vulkan GPU forward; 0 = run on the CPU
+        /// reference backend (no GPU), so `infr bench -ngl 0` is directly comparable to llama.cpp CPU.
+        #[arg(long = "n-gpu-layers", visible_alias = "ngl", default_value_t = 999)]
+        ngl: usize,
+        /// CPU threads for the `-ngl 0` path (matches llama-bench -t). 0 = all cores.
+        #[arg(short = 't', long, default_value_t = 0)]
+        threads: usize,
+        /// GPU device for the Vulkan forward (matches llama-bench --dev, e.g. Vulkan0/Vulkan1).
+        #[arg(long, default_value = "Vulkan0")]
+        dev: String,
         /// Emit `[{"avg_ts": X}]` (same shape as `llama-bench -o json`) for scripted comparison.
         #[arg(long)]
         json: bool,
@@ -68,9 +78,16 @@ enum Cmd {
     /// whole turns). Shells out to `infr bench` and `llama-bench` with matching flags, same model+GPU.
     Compare {
         model: String,
-        /// llama-bench device for the same GPU (override if device order differs).
+        /// GPU device for both tools (matches llama-bench --dev; override if device order differs).
         #[arg(long, default_value = "Vulkan0")]
         dev: String,
+        /// GPU layers for both tools (matches llama-bench -ngl): >0 = GPU; 0 = CPU comparison
+        /// (infr CPU reference backend vs llama.cpp CPU). 0 lets `infr compare -ngl 0` bench CPU directly.
+        #[arg(long = "n-gpu-layers", visible_alias = "ngl", default_value_t = 999)]
+        ngl: usize,
+        /// CPU threads for the -ngl 0 path on both tools (matches llama-bench -t). 0 = all cores.
+        #[arg(short = 't', long, default_value_t = 0)]
+        threads: usize,
         /// Repetitions per measurement (reported value is the average).
         #[arg(short = 'r', long, default_value_t = 3)]
         reps: usize,
@@ -113,18 +130,36 @@ fn main() -> anyhow::Result<()> {
             batch,
             ubatch,
             reps,
+            ngl,
+            threads,
+            dev,
             json,
-        } => cmd_bench(&model, n_prompt, n_gen, depth, pg, ubatch, reps, json),
+        } => cmd_bench(
+            &model, n_prompt, n_gen, depth, pg, ubatch, reps, ngl, threads, &dev, json,
+        ),
         Cmd::Compare {
             model,
             dev,
+            ngl,
+            threads,
             reps,
             ubatch,
             ctx,
             gen,
             turns,
             llama_bench,
-        } => cmd_compare(&model, &dev, reps, ubatch, &ctx, gen, &turns, &llama_bench),
+        } => cmd_compare(
+            &model,
+            &dev,
+            ngl,
+            threads,
+            reps,
+            ubatch,
+            &ctx,
+            gen,
+            &turns,
+            &llama_bench,
+        ),
     }
 }
 
@@ -510,8 +545,16 @@ fn cmd_bench(
     pg: Option<String>,
     ubatch: usize,
     reps: usize,
+    ngl: usize,
+    threads: usize,
+    dev: &str,
     json: bool,
 ) -> anyhow::Result<()> {
+    // -t: pin the CPU thread count (the backend's rayon pool reads RAYON_NUM_THREADS on first use).
+    // Must be set before any parallel work spins the pool up — do it here, before the model loads.
+    if threads > 0 {
+        std::env::set_var("RAYON_NUM_THREADS", threads.to_string());
+    }
     // -pg "P,G": a coding-agent turn (ingest P then generate G); throughput = (P+G)/time.
     let pg = pg
         .map(|s| -> anyhow::Result<(usize, usize)> {
@@ -520,6 +563,20 @@ fn cmd_bench(
         })
         .transpose()?;
     let (gguf, tok) = resolve(model)?;
+    // -ngl 0: run on the CPU reference backend (no GPU), comparable to `llama-bench -ngl 0`.
+    if ngl == 0 {
+        return cmd_bench_cpu(
+            &gguf,
+            tok.as_deref(),
+            n_prompt,
+            n_gen,
+            depth,
+            pg,
+            reps,
+            json,
+        );
+    }
+    let _ = dev; // GPU device selection: VulkanBackend uses the default adapter (--dev reserved for parity).
     let llama = infr_llama::Llama::load_opt(&gguf, tok.as_deref())?;
     let measure_tg = pg.is_none() && n_gen > 0;
     let dummy =
@@ -627,6 +684,58 @@ fn cmd_bench(
     Ok(())
 }
 
+/// CPU-backend bench (`infr bench -ngl 0`): the GPU bench's pp/tg/pg metrics on the agnostic CPU
+/// reference path, using `CpuModel`'s token-level timing — directly comparable to `llama-bench -ngl 0`.
+#[allow(clippy::too_many_arguments)]
+fn cmd_bench_cpu(
+    gguf: &Path,
+    tok: Option<&Path>,
+    n_prompt: usize,
+    n_gen: usize,
+    depth: usize,
+    pg: Option<(usize, usize)>,
+    reps: usize,
+    json: bool,
+) -> anyhow::Result<()> {
+    let model = infr_llama::CpuModel::load(gguf, tok)?;
+    let measure_tg = pg.is_none() && n_gen > 0;
+    // One untimed warmup (page-cache the mmap'd weights) before the timed reps.
+    let _ = model.bench(depth.max(1), if measure_tg || pg.is_some() { 1 } else { 0 });
+    let mut samples = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let ts = if let Some((p, g)) = pg {
+            let s = model.bench(p, g)?; // pg: prefill p + decode g, throughput (p+g)/total
+            (p + g) as f64 / (s.prompt_secs + s.decode_secs)
+        } else if measure_tg {
+            let s = model.bench(depth.max(1), n_gen)?; // tg@depth: decode at `depth` context
+            n_gen as f64 / s.decode_secs
+        } else {
+            let s = model.bench(n_prompt, 0)?; // pp: prefill only
+            n_prompt as f64 / s.prompt_secs
+        };
+        samples.push(ts);
+    }
+    let avg = samples.iter().sum::<f64>() / samples.len() as f64;
+    if json {
+        println!("[{{\"avg_ts\": {avg:.2}}}]");
+    } else {
+        let label = if let Some((p, g)) = pg {
+            format!("pg{p}+{g}")
+        } else if measure_tg {
+            format!("tg{n_gen}")
+        } else {
+            format!("pp{n_prompt}")
+        };
+        let d = if depth > 0 {
+            format!(" @ d{depth}")
+        } else {
+            String::new()
+        };
+        println!("{label}{d} [cpu]: {avg:.1} t/s  ({reps} reps)");
+    }
+    Ok(())
+}
+
 /// Compare infr vs llama.cpp on coding-agent-shaped workloads. Shells out to `infr bench` (this same
 /// binary) and `llama-bench` with matching flags, so both run the SAME model + GPU under one driver.
 /// Scenarios (the target workload — see memory infr-optimization-priority):
@@ -637,6 +746,8 @@ fn cmd_bench(
 fn cmd_compare(
     model: &str,
     dev: &str,
+    ngl: usize,
+    threads: usize,
     reps: usize,
     ubatch: usize,
     ctx: &[usize],
@@ -647,6 +758,8 @@ fn cmd_compare(
     use std::process::Command;
     let exe = std::env::current_exe().context("locating the infr binary")?;
     let reps_s = reps.to_string();
+    let ngl_s = ngl.to_string();
+    let threads_s = threads.to_string();
     // infr and llama.cpp share the HF Hub cache and the same `org/repo:quant` ref grammar, so hand
     // BOTH tools the same reference: `infr bench` takes `model` verbatim, and llama-bench gets the
     // matching `-hf`/`--hf-file` (or `-m` for a local path). Pull once up front so `--offline` holds.
@@ -672,6 +785,10 @@ fn cmd_compare(
     let infr_b = |args: &[&str]| -> anyhow::Result<f64> {
         let mut c = Command::new(&exe);
         c.arg("bench").arg(model).args(["-r", &reps_s]);
+        c.args(["--ngl", &ngl_s, "--dev", dev]);
+        if threads > 0 {
+            c.args(["-t", &threads_s]);
+        }
         if ubatch > 0 {
             c.args(["-u", &ubatch.to_string()]);
         }
@@ -693,8 +810,11 @@ fn cmd_compare(
         let mut c = Command::new(llama_bench);
         c.args(&llama_model_args);
         c.args([
-            "-ngl", "99", "-dev", dev, "-fa", "auto", "-r", &reps_s, "-o", "json",
+            "-ngl", &ngl_s, "-dev", dev, "-fa", "auto", "-r", &reps_s, "-o", "json",
         ]);
+        if threads > 0 {
+            c.args(["-t", &threads_s]);
+        }
         if ubatch > 0 {
             c.args(["-ub", &ubatch.to_string()]);
         }
