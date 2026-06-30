@@ -71,4 +71,9 @@ void main() {
         y[out_base_idx + i0] = float16_t(a * co - b * s);
         y[out_base_idx + i1] = float16_t(a * s + b * co);
     }
+    // Partial RoPE (qwen35: rope_dim=64 < hd=256): dims [rope_dim, hd) are rmsnormed but NOT rotated;
+    // they must still be written through. Empty when rope_dim==hd (qwen3/gemma), so no effect there.
+    for (uint i = pc.rope_dim + t; i < pc.hd; i += 64u) {
+        y[out_base_idx + i] = float16_t(xs[i] * scale * nw[i]);
+    }
 }

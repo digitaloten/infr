@@ -488,6 +488,15 @@ fn read(be: &VulkanBackend, buf: &dyn Buffer, n: usize) -> Vec<f32> {
     be.download(buf, &mut bytes).expect("download");
     bytemuck::cast_slice(&bytes).to_vec()
 }
+/// Download `n` f16s from a device buffer, widened to f32.
+fn read_f16(be: &VulkanBackend, buf: &dyn Buffer, n: usize) -> Vec<f32> {
+    let mut bytes = vec![0u8; n * 2];
+    be.download(buf, &mut bytes).expect("download");
+    bytes
+        .chunks_exact(2)
+        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+        .collect()
+}
 
 /// Per-layer recurrent state for the CPU reference.
 enum LayerState {
@@ -886,6 +895,139 @@ impl Model {
         read(be, ob.as_ref(), nh * hd)
     }
 
+    /// Fully-recorded GPU attention mixer (no host compute): rmsnorm → q/k/v GEMV → deinterleave
+    /// q/gate (strided copies) → qk-norm+rope → GQA softmax (f16 cache) → sigmoid output gate → out
+    /// proj. Two command buffers: stage 1 produces the normed k/v read back into the host f32 cache
+    /// (memory bookkeeping, not compute); stage 2 runs the attention + gate + out proj. The host f32
+    /// KV cache (re-uploaded f16 per token) is a perf wart, not host compute — the resident forward
+    /// will make it GPU-resident.
+    #[allow(clippy::too_many_arguments)]
+    fn attn_mixer_gpu(
+        &self,
+        be: &VulkanBackend,
+        w: &AttnLayer,
+        gpu: &AttnGpuW,
+        hidden: &[f32],
+        kc: &mut Vec<f32>,
+        vc: &mut Vec<f32>,
+        pos: usize,
+    ) -> Vec<f32> {
+        let c = &self.cfg;
+        let (ne, hd) = (c.n_embd, c.head_dim);
+        let (nh, nkv) = (c.n_head, c.n_kv);
+        let alloc = |n: usize| {
+            be.alloc((n * 4).max(4), BufferUsage::Activations)
+                .expect("alloc")
+        };
+        // qk_norm_rope writes f16 (it feeds attention_kv / the f16 KV cache directly), so q/k land
+        // in f16 buffers; q is consumed by attention_kv as-is, k is widened back for the host cache.
+        let alloc_f16 = |n: usize| {
+            be.alloc((n * 2).max(4), BufferUsage::Activations)
+                .expect("alloc f16")
+        };
+        // --- stage 1: norm + projections + deinterleave + qk-norm/rope ---
+        // qk_norm_rope reads x (f32) and writes y (f16) to separate bindings: qd/kd are the f32
+        // projection outputs, qf16/kf16 the normed+roped f16 fed to attention_kv / the host cache.
+        let hb = dev(be, hidden);
+        let xn = alloc(ne);
+        let qg = alloc(nh * 2 * hd);
+        let qd = alloc(nh * hd);
+        let qf16 = alloc_f16(nh * hd);
+        let gateb = alloc(nh * hd);
+        let kd = alloc(nkv * hd);
+        let kf16 = alloc_f16(nkv * hd);
+        let vb = alloc(nkv * hd);
+        {
+            let rec = be.recorder().expect("recorder");
+            rec.rmsnorm(
+                hb.as_ref(),
+                gpu.attn_norm.as_ref(),
+                xn.as_ref(),
+                1,
+                ne,
+                c.eps,
+            );
+            // attn_q outputs query+gate INTERLEAVED per head: [h q(hd) | h gate(hd) | …].
+            w.q.record(&rec, xn.as_ref(), qg.as_ref(), ne, nh * 2 * hd);
+            w.k.record(&rec, xn.as_ref(), kd.as_ref(), ne, nkv * hd);
+            w.v.record(&rec, xn.as_ref(), vb.as_ref(), ne, nkv * hd);
+            for h in 0..nh {
+                let qoff = h * 2 * hd * 4;
+                rec.copy(qg.as_ref(), qoff, qd.as_ref(), h * hd * 4, hd * 4);
+                rec.copy(
+                    qg.as_ref(),
+                    qoff + hd * 4,
+                    gateb.as_ref(),
+                    h * hd * 4,
+                    hd * 4,
+                );
+            }
+            // per-head q/k rmsnorm + RoPE: f32 in (qd/kd) → f16 out (qf16/kf16)
+            rec.qk_norm_rope(
+                qd.as_ref(),
+                gpu.q_norm.as_ref(),
+                qf16.as_ref(),
+                1,
+                nh,
+                hd,
+                c.rope_dim,
+                c.rope_theta,
+                pos,
+                0,
+                c.eps,
+                None,
+            );
+            rec.qk_norm_rope(
+                kd.as_ref(),
+                gpu.k_norm.as_ref(),
+                kf16.as_ref(),
+                1,
+                nkv,
+                hd,
+                c.rope_dim,
+                c.rope_theta,
+                pos,
+                0,
+                c.eps,
+                None,
+            );
+            rec.finish().expect("finish");
+        }
+        // append normed k/v to the host f32 cache (memory bookkeeping; no compute)
+        kc.extend_from_slice(&read_f16(be, kf16.as_ref(), nkv * hd));
+        vc.extend_from_slice(&read(be, vb.as_ref(), nkv * hd));
+        let t = pos + 1;
+        // --- stage 2: GQA softmax (f16 cache) + sigmoid gate + out proj, one cmd buffer ---
+        // q is already f16 from qk_norm_rope → feed attention_kv directly.
+        let kf = be.upload_weight_f16(kc).expect("kc f16");
+        let vf = be.upload_weight_f16(vc).expect("vc f16");
+        let ob = alloc(nh * hd);
+        let og = alloc(nh * hd);
+        let res = alloc(ne);
+        {
+            let rec = be.recorder().expect("recorder");
+            // pos_offset = t-1 (abs position); window 0 = full causal; scale 0 = default 1/√hd.
+            rec.attention_kv(
+                qf16.as_ref(),
+                kf.as_ref(),
+                vf.as_ref(),
+                ob.as_ref(),
+                1,
+                t,
+                nh,
+                nkv,
+                hd,
+                t - 1,
+                0,
+                0.0,
+            );
+            rec.mul_sigmoid(ob.as_ref(), gateb.as_ref(), og.as_ref(), nh * hd);
+            w.out.record(&rec, og.as_ref(), res.as_ref(), nh * hd, ne);
+            rec.finish().expect("finish");
+        }
+        read(be, res.as_ref(), ne)
+    }
+
     fn attn_mixer(
         &self,
         w: &AttnLayer,
@@ -894,6 +1036,10 @@ impl Model {
         vc: &mut Vec<f32>,
         pos: usize,
     ) -> Vec<f32> {
+        if let (Some(be), Some(gpu)) = (self.be.as_ref(), w.gpu.as_ref()) {
+            return self.attn_mixer_gpu(be, w, gpu, hidden, kc, vc, pos);
+        }
+        // --- CPU reference oracle (Q35_CPU=1; no backend) ---
         let c = &self.cfg;
         let (ne, hd) = (c.n_embd, c.head_dim);
         let (nh, nkv) = (c.n_head, c.n_kv);
