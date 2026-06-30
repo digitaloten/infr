@@ -2482,36 +2482,47 @@ impl Backend for CpuBackend {
                         head_dim as usize,
                         rope_dim as usize,
                     );
-                    let xs = vals[x.0 as usize].clone();
+                    let xs = &vals[x.0 as usize];
                     let ws = weight(w);
-                    let pos = vals[positions.0 as usize].clone();
+                    let pos = &vals[positions.0 as usize];
                     let ff = freq_factors.map(|f| vals[f.0 as usize].clone());
                     let mut out = vec![0f32; rows * nh * hd];
                     let hf = rd / 2;
-                    for r in 0..rows {
-                        let p0 = pos[r];
-                        for h in 0..nh {
-                            let b = (r * nh + h) * hd;
-                            let ss: f32 =
-                                (0..hd).map(|i| xs[b + i] * xs[b + i]).sum::<f32>() / hd as f32;
-                            let s = 1.0 / (ss + eps).sqrt();
-                            for i in 0..hd {
-                                out[b + i] = xs[b + i] * s * ws[i];
-                            }
-                            for p in 0..hf {
-                                let (i0, i1) = (p, p + hf);
-                                let mut ang = p0 * theta.powf(-2.0 * p as f32 / rd as f32);
-                                if let Some(ff) = &ff {
-                                    ang /= ff[p];
+                    // Parallel over the m rows. Within a row the RoPE angles depend only on the
+                    // position (not the head), so precompute (cos,sin) per rope index ONCE per row and
+                    // reuse across all heads — the powf/sin/cos were the bulk and were redone nh×.
+                    out.par_chunks_mut(nh * hd)
+                        .enumerate()
+                        .for_each(|(r, orow)| {
+                            let p0 = pos[r];
+                            let cs: Vec<(f32, f32)> = (0..hf)
+                                .map(|p| {
+                                    let mut ang = p0 * theta.powf(-2.0 * p as f32 / rd as f32);
+                                    if let Some(ff) = &ff {
+                                        ang /= ff[p];
+                                    }
+                                    (ang.cos(), ang.sin())
+                                })
+                                .collect();
+                            let xr = &xs[r * nh * hd..r * nh * hd + nh * hd];
+                            for h in 0..nh {
+                                let b = h * hd;
+                                let ss: f32 =
+                                    (0..hd).map(|i| xr[b + i] * xr[b + i]).sum::<f32>() / hd as f32;
+                                let s = 1.0 / (ss + eps).sqrt();
+                                for i in 0..hd {
+                                    orow[b + i] = xr[b + i] * s * ws[i];
                                 }
-                                let (sn, c) = (ang.sin(), ang.cos());
-                                let a = out[b + i0];
-                                let bb = out[b + i1];
-                                out[b + i0] = a * c - bb * sn;
-                                out[b + i1] = a * sn + bb * c;
+                                for p in 0..hf {
+                                    let (i0, i1) = (p, p + hf);
+                                    let (c, sn) = cs[p];
+                                    let a = orow[b + i0];
+                                    let bb = orow[b + i1];
+                                    orow[b + i0] = a * c - bb * sn;
+                                    orow[b + i1] = a * sn + bb * c;
+                                }
                             }
-                        }
-                    }
+                        });
                     vals[dst.0 as usize] = out;
                 }
                 Op::WriteKv {
