@@ -845,6 +845,1101 @@ unsafe fn vec_dot_q5k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     sumf
 }
 
+// ─── Batched dot kernels (prefill: m > 1) ────────────────────────────────────
+//
+// Each `vec_dot_qXk_batch(row, q8s, in_f, out)` is equivalent to calling
+// `vec_dot_qXk(row, &q8s[r], in_f)` for every r, but decodes the weight row
+// ONCE and loops over the m token activations with the pre-decoded data.
+//
+// Bit-identity guarantee: the per-token f32 result equals the single-token
+// kernel exactly (integer dots have no rounding, same accumulation grouping).
+
+// ── Q4_K batch ────────────────────────────────────────────────────────────────
+
+fn vec_dot_q4k_batch_scalar(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    let m = q8s.len();
+    let nb = in_f / 256;
+
+    // Decode weight row once: per-block d/dmin/sc/m, expanded nibbles (0–15).
+    let mut d_arr = vec![0f32; nb];
+    let mut dmin_arr = vec![0f32; nb];
+    let mut sc_arr = vec![0u32; nb * 8];
+    let mut m_arr = vec![0u32; nb * 8];
+    let mut q4_flat = vec![0u8; nb * 256]; // one byte per element, value 0–15
+
+    for b in 0..nb {
+        let blk = &row[b * 144..b * 144 + 144];
+        d_arr[b] = crate::rdf16(&blk[0..2]);
+        dmin_arr[b] = crate::rdf16(&blk[2..4]);
+        let scales = &blk[4..16];
+        let qs = &blk[16..144];
+        for s in 0..8usize {
+            let (sc, mv) = crate::k4(s, scales);
+            sc_arr[b * 8 + s] = sc;
+            m_arr[b * 8 + s] = mv;
+            let hi = s % 2 == 1;
+            let half = s / 2;
+            let qbyte = &qs[half * 32..half * 32 + 32];
+            let flat = &mut q4_flat[b * 256 + s * 32..b * 256 + s * 32 + 32];
+            for l in 0..32 {
+                flat[l] = if hi { qbyte[l] >> 4 } else { qbyte[l] & 0xF };
+            }
+        }
+    }
+
+    // Per-token dot using pre-expanded data (identical order to scalar single-token).
+    for r in 0..m {
+        let q8 = &q8s[r];
+        let mut sumf = 0f32;
+        for b in 0..nb {
+            let (mut sd, mut sm) = (0i32, 0i32);
+            for s in 0..8usize {
+                let mut iprod = 0i32;
+                let fb = &q4_flat[b * 256 + s * 32..b * 256 + s * 32 + 32];
+                let q8b = &q8.qs[b * 256 + s * 32..b * 256 + s * 32 + 32];
+                for l in 0..32 {
+                    iprod += fb[l] as i32 * q8b[l] as i32;
+                }
+                sd += sc_arr[b * 8 + s] as i32 * iprod;
+                sm += m_arr[b * 8 + s] as i32 * q8.bsums[b * 8 + s];
+            }
+            sumf += q8.d[b] * (d_arr[b] * sd as f32 - dmin_arr[b] * sm as f32);
+        }
+        out[r] = sumf;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn vec_dot_q4k_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let m = q8s.len();
+    let nb = in_f / 256;
+    let mask_lo = _mm256_set1_epi8(0x0F_u8 as i8);
+    let ones = _mm256_set1_epi16(1i16);
+
+    // Pre-expand nibbles into flat[b*256..b*256+256] once.
+    // Layout: flat[b*256 + s*32 .. b*256 + s*32 + 32] = expanded q4 for sub-block s.
+    // For pair k: flat[b*256 + k*64..b*256 + k*64 + 32] = lo nibbles (sub-block 2k),
+    //             flat[b*256 + k*64 + 32..b*256 + k*64 + 64] = hi nibbles (sub-block 2k+1).
+    let mut d_arr = vec![0f32; nb];
+    let mut dmin_arr = vec![0f32; nb];
+    let mut sc_arr = vec![[0u32; 8]; nb];
+    let mut m_arr = vec![[0u32; 8]; nb];
+    let mut q4_flat = vec![0u8; nb * 256];
+
+    for b in 0..nb {
+        let blk = &row[b * 144..b * 144 + 144];
+        d_arr[b] = crate::rdf16(&blk[0..2]);
+        dmin_arr[b] = crate::rdf16(&blk[2..4]);
+        let scales = &blk[4..16];
+        let qs = &blk[16..144];
+        for s in 0..8usize {
+            let (sc, mv) = crate::k4(s, scales);
+            sc_arr[b][s] = sc;
+            m_arr[b][s] = mv;
+        }
+        // Unpack 4 nibble pairs with SIMD, store lo then hi in contiguous slots.
+        let flat = &mut q4_flat[b * 256..b * 256 + 256];
+        for k in 0..4usize {
+            let nibbles = _mm256_loadu_si256(qs[k * 32..].as_ptr() as *const __m256i);
+            let lo_nib = _mm256_and_si256(nibbles, mask_lo); // sub-block 2k
+            let hi_nib = _mm256_and_si256(_mm256_srli_epi16(nibbles, 4), mask_lo); // sub-block 2k+1
+            _mm256_storeu_si256(flat[k * 64..].as_mut_ptr() as *mut __m256i, lo_nib);
+            _mm256_storeu_si256(flat[k * 64 + 32..].as_mut_ptr() as *mut __m256i, hi_nib);
+        }
+    }
+
+    // Per-token dots: load pre-expanded q4 ymm + q8 ymm, maddubs → madd → hadd.
+    // Accumulation order identical to single-token AVX2 kernel → bit-identical result.
+    for r in 0..m {
+        let q8 = &q8s[r];
+        let mut sumf = 0f32;
+        for b in 0..nb {
+            let (mut sd, mut sm) = (0i32, 0i32);
+            let flat = &q4_flat[b * 256..b * 256 + 256];
+            let q8b = &q8.qs[b * 256..b * 256 + 256];
+            for s in 0..8usize {
+                let q4 = _mm256_loadu_si256(flat[s * 32..].as_ptr() as *const __m256i);
+                let q8v = _mm256_loadu_si256(q8b[s * 32..].as_ptr() as *const __m256i);
+                let prod = _mm256_maddubs_epi16(q4, q8v);
+                let sum32 = _mm256_madd_epi16(prod, ones);
+                let iprod = hadd_i32_ymm(sum32);
+                let isum = q8.bsums[b * 8 + s];
+                sd += sc_arr[b][s] as i32 * iprod;
+                sm += m_arr[b][s] as i32 * isum;
+            }
+            sumf += q8.d[b] * (d_arr[b] * sd as f32 - dmin_arr[b] * sm as f32);
+        }
+        out[r] = sumf;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+unsafe fn vec_dot_q4k_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let m = q8s.len();
+    let nb = in_f / 256;
+    let mask_lo = _mm256_set1_epi8(0x0F_u8 as i8);
+    let ones512 = _mm512_set1_epi16(1i16);
+
+    // Pre-expand nibbles (same layout as AVX2 batch): flat[b*256 + k*64..+64] =
+    // [lo_nib_2k (32 B), hi_nib_2k+1 (32 B)], directly loadable as a zmm per pair k.
+    let mut d_arr = vec![0f32; nb];
+    let mut dmin_arr = vec![0f32; nb];
+    let mut sc_arr = vec![[0u32; 8]; nb];
+    let mut m_arr = vec![[0u32; 8]; nb];
+    let mut q4_flat = vec![0u8; nb * 256];
+
+    for b in 0..nb {
+        let blk = &row[b * 144..b * 144 + 144];
+        d_arr[b] = crate::rdf16(&blk[0..2]);
+        dmin_arr[b] = crate::rdf16(&blk[2..4]);
+        let scales = &blk[4..16];
+        let qs = &blk[16..144];
+        for s in 0..8usize {
+            let (sc, mv) = crate::k4(s, scales);
+            sc_arr[b][s] = sc;
+            m_arr[b][s] = mv;
+        }
+        let flat = &mut q4_flat[b * 256..b * 256 + 256];
+        for k in 0..4usize {
+            let nibbles = _mm256_loadu_si256(qs[k * 32..].as_ptr() as *const __m256i);
+            let lo_nib = _mm256_and_si256(nibbles, mask_lo);
+            let hi_nib = _mm256_and_si256(_mm256_srli_epi16(nibbles, 4), mask_lo);
+            _mm256_storeu_si256(flat[k * 64..].as_mut_ptr() as *mut __m256i, lo_nib);
+            _mm256_storeu_si256(flat[k * 64 + 32..].as_mut_ptr() as *mut __m256i, hi_nib);
+        }
+    }
+
+    // Per-token: one zmm load per pair (64 pre-expanded bytes) + one zmm q8 load.
+    // maddubs512 → madd512 → split ymm → hadd×2. Identical to single-token avx512bw kernel.
+    for r in 0..m {
+        let q8 = &q8s[r];
+        let mut sumf = 0f32;
+        for b in 0..nb {
+            let (mut sd, mut sm) = (0i32, 0i32);
+            let flat = &q4_flat[b * 256..b * 256 + 256];
+            let q8b = &q8.qs[b * 256..b * 256 + 256];
+            for k in 0..4usize {
+                let (sc_e, m_e) = (sc_arr[b][2 * k], m_arr[b][2 * k]);
+                let (sc_o, m_o) = (sc_arr[b][2 * k + 1], m_arr[b][2 * k + 1]);
+                // flat[k*64..k*64+64]: lower 256 = sub-block 2k, upper 256 = sub-block 2k+1
+                let q4_zmm = _mm512_loadu_si512(flat[k * 64..].as_ptr() as *const __m512i);
+                let q8_zmm = _mm512_loadu_si512(q8b[k * 64..].as_ptr() as *const __m512i);
+                let prod = _mm512_maddubs_epi16(q4_zmm, q8_zmm);
+                let sum32 = _mm512_madd_epi16(prod, ones512);
+                let lo_ymm = _mm512_castsi512_si256(sum32);
+                let hi_ymm = _mm512_extracti64x4_epi64::<1>(sum32);
+                let iprod_e = hadd_i32_ymm(lo_ymm);
+                let iprod_o = hadd_i32_ymm(hi_ymm);
+                let isum_e = q8.bsums[b * 8 + 2 * k];
+                let isum_o = q8.bsums[b * 8 + 2 * k + 1];
+                sd += sc_e as i32 * iprod_e + sc_o as i32 * iprod_o;
+                sm += m_e as i32 * isum_e + m_o as i32 * isum_o;
+            }
+            sumf += q8.d[b] * (d_arr[b] * sd as f32 - dmin_arr[b] * sm as f32);
+        }
+        out[r] = sumf;
+    }
+}
+
+/// Batch Q4_K dot: `out[r] = vec_dot_q4k(row, &q8s[r], in_f)` for all r, bit-identical to
+/// the single-token kernel. The weight row is decoded ONCE; per-token work is the integer dot only.
+fn vec_dot_q4k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512bw") {
+            return unsafe { vec_dot_q4k_batch_avx512bw(row, q8s, in_f, out) };
+        }
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { vec_dot_q4k_batch_avx2(row, q8s, in_f, out) };
+        }
+    }
+    vec_dot_q4k_batch_scalar(row, q8s, in_f, out);
+}
+
+// ── Q4_K 2-row tiled batch ────────────────────────────────────────────────────
+//
+// Process TWO output rows simultaneously so the Q8 activation data (loaded from
+// L3 cache) is reused for both dots instead of loaded twice. This halves the L3
+// bandwidth for Q8 reads which is the dominant bottleneck during large-batch prefill.
+//
+// `out_a` and `out_b` receive the dots for row `row_a` and `row_b` respectively.
+// Bit-identical: each `out_x[r]` equals `vec_dot_q4k(row_x, &q8s[r], in_f)`.
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+unsafe fn vec_dot_q4k_batch2_avx512bw(
+    row_a: &[u8],
+    row_b: &[u8],
+    q8s: &[Q8],
+    in_f: usize,
+    out_a: &mut [f32],
+    out_b: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    let m = q8s.len();
+    let nb = in_f / 256;
+    let mask_lo = _mm256_set1_epi8(0x0F_u8 as i8);
+    let ones512 = _mm512_set1_epi16(1i16);
+
+    // Pre-expand both weight rows.
+    let mut d_a = vec![0f32; nb];
+    let mut dmin_a = vec![0f32; nb];
+    let mut sc_a = vec![[0u32; 8]; nb];
+    let mut m_a = vec![[0u32; 8]; nb];
+    let mut flat_a = vec![0u8; nb * 256];
+
+    let mut d_b = vec![0f32; nb];
+    let mut dmin_b = vec![0f32; nb];
+    let mut sc_b = vec![[0u32; 8]; nb];
+    let mut m_b = vec![[0u32; 8]; nb];
+    let mut flat_b = vec![0u8; nb * 256];
+
+    for b in 0..nb {
+        // Row A
+        let blk_a = &row_a[b * 144..b * 144 + 144];
+        d_a[b] = crate::rdf16(&blk_a[0..2]);
+        dmin_a[b] = crate::rdf16(&blk_a[2..4]);
+        let scales_a = &blk_a[4..16];
+        let qs_a = &blk_a[16..144];
+        for s in 0..8usize {
+            let (sc, mv) = crate::k4(s, scales_a);
+            sc_a[b][s] = sc;
+            m_a[b][s] = mv;
+        }
+        let fa = &mut flat_a[b * 256..b * 256 + 256];
+        for k in 0..4usize {
+            let nibs = _mm256_loadu_si256(qs_a[k * 32..].as_ptr() as *const __m256i);
+            let lo = _mm256_and_si256(nibs, mask_lo);
+            let hi = _mm256_and_si256(_mm256_srli_epi16(nibs, 4), mask_lo);
+            _mm256_storeu_si256(fa[k * 64..].as_mut_ptr() as *mut __m256i, lo);
+            _mm256_storeu_si256(fa[k * 64 + 32..].as_mut_ptr() as *mut __m256i, hi);
+        }
+
+        // Row B
+        let blk_b = &row_b[b * 144..b * 144 + 144];
+        d_b[b] = crate::rdf16(&blk_b[0..2]);
+        dmin_b[b] = crate::rdf16(&blk_b[2..4]);
+        let scales_b = &blk_b[4..16];
+        let qs_b = &blk_b[16..144];
+        for s in 0..8usize {
+            let (sc, mv) = crate::k4(s, scales_b);
+            sc_b[b][s] = sc;
+            m_b[b][s] = mv;
+        }
+        let fb = &mut flat_b[b * 256..b * 256 + 256];
+        for k in 0..4usize {
+            let nibs = _mm256_loadu_si256(qs_b[k * 32..].as_ptr() as *const __m256i);
+            let lo = _mm256_and_si256(nibs, mask_lo);
+            let hi = _mm256_and_si256(_mm256_srli_epi16(nibs, 4), mask_lo);
+            _mm256_storeu_si256(fb[k * 64..].as_mut_ptr() as *mut __m256i, lo);
+            _mm256_storeu_si256(fb[k * 64 + 32..].as_mut_ptr() as *mut __m256i, hi);
+        }
+    }
+
+    // Per-token: load q8 ONCE per block per pair k; compute both row A and row B dots.
+    for r in 0..m {
+        let q8 = &q8s[r];
+        let mut sumf_a = 0f32;
+        let mut sumf_b = 0f32;
+        for b in 0..nb {
+            let (mut sd_a, mut sm_a) = (0i32, 0i32);
+            let (mut sd_b, mut sm_b) = (0i32, 0i32);
+            let fa = &flat_a[b * 256..b * 256 + 256];
+            let fb = &flat_b[b * 256..b * 256 + 256];
+            let q8b = &q8.qs[b * 256..b * 256 + 256];
+
+            for k in 0..4usize {
+                let (sca_e, ma_e) = (sc_a[b][2 * k], m_a[b][2 * k]);
+                let (sca_o, ma_o) = (sc_a[b][2 * k + 1], m_a[b][2 * k + 1]);
+                let (scb_e, mb_e) = (sc_b[b][2 * k], m_b[b][2 * k]);
+                let (scb_o, mb_o) = (sc_b[b][2 * k + 1], m_b[b][2 * k + 1]);
+
+                // Load q8 ONCE for this pair (shared by both row A and row B).
+                let q8_zmm = _mm512_loadu_si512(q8b[k * 64..].as_ptr() as *const __m512i);
+
+                // Row A dot
+                let qa_zmm = _mm512_loadu_si512(fa[k * 64..].as_ptr() as *const __m512i);
+                let prod_a = _mm512_maddubs_epi16(qa_zmm, q8_zmm);
+                let sum32_a = _mm512_madd_epi16(prod_a, ones512);
+                let lo_a = _mm512_castsi512_si256(sum32_a);
+                let hi_a = _mm512_extracti64x4_epi64::<1>(sum32_a);
+
+                // Row B dot (q8_zmm reused, no reload)
+                let qb_zmm = _mm512_loadu_si512(fb[k * 64..].as_ptr() as *const __m512i);
+                let prod_b = _mm512_maddubs_epi16(qb_zmm, q8_zmm);
+                let sum32_b = _mm512_madd_epi16(prod_b, ones512);
+                let lo_b = _mm512_castsi512_si256(sum32_b);
+                let hi_b = _mm512_extracti64x4_epi64::<1>(sum32_b);
+
+                let isum_e = q8.bsums[b * 8 + 2 * k];
+                let isum_o = q8.bsums[b * 8 + 2 * k + 1];
+
+                sd_a += sca_e as i32 * hadd_i32_ymm(lo_a) + sca_o as i32 * hadd_i32_ymm(hi_a);
+                sm_a += ma_e as i32 * isum_e + ma_o as i32 * isum_o;
+
+                sd_b += scb_e as i32 * hadd_i32_ymm(lo_b) + scb_o as i32 * hadd_i32_ymm(hi_b);
+                sm_b += mb_e as i32 * isum_e + mb_o as i32 * isum_o;
+            }
+            sumf_a += q8.d[b] * (d_a[b] * sd_a as f32 - dmin_a[b] * sm_a as f32);
+            sumf_b += q8.d[b] * (d_b[b] * sd_b as f32 - dmin_b[b] * sm_b as f32);
+        }
+        out_a[r] = sumf_a;
+        out_b[r] = sumf_b;
+    }
+}
+
+fn vec_dot_q4k_batch2(
+    row_a: &[u8],
+    row_b: &[u8],
+    q8s: &[Q8],
+    in_f: usize,
+    out_a: &mut [f32],
+    out_b: &mut [f32],
+) {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx512bw") {
+        return unsafe { vec_dot_q4k_batch2_avx512bw(row_a, row_b, q8s, in_f, out_a, out_b) };
+    }
+    // Scalar fallback: call single-row batch twice (still unpack once per row).
+    vec_dot_q4k_batch(row_a, q8s, in_f, out_a);
+    vec_dot_q4k_batch(row_b, q8s, in_f, out_b);
+}
+
+// ── Q6_K batch ────────────────────────────────────────────────────────────────
+
+fn vec_dot_q6k_batch_scalar(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    let m = q8s.len();
+    let nb = in_f / 256;
+
+    // Pre-expand Q6 nibbles + high bits into flat[b*256..b*256+256] (values 0–63).
+    // Layout: flat[b*256 + half*128 + ci*32 .. +32] = q6 column ci for that half
+    // (matches the AVX2 single-token column layout; also usable by scalar per sub-block).
+    let mut d_arr = vec![0f32; nb];
+    let mut scales_arr = vec![0i8; nb * 16];
+    let mut q6_flat = vec![0u8; nb * 256];
+
+    for b in 0..nb {
+        let blk = &row[b * 210..b * 210 + 210];
+        let ql = &blk[0..128];
+        let qh = &blk[128..192];
+        let scales = &blk[192..208];
+        d_arr[b] = crate::rdf16(&blk[208..210]);
+        for i in 0..16 {
+            scales_arr[b * 16 + i] = scales[i] as i8;
+        }
+        let flat = &mut q6_flat[b * 256..b * 256 + 256];
+        for half in 0..2usize {
+            let (qlo, qho) = (half * 64, half * 32);
+            for l in 0..32usize {
+                let q1 = (ql[qlo + l] & 0xF) | ((qh[qho + l] & 3) << 4);
+                let q2 = (ql[qlo + l + 32] & 0xF) | (((qh[qho + l] >> 2) & 3) << 4);
+                let q3 = (ql[qlo + l] >> 4) | (((qh[qho + l] >> 4) & 3) << 4);
+                let q4 = (ql[qlo + l + 32] >> 4) | (((qh[qho + l] >> 6) & 3) << 4);
+                // column-first layout: ci=0→col0(q1), ci=1→col1(q2), ci=2→col2(q3), ci=3→col3(q4)
+                flat[half * 128 + l] = q1;
+                flat[half * 128 + 32 + l] = q2;
+                flat[half * 128 + 64 + l] = q3;
+                flat[half * 128 + 96 + l] = q4;
+            }
+        }
+    }
+
+    // Per-token: accumulate sumi/bsum per sub-block, apply int8 scales.
+    // sub_off(sub) = (sub/8)*128 + ((sub%8)/2)*32 + ((sub%8)%2)*16
+    // This matches both flat q6 and q8.qs layout (same 16-element stride).
+    for r in 0..m {
+        let q8 = &q8s[r];
+        let mut sumf = 0f32;
+        for b in 0..nb {
+            let mut sumi = [0i32; 16];
+            let mut bsum = [0i32; 16];
+            for sub in 0..16usize {
+                let sub_off = (sub / 8) * 128 + ((sub % 8) / 2) * 32 + ((sub % 8) % 2) * 16;
+                let q6_ptr = &q6_flat[b * 256 + sub_off..b * 256 + sub_off + 16];
+                let q8_ptr = &q8.qs[b * 256 + sub_off..b * 256 + sub_off + 16];
+                for i in 0..16 {
+                    let q6v = q6_ptr[i] as i32;
+                    let v = q8_ptr[i] as i32;
+                    sumi[sub] += q6v * v;
+                    bsum[sub] += v;
+                }
+            }
+            let mut s = 0f32;
+            for sub in 0..16 {
+                s += scales_arr[b * 16 + sub] as f32 * (sumi[sub] - 32 * bsum[sub]) as f32;
+            }
+            sumf += d_arr[b] * q8.d[b] * s;
+        }
+        out[r] = sumf;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn vec_dot_q6k_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let m = q8s.len();
+    let nb = in_f / 256;
+
+    let mask_0f = _mm256_set1_epi8(0x0F_u8 as i8);
+    let mask_30 = _mm256_set1_epi8(0x30_u8 as i8);
+    let mask_03 = _mm256_set1_epi8(0x03_u8 as i8);
+    let ones_u8 = _mm256_set1_epi8(1i8);
+    let ones_i16 = _mm256_set1_epi16(1i16);
+
+    // Pre-expand all Q6 nibbles using AVX2 shifts (same ops as single-token, done once).
+    let mut d_arr = vec![0f32; nb];
+    let mut scales_arr = vec![0i8; nb * 16];
+    let mut q6_flat = vec![0u8; nb * 256];
+
+    for b in 0..nb {
+        let blk = &row[b * 210..b * 210 + 210];
+        let ql = &blk[0..128];
+        let qh = &blk[128..192];
+        let scales = &blk[192..208];
+        d_arr[b] = crate::rdf16(&blk[208..210]);
+        for i in 0..16 {
+            scales_arr[b * 16 + i] = scales[i] as i8;
+        }
+        let flat = &mut q6_flat[b * 256..b * 256 + 256];
+
+        for half in 0..2usize {
+            let qlo = half * 64;
+            let qho = half * 32;
+
+            let qh_ymm = _mm256_loadu_si256(qh[qho..].as_ptr() as *const __m256i);
+            let ql_lo = _mm256_loadu_si256(ql[qlo..].as_ptr() as *const __m256i);
+            let ql_hi = _mm256_loadu_si256(ql[qlo + 32..].as_ptr() as *const __m256i);
+
+            let qh_sr2 = _mm256_and_si256(_mm256_srli_epi16(qh_ymm, 2), mask_03);
+
+            let q6_c0 = _mm256_or_si256(
+                _mm256_and_si256(ql_lo, mask_0f),
+                _mm256_slli_epi16(_mm256_and_si256(qh_ymm, mask_03), 4),
+            );
+            let q6_c2 = _mm256_or_si256(
+                _mm256_and_si256(ql_hi, mask_0f),
+                _mm256_slli_epi16(qh_sr2, 4),
+            );
+            let q6_c4 = _mm256_or_si256(
+                _mm256_and_si256(_mm256_srli_epi16(ql_lo, 4), mask_0f),
+                _mm256_and_si256(qh_ymm, mask_30),
+            );
+            let q6_c6 = _mm256_or_si256(
+                _mm256_and_si256(_mm256_srli_epi16(ql_hi, 4), mask_0f),
+                _mm256_and_si256(_mm256_srli_epi16(qh_ymm, 2), mask_30),
+            );
+
+            // Store columns contiguously: flat[half*128 + ci*32..+32]
+            _mm256_storeu_si256(flat[half * 128..].as_mut_ptr() as *mut __m256i, q6_c0);
+            _mm256_storeu_si256(flat[half * 128 + 32..].as_mut_ptr() as *mut __m256i, q6_c2);
+            _mm256_storeu_si256(flat[half * 128 + 64..].as_mut_ptr() as *mut __m256i, q6_c4);
+            _mm256_storeu_si256(flat[half * 128 + 96..].as_mut_ptr() as *mut __m256i, q6_c6);
+        }
+    }
+
+    // Per-token: dot each column (32 elements) with q8, compute bsum simultaneously.
+    // Identical column/scale accumulation order as single-token AVX2 Q6K → bit-identical.
+    for r in 0..m {
+        let q8 = &q8s[r];
+        let mut sumf = 0f32;
+        for b in 0..nb {
+            let d = d_arr[b];
+            let flat = &q6_flat[b * 256..b * 256 + 256];
+            let q8b = &q8.qs[b * 256..b * 256 + 256];
+
+            let mut s = 0f32;
+            for half in 0..2usize {
+                let sco = half * 8;
+                let base = half * 128;
+
+                for ci in 0..4usize {
+                    let q6_ymm =
+                        _mm256_loadu_si256(flat[half * 128 + ci * 32..].as_ptr() as *const __m256i);
+                    let q8_ymm =
+                        _mm256_loadu_si256(q8b[base + ci * 32..].as_ptr() as *const __m256i);
+
+                    let prod = _mm256_maddubs_epi16(q6_ymm, q8_ymm);
+                    let sum32 = _mm256_madd_epi16(prod, ones_i16);
+                    let bsum_i16 = _mm256_maddubs_epi16(ones_u8, q8_ymm);
+                    let bsum_i32 = _mm256_madd_epi16(bsum_i16, ones_i16);
+
+                    let sum_lo = _mm256_castsi256_si128(sum32);
+                    let sum_hi = _mm256_extracti128_si256::<1>(sum32);
+                    let bs_lo = _mm256_castsi256_si128(bsum_i32);
+                    let bs_hi = _mm256_extracti128_si256::<1>(bsum_i32);
+
+                    let iprod_0 = hadd_i32_xmm(sum_lo);
+                    let iprod_1 = hadd_i32_xmm(sum_hi);
+                    let bs_0 = hadd_i32_xmm(bs_lo);
+                    let bs_1 = hadd_i32_xmm(bs_hi);
+
+                    let sub_0 = sco + ci * 2;
+                    let sub_1 = sco + ci * 2 + 1;
+                    s += scales_arr[b * 16 + sub_0] as f32 * (iprod_0 - 32 * bs_0) as f32;
+                    s += scales_arr[b * 16 + sub_1] as f32 * (iprod_1 - 32 * bs_1) as f32;
+                }
+            }
+            sumf += d * q8.d[b] * s;
+        }
+        out[r] = sumf;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+unsafe fn vec_dot_q6k_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let m = q8s.len();
+    let nb = in_f / 256;
+
+    let mask_0f_z = _mm512_set1_epi8(0x0F_u8 as i8);
+    let mask_30_z = _mm512_set1_epi8(0x30_u8 as i8);
+    let mask_03_z = _mm512_set1_epi8(0x03_u8 as i8);
+    let ones_u8_z = _mm512_set1_epi8(1i8);
+    let ones_i16_z = _mm512_set1_epi16(1i16);
+
+    // Pre-expand Q6 both halves simultaneously via zmm, store to q6_flat.
+    // flat[b*256 + half*128 + ci*32..+32] = q6 column ci for half.
+    let mut d_arr = vec![0f32; nb];
+    let mut scales_arr = vec![0i8; nb * 16];
+    let mut q6_flat = vec![0u8; nb * 256];
+
+    for b in 0..nb {
+        let blk = &row[b * 210..b * 210 + 210];
+        let ql = &blk[0..128];
+        let qh = &blk[128..192];
+        let scales = &blk[192..208];
+        d_arr[b] = crate::rdf16(&blk[208..210]);
+        for i in 0..16 {
+            scales_arr[b * 16 + i] = scales[i] as i8;
+        }
+        let flat = &mut q6_flat[b * 256..b * 256 + 256];
+
+        // qh is 64 contiguous bytes for both halves → single zmm load.
+        let qh_z = _mm512_loadu_si512(qh.as_ptr() as *const __m512i);
+
+        let ql_lo_h0 = _mm256_loadu_si256(ql[0..].as_ptr() as *const __m256i);
+        let ql_lo_h1 = _mm256_loadu_si256(ql[64..].as_ptr() as *const __m256i);
+        let ql_lo_z = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(ql_lo_h0), ql_lo_h1);
+        let ql_hi_h0 = _mm256_loadu_si256(ql[32..].as_ptr() as *const __m256i);
+        let ql_hi_h1 = _mm256_loadu_si256(ql[96..].as_ptr() as *const __m256i);
+        let ql_hi_z = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(ql_hi_h0), ql_hi_h1);
+
+        let qh_sr2_z = _mm512_and_si512(_mm512_srli_epi16(qh_z, 2), mask_03_z);
+
+        let q6_c0_z = _mm512_or_si512(
+            _mm512_and_si512(ql_lo_z, mask_0f_z),
+            _mm512_slli_epi16(_mm512_and_si512(qh_z, mask_03_z), 4),
+        );
+        let q6_c2_z = _mm512_or_si512(
+            _mm512_and_si512(ql_hi_z, mask_0f_z),
+            _mm512_slli_epi16(qh_sr2_z, 4),
+        );
+        let q6_c4_z = _mm512_or_si512(
+            _mm512_and_si512(_mm512_srli_epi16(ql_lo_z, 4), mask_0f_z),
+            _mm512_and_si512(qh_z, mask_30_z),
+        );
+        let q6_c6_z = _mm512_or_si512(
+            _mm512_and_si512(_mm512_srli_epi16(ql_hi_z, 4), mask_0f_z),
+            _mm512_and_si512(_mm512_srli_epi16(qh_z, 2), mask_30_z),
+        );
+
+        // Each zmm has h0 in lower 256 and h1 in upper 256.
+        // Store as [h0(ci), h1(ci)] per column → deinterleave into two 32-byte stores.
+        for (ci, q6_z) in [q6_c0_z, q6_c2_z, q6_c4_z, q6_c6_z].iter().enumerate() {
+            let h0 = _mm512_castsi512_si256(*q6_z);
+            let h1 = _mm512_extracti64x4_epi64::<1>(*q6_z);
+            _mm256_storeu_si256(flat[ci * 32..].as_mut_ptr() as *mut __m256i, h0);
+            _mm256_storeu_si256(flat[128 + ci * 32..].as_mut_ptr() as *mut __m256i, h1);
+        }
+    }
+
+    // Per-token: two halves merged into zmm for 4 columns; split back per scale accumulation.
+    for r in 0..m {
+        let q8 = &q8s[r];
+        let mut sumf = 0f32;
+        for b in 0..nb {
+            let mut simd_sumi = [0i32; 16];
+            let mut simd_bsum = [0i32; 16];
+            let flat = &q6_flat[b * 256..b * 256 + 256];
+            let q8b = &q8.qs[b * 256..b * 256 + 256];
+
+            for ci in 0..4usize {
+                // Load h0 and h1 columns into zmm.
+                let q6_h0 = _mm256_loadu_si256(flat[ci * 32..].as_ptr() as *const __m256i);
+                let q6_h1 = _mm256_loadu_si256(flat[128 + ci * 32..].as_ptr() as *const __m256i);
+                let q6_z = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(q6_h0), q6_h1);
+
+                let q8_h0 = _mm256_loadu_si256(q8b[ci * 32..].as_ptr() as *const __m256i);
+                let q8_h1 = _mm256_loadu_si256(q8b[128 + ci * 32..].as_ptr() as *const __m256i);
+                let q8_z = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(q8_h0), q8_h1);
+
+                let prod = _mm512_maddubs_epi16(q6_z, q8_z);
+                let sum32_z = _mm512_madd_epi16(prod, ones_i16_z);
+                let bsum_i16_z = _mm512_maddubs_epi16(ones_u8_z, q8_z);
+                let bsum_i32_z = _mm512_madd_epi16(bsum_i16_z, ones_i16_z);
+
+                let sum_h0 = _mm512_castsi512_si256(sum32_z);
+                let sum_h1 = _mm512_extracti64x4_epi64::<1>(sum32_z);
+                let bsum_h0 = _mm512_castsi512_si256(bsum_i32_z);
+                let bsum_h1 = _mm512_extracti64x4_epi64::<1>(bsum_i32_z);
+
+                let s_h0_lo = _mm256_castsi256_si128(sum_h0);
+                let s_h0_hi = _mm256_extracti128_si256::<1>(sum_h0);
+                let s_h1_lo = _mm256_castsi256_si128(sum_h1);
+                let s_h1_hi = _mm256_extracti128_si256::<1>(sum_h1);
+                let b_h0_lo = _mm256_castsi256_si128(bsum_h0);
+                let b_h0_hi = _mm256_extracti128_si256::<1>(bsum_h0);
+                let b_h1_lo = _mm256_castsi256_si128(bsum_h1);
+                let b_h1_hi = _mm256_extracti128_si256::<1>(bsum_h1);
+
+                simd_sumi[ci * 2] = hadd_i32_xmm(s_h0_lo);
+                simd_sumi[ci * 2 + 1] = hadd_i32_xmm(s_h0_hi);
+                simd_sumi[8 + ci * 2] = hadd_i32_xmm(s_h1_lo);
+                simd_sumi[8 + ci * 2 + 1] = hadd_i32_xmm(s_h1_hi);
+
+                simd_bsum[ci * 2] = hadd_i32_xmm(b_h0_lo);
+                simd_bsum[ci * 2 + 1] = hadd_i32_xmm(b_h0_hi);
+                simd_bsum[8 + ci * 2] = hadd_i32_xmm(b_h1_lo);
+                simd_bsum[8 + ci * 2 + 1] = hadd_i32_xmm(b_h1_hi);
+            }
+
+            let mut s = 0f32;
+            for sub in 0..16 {
+                s +=
+                    scales_arr[b * 16 + sub] as f32 * (simd_sumi[sub] - 32 * simd_bsum[sub]) as f32;
+            }
+            sumf += d_arr[b] * q8.d[b] * s;
+        }
+        out[r] = sumf;
+    }
+}
+
+fn vec_dot_q6k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512bw") {
+            return unsafe { vec_dot_q6k_batch_avx512bw(row, q8s, in_f, out) };
+        }
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { vec_dot_q6k_batch_avx2(row, q8s, in_f, out) };
+        }
+    }
+    vec_dot_q6k_batch_scalar(row, q8s, in_f, out);
+}
+
+// ── Q8_0 batch ────────────────────────────────────────────────────────────────
+
+fn vec_dot_q8_0_batch_scalar(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    let m = q8s.len();
+    let nb_super = in_f / 256;
+    let bpr = 34usize;
+
+    // Pre-read weight scales and i8 values (no nibble extraction needed for Q8_0).
+    let mut dw_arr = vec![0f32; nb_super * 8];
+    let mut qw_flat = vec![0i8; nb_super * 256]; // raw i8 weight bytes
+
+    for b in 0..nb_super {
+        for s in 0..8usize {
+            let wb = b * 8 + s;
+            let blk = &row[wb * bpr..wb * bpr + bpr];
+            dw_arr[b * 8 + s] = crate::rdf16(&blk[0..2]);
+            let src = &blk[2..34];
+            let dst = &mut qw_flat[b * 256 + s * 32..b * 256 + s * 32 + 32];
+            for i in 0..32 {
+                dst[i] = src[i] as i8;
+            }
+        }
+    }
+
+    for r in 0..m {
+        let q8 = &q8s[r];
+        let mut sumf = 0f32;
+        for b in 0..nb_super {
+            let d8 = q8.d[b];
+            for s in 0..8usize {
+                let qw = &qw_flat[b * 256 + s * 32..b * 256 + s * 32 + 32];
+                let qx = &q8.qs[b * 256 + s * 32..b * 256 + s * 32 + 32];
+                let iprod: i32 = (0..32).map(|i| qw[i] as i32 * qx[i] as i32).sum();
+                sumf += d8 * dw_arr[b * 8 + s] * iprod as f32;
+            }
+        }
+        out[r] = sumf;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn vec_dot_q8_0_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let m = q8s.len();
+    let nb_super = in_f / 256;
+    let bpr = 34usize;
+    let ones = _mm256_set1_epi16(1i16);
+
+    // Pre-read weight scales + abs(qw) (u8) + sign bytes (for _mm256_sign_epi8 per token).
+    // Storing qw as raw i8 and applying abs+sign per token avoids two extra arrays.
+    let mut dw_arr = vec![0f32; nb_super * 8];
+    let mut qw_flat = vec![0u8; nb_super * 256]; // i8 as u8 bytes, to be cast per-kernel call
+
+    for b in 0..nb_super {
+        for s in 0..8usize {
+            let wb = b * 8 + s;
+            let blk = &row[wb * bpr..wb * bpr + bpr];
+            dw_arr[b * 8 + s] = crate::rdf16(&blk[0..2]);
+            let src = &blk[2..34];
+            qw_flat[b * 256 + s * 32..b * 256 + s * 32 + 32].copy_from_slice(src);
+        }
+    }
+
+    for r in 0..m {
+        let q8 = &q8s[r];
+        let mut sumf = 0f32;
+        for b in 0..nb_super {
+            let d8 = q8.d[b];
+            for s in 0..8usize {
+                let qw = _mm256_loadu_si256(qw_flat[b * 256 + s * 32..].as_ptr() as *const __m256i);
+                let qx = _mm256_loadu_si256(q8.qs[b * 256 + s * 32..].as_ptr() as *const __m256i);
+                let qw_abs = _mm256_abs_epi8(qw);
+                let qx_signed = _mm256_sign_epi8(qx, qw);
+                let prod = _mm256_maddubs_epi16(qw_abs, qx_signed);
+                let sum32 = _mm256_madd_epi16(prod, ones);
+                let iprod = hadd_i32_ymm(sum32);
+                sumf += d8 * dw_arr[b * 8 + s] * iprod as f32;
+            }
+        }
+        out[r] = sumf;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+unsafe fn vec_dot_q8_0_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let m = q8s.len();
+    let nb_super = in_f / 256;
+    let bpr = 34usize;
+    let ones512 = _mm512_set1_epi16(1i16);
+
+    let mut dw_arr = vec![0f32; nb_super * 8];
+    let mut qw_flat = vec![0u8; nb_super * 256];
+
+    for b in 0..nb_super {
+        for s in 0..8usize {
+            let wb = b * 8 + s;
+            let blk = &row[wb * bpr..wb * bpr + bpr];
+            dw_arr[b * 8 + s] = crate::rdf16(&blk[0..2]);
+            qw_flat[b * 256 + s * 32..b * 256 + s * 32 + 32].copy_from_slice(&blk[2..34]);
+        }
+    }
+
+    for r in 0..m {
+        let q8 = &q8s[r];
+        let mut sumf = 0f32;
+        for b in 0..nb_super {
+            let d8 = q8.d[b];
+            // Process pairs of sub-blocks with zmm (identical to single-token avx512bw).
+            for k in 0..4usize {
+                let s0 = 2 * k;
+                let s1 = 2 * k + 1;
+                let qw0 =
+                    _mm256_loadu_si256(qw_flat[b * 256 + s0 * 32..].as_ptr() as *const __m256i);
+                let qw1 =
+                    _mm256_loadu_si256(qw_flat[b * 256 + s1 * 32..].as_ptr() as *const __m256i);
+                // Load 64 contiguous activation bytes
+                let qx_z =
+                    _mm512_loadu_si512(q8.qs[b * 256 + s0 * 32..].as_ptr() as *const __m512i);
+                let qx0 = _mm512_castsi512_si256(qx_z);
+                let qx1 = _mm512_extracti64x4_epi64::<1>(qx_z);
+                let qw_abs0 = _mm256_abs_epi8(qw0);
+                let qw_abs1 = _mm256_abs_epi8(qw1);
+                let qx_s0 = _mm256_sign_epi8(qx0, qw0);
+                let qx_s1 = _mm256_sign_epi8(qx1, qw1);
+                let qw_a_z = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(qw_abs0), qw_abs1);
+                let qx_s_z = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(qx_s0), qx_s1);
+                let prod = _mm512_maddubs_epi16(qw_a_z, qx_s_z);
+                let sum32_z = _mm512_madd_epi16(prod, ones512);
+                let lo_ymm = _mm512_castsi512_si256(sum32_z);
+                let hi_ymm = _mm512_extracti64x4_epi64::<1>(sum32_z);
+                let iprod0 = hadd_i32_ymm(lo_ymm);
+                let iprod1 = hadd_i32_ymm(hi_ymm);
+                sumf +=
+                    d8 * (dw_arr[b * 8 + s0] * iprod0 as f32 + dw_arr[b * 8 + s1] * iprod1 as f32);
+            }
+        }
+        out[r] = sumf;
+    }
+}
+
+fn vec_dot_q8_0_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512bw") {
+            return unsafe { vec_dot_q8_0_batch_avx512bw(row, q8s, in_f, out) };
+        }
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { vec_dot_q8_0_batch_avx2(row, q8s, in_f, out) };
+        }
+    }
+    vec_dot_q8_0_batch_scalar(row, q8s, in_f, out);
+}
+
+// ── Q5_K batch ────────────────────────────────────────────────────────────────
+
+fn vec_dot_q5k_batch_scalar(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    let m = q8s.len();
+    let nb = in_f / 256;
+
+    // Pre-expand Q5 values (0–31) into flat[b*256..b*256+256].
+    // Layout: flat[b*256 + s*32 .. +32] = q5 for sub-block s (same as Q4K flat layout).
+    let mut d_arr = vec![0f32; nb];
+    let mut dmin_arr = vec![0f32; nb];
+    let mut sc_arr = vec![0u32; nb * 8];
+    let mut m_arr = vec![0u32; nb * 8];
+    let mut q5_flat = vec![0u8; nb * 256];
+
+    for b in 0..nb {
+        let blk = &row[b * 176..b * 176 + 176];
+        d_arr[b] = crate::rdf16(&blk[0..2]);
+        dmin_arr[b] = crate::rdf16(&blk[2..4]);
+        let scales = &blk[4..16];
+        let qh = &blk[16..48];
+        let ql = &blk[48..176];
+        let mut u1 = 1u8;
+        let mut u2 = 2u8;
+        for j in 0..4usize {
+            let (sc_e, m_e) = crate::k4(2 * j, scales);
+            let (sc_o, m_o) = crate::k4(2 * j + 1, scales);
+            sc_arr[b * 8 + 2 * j] = sc_e;
+            m_arr[b * 8 + 2 * j] = m_e;
+            sc_arr[b * 8 + 2 * j + 1] = sc_o;
+            m_arr[b * 8 + 2 * j + 1] = m_o;
+            let base_e = b * 256 + (2 * j) * 32;
+            let base_o = b * 256 + (2 * j + 1) * 32;
+            for l in 0..32 {
+                let v = ql[j * 32 + l];
+                q5_flat[base_e + l] = (v & 0xF) + if qh[l] & u1 != 0 { 16 } else { 0 };
+                q5_flat[base_o + l] = (v >> 4) + if qh[l] & u2 != 0 { 16 } else { 0 };
+            }
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+
+    for r in 0..m {
+        let q8 = &q8s[r];
+        let mut sumf = 0f32;
+        for b in 0..nb {
+            let (mut sd, mut sm) = (0i32, 0i32);
+            for j in 0..4usize {
+                let mut iprod_e = 0i32;
+                let mut iprod_o = 0i32;
+                let fe = &q5_flat[b * 256 + (2 * j) * 32..b * 256 + (2 * j) * 32 + 32];
+                let fo = &q5_flat[b * 256 + (2 * j + 1) * 32..b * 256 + (2 * j + 1) * 32 + 32];
+                let q8e = &q8.qs[b * 256 + (2 * j) * 32..b * 256 + (2 * j) * 32 + 32];
+                let q8o = &q8.qs[b * 256 + (2 * j + 1) * 32..b * 256 + (2 * j + 1) * 32 + 32];
+                for l in 0..32 {
+                    iprod_e += fe[l] as i32 * q8e[l] as i32;
+                    iprod_o += fo[l] as i32 * q8o[l] as i32;
+                }
+                sd += sc_arr[b * 8 + 2 * j] as i32 * iprod_e
+                    + sc_arr[b * 8 + 2 * j + 1] as i32 * iprod_o;
+                sm += m_arr[b * 8 + 2 * j] as i32 * q8.bsums[b * 8 + 2 * j]
+                    + m_arr[b * 8 + 2 * j + 1] as i32 * q8.bsums[b * 8 + 2 * j + 1];
+            }
+            sumf += q8.d[b] * (d_arr[b] * sd as f32 - dmin_arr[b] * sm as f32);
+        }
+        out[r] = sumf;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn vec_dot_q5k_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let m = q8s.len();
+    let nb = in_f / 256;
+    let mask_lo = _mm256_set1_epi8(0x0F_u8 as i8);
+    let sixteen = _mm256_set1_epi8(0x10_u8 as i8);
+    let ones = _mm256_set1_epi16(1i16);
+    let zero = _mm256_setzero_si256();
+
+    // Pre-expand q5 values (0–31) using the same AVX2 logic as the single-token kernel.
+    // flat[b*256 + k*64..+32] = even sub-block 2k (lo nibble + high bit),
+    // flat[b*256 + k*64+32..+32] = odd sub-block 2k+1 (hi nibble + high bit).
+    let mut d_arr = vec![0f32; nb];
+    let mut dmin_arr = vec![0f32; nb];
+    let mut sc_arr = vec![[0u32; 8]; nb];
+    let mut m_arr = vec![[0u32; 8]; nb];
+    let mut q5_flat = vec![0u8; nb * 256];
+
+    for b in 0..nb {
+        let blk = &row[b * 176..b * 176 + 176];
+        d_arr[b] = crate::rdf16(&blk[0..2]);
+        dmin_arr[b] = crate::rdf16(&blk[2..4]);
+        let scales = &blk[4..16];
+        let qh = &blk[16..48];
+        let ql = &blk[48..176];
+        for s in 0..8usize {
+            let (sc, mv) = crate::k4(s, scales);
+            sc_arr[b][s] = sc;
+            m_arr[b][s] = mv;
+        }
+        let qh_ymm = _mm256_loadu_si256(qh.as_ptr() as *const __m256i);
+        let flat = &mut q5_flat[b * 256..b * 256 + 256];
+        let mut u1 = 1u8;
+        let mut u2 = 2u8;
+        for k in 0..4usize {
+            let nibbles = _mm256_loadu_si256(ql[k * 32..].as_ptr() as *const __m256i);
+            let lo_nib = _mm256_and_si256(nibbles, mask_lo);
+            let hi_nib = _mm256_and_si256(_mm256_srli_epi16(nibbles, 4), mask_lo);
+            let u1v = _mm256_set1_epi8(u1 as i8);
+            let u2v = _mm256_set1_epi8(u2 as i8);
+            let has_e = _mm256_and_si256(qh_ymm, u1v);
+            let has_o = _mm256_and_si256(qh_ymm, u2v);
+            let high_e = _mm256_andnot_si256(_mm256_cmpeq_epi8(has_e, zero), sixteen);
+            let high_o = _mm256_andnot_si256(_mm256_cmpeq_epi8(has_o, zero), sixteen);
+            let q5_e = _mm256_or_si256(lo_nib, high_e);
+            let q5_o = _mm256_or_si256(hi_nib, high_o);
+            _mm256_storeu_si256(flat[k * 64..].as_mut_ptr() as *mut __m256i, q5_e);
+            _mm256_storeu_si256(flat[k * 64 + 32..].as_mut_ptr() as *mut __m256i, q5_o);
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+
+    for r in 0..m {
+        let q8 = &q8s[r];
+        let mut sumf = 0f32;
+        for b in 0..nb {
+            let (mut sd, mut sm) = (0i32, 0i32);
+            let flat = &q5_flat[b * 256..b * 256 + 256];
+            let q8b = &q8.qs[b * 256..b * 256 + 256];
+            for j in 0..4usize {
+                let (sc_e, m_e) = (sc_arr[b][2 * j], m_arr[b][2 * j]);
+                let (sc_o, m_o) = (sc_arr[b][2 * j + 1], m_arr[b][2 * j + 1]);
+                let q5_e = _mm256_loadu_si256(flat[j * 64..].as_ptr() as *const __m256i);
+                let q5_o = _mm256_loadu_si256(flat[j * 64 + 32..].as_ptr() as *const __m256i);
+                let q8_e = _mm256_loadu_si256(q8b[2 * j * 32..].as_ptr() as *const __m256i);
+                let q8_o = _mm256_loadu_si256(q8b[(2 * j + 1) * 32..].as_ptr() as *const __m256i);
+                let prod_e = _mm256_maddubs_epi16(q5_e, q8_e);
+                let sum32_e = _mm256_madd_epi16(prod_e, ones);
+                let iprod_e = hadd_i32_ymm(sum32_e);
+                let prod_o = _mm256_maddubs_epi16(q5_o, q8_o);
+                let sum32_o = _mm256_madd_epi16(prod_o, ones);
+                let iprod_o = hadd_i32_ymm(sum32_o);
+                let isum_e = q8.bsums[b * 8 + 2 * j];
+                let isum_o = q8.bsums[b * 8 + 2 * j + 1];
+                sd += sc_e as i32 * iprod_e + sc_o as i32 * iprod_o;
+                sm += m_e as i32 * isum_e + m_o as i32 * isum_o;
+            }
+            sumf += q8.d[b] * (d_arr[b] * sd as f32 - dmin_arr[b] * sm as f32);
+        }
+        out[r] = sumf;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+unsafe fn vec_dot_q5k_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let m = q8s.len();
+    let nb = in_f / 256;
+    let mask_lo = _mm256_set1_epi8(0x0F_u8 as i8);
+    let sixteen = _mm256_set1_epi8(0x10_u8 as i8);
+    let ones512 = _mm512_set1_epi16(1i16);
+    let zero256 = _mm256_setzero_si256();
+
+    // Pre-expand q5: same flat layout as AVX2 batch (k*64 = [even 32B, odd 32B]).
+    let mut d_arr = vec![0f32; nb];
+    let mut dmin_arr = vec![0f32; nb];
+    let mut sc_arr = vec![[0u32; 8]; nb];
+    let mut m_arr = vec![[0u32; 8]; nb];
+    let mut q5_flat = vec![0u8; nb * 256];
+
+    for b in 0..nb {
+        let blk = &row[b * 176..b * 176 + 176];
+        d_arr[b] = crate::rdf16(&blk[0..2]);
+        dmin_arr[b] = crate::rdf16(&blk[2..4]);
+        let scales = &blk[4..16];
+        let qh = &blk[16..48];
+        let ql = &blk[48..176];
+        for s in 0..8usize {
+            let (sc, mv) = crate::k4(s, scales);
+            sc_arr[b][s] = sc;
+            m_arr[b][s] = mv;
+        }
+        let qh_ymm = _mm256_loadu_si256(qh.as_ptr() as *const __m256i);
+        let flat = &mut q5_flat[b * 256..b * 256 + 256];
+        let mut u1 = 1u8;
+        let mut u2 = 2u8;
+        for k in 0..4usize {
+            let nibbles = _mm256_loadu_si256(ql[k * 32..].as_ptr() as *const __m256i);
+            let lo_nib = _mm256_and_si256(nibbles, mask_lo);
+            let hi_nib = _mm256_and_si256(_mm256_srli_epi16(nibbles, 4), mask_lo);
+            let u1v = _mm256_set1_epi8(u1 as i8);
+            let u2v = _mm256_set1_epi8(u2 as i8);
+            let has_e = _mm256_and_si256(qh_ymm, u1v);
+            let has_o = _mm256_and_si256(qh_ymm, u2v);
+            let high_e = _mm256_andnot_si256(_mm256_cmpeq_epi8(has_e, zero256), sixteen);
+            let high_o = _mm256_andnot_si256(_mm256_cmpeq_epi8(has_o, zero256), sixteen);
+            let q5_e = _mm256_or_si256(lo_nib, high_e);
+            let q5_o = _mm256_or_si256(hi_nib, high_o);
+            _mm256_storeu_si256(flat[k * 64..].as_mut_ptr() as *mut __m256i, q5_e);
+            _mm256_storeu_si256(flat[k * 64 + 32..].as_mut_ptr() as *mut __m256i, q5_o);
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+
+    for r in 0..m {
+        let q8 = &q8s[r];
+        let mut sumf = 0f32;
+        for b in 0..nb {
+            let (mut sd, mut sm) = (0i32, 0i32);
+            let flat = &q5_flat[b * 256..b * 256 + 256];
+            let q8b = &q8.qs[b * 256..b * 256 + 256];
+            for k in 0..4usize {
+                let (sc_e, m_e) = (sc_arr[b][2 * k], m_arr[b][2 * k]);
+                let (sc_o, m_o) = (sc_arr[b][2 * k + 1], m_arr[b][2 * k + 1]);
+                // flat[k*64..+64]: lower 32B = even sub-block, upper 32B = odd
+                let q5_zmm = _mm512_loadu_si512(flat[k * 64..].as_ptr() as *const __m512i);
+                let q8_zmm = _mm512_loadu_si512(q8b[k * 64..].as_ptr() as *const __m512i);
+                let prod = _mm512_maddubs_epi16(q5_zmm, q8_zmm);
+                let sum32_z = _mm512_madd_epi16(prod, ones512);
+                let lo_ymm = _mm512_castsi512_si256(sum32_z);
+                let hi_ymm = _mm512_extracti64x4_epi64::<1>(sum32_z);
+                let iprod_e = hadd_i32_ymm(lo_ymm);
+                let iprod_o = hadd_i32_ymm(hi_ymm);
+                let isum_e = q8.bsums[b * 8 + 2 * k];
+                let isum_o = q8.bsums[b * 8 + 2 * k + 1];
+                sd += sc_e as i32 * iprod_e + sc_o as i32 * iprod_o;
+                sm += m_e as i32 * isum_e + m_o as i32 * isum_o;
+            }
+            sumf += q8.d[b] * (d_arr[b] * sd as f32 - dmin_arr[b] * sm as f32);
+        }
+        out[r] = sumf;
+    }
+}
+
+fn vec_dot_q5k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512bw") {
+            return unsafe { vec_dot_q5k_batch_avx512bw(row, q8s, in_f, out) };
+        }
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { vec_dot_q5k_batch_avx2(row, q8s, in_f, out) };
+        }
+    }
+    vec_dot_q5k_batch_scalar(row, q8s, in_f, out);
+}
+
 /// `Σ f16_weight·x` (weight is 2 bytes/elem). `target-cpu=native` lowers the f16→f32 to F16C.
 fn dot_f16(w: &[u8], x: &[f32]) -> f32 {
     let mut acc = [0f32; 8];
@@ -1208,9 +2303,11 @@ impl Backend for CpuBackend {
                             };
                         });
                     } else {
-                        // PREFILL (m > 1): parallelize over output rows (one weight row per task),
-                        // reuse each weight row across all m token activations, use the same fast
-                        // Q8 integer-dot kernels as the decode path.
+                        // PREFILL (m > 1): parallelize over output rows (one weight row per task).
+                        // For quant types, use the batched dot kernels: the weight row is decoded
+                        // ONCE per output row (inside the batch fn), then the integer dot is
+                        // repeated across all m token activations — amortising the expensive
+                        // nibble/bit unpacking that the single-token path was redoing m times.
                         //
                         // Layout: out[r * out_f + o].  We accumulate into a transposed buffer
                         // out_t[o * m + r] (contiguous in o-major order) so each parallel chunk
@@ -1224,54 +2321,64 @@ impl Backend for CpuBackend {
                                 Vec::new()
                             };
                         let mut out_t = vec![0f32; out_f * m];
-                        out_t.par_chunks_mut(m).enumerate().for_each(|(o, chunk)| {
-                            let row = &wbytes[o * bpr..o * bpr + bpr];
-                            match dt {
-                                DType::Q4K => {
-                                    for r in 0..m {
-                                        chunk[r] = vec_dot_q4k(row, &q8s[r], in_f);
-                                    }
-                                }
-                                DType::Q6K => {
-                                    for r in 0..m {
-                                        chunk[r] = vec_dot_q6k(row, &q8s[r], in_f);
-                                    }
-                                }
-                                DType::Q8_0 => {
-                                    for r in 0..m {
-                                        chunk[r] = vec_dot_q8_0(row, &q8s[r], in_f);
-                                    }
-                                }
-                                DType::Q5K => {
-                                    for r in 0..m {
-                                        chunk[r] = vec_dot_q5k(row, &q8s[r], in_f);
-                                    }
-                                }
-                                DType::F32 => {
-                                    let w32: &[f32] = bytemuck::cast_slice(row);
-                                    for r in 0..m {
-                                        chunk[r] = dot(w32, &xs[r * in_f..r * in_f + in_f]);
-                                    }
-                                }
-                                DType::F16 => {
-                                    for r in 0..m {
-                                        chunk[r] = dot_f16(row, &xs[r * in_f..r * in_f + in_f]);
-                                    }
-                                }
-                                DType::Bf16 => {
-                                    for r in 0..m {
-                                        chunk[r] = dot_bf16(row, &xs[r * in_f..r * in_f + in_f]);
-                                    }
-                                }
-                                _ => {
-                                    // Dequant the weight row ONCE, reuse across all m tokens.
-                                    let wf = bytes_to_f32(row, dt);
-                                    for r in 0..m {
-                                        chunk[r] = dot(&wf, &xs[r * in_f..r * in_f + in_f]);
-                                    }
-                                }
+                        // For Q4_K, use 2-row tiling: each rayon task handles two consecutive
+                        // output rows and shares the Q8 activation loads between them.
+                        // This halves the L3 bandwidth for activation reads (dominant bottleneck).
+                        if dt == DType::Q4K && out_f >= 2 {
+                            let pairs = out_f / 2;
+                            let (even_t, odd_t) = out_t.split_at_mut(pairs * 2 * m);
+                            // Process pairs of output rows together.
+                            even_t
+                                .par_chunks_mut(2 * m)
+                                .enumerate()
+                                .for_each(|(pair, dc)| {
+                                    let o = pair * 2;
+                                    let (chunk_a, chunk_b) = dc.split_at_mut(m);
+                                    let row_a = &wbytes[o * bpr..o * bpr + bpr];
+                                    let row_b = &wbytes[(o + 1) * bpr..(o + 1) * bpr + bpr];
+                                    vec_dot_q4k_batch2(row_a, row_b, &q8s, in_f, chunk_a, chunk_b);
+                                });
+                            // Handle last row if out_f is odd.
+                            if out_f % 2 != 0 {
+                                let o = out_f - 1;
+                                let row = &wbytes[o * bpr..o * bpr + bpr];
+                                vec_dot_q4k_batch(row, &q8s, in_f, odd_t);
                             }
-                        });
+                        } else {
+                            out_t.par_chunks_mut(m).enumerate().for_each(|(o, chunk)| {
+                                let row = &wbytes[o * bpr..o * bpr + bpr];
+                                match dt {
+                                    DType::Q4K => vec_dot_q4k_batch(row, &q8s, in_f, chunk),
+                                    DType::Q6K => vec_dot_q6k_batch(row, &q8s, in_f, chunk),
+                                    DType::Q8_0 => vec_dot_q8_0_batch(row, &q8s, in_f, chunk),
+                                    DType::Q5K => vec_dot_q5k_batch(row, &q8s, in_f, chunk),
+                                    DType::F32 => {
+                                        let w32: &[f32] = bytemuck::cast_slice(row);
+                                        for r in 0..m {
+                                            chunk[r] = dot(w32, &xs[r * in_f..r * in_f + in_f]);
+                                        }
+                                    }
+                                    DType::F16 => {
+                                        for r in 0..m {
+                                            chunk[r] = dot_f16(row, &xs[r * in_f..r * in_f + in_f]);
+                                        }
+                                    }
+                                    DType::Bf16 => {
+                                        for r in 0..m {
+                                            chunk[r] =
+                                                dot_bf16(row, &xs[r * in_f..r * in_f + in_f]);
+                                        }
+                                    }
+                                    _ => {
+                                        // Dequant the weight row ONCE, reuse across all m tokens.
+                                        let wf = bytes_to_f32(row, dt);
+                                        for r in 0..m {
+                                            chunk[r] = dot(&wf, &xs[r * in_f..r * in_f + in_f]);
+                                        }
+                                    }
+                                }
+                            });
+                        }
                         // Transpose out_t[o * m + r] → out[r * out_f + o].
                         for o in 0..out_f {
                             for r in 0..m {
@@ -2964,5 +4071,116 @@ mod kernel_tests {
             .map(|&v| f32::from_bits((v.to_bits() >> 16) << 16))
             .collect();
         assert!(rel_err(dot_bf16(&wbytes, &x), dot(&wref, &x)) < 1e-4);
+    }
+
+    // ── Batch kernel bit-identity tests ──────────────────────────────────────
+    //
+    // For each quant type, assert that `vec_dot_qXk_batch` produces the same
+    // f32 bits as calling `vec_dot_qXk` per-activation on every token.
+
+    #[test]
+    fn q4k_batch_bit_identical_to_single() {
+        let in_f = 512; // 2 super-blocks
+        let nb = in_f / 256;
+        let m = 7usize; // odd count to test non-power-of-2
+        let mut w = det_bytes(nb * 144, 20);
+        for k in 0..nb {
+            put_f16(&mut w[k * 144..k * 144 + 2], 0.05);
+            put_f16(&mut w[k * 144 + 2..k * 144 + 4], 0.015);
+        }
+        let q8s: Vec<Q8> = (0..m)
+            .map(|r| quantize_q8(&det_x(in_f, 30 + r as u64)))
+            .collect();
+        let mut batch_out = vec![0f32; m];
+        vec_dot_q4k_batch(&w, &q8s, in_f, &mut batch_out);
+        for r in 0..m {
+            let want = vec_dot_q4k(&w, &q8s[r], in_f);
+            assert_eq!(
+                batch_out[r].to_bits(),
+                want.to_bits(),
+                "q4k batch[{r}]: got {}, want {}",
+                batch_out[r],
+                want,
+            );
+        }
+    }
+
+    #[test]
+    fn q6k_batch_bit_identical_to_single() {
+        let in_f = 512;
+        let nb = in_f / 256;
+        let m = 5usize;
+        let mut w = det_bytes(nb * 210, 21);
+        for k in 0..nb {
+            put_f16(&mut w[k * 210 + 208..k * 210 + 210], 0.04);
+        }
+        let q8s: Vec<Q8> = (0..m)
+            .map(|r| quantize_q8(&det_x(in_f, 40 + r as u64)))
+            .collect();
+        let mut batch_out = vec![0f32; m];
+        vec_dot_q6k_batch(&w, &q8s, in_f, &mut batch_out);
+        for r in 0..m {
+            let want = vec_dot_q6k(&w, &q8s[r], in_f);
+            assert_eq!(
+                batch_out[r].to_bits(),
+                want.to_bits(),
+                "q6k batch[{r}]: got {}, want {}",
+                batch_out[r],
+                want,
+            );
+        }
+    }
+
+    #[test]
+    fn q8_0_batch_bit_identical_to_single() {
+        let in_f = 512; // 2 super-blocks = 16 Q8_0 weight blocks
+        let nb_w = in_f / 32;
+        let m = 6usize;
+        let mut w = det_bytes(nb_w * 34, 22);
+        for k in 0..nb_w {
+            put_f16(&mut w[k * 34..k * 34 + 2], 0.03);
+        }
+        let q8s: Vec<Q8> = (0..m)
+            .map(|r| quantize_q8(&det_x(in_f, 50 + r as u64)))
+            .collect();
+        let mut batch_out = vec![0f32; m];
+        vec_dot_q8_0_batch(&w, &q8s, in_f, &mut batch_out);
+        for r in 0..m {
+            let want = vec_dot_q8_0(&w, &q8s[r], in_f);
+            assert_eq!(
+                batch_out[r].to_bits(),
+                want.to_bits(),
+                "q8_0 batch[{r}]: got {}, want {}",
+                batch_out[r],
+                want,
+            );
+        }
+    }
+
+    #[test]
+    fn q5k_batch_bit_identical_to_single() {
+        let in_f = 512;
+        let nb = in_f / 256;
+        let m = 4usize;
+        let mut w = det_bytes(nb * 176, 23);
+        for k in 0..nb {
+            put_f16(&mut w[k * 176..k * 176 + 2], 0.05);
+            put_f16(&mut w[k * 176 + 2..k * 176 + 4], 0.01);
+        }
+        let q8s: Vec<Q8> = (0..m)
+            .map(|r| quantize_q8(&det_x(in_f, 60 + r as u64)))
+            .collect();
+        let mut batch_out = vec![0f32; m];
+        vec_dot_q5k_batch(&w, &q8s, in_f, &mut batch_out);
+        for r in 0..m {
+            let want = vec_dot_q5k(&w, &q8s[r], in_f);
+            assert_eq!(
+                batch_out[r].to_bits(),
+                want.to_bits(),
+                "q5k batch[{r}]: got {}, want {}",
+                batch_out[r],
+                want,
+            );
+        }
     }
 }
