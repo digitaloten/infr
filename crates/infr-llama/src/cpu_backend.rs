@@ -1,5 +1,6 @@
 //! CPU reference backend — a correctness-first interpreter of the backend-agnostic
-//! [`infr_core`] compute [`Graph`]. No SIMD, no threading yet: every op is a plain scalar loop.
+//! [`infr_core`] compute [`Graph`]. Projection matmuls and attention use rayon for multi-core
+//! parallelism; QK/PV inner loops use an 8-accumulator dot for AVX autovectorization.
 //! Weights are read **zero-copy from the GGUF mmap** (no `memcpy`, no owned RAM): the bulk
 //! projection weights (`Op::Linear`) are dequantized one row at a time straight from the mapping
 //! inside the dot, so 12B / MoE models cost only their on-disk size in page cache. Only the tiny
@@ -1135,18 +1136,24 @@ impl Backend for CpuBackend {
                         AttnMask::SlidingWindow(w) => w,
                     };
                     let mut out = vec![0f32; rows * nh * hd];
-                    for ti in 0..rows {
-                        let abs = pos as usize + ti; // absolute position of this query
-                        for h in 0..nh {
+                    // Each (ti, h) pair writes exactly one hd-sized output slice with no
+                    // cross-iteration deps → embarrassingly parallel.  Chunk index i = ti*nh+h.
+                    out.par_chunks_mut(hd)
+                        .enumerate()
+                        .for_each(|(i, ob_slice)| {
+                            let ti = i / nh;
+                            let h = i % nh;
                             let kvh = h / group;
                             let qb = (ti * nh + h) * hd;
-                            // visible keys: [lo, abs] (causal); SWA clips lo to abs-window+1.
+                            let abs = pos as usize + ti; // absolute position of this query
+                                                         // visible keys: [lo, abs] (causal); SWA clips lo to abs-window+1.
                             let lo = if window > 0 && abs + 1 > window {
                                 abs + 1 - window
                             } else {
                                 0
                             };
-                            let mut sc = vec![0f32; abs + 1 - lo];
+                            let n_keys = abs + 1 - lo;
+                            let mut sc = vec![0f32; n_keys];
                             let mut mx = f32::NEG_INFINITY;
                             for (jj, scj) in sc.iter_mut().enumerate() {
                                 let j = lo + jj;
@@ -1156,20 +1163,18 @@ impl Backend for CpuBackend {
                                 mx = mx.max(*scj);
                             }
                             let mut l = 0f32;
-                            for s in &sc {
+                            for &s in &sc {
                                 l += (s - mx).exp();
                             }
-                            let ob = (ti * nh + h) * hd;
-                            for (jj, s) in sc.iter().enumerate() {
+                            for (jj, &s) in sc.iter().enumerate() {
                                 let j = lo + jj;
                                 let p = (s - mx).exp() / l;
                                 let vb = (j * nkv + kvh) * hd;
                                 for x in 0..hd {
-                                    out[ob + x] += p * vs[vb + x];
+                                    ob_slice[x] += p * vs[vb + x];
                                 }
                             }
-                        }
-                    }
+                        });
                     vals[dst.0 as usize] = out;
                 }
                 Op::GatedAct {
