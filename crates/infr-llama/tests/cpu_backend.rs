@@ -3,10 +3,46 @@
 //! run the backend-agnostic compute Graph on the CPU reference backend (no GPU); the GPU goldens run
 //! the production Vulkan path. Both are captured with `INFR_BLESS=1` and read for coherence.
 //!
-//! Run (CPU goldens need only the GGUF; GPU goldens also need a Vulkan GPU):
-//!   INFR_TEMP=0 cargo test --release -p infr-llama --test cpu_backend -- --ignored --nocapture
+//! These are NOT `#[ignore]`d — each self-skips at runtime when its GGUF isn't in the HF cache (and
+//! the GPU goldens additionally skip when no Vulkan device is present), so they RUN automatically
+//! wherever the models + hardware exist, and quietly no-op elsewhere:
+//!   INFR_TEMP=0 cargo test --release -p infr-llama --test cpu_backend -- --nocapture
 
 use std::path::PathBuf;
+
+/// Locate a cached GGUF `<file>` under `~/.cache/huggingface/hub/models--<repo>/snapshots/*/`, or
+/// `None` if it isn't downloaded (the test self-skips). `repo` is the HF id with `/` → `--`.
+fn find_gguf(repo: &str, file: &str) -> Option<PathBuf> {
+    let hub = std::env::var("HOME").ok()? + "/.cache/huggingface/hub";
+    let base = format!("{hub}/models--{repo}/snapshots");
+    std::fs::read_dir(&base).ok()?.find_map(|e| {
+        let f = e.ok()?.path().join(file);
+        f.exists().then_some(f)
+    })
+}
+
+/// Resolve a model path or self-skip the test (it runs only when the GGUF is present).
+macro_rules! need_model {
+    ($opt:expr, $what:expr) => {
+        match $opt {
+            Some(p) => p,
+            None => {
+                eprintln!("skip: {} not in the HF cache", $what);
+                return;
+            }
+        }
+    };
+}
+
+/// Self-skip the test when there's no Vulkan device (the GPU goldens run only with a GPU present).
+macro_rules! need_gpu {
+    () => {
+        if !infr_llama::gpu_available() {
+            eprintln!("skip: no Vulkan GPU");
+            return;
+        }
+    };
+}
 
 // ─── CPU-only correctness (no GPU) ───────────────────────────────────────────────
 //
@@ -43,33 +79,6 @@ fn cpu_gen(model: &infr_llama::CpuModel, prompt: &str, n: usize) -> String {
     out
 }
 
-/// Golden hashes of the deterministic CPU output `(prompt, n, fnv1a)`. Capture/refresh with
-/// `INFR_BLESS=1` (prints the tuples); paste them here. A buggy op flips the hash.
-// Captured + verified coherent (chat-templated, Qwen3 thinks then answers): "…France's capital is
-// Paris", a simple-terms computer explanation, an ocean paragraph.
-const QWEN3_GOLDEN: &[(&str, usize, u64)] = &[
-    ("The capital of France is", 32, 0xfd63781ea3bfa785),
-    (
-        "Explain how a computer works in simple terms.",
-        48,
-        0xcf56ba8c4bb5c455,
-    ),
-    (
-        "Write a short paragraph about the ocean.",
-        48,
-        0xe78aa4678afa273b,
-    ),
-];
-// Captured + verified coherent: "The capital of France is Paris. 😊", a brave-knight short story.
-const GEMMA3_GOLDEN: &[(&str, usize, u64)] = &[
-    ("The capital of France is", 32, 0xe5a37ab078db3a2c),
-    (
-        "Tell me a short story about a brave knight.",
-        48,
-        0x5147de9a0ddfae50,
-    ),
-];
-
 /// Assert (or, with `INFR_BLESS=1`, print) the golden hash for each case.
 fn check_golden(model: &infr_llama::CpuModel, cases: &[(&str, usize, u64)]) {
     let bless = std::env::var("INFR_BLESS").is_ok();
@@ -87,30 +96,6 @@ fn check_golden(model: &infr_llama::CpuModel, cases: &[(&str, usize, u64)]) {
         }
     }
 }
-
-fn qwen3_06b() -> PathBuf {
-    if let Ok(p) = std::env::var("INFR_TEST_MODEL") {
-        return PathBuf::from(p);
-    }
-    let hub = std::env::var("HOME").unwrap() + "/.cache/huggingface/hub";
-    let base = format!("{hub}/models--unsloth--Qwen3-0.6B-GGUF/snapshots");
-    for e in std::fs::read_dir(&base).expect("snapshots dir") {
-        let f = e.unwrap().path().join("Qwen3-0.6B-Q4_K_M.gguf");
-        if f.exists() {
-            return f;
-        }
-    }
-    panic!("Qwen3-0.6B gguf not found; set INFR_TEST_MODEL");
-}
-
-// ─── GPU integration goldens (need a Vulkan GPU) ─────────────────────────────────
-//
-// The GPU path is locked the SAME way as the CPU path: a plain-text prompt is rendered through the
-// model's jinja chat template, generated greedily on the GPU, and a stable FNV-1a of the output is
-// asserted. These hashes are GPU-specific (f16 + native-quant kernels, distinct from the CPU's f32),
-// so they get their own constants — captured with `INFR_BLESS=1` and read to confirm coherence. They
-// replace the old `cpu_matches_gpu_*` token-for-token checks, which were precision-brittle (CPU f32
-// vs GPU f16 split on greedy near-ties — not a bug; see the CPU-only note above).
 
 /// Greedy GPU generation: render the plain-text prompt with the model's chat template, generate on
 /// the GPU dense path, return the text. The production GPU path; mirrors [`cpu_gen`].
@@ -144,6 +129,48 @@ fn check_gpu_golden(gen: impl Fn(&str, usize) -> String, cases: &[(&str, usize, 
     }
 }
 
+// ─── Qwen3-0.6B (dense) ───────────────────────────────────────────────────────────
+
+fn qwen3_06b() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("INFR_TEST_MODEL") {
+        return Some(PathBuf::from(p));
+    }
+    find_gguf("unsloth--Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q4_K_M.gguf")
+}
+
+/// Path to a specific Qwen3-0.6B quantization in the HF cache (for the quant-coverage sweep).
+fn qwen3_quant(quant: &str) -> Option<PathBuf> {
+    find_gguf(
+        "unsloth--Qwen3-0.6B-GGUF",
+        &format!("Qwen3-0.6B-{quant}.gguf"),
+    )
+}
+
+// Captured + verified coherent (chat-templated, Qwen3 thinks then answers): "…France's capital is
+// Paris", a simple-terms computer explanation, an ocean paragraph.
+const QWEN3_GOLDEN: &[(&str, usize, u64)] = &[
+    ("The capital of France is", 32, 0xfd63781ea3bfa785),
+    (
+        "Explain how a computer works in simple terms.",
+        48,
+        0xcf56ba8c4bb5c455,
+    ),
+    (
+        "Write a short paragraph about the ocean.",
+        48,
+        0xe78aa4678afa273b,
+    ),
+];
+
+/// CPU-only: the deterministic Qwen3 output (short + long) must match its golden hash.
+#[test]
+fn cpu_golden_qwen3() {
+    let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
+    std::env::set_var("INFR_TEMP", "0");
+    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    check_golden(&model, QWEN3_GOLDEN);
+}
+
 // Captured + verified coherent on the GPU (chat-templated Qwen3-0.6B Q4_K_M).
 const QWEN3_GPU_GOLDEN: &[(&str, usize, u64)] = &[
     ("The capital of France is", 32, 0xfd63781ea3bfa785),
@@ -154,13 +181,53 @@ const QWEN3_GPU_GOLDEN: &[(&str, usize, u64)] = &[
     ),
 ];
 
-/// GPU dense Qwen3-0.6B golden-hash lock (replaces the old CPU-vs-GPU token-match test).
+/// GPU dense Qwen3-0.6B golden-hash lock.
 #[test]
-#[ignore = "needs a Vulkan GPU + the Qwen3-0.6B GGUF"]
 fn gpu_golden_qwen3() {
+    let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
+    need_gpu!();
     std::env::set_var("INFR_TEMP", "0");
-    let llama = infr_llama::Llama::load_opt(&qwen3_06b(), None).expect("load");
+    let llama = infr_llama::Llama::load_opt(&path, None).expect("load");
     check_gpu_golden(|p, n| gpu_gen(&llama, p, n), QWEN3_GPU_GOLDEN);
+}
+
+// CPU quant coverage: the SAME prompt through every available quantization of Qwen3-0.6B — legacy
+// round (Q4_0), k-quants (Q2_K/Q4_K/Q5_K/Q6_K), high-bit (Q8_0), i-quant codebook (IQ4_XS), and float
+// (BF16). Each exercises a different dequant/dot path; the per-quant golden hash is locked (each
+// verified coherent at capture). Missing quants are skipped. Refresh with `INFR_BLESS=1`.
+// All verified coherent at capture — every quant recalls "France's capital is Paris" (Q2_K is a
+// touch repetitive, as expected for 2-bit; higher-precision quants converge: Q4_K==Q6_K,
+// Q5_K==Q8_0==BF16).
+const QWEN3_QUANT_GOLDEN: &[(&str, usize, u64)] = &[
+    ("IQ4_XS", 32, 0xd028ff03b524cb28),
+    ("Q2_K", 32, 0x6442c2818c12ca56),
+    ("Q4_0", 32, 0x88221dcfca820246),
+    ("Q4_K_M", 32, 0xfd63781ea3bfa785),
+    ("Q5_K_M", 32, 0xb68f96c3aa8d22fe),
+    ("Q6_K", 32, 0xfd63781ea3bfa785),
+    ("Q8_0", 32, 0xb68f96c3aa8d22fe),
+    ("BF16", 32, 0xb68f96c3aa8d22fe),
+];
+
+#[test]
+fn cpu_golden_qwen3_quants() {
+    std::env::set_var("INFR_TEMP", "0");
+    let bless = std::env::var("INFR_BLESS").is_ok();
+    let prompt = "The capital of France is";
+    for (quant, n, want) in QWEN3_QUANT_GOLDEN {
+        let Some(path) = qwen3_quant(quant) else {
+            eprintln!("skip {quant}: not downloaded");
+            continue;
+        };
+        let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+        let out = cpu_gen(&model, prompt, *n);
+        let h = fnv1a(&out);
+        if bless {
+            println!("    ({quant:?}, {n}, 0x{h:016x}),  // {out:?}");
+        } else {
+            assert_eq!(h, *want, "quant {quant} golden changed\n  out: {out:?}");
+        }
+    }
 }
 
 // GPU quant coverage: the SAME prompt through every downloaded Qwen3-0.6B quant, all via the raw
@@ -178,18 +245,17 @@ const QWEN3_QUANT_GPU_GOLDEN: &[(&str, usize, u64)] = &[
     ("BF16", 32, 0xb68f96c3aa8d22fe),
 ];
 
-/// GPU native-upload coverage across quant formats: every available Qwen3-0.6B quant generated on the
-/// GPU, locked by golden hash. Proves the codebook IQ4_XS path runs natively alongside the affine
-/// k-quants. Refresh with `INFR_BLESS=1`.
+/// GPU native-upload coverage across quant formats — proves the codebook IQ4_XS path runs natively
+/// alongside the affine k-quants. Refresh with `INFR_BLESS=1`.
 #[test]
-#[ignore = "needs a Vulkan GPU + the Qwen3-0.6B GGUFs in several quants"]
 fn gpu_golden_qwen3_quants() {
+    need_gpu!();
     std::env::set_var("INFR_TEMP", "0");
     let bless = std::env::var("INFR_BLESS").is_ok();
     let prompt = "The capital of France is";
     for (quant, n, want) in QWEN3_QUANT_GPU_GOLDEN {
         let Some(path) = qwen3_quant(quant) else {
-            eprintln!("(skip {quant}: not downloaded)");
+            eprintln!("skip {quant}: not downloaded");
             continue;
         };
         let llama = infr_llama::Llama::load_opt(&path, None).expect("load");
@@ -203,16 +269,29 @@ fn gpu_golden_qwen3_quants() {
     }
 }
 
-fn gemma3_1b() -> PathBuf {
-    let hub = std::env::var("HOME").unwrap() + "/.cache/huggingface/hub";
-    let base = format!("{hub}/models--unsloth--gemma-3-1b-it-GGUF/snapshots");
-    for e in std::fs::read_dir(&base).expect("snapshots dir") {
-        let f = e.unwrap().path().join("gemma-3-1b-it-Q4_K_M.gguf");
-        if f.exists() {
-            return f;
-        }
-    }
-    panic!("gemma-3-1b gguf not found");
+// ─── Gemma 3 (dense) ────────────────────────────────────────────────────────────
+
+fn gemma3_1b() -> Option<PathBuf> {
+    find_gguf("unsloth--gemma-3-1b-it-GGUF", "gemma-3-1b-it-Q4_K_M.gguf")
+}
+
+// Captured + verified coherent: "The capital of France is Paris. 😊", a brave-knight short story.
+const GEMMA3_GOLDEN: &[(&str, usize, u64)] = &[
+    ("The capital of France is", 32, 0xe5a37ab078db3a2c),
+    (
+        "Tell me a short story about a brave knight.",
+        48,
+        0x5147de9a0ddfae50,
+    ),
+];
+
+/// CPU-only: Gemma 3 (sandwich norms, GeGLU, dual-RoPE, SWA) golden-hash lock.
+#[test]
+fn cpu_golden_gemma3() {
+    let path = need_model!(gemma3_1b(), "gemma-3-1b");
+    std::env::set_var("INFR_TEMP", "0");
+    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    check_golden(&model, GEMMA3_GOLDEN);
 }
 
 // Captured + verified coherent on the GPU (gemma-3-1b Q4_K_M: sandwich norms, GeGLU, dual-RoPE, SWA).
@@ -227,92 +306,18 @@ const GEMMA3_GPU_GOLDEN: &[(&str, usize, u64)] = &[
 
 /// GPU dense Gemma 3 golden-hash lock (sandwich norms, GeGLU, dual-RoPE, SWA, √n_embd embed scale).
 #[test]
-#[ignore = "needs a Vulkan GPU + the gemma-3-1b GGUF"]
 fn gpu_golden_gemma3() {
+    let path = need_model!(gemma3_1b(), "gemma-3-1b");
+    need_gpu!();
     std::env::set_var("INFR_TEMP", "0");
-    let llama = infr_llama::Llama::load_opt(&gemma3_1b(), None).expect("load");
+    let llama = infr_llama::Llama::load_opt(&path, None).expect("load");
     check_gpu_golden(|p, n| gpu_gen(&llama, p, n), GEMMA3_GPU_GOLDEN);
 }
 
-/// CPU-only (no GPU): the deterministic Qwen3 output (short + long) must match its golden hash. Any
-/// op regression flips the hash. Refresh with `INFR_BLESS=1`.
-#[test]
-#[ignore = "needs the Qwen3-0.6B GGUF (no GPU)"]
-fn cpu_golden_qwen3() {
-    std::env::set_var("INFR_TEMP", "0");
-    let model = infr_llama::CpuModel::load(&qwen3_06b(), None).expect("cpu load");
-    check_golden(&model, QWEN3_GOLDEN);
-}
+// ─── Qwen3.5 / Qwen3-Next (gated DeltaNet) ──────────────────────────────────────
 
-/// Path to a specific Qwen3-0.6B quantization in the HF cache (for the quant-coverage sweep).
-fn qwen3_quant(quant: &str) -> Option<PathBuf> {
-    let hub = std::env::var("HOME").unwrap() + "/.cache/huggingface/hub";
-    let base = format!("{hub}/models--unsloth--Qwen3-0.6B-GGUF/snapshots");
-    std::fs::read_dir(&base).ok()?.find_map(|e| {
-        let f = e.ok()?.path().join(format!("Qwen3-0.6B-{quant}.gguf"));
-        f.exists().then_some(f)
-    })
-}
-
-/// CPU-only quant coverage: the SAME prompt through every available quantization of Qwen3-0.6B —
-/// legacy round (Q4_0), k-quants (Q2_K/Q4_K/Q5_K/Q6_K), high-bit (Q8_0), i-quant codebook (IQ4_XS),
-/// and float (BF16). Each exercises a different dequant/dot path; the per-quant golden hash is locked
-/// (each verified coherent at capture). Missing quants are skipped. Refresh with `INFR_BLESS=1`.
-// All verified coherent at capture — every quant recalls "France's capital is Paris" (Q2_K is a
-// touch repetitive, as expected for 2-bit; higher-precision quants converge: Q4_K==Q6_K,
-// Q5_K==Q8_0==BF16).
-const QWEN3_QUANT_GOLDEN: &[(&str, usize, u64)] = &[
-    ("IQ4_XS", 32, 0xd028ff03b524cb28),
-    ("Q2_K", 32, 0x6442c2818c12ca56),
-    ("Q4_0", 32, 0x88221dcfca820246),
-    ("Q4_K_M", 32, 0xfd63781ea3bfa785),
-    ("Q5_K_M", 32, 0xb68f96c3aa8d22fe),
-    ("Q6_K", 32, 0xfd63781ea3bfa785),
-    ("Q8_0", 32, 0xb68f96c3aa8d22fe),
-    ("BF16", 32, 0xb68f96c3aa8d22fe),
-];
-
-#[test]
-#[ignore = "needs the Qwen3-0.6B GGUFs in several quants (no GPU)"]
-fn cpu_golden_qwen3_quants() {
-    std::env::set_var("INFR_TEMP", "0");
-    let bless = std::env::var("INFR_BLESS").is_ok();
-    let prompt = "The capital of France is";
-    for (quant, n, want) in QWEN3_QUANT_GOLDEN {
-        let Some(path) = qwen3_quant(quant) else {
-            eprintln!("(skip {quant}: not downloaded)");
-            continue;
-        };
-        let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
-        let out = cpu_gen(&model, prompt, *n);
-        let h = fnv1a(&out);
-        if bless {
-            println!("    ({quant:?}, {n}, 0x{h:016x}),  // {out:?}");
-        } else {
-            assert_eq!(h, *want, "quant {quant} golden changed\n  out: {out:?}");
-        }
-    }
-}
-
-/// CPU-only (no GPU): Gemma 3 (sandwich norms, GeGLU, dual-RoPE, SWA) golden-hash lock.
-#[test]
-#[ignore = "needs the gemma-3-1b GGUF (no GPU)"]
-fn cpu_golden_gemma3() {
-    std::env::set_var("INFR_TEMP", "0");
-    let model = infr_llama::CpuModel::load(&gemma3_1b(), None).expect("cpu load");
-    check_golden(&model, GEMMA3_GOLDEN);
-}
-
-fn qwen35_08b() -> PathBuf {
-    let hub = std::env::var("HOME").unwrap() + "/.cache/huggingface/hub";
-    let base = format!("{hub}/models--unsloth--Qwen3.5-0.8B-GGUF/snapshots");
-    for e in std::fs::read_dir(&base).expect("snapshots dir") {
-        let f = e.unwrap().path().join("Qwen3.5-0.8B-Q4_K_M.gguf");
-        if f.exists() {
-            return f;
-        }
-    }
-    panic!("Qwen3.5-0.8B gguf not found");
+fn qwen35_08b() -> Option<PathBuf> {
+    find_gguf("unsloth--Qwen3.5-0.8B-GGUF", "Qwen3.5-0.8B-Q4_K_M.gguf")
 }
 
 // Captured + verified coherent (qwen35 / Qwen3-Next: gated-DeltaNet + gated full-attention): "The
@@ -327,13 +332,12 @@ const QWEN35_GOLDEN: &[(&str, usize, u64)] = &[
     ),
 ];
 
-/// CPU-only (no GPU): qwen35 / Qwen3-Next golden-hash lock (the gated-DeltaNet recurrence + conv +
-/// gated full-attention path). Uses the dedicated `qwen35::generate_cpu` runner.
+/// CPU-only: qwen35 / Qwen3-Next golden-hash lock (gated-DeltaNet recurrence + conv + gated full
+/// attention). Uses the dedicated `qwen35::generate_cpu` runner.
 #[test]
-#[ignore = "needs the Qwen3.5-0.8B GGUF (no GPU)"]
 fn cpu_golden_qwen35() {
+    let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
     std::env::set_var("INFR_TEMP", "0");
-    let path = qwen35_08b();
     let bless = std::env::var("INFR_BLESS").is_ok();
     for (prompt, n, want) in QWEN35_GOLDEN {
         let rendered = infr_llama::qwen35::render_chat(&path, prompt).expect("render");
@@ -351,29 +355,23 @@ fn cpu_golden_qwen35() {
     }
 }
 
-fn qwen3moe_30b() -> PathBuf {
-    let hub = std::env::var("HOME").unwrap() + "/.cache/huggingface/hub";
-    let base = format!("{hub}/models--unsloth--Qwen3-30B-A3B-GGUF/snapshots");
-    for e in std::fs::read_dir(&base).expect("snapshots dir") {
-        let f = e.unwrap().path().join("Qwen3-30B-A3B-Q4_K_M.gguf");
-        if f.exists() {
-            return f;
-        }
-    }
-    panic!("Qwen3-30B-A3B gguf not found");
+// ─── Qwen3-MoE (routed experts) ─────────────────────────────────────────────────
+
+fn qwen3moe_30b() -> Option<PathBuf> {
+    find_gguf("unsloth--Qwen3-30B-A3B-GGUF", "Qwen3-30B-A3B-Q4_K_M.gguf")
 }
 
 // Captured + verified coherent (qwen3moe: routed-expert FFN, ~3B active of 30B).
 const QWEN3MOE_GOLDEN: &[(&str, usize, u64)] =
     &[("The capital of France is", 24, 0xdac3e0eea1da12ed)];
 
-/// CPU-only (no GPU): qwen3moe golden-hash lock (the Op::MoeFfn routed-expert path). 30B but only
-/// `n_used` experts run per token; still slow on CPU, so a single short case.
+/// CPU-only: qwen3moe golden-hash lock (the Op::MoeFfn routed-expert path). 30B but only `n_used`
+/// experts run per token; still slow on CPU, so a single short case.
 #[test]
-#[ignore = "needs the Qwen3-30B-A3B GGUF (no GPU); slow"]
 fn cpu_golden_qwen3moe() {
+    let path = need_model!(qwen3moe_30b(), "Qwen3-30B-A3B");
     std::env::set_var("INFR_TEMP", "0");
-    let model = infr_llama::CpuModel::load(&qwen3moe_30b(), None).expect("cpu load");
+    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
     check_golden(&model, QWEN3MOE_GOLDEN);
 }
 
@@ -384,37 +382,18 @@ const QWEN3MOE_GPU_GOLDEN: &[(&str, usize, u64)] =
 /// GPU qwen3moe golden-hash lock (routed-expert FFN: softmax router → top-k → renormalized weighted
 /// SwiGLU sum). Only `n_used` of 128 experts run per token; uses the dedicated MoE GPU forward.
 #[test]
-#[ignore = "needs a Vulkan GPU + the Qwen3-30B-A3B GGUF"]
 fn gpu_golden_qwen3moe() {
+    let path = need_model!(qwen3moe_30b(), "Qwen3-30B-A3B");
+    need_gpu!();
     std::env::set_var("INFR_TEMP", "0");
-    let llama = infr_llama::Llama::load_opt(&qwen3moe_30b(), None).expect("load");
+    let llama = infr_llama::Llama::load_opt(&path, None).expect("load");
     check_gpu_golden(|p, n| gpu_gen_moe(&llama, p, n), QWEN3MOE_GPU_GOLDEN);
 }
 
-fn gemma4_e2b() -> PathBuf {
-    let hub = std::env::var("HOME").unwrap() + "/.cache/huggingface/hub";
-    let base = format!("{hub}/models--unsloth--gemma-4-E2B-it-GGUF/snapshots");
-    for e in std::fs::read_dir(&base).expect("snapshots dir") {
-        let f = e.unwrap().path().join("gemma-4-E2B-it-Q4_K_M.gguf");
-        if f.exists() {
-            return f;
-        }
-    }
-    panic!("gemma-4-E2B gguf not found");
-}
+// ─── Gemma 4 E2B (gemma3n: per-layer embeds + KV sharing) ───────────────────────
 
-// Captured + verified coherent on the GPU (gemma-4-E2B Q4_K_M: per-layer input embeds + KV sharing).
-const GEMMA4_E2B_GPU_GOLDEN: &[(&str, usize, u64)] =
-    &[("The capital of France is", 32, 0xfd644a0cebde4e73)];
-
-/// GPU Gemma 4 E2B (gemma3n) golden-hash lock: per-layer input embeddings + KV-layer sharing on top
-/// of the gemma4 dense path.
-#[test]
-#[ignore = "needs a Vulkan GPU + the gemma-4-E2B GGUF"]
-fn gpu_golden_gemma4_e2b() {
-    std::env::set_var("INFR_TEMP", "0");
-    let llama = infr_llama::Llama::load_opt(&gemma4_e2b(), None).expect("load");
-    check_gpu_golden(|p, n| gpu_gen(&llama, p, n), GEMMA4_E2B_GPU_GOLDEN);
+fn gemma4_e2b() -> Option<PathBuf> {
+    find_gguf("unsloth--gemma-4-E2B-it-GGUF", "gemma-4-E2B-it-Q4_K_M.gguf")
 }
 
 // Captured + verified coherent (gemma4 E2B: per-layer input embeds + KV sharing): "The capital of
@@ -428,25 +407,34 @@ const GEMMA4_E2B_GOLDEN: &[(&str, usize, u64)] = &[
     ),
 ];
 
-/// CPU-only (no GPU): Gemma 4 E2B golden-hash lock.
+/// CPU-only: Gemma 4 E2B golden-hash lock.
 #[test]
-#[ignore = "needs the gemma-4-E2B GGUF (no GPU)"]
 fn cpu_golden_gemma4_e2b() {
+    let path = need_model!(gemma4_e2b(), "gemma-4-E2B");
     std::env::set_var("INFR_TEMP", "0");
-    let model = infr_llama::CpuModel::load(&gemma4_e2b(), None).expect("cpu load");
+    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
     check_golden(&model, GEMMA4_E2B_GOLDEN);
 }
 
-fn gemma4_12b() -> PathBuf {
-    let hub = std::env::var("HOME").unwrap() + "/.cache/huggingface/hub";
-    let base = format!("{hub}/models--unsloth--gemma-4-12b-it-GGUF/snapshots");
-    for e in std::fs::read_dir(&base).expect("snapshots dir") {
-        let f = e.unwrap().path().join("gemma-4-12b-it-Q4_K_M.gguf");
-        if f.exists() {
-            return f;
-        }
-    }
-    panic!("gemma-4-12b gguf not found");
+// Captured + verified coherent on the GPU (gemma-4-E2B Q4_K_M: per-layer input embeds + KV sharing).
+const GEMMA4_E2B_GPU_GOLDEN: &[(&str, usize, u64)] =
+    &[("The capital of France is", 32, 0xfd644a0cebde4e73)];
+
+/// GPU Gemma 4 E2B (gemma3n) golden-hash lock: per-layer input embeddings + KV-layer sharing on top
+/// of the gemma4 dense path.
+#[test]
+fn gpu_golden_gemma4_e2b() {
+    let path = need_model!(gemma4_e2b(), "gemma-4-E2B");
+    need_gpu!();
+    std::env::set_var("INFR_TEMP", "0");
+    let llama = infr_llama::Llama::load_opt(&path, None).expect("load");
+    check_gpu_golden(|p, n| gpu_gen(&llama, p, n), GEMMA4_E2B_GPU_GOLDEN);
+}
+
+// ─── Gemma 4 12b (dense) ────────────────────────────────────────────────────────
+
+fn gemma4_12b() -> Option<PathBuf> {
+    find_gguf("unsloth--gemma-4-12b-it-GGUF", "gemma-4-12b-it-Q4_K_M.gguf")
 }
 
 // Captured + verified coherent on the GPU (gemma-4-12b Q4_K_M: per-layer SWA/full head dims,
@@ -458,9 +446,10 @@ const GEMMA4_12B_GPU_GOLDEN: &[(&str, usize, u64)] =
 /// reuse on full layers, proportional-RoPE freq_factors, attn scale 1.0, per-layer output scale,
 /// final softcap.
 #[test]
-#[ignore = "needs a Vulkan GPU + the gemma-4-12b GGUF"]
 fn gpu_golden_gemma4() {
+    let path = need_model!(gemma4_12b(), "gemma-4-12b");
+    need_gpu!();
     std::env::set_var("INFR_TEMP", "0");
-    let llama = infr_llama::Llama::load_opt(&gemma4_12b(), None).expect("load");
+    let llama = infr_llama::Llama::load_opt(&path, None).expect("load");
     check_gpu_golden(|p, n| gpu_gen(&llama, p, n), GEMMA4_12B_GPU_GOLDEN);
 }

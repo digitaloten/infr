@@ -424,6 +424,12 @@ fn no_template_err() -> anyhow::Error {
     )
 }
 
+/// Whether a Vulkan device is available — a cheap probe (creates and drops a backend). Lets callers
+/// (and tests) decide between the GPU and CPU paths, or skip GPU-only work when there's no device.
+pub fn gpu_available() -> bool {
+    VulkanBackend::new().is_ok()
+}
+
 /// Append chat-end markers in the vocab (`<|im_end|>` / `<|endoftext|>` / `<|eot_id|>`) to
 /// `cfg.eos_ids` so generation stops on any of them, not just the GGUF `eos`.
 fn add_chat_eos(cfg: &mut Config, tokenizer: &Tokenizer) {
