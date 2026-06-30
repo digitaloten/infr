@@ -846,6 +846,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "infr-chat"
+version = "0.0.0"
+dependencies = [
+ "infr-core",
+ "infr-gguf",
+ "minijinja",
+ "minijinja-contrib",
+ "serde_json",
+ "tokenizers",
+]
+
+[[package]]
 name = "infr-cli"
 version = "0.0.0"
 dependencies = [
@@ -888,6 +900,7 @@ name = "infr-engine"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "infr-chat",
  "infr-core",
  "infr-decode",
  "infr-gguf",
@@ -934,13 +947,11 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "half",
+ "infr-chat",
  "infr-core",
  "infr-gguf",
  "infr-vulkan",
- "minijinja",
- "minijinja-contrib",
  "rayon",
- "serde_json",
  "tokenizers",
  "tracing",
 ]

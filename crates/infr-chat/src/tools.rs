@@ -1,5 +1,5 @@
-//! Pure-logic chat helpers — channel splitting, tool-call parsing, message normalisation,
-//! and chat-template rendering. No GPU, no model, no IO.
+//! Parsing model OUTPUT back into structured pieces — channel splitting (reasoning vs answer),
+//! `<|tool_call>…<tool_call|>` block parsing, and inbound message normalisation. Pure logic, no IO.
 //!
 //! Reference: `~/Projects/scratch/dgemma-openai-server.py` (Python shim).
 //! Token formats: docs/PLAN.md "DiffusionGemma spec".

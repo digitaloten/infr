@@ -7,6 +7,7 @@ members = [
     "crates/infr-gguf",
     "crates/infr-model",
     "crates/infr-decode",
+    "crates/infr-chat",
     "crates/infr-engine",
     "crates/infr-server",
     "crates/infr-llama",
@@ -27,6 +28,7 @@ infr-hub = { path = "crates/infr-hub" }
 infr-gguf = { path = "crates/infr-gguf" }
 infr-model = { path = "crates/infr-model" }
 infr-decode = { path = "crates/infr-decode" }
+infr-chat = { path = "crates/infr-chat" }
 infr-engine = { path = "crates/infr-engine" }
 infr-server = { path = "crates/infr-server" }
 

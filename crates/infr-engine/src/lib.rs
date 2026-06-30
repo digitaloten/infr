@@ -5,23 +5,15 @@
 //! See docs/PLAN.md "engine".
 #![allow(dead_code, unused_variables)]
 
-pub mod chat;
-
-pub use chat::{normalize_messages, parse_tool_calls, split_channels, ToolCall};
+// Chat text logic (prompt rendering, channel/tool-call parsing, message types) lives in the shared
+// `infr-chat` crate so backends and the server share ONE implementation. Re-exported here for the
+// existing `infr_engine::{ChatMessage, …}` call sites.
+pub use infr_chat::{normalize_messages, parse_tool_calls, split_channels, ChatMessage, ToolCall};
 
 use std::path::Path;
 use std::sync::Arc;
 
 use infr_core::{error::Result, Backend};
-
-/// One chat message (OpenAI-shaped; tool fields preserved for the agentic round-trip).
-#[derive(Clone, Debug)]
-pub struct ChatMessage {
-    pub role: String,
-    pub content: String,
-    pub tool_call_id: Option<String>,
-    pub name: Option<String>,
-}
 
 /// A streamed piece of a response.
 #[derive(Clone, Debug)]
