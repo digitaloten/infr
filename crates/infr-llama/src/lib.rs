@@ -10,6 +10,9 @@
 
 mod config;
 pub mod cpu_backend;
+mod kv;
+pub(crate) use kv::{DecodeScratch, DenseDecodeScratch, PrefillScratch, QBufs};
+pub use kv::{KvCache, MoeConfig, MoeKv};
 mod sampling;
 pub use config::Config;
 pub(crate) use sampling::*;
@@ -209,107 +212,6 @@ impl CpuModel {
     }
 }
 
-/// Mixture-of-experts FFN parameters (qwen3moe): a softmax router picks `n_used` of `n_expert`
-/// experts per token, each a SwiGLU FFN of inner size `n_ff_exp`, summed by renormalized top-k
-/// weights (`scale` applied). Attention is identical to dense qwen3.
-#[derive(Clone, Copy, Debug)]
-pub struct MoeConfig {
-    pub n_expert: usize,
-    pub n_used: usize,
-    pub n_ff_exp: usize,
-    pub scale: f32,
-}
-
-/// State for the eager MoE generation: a GPU KV cache (so context competes for VRAM, like the dense
-/// path) + the streaming `ExpertPool` for `INFR_MOE_STREAM` (lazily created on first streamed layer).
-pub struct MoeKv {
-    kv: KvCache,
-    pool: Option<infr_vulkan::ExpertPool>,
-    /// Persistent decode scratch (Tier 0): the per-token activation buffers, allocated once and
-    /// reused every decode step instead of created/freed per token.
-    dec: Option<DecodeScratch>,
-    /// Persistent prefill expert scratch: one reusable buffer set the grouped-expert FFN reuses for
-    /// every active expert (instead of `create_buffer`/free ~8 buffers per expert per layer,
-    /// ~50k/chunk). Experts serialize through it (a barrier on reuse) — which a K-sweep showed they
-    /// did anyway (the win is removing the alloc churn, not concurrency). Sized for the largest chunk.
-    pf: Option<PrefillScratch>,
-    /// Record-once decode: the GPU-resident decode forward recorded into a resubmittable command
-    /// buffer, keyed by its attention structure `(use_split, chunk, n_chunks)`. Replayed each token
-    /// (only the params SSBO + embedding change) instead of re-recorded; re-recorded when the
-    /// signature changes (every ~chunk tokens) or never if it doesn't.
-    rec_decode: Option<((bool, usize, usize, bool), infr_vulkan::RecordedCmd)>,
-}
-
-/// A `(quants, scales, sums)` int8-activation buffer triple produced by `quant_q8`.
-type QBufs = (Box<dyn Buffer>, Box<dyn Buffer>, Box<dyn Buffer>);
-
-/// One reusable scratch set for a grouped prefill expert's SwiGLU. Sized for `m_pad` row capacity;
-/// an expert with fewer rows uses the leading prefix.
-struct PrefillScratch {
-    m_pad: usize,
-    xe: Box<dyn Buffer>,
-    ge: Box<dyn Buffer>,
-    ue: Box<dyn Buffer>,
-    ae: Box<dyn Buffer>,
-    ye: Box<dyn Buffer>,
-    gqa: Box<dyn Buffer>,
-    gda: Box<dyn Buffer>,
-    gsa: Box<dyn Buffer>,
-    dqa: Box<dyn Buffer>,
-    dda: Box<dyn Buffer>,
-    dsa: Box<dyn Buffer>,
-}
-
-/// Reusable GPU scratch for one decode step's forward (all buffers sized for a single token; the
-/// split-K attention buffers are sized for the cache's worst-case chunk count). Held by [`MoeKv`]
-/// so decode doesn't churn ~22 buffer create/free calls per token.
-struct DecodeScratch {
-    hidden: Box<dyn Buffer>,
-    hn: Box<dyn Buffer>,
-    hn2: Box<dyn Buffer>,
-    ao: Box<dyn Buffer>,
-    qr: Box<dyn Buffer>,
-    kr: Box<dyn Buffer>,
-    vr: Box<dyn Buffer>,
-    q_f16: Box<dyn Buffer>,
-    attn: Box<dyn Buffer>,
-    g: Box<dyn Buffer>,
-    u: Box<dyn Buffer>,
-    act: Box<dyn Buffer>,
-    y: Box<dyn Buffer>,
-    logits: Box<dyn Buffer>,
-    ids: Box<dyn Buffer>,
-    wts: Box<dyn Buffer>,
-    qa: Box<dyn Buffer>,
-    dact: Box<dyn Buffer>,
-    sact: Box<dyn Buffer>,
-    pm: Box<dyn Buffer>,
-    pl: Box<dyn Buffer>,
-    pacc: Box<dyn Buffer>,
-    /// Host-visible [pos, kv_len] u32 SSBO the `_dyn` decode kernels read, so the decode command
-    /// buffer can be recorded once and replayed (only this + the embedding change per token).
-    params: Box<dyn Buffer>,
-    /// Host-visible source for this token's embedding row: the recorded buffer copies `emb_in`→`hidden`
-    /// at its start, so the host just writes here (mapped, no submit) instead of a per-token upload.
-    emb_in: Box<dyn Buffer>,
-    /// lm-head scratch, folded into the replayed buffer for greedy decode (final norm + vocab GEMV +
-    /// argmax → `tok`), so the whole token is one replay + a 4-byte readback.
-    normed: Box<dyn Buffer>,
-    final_logits: Box<dyn Buffer>,
-    tok: Box<dyn Buffer>,
-}
-
-impl MoeKv {
-    /// Tokens currently resident in the cache (the next chunk's start position).
-    pub fn len(&self) -> usize {
-        self.kv.len
-    }
-    /// True when no tokens are resident yet.
-    pub fn is_empty(&self) -> bool {
-        self.kv.len == 0
-    }
-}
-
 struct LayerWeights {
     attn_norm: Vec<f32>,
     ffn_norm: Vec<f32>,
@@ -415,50 +317,6 @@ pub struct Llama {
     /// The model's GGUF, kept mmap-alive so host-backed MoE experts can read their bytes on demand
     /// (zero-copy from the OS page cache) instead of duplicating them into RAM.
     gguf: Gguf,
-}
-
-/// Per-layer key/value cache held on the GPU (persists across decode steps).
-pub struct KvCache {
-    k: Vec<Box<dyn Buffer>>, // per layer: [max_ctx, n_kv*head_dim]
-    v: Vec<Box<dyn Buffer>>,
-    len: usize,
-    max_ctx: usize,
-    /// Record-once decode (Qwen3-style dense models): persistent per-token scratch + the recorded,
-    /// replayable command buffer keyed by `(use_split, chunk, n_chunks)` — mirrors the MoE decode path.
-    dec: Option<DenseDecodeScratch>,
-    rec_decode: Option<((bool, usize, usize), infr_vulkan::RecordedCmd)>,
-}
-
-/// Reusable single-token decode scratch for a dense (non-MoE) Qwen3 model (allocated once, replayed).
-struct DenseDecodeScratch {
-    hidden: Box<dyn Buffer>,
-    hn: Box<dyn Buffer>,
-    qr: Box<dyn Buffer>,
-    kr: Box<dyn Buffer>,
-    vr: Box<dyn Buffer>,
-    q_f16: Box<dyn Buffer>,
-    attn: Box<dyn Buffer>,
-    gu: Box<dyn Buffer>,
-    act: Box<dyn Buffer>,
-    hlast: Box<dyn Buffer>,
-    logits: Box<dyn Buffer>,
-    pm: Box<dyn Buffer>,
-    pl: Box<dyn Buffer>,
-    pacc: Box<dyn Buffer>,
-    params: Box<dyn Buffer>,
-    emb_in: Box<dyn Buffer>,
-}
-
-impl KvCache {
-    /// Tokens currently resident in the cache (the next forward's start position).
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// True when no tokens are resident yet.
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
 }
 
 pub(crate) fn meta_u64(g: &Gguf, key: &str) -> Option<u64> {
