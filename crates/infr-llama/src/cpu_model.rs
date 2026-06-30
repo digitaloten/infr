@@ -47,6 +47,48 @@ impl CpuModel {
         &self.cfg
     }
 
+    /// Run the dense decode through the agnostic compute seam on the **Vulkan** backend — the GPU
+    /// twin of [`generate_cpu`](Self::generate_cpu). Each native-dtype GGUF weight is padded + uploaded
+    /// to VRAM (the CPU path maps it zero-copy instead); the per-token [`infr_core::graph::Graph`] is
+    /// compiled + executed by `VulkanBackend`; greedy tokens are detokenized. Same graph, two
+    /// backends — this is the end-to-end dense CPU↔GPU parity path.
+    pub fn generate_dense_vulkan(&self, prompt: &str, max_new: usize) -> Result<String> {
+        use infr_core::backend::{Backend, Buffer, BufferUsage};
+        use infr_core::tensor::DType;
+        use infr_gguf::TensorBytes;
+        let enc = self
+            .tokenizer
+            .encode(prompt, false)
+            .map_err(|e| anyhow!("encode: {e}"))?;
+        let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
+        let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
+        // GPU weight binder: pad each native tensor to u32 alignment (what `linear_native` reads) and
+        // upload it to a VRAM `Weights` buffer.
+        let bind = |tb: TensorBytes, _dt: DType, _n: usize| -> Result<Box<dyn Buffer>> {
+            let padded = infr_vulkan::linear::pad_to_u32_align(tb.as_ref());
+            let b = vk
+                .alloc(padded.len(), BufferUsage::Weights)
+                .map_err(|e| anyhow!("alloc weight: {e}"))?;
+            vk.upload(b.as_ref(), &padded)
+                .map_err(|e| anyhow!("upload weight: {e}"))?;
+            Ok(b)
+        };
+        let (generated, _stats) = crate::cpu_backend::generate_dense_backend(
+            &vk,
+            &bind,
+            &self.gguf,
+            &self.cfg,
+            &self.token_embd,
+            self.per_layer_embd.as_ref(),
+            &prompt_tokens,
+            max_new,
+            |_| {},
+        )?;
+        self.tokenizer
+            .decode(&generated, true)
+            .map_err(|e| anyhow!("decode: {e}"))
+    }
+
     /// Render a user turn with the model's OWN embedded chat template (so an instruct model — Gemma,
     /// Qwen, … — answers coherently). Errors if the GGUF has no `tokenizer.chat_template` or it fails
     /// to render — infr only supports models that ship one (no fabricated-ChatML fallback).

@@ -191,6 +191,39 @@ fn gpu_golden_qwen3() {
     check_gpu_golden(|p, n| gpu_gen(&llama, p, n), QWEN3_GPU_GOLDEN);
 }
 
+// Captured + verified coherent on the Vulkan backend via the agnostic compute seam (the SAME dense
+// `Graph` the CPU oracle builds, mapped op-for-op to GPU kernels). Should reproduce the production
+// GPU path (QWEN3_GPU_GOLDEN) — the France case shares its hash (0xfd63781ea3bfa785), confirming the
+// seam matches the hand-written Recorder forward token-for-token.
+const QWEN3_SEAM_GOLDEN: &[(&str, usize, u64)] = &[
+    ("The capital of France is", 32, 0xfd63781ea3bfa785),
+    (
+        "Explain how a computer works in simple terms.",
+        48,
+        0xcf56ba8c4bb5c455,
+    ),
+];
+
+/// End-to-end dense parity: run the full Qwen3-0.6B dense forward on the **Vulkan** backend through
+/// the agnostic compute seam ([`CpuModel::generate_dense_vulkan`]) and lock its golden. The seam runs
+/// the identical `Graph` the CPU reference builds; this proves the dense forward maps faithfully to
+/// the GPU and reproduces the production GPU path (`gpu_golden_qwen3`).
+#[test]
+fn gpu_seam_golden_qwen3() {
+    let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
+    need_gpu!();
+    std::env::set_var("INFR_TEMP", "0");
+    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    check_gpu_golden(
+        |p, n| {
+            model
+                .generate_dense_vulkan(&model.render_chat(p).expect("render chat"), n)
+                .expect("seam gen")
+        },
+        QWEN3_SEAM_GOLDEN,
+    );
+}
+
 // CPU quant coverage: the SAME prompt through every available quantization of Qwen3-0.6B — legacy
 // round (Q4_0), k-quants (Q2_K/Q4_K/Q5_K/Q6_K), high-bit (Q8_0), i-quant codebook (IQ4_XS), and float
 // (BF16). Each exercises a different dequant/dot path; the per-quant golden hash is locked (each

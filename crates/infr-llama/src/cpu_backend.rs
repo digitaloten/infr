@@ -1083,10 +1083,42 @@ pub(crate) fn generate_dense_cpu(
     ple: Option<&PerLayerEmbd>,
     prompt: &[u32],
     max_new: usize,
+    on_token: impl FnMut(u32),
+) -> AResult<(Vec<u32>, CpuStats)> {
+    // Thin CPU wrapper over the backend-generic runner: a CpuBackend + a zero-copy weight binder
+    // (maps each tensor straight from the GGUF mmap — no alloc, no memcpy).
+    let cpu_be = CpuBackend::new();
+    generate_dense_backend(
+        &cpu_be,
+        &|tb, _dt, _n| Ok(cpu_be.map_weight(tb)),
+        g,
+        cfg,
+        token_embd,
+        ple,
+        prompt,
+        max_new,
+        on_token,
+    )
+}
+
+/// Backend-generic dense decode runner. Builds the agnostic decode [`Graph`] per token and runs it
+/// on `be` (CPU reference or Vulkan). `bind_weight` turns each native-dtype GGUF tensor into a
+/// backend buffer: the CPU maps it zero-copy from the mmap; the GPU pads + uploads it to VRAM. This
+/// is the single forward both backends share — running it on Vulkan and diffing the CPU oracle is
+/// the end-to-end dense parity check.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_dense_backend(
+    be: &dyn Backend,
+    bind_weight: &dyn Fn(TensorBytes, DType, usize) -> AResult<Box<dyn Buffer>>,
+    g: &Gguf,
+    cfg: &Config,
+    token_embd: &[f32],
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    max_new: usize,
     mut on_token: impl FnMut(u32),
 ) -> AResult<(Vec<u32>, CpuStats)> {
     let c = cfg;
-    let be = CpuBackend::new();
     let (ne, nh) = (c.n_embd, c.n_head);
     // gemma4: per-layer SWA/full dims differ; size shared scratch + KV by the max over layers.
     let max_hd = c.max_head_dim();
@@ -1155,7 +1187,7 @@ pub(crate) fn generate_dense_cpu(
             .clone();
         let numel: usize = info.shape.iter().product();
         let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
-        wbufs.push(be.map_weight(tb));
+        wbufs.push(bind_weight(tb, info.dtype, numel)?);
         wspecs.push((info.dtype, numel));
         Ok(())
     };
