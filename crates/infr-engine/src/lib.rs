@@ -8,7 +8,10 @@
 // Chat text logic (prompt rendering, channel/tool-call parsing, message types) lives in the shared
 // `infr-chat` crate so backends and the server share ONE implementation. Re-exported here for the
 // existing `infr_engine::{ChatMessage, …}` call sites.
-pub use infr_chat::{normalize_messages, parse_tool_calls, split_channels, ChatMessage, ToolCall};
+pub use infr_chat::{
+    normalize_messages, parse_hermes_tool_calls, parse_tool_calls, split_channels, split_think,
+    ChatMessage, ToolCall,
+};
 
 use std::path::Path;
 use std::sync::Arc;

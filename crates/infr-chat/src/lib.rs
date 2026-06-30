@@ -13,14 +13,21 @@
 mod template;
 mod tools;
 
-pub use template::{render_chat_jinja, render_chat_user};
-pub use tools::{normalize_messages, parse_tool_calls, split_channels, ToolCall};
+pub use template::{render_chat_jinja, render_chat_oai, render_chat_user};
+pub use tools::{
+    normalize_messages, parse_hermes_tool_calls, parse_tool_calls, split_channels, split_think,
+    ToolCall,
+};
 
 /// One chat message (OpenAI-shaped; tool fields preserved for the agentic round-trip).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// The assistant's OUTGOING tool calls (OpenAI `message.tool_calls`), replayed into the prompt on
+    /// the next turn so the model sees its own prior calls. Empty/None for non-assistant messages.
+    pub tool_calls: Option<Vec<ToolCall>>,
+    /// For a `tool`-role result message: which call it answers (OpenAI `tool_call_id`).
     pub tool_call_id: Option<String>,
     pub name: Option<String>,
 }

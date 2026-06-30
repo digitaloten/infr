@@ -30,7 +30,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use infr_engine::{ChatMessage, Delta, Engine};
+use infr_engine::{ChatMessage, Delta, Engine, ToolCall};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -79,6 +79,10 @@ pub struct ChatMessageDto {
     pub role: String,
     #[serde(default)]
     pub content: Option<serde_json::Value>,
+    /// Assistant's prior tool calls (OpenAI `[{id,type,function:{name,arguments}}]`), replayed on the
+    /// next turn so the model sees its own calls.
+    #[serde(default)]
+    pub tool_calls: Option<serde_json::Value>,
     #[serde(default)]
     pub tool_call_id: Option<String>,
     #[serde(default)]
@@ -556,9 +560,33 @@ fn dto_to_engine(dto: &ChatMessageDto) -> ChatMessage {
     ChatMessage {
         role: dto.role.clone(),
         content: flatten_content(&dto.content),
+        tool_calls: dto.tool_calls.as_ref().and_then(parse_oai_tool_calls),
         tool_call_id: dto.tool_call_id.clone(),
         name: dto.name.clone(),
     }
+}
+
+/// Convert an inbound OpenAI `tool_calls` array (`[{function:{name, arguments}}]`, where `arguments`
+/// is a JSON STRING) into engine [`ToolCall`]s with `arguments` parsed to a `Value`. Returns `None`
+/// if the field isn't a non-empty array of valid calls.
+fn parse_oai_tool_calls(v: &serde_json::Value) -> Option<Vec<ToolCall>> {
+    let arr = v.as_array()?;
+    let calls: Vec<ToolCall> = arr
+        .iter()
+        .filter_map(|c| {
+            let f = c.get("function")?;
+            let name = f.get("name")?.as_str()?.to_owned();
+            let arguments = match f.get("arguments") {
+                Some(serde_json::Value::String(s)) => {
+                    serde_json::from_str(s).unwrap_or(serde_json::Value::String(s.clone()))
+                }
+                Some(other) => other.clone(),
+                None => serde_json::Value::Object(serde_json::Map::new()),
+            };
+            Some(ToolCall { name, arguments })
+        })
+        .collect();
+    (!calls.is_empty()).then_some(calls)
 }
 
 // ---------------------------------------------------------------------------

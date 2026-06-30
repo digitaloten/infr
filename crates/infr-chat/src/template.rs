@@ -5,7 +5,10 @@
 use infr_core::loader::MetaValue;
 use infr_core::WeightSource; // brings `Gguf::metadata()` into scope
 use infr_gguf::Gguf;
+use serde_json::Value;
 use tokenizers::Tokenizer;
+
+use crate::ChatMessage;
 
 /// THE jinja chat renderer — turns `(role, content)` messages into a prompt via the GGUF's embedded
 /// `tokenizer.chat_template`. Template handling (pycompat, `enable_thinking`, bos/eos, tools) lives
@@ -16,6 +19,79 @@ pub fn render_chat_jinja(
     tokenizer: &Tokenizer,
     eos: u32,
     messages: &[(&str, &str)],
+    add_generation_prompt: bool,
+) -> Option<String> {
+    let msgs: Vec<Value> = messages
+        .iter()
+        .map(|(r, c)| serde_json::json!({ "role": r, "content": c }))
+        .collect();
+    render_core(
+        gguf,
+        tokenizer,
+        eos,
+        msgs,
+        Value::Null,
+        add_generation_prompt,
+    )
+}
+
+/// Render OpenAI-shaped [`ChatMessage`]s (full multi-turn history WITH tool calls + results) plus an
+/// optional `tools` spec through the GGUF's embedded chat template. This is the tool-calling entry
+/// point: the model's OWN template renders the tool definitions and wraps prior `tool_calls` /
+/// `tool` results in its native format — so infr never hardcodes a per-model tool syntax.
+///
+/// `tools` is the request's OpenAI `tools` array (`[{type:"function", function:{name, parameters}}]`)
+/// or `None`. Assistant `tool_calls` are emitted as `{type:"function", function:{name, arguments}}`
+/// with `arguments` as a JSON object (templates `| tojson` it).
+pub fn render_chat_oai(
+    gguf: &Gguf,
+    tokenizer: &Tokenizer,
+    eos: u32,
+    messages: &[ChatMessage],
+    tools: Option<&Value>,
+    add_generation_prompt: bool,
+) -> Option<String> {
+    let msgs: Vec<Value> = messages.iter().map(message_to_json).collect();
+    let tools = tools.cloned().unwrap_or(Value::Null);
+    render_core(gguf, tokenizer, eos, msgs, tools, add_generation_prompt)
+}
+
+/// Build the template's per-message dict, preserving the tool round-trip fields the HF chat templates
+/// read (`tool_calls`, `tool_call_id`, `name`).
+fn message_to_json(m: &ChatMessage) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("role".into(), m.role.clone().into());
+    obj.insert("content".into(), m.content.clone().into());
+    if let Some(calls) = &m.tool_calls {
+        let arr: Vec<Value> = calls
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": { "name": c.name, "arguments": c.arguments },
+                })
+            })
+            .collect();
+        obj.insert("tool_calls".into(), Value::Array(arr));
+    }
+    if let Some(id) = &m.tool_call_id {
+        obj.insert("tool_call_id".into(), id.clone().into());
+    }
+    if let Some(name) = &m.name {
+        obj.insert("name".into(), name.clone().into());
+    }
+    Value::Object(obj)
+}
+
+/// Core renderer: set up the minijinja env (pycompat, `raise_exception`, `tojson`), bind the prompt
+/// context (`messages`, `tools`, bos/eos, `enable_thinking`), and render. Shared by every entry
+/// point so template handling lives in ONE place.
+fn render_core(
+    gguf: &Gguf,
+    tokenizer: &Tokenizer,
+    eos: u32,
+    msgs: Vec<Value>,
+    tools: Value,
     add_generation_prompt: bool,
 ) -> Option<String> {
     let template = gguf.metadata().str("tokenizer.chat_template")?;
@@ -49,13 +125,9 @@ pub fn render_chat_jinja(
         return None;
     }
     let tmpl = env.get_template("chat").ok()?;
-    let msgs: Vec<serde_json::Value> = messages
-        .iter()
-        .map(|(r, c)| serde_json::json!({ "role": r, "content": c }))
-        .collect();
     let mut ctx = serde_json::Map::new();
-    ctx.insert("messages".into(), serde_json::Value::Array(msgs));
-    ctx.insert("tools".into(), serde_json::Value::Null);
+    ctx.insert("messages".into(), Value::Array(msgs));
+    ctx.insert("tools".into(), tools);
     ctx.insert("add_generation_prompt".into(), add_generation_prompt.into());
     ctx.insert("bos_token".into(), bos.into());
     ctx.insert("eos_token".into(), eos_s.into());

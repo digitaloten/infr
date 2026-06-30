@@ -9,6 +9,7 @@ repository.workspace = true
 infr-core.workspace = true
 infr-chat.workspace = true
 infr-vulkan.workspace = true
+serde_json.workspace = true
 infr-gguf.workspace = true
 half.workspace = true
 bytemuck.workspace = true

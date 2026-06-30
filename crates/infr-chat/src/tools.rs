@@ -228,23 +228,99 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
 }
 
 // ---------------------------------------------------------------------------
+// Hermes / Qwen tool-call parsing (`<tool_call>{json}</tool_call>`)
+// ---------------------------------------------------------------------------
+
+const HERMES_OPEN: &str = "<tool_call>";
+const HERMES_CLOSE: &str = "</tool_call>";
+
+/// Parse the Hermes / Qwen tool-call format — `<tool_call>{"name":..,"arguments":{..}}</tool_call>`
+/// (the format Qwen3 and most OSS function-calling models emit, and what the GGUF chat templates
+/// render). Returns `(clean, calls)`: `clean` is the text with all tool-call blocks removed; `calls`
+/// the parsed invocations. The body is real JSON, so it's parsed with serde (no hand-rolled scanner);
+/// `arguments` is accepted as either an object or a JSON string and normalised to a `Value`.
+pub fn parse_hermes_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
+    let mut calls = Vec::new();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut from = 0usize;
+    while let Some(open) = text[from..].find(HERMES_OPEN) {
+        let open_abs = from + open;
+        let body_start = open_abs + HERMES_OPEN.len();
+        let Some(close_rel) = text[body_start..].find(HERMES_CLOSE) else {
+            break;
+        };
+        let body = text[body_start..body_start + close_rel].trim();
+        let close_abs = body_start + close_rel + HERMES_CLOSE.len();
+        from = close_abs;
+        if let Some(call) = parse_hermes_body(body) {
+            calls.push(call);
+            spans.push((open_abs, close_abs));
+        }
+    }
+    let mut clean = text.to_owned();
+    for (start, end) in spans.into_iter().rev() {
+        clean.replace_range(start..end, "");
+    }
+    (clean.trim().to_owned(), calls)
+}
+
+/// Parse one `<tool_call>` body (`{"name":..,"arguments":..}`) into a [`ToolCall`]. Tolerates
+/// `arguments` given as a nested object or as an embedded JSON string.
+fn parse_hermes_body(body: &str) -> Option<ToolCall> {
+    let v: Value = serde_json::from_str(body).ok()?;
+    let name = v.get("name")?.as_str()?.to_owned();
+    let arguments = match v.get("arguments") {
+        Some(Value::String(s)) => serde_json::from_str(s).unwrap_or(Value::String(s.clone())),
+        Some(other) => other.clone(),
+        None => Value::Object(serde_json::Map::new()),
+    };
+    Some(ToolCall { name, arguments })
+}
+
+// ---------------------------------------------------------------------------
+// Reasoning split (`<think>…</think>`)
+// ---------------------------------------------------------------------------
+
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
+
+/// Split output into `(reasoning, content)` on the `<think>…</think>` markers Qwen3/DeepSeek-R1 emit.
+/// Handles the prefilled-`<think>` case where the open marker was added by the template (output then
+/// starts mid-reasoning and only the close marker appears). No marker ⇒ all content, empty reasoning.
+pub fn split_think(text: &str) -> (String, String) {
+    if let Some(close) = text.find(THINK_CLOSE) {
+        let head = &text[..close];
+        let head = head.strip_prefix(THINK_OPEN).unwrap_or(head);
+        let head = head.trim_start_matches(THINK_OPEN); // tolerate a stray duplicate
+        let tail = &text[close + THINK_CLOSE.len()..];
+        (head.trim().to_owned(), tail.trim().to_owned())
+    } else if let Some(open) = text.find(THINK_OPEN) {
+        // Open but no close (truncated / max tokens) — everything after the open is reasoning.
+        (
+            text[open + THINK_OPEN.len()..].trim().to_owned(),
+            String::new(),
+        )
+    } else {
+        (String::new(), text.trim().to_owned())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Message normalisation
 // ---------------------------------------------------------------------------
 
 /// Normalise a slice of [`ChatMessage`]s for feeding into the chat template.
 ///
 /// - Flattens content arrays to plain text.
-/// - Preserves `tool_call_id`, `name`.
-/// - Returns new owned `ChatMessage` values (cheap: Strings only).
-///
-/// In the Python shim this also preserves `tool_calls` / `reasoning_content`
-/// fields, but those live outside `ChatMessage` in our type; callers handle them.
+/// - Preserves `tool_calls`, `tool_call_id`, `name` (the agentic round-trip).
+/// - Returns new owned `ChatMessage` values.
 pub fn normalize_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     messages
         .iter()
         .map(|m| ChatMessage {
             role: m.role.clone(),
             content: m.content.clone(),
+            tool_calls: m.tool_calls.clone(),
             tool_call_id: m.tool_call_id.clone(),
             name: m.name.clone(),
         })
@@ -380,6 +456,77 @@ mod tests {
         );
     }
 
+    // --- parse_hermes_tool_calls (Qwen3 / Hermes) ------------------------
+
+    #[test]
+    fn hermes_single_call_object_args() {
+        let text =
+            "<tool_call>\n{\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"}}\n</tool_call>";
+        let (clean, calls) = parse_hermes_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "bash");
+        assert_eq!(calls[0].arguments, json!({"command": "ls"}));
+        assert_eq!(clean, "");
+    }
+
+    #[test]
+    fn hermes_string_args_are_reparsed() {
+        // Some templates emit arguments as an embedded JSON string.
+        let text = r#"<tool_call>{"name":"get","arguments":"{\"id\":7}"}</tool_call>"#;
+        let (_, calls) = parse_hermes_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments, json!({"id": 7}));
+    }
+
+    #[test]
+    fn hermes_multiple_calls_and_surrounding_text() {
+        let text = "ok <tool_call>{\"name\":\"a\",\"arguments\":{}}</tool_call> then <tool_call>{\"name\":\"b\",\"arguments\":{\"x\":1}}</tool_call>";
+        let (clean, calls) = parse_hermes_tool_calls(text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "a");
+        assert_eq!(calls[1].name, "b");
+        assert!(clean.contains("ok") && clean.contains("then"));
+    }
+
+    #[test]
+    fn hermes_no_calls_passes_text_through() {
+        let text = "Just an answer.";
+        let (clean, calls) = parse_hermes_tool_calls(text);
+        assert!(calls.is_empty());
+        assert_eq!(clean, "Just an answer.");
+    }
+
+    #[test]
+    fn hermes_malformed_body_is_skipped() {
+        let text = "<tool_call>not json</tool_call>";
+        let (_, calls) = parse_hermes_tool_calls(text);
+        assert!(calls.is_empty());
+    }
+
+    // --- split_think -----------------------------------------------------
+
+    #[test]
+    fn think_splits_reasoning_and_content() {
+        let (r, c) = split_think("<think>\nplanning\n</think>\nThe answer is 42.");
+        assert_eq!(r, "planning");
+        assert_eq!(c, "The answer is 42.");
+    }
+
+    #[test]
+    fn think_prefilled_open_marker() {
+        // Template prefilled `<think>`, so output begins mid-reasoning with only the close marker.
+        let (r, c) = split_think("reasoning here</think>answer");
+        assert_eq!(r, "reasoning here");
+        assert_eq!(c, "answer");
+    }
+
+    #[test]
+    fn think_absent_is_all_content() {
+        let (r, c) = split_think("plain answer");
+        assert_eq!(r, "");
+        assert_eq!(c, "plain answer");
+    }
+
     // --- normalize_messages ----------------------------------------------
 
     #[test]
@@ -388,14 +535,14 @@ mod tests {
             ChatMessage {
                 role: "user".to_owned(),
                 content: "hello".to_owned(),
-                tool_call_id: None,
-                name: None,
+                ..Default::default()
             },
             ChatMessage {
                 role: "assistant".to_owned(),
                 content: "hi".to_owned(),
                 tool_call_id: Some("tc_1".to_owned()),
                 name: Some("my_fn".to_owned()),
+                ..Default::default()
             },
         ];
         let out = normalize_messages(&msgs);

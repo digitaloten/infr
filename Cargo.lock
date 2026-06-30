@@ -952,6 +952,7 @@ dependencies = [
  "infr-gguf",
  "infr-vulkan",
  "rayon",
+ "serde_json",
  "tokenizers",
  "tracing",
 ]

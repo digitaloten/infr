@@ -405,20 +405,45 @@ impl infr_server::ChatGenerator for LlamaGenerator {
     fn chat(
         &mut self,
         messages: &[infr_engine::ChatMessage],
-        _tools_json: Option<&str>,
+        tools_json: Option<&str>,
         on_delta: &mut dyn FnMut(infr_engine::Delta),
     ) -> anyhow::Result<()> {
-        // Bring-up: use the last user message; full chat-template/tools wiring comes later.
-        let user = messages
-            .iter()
-            .rev()
-            .find(|m| m.role == "user")
-            .map(|m| m.content.clone())
-            .unwrap_or_default();
-        let prompt = self.llama.render_chat(&user)?;
-        self.llama.generate(&prompt, 256, |piece| {
-            on_delta(infr_engine::Delta::Content(piece.to_string()));
-        })?;
+        // Render the FULL conversation (system/user/assistant-with-tool_calls/tool results) + the
+        // request's tool spec through the model's own chat template — the template emits each model's
+        // native tool syntax, so infr never hardcodes a format.
+        let tools: Option<serde_json::Value> = tools_json
+            .map(serde_json::from_str)
+            .transpose()
+            .context("parsing request `tools`")?;
+        let prompt = self.llama.render_chat_oai(messages, tools.as_ref())?;
+        let max_new = std::env::var("INFR_MAX_NEW")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2048usize);
+
+        // Generate raw ids, then detokenize WITHOUT stripping special tokens so `<think>` / tool
+        // markers survive for parsing.
+        let ids = self.llama.generate_ids(&prompt, max_new, |_| {})?;
+        let raw = self.llama.decode_ids(&ids, false)?;
+
+        // Split reasoning (`<think>…</think>`) from the answer, then pull tool calls
+        // (`<tool_call>{json}</tool_call>`) out of the remaining text.
+        let (reasoning, body) = infr_engine::split_think(&raw);
+        let (content, calls) = infr_engine::parse_hermes_tool_calls(&body);
+
+        if !reasoning.is_empty() {
+            on_delta(infr_engine::Delta::Reasoning(reasoning));
+        }
+        if !content.is_empty() {
+            on_delta(infr_engine::Delta::Content(content));
+        }
+        for call in calls {
+            on_delta(infr_engine::Delta::ToolCall {
+                name: call.name,
+                arguments: serde_json::to_string(&call.arguments)
+                    .unwrap_or_else(|_| "{}".to_string()),
+            });
+        }
         Ok(())
     }
 }
@@ -713,6 +738,15 @@ fn cmd_compare(
 fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
     let (gguf, tok) = resolve(model)?;
     let llama = infr_llama::Llama::load_opt(&gguf, tok.as_deref())?;
+    // Qwen3's recommended sampling — pure greedy makes thinking models degenerate (unterminated
+    // `<think>`, repeated tokens). Mirrors `cmd_run`; tune via INFR_TEMP / INFR_TOP_K / INFR_TOP_P.
+    let envf = |k: &str, d: f32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let envu = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    llama.set_sampling(
+        envf("INFR_TEMP", 0.6),
+        envu("INFR_TOP_K", 20),
+        envf("INFR_TOP_P", 0.95),
+    );
     let model_id = gguf
         .file_stem()
         .and_then(|s| s.to_str())

@@ -4,7 +4,7 @@
 #![allow(clippy::needless_range_loop)]
 use crate::*;
 use anyhow::{anyhow, bail, Result};
-use infr_chat::{render_chat_jinja, render_chat_user};
+use infr_chat::{render_chat_jinja, render_chat_oai, render_chat_user, ChatMessage};
 use infr_core::backend::{Buffer, BufferUsage};
 use infr_core::{Backend, WeightSource};
 use infr_gguf::Gguf;
@@ -1878,6 +1878,50 @@ impl Llama {
     pub fn render_chat(&self, user: &str) -> Result<String> {
         render_chat_user(&self.gguf, &self.tokenizer, self.cfg.eos, user)
             .ok_or_else(no_template_err)
+    }
+
+    /// Render a full OpenAI-shaped conversation (multi-turn, with tool calls + results) plus an
+    /// optional `tools` spec through the model's embedded chat template — the tool-calling prompt
+    /// path for the server. Errors if the GGUF has no chat template or it fails to render.
+    pub fn render_chat_oai(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&serde_json::Value>,
+    ) -> Result<String> {
+        render_chat_oai(
+            &self.gguf,
+            &self.tokenizer,
+            self.cfg.eos,
+            messages,
+            tools,
+            true,
+        )
+        .ok_or_else(no_template_err)
+    }
+
+    /// Generate raw token ids (not a decoded string). For callers that must inspect special markers
+    /// (`<think>`, `<tool_call>`) which `decode(.., skip_special=true)` would strip — e.g. the
+    /// tool-calling server path. Streams decoded pieces via `on_token` like [`generate`](Self::generate).
+    pub fn generate_ids(
+        &self,
+        prompt: &str,
+        max_new: usize,
+        on_token: impl FnMut(&str),
+    ) -> Result<Vec<u32>> {
+        let enc = self
+            .tokenizer
+            .encode(prompt, false)
+            .map_err(|e| anyhow!("encode: {e}"))?;
+        let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
+        let mut kv = self.new_kv(prompt_tokens.len() + max_new + 8)?;
+        self.run_in_cache(&prompt_tokens, &mut kv, max_new, on_token)
+    }
+
+    /// Detokenize ids. `skip_special=false` preserves marker tokens (`<think>`, …) for parsing.
+    pub fn decode_ids(&self, ids: &[u32], skip_special: bool) -> Result<String> {
+        self.tokenizer
+            .decode(ids, skip_special)
+            .map_err(|e| anyhow!("decode: {e}"))
     }
 
     /// Greedy generate up to `max_new` tokens after `prompt` (already a chat-formatted string).
