@@ -1385,6 +1385,11 @@ pub(crate) fn generate_dense_cpu(
         let q = g.internal(f32d(max_qrow));
         let k = g.internal(f32d(max_kvrow));
         let v = g.internal(f32d(max_kvrow));
+        // QkNorm+RoPE writes f16 (the GPU `qk_norm_rope` is f32-in→f16-out, can't be in place; the GPU
+        // attention reads f16 q). q16/k16 hold the f16 normed+roped q/k for the q/k-norm (qwen3/gemma)
+        // path; the llama RoPE-only path stays in f32 q/k. Free on the CPU (its store is f32 regardless).
+        let q16 = g.internal(f16d(max_qrow));
+        let k16 = g.internal(f16d(max_kvrow));
         let attn = g.internal(f32d(max_qrow));
         let gbuf = g.internal(f32d(nff));
         let ubuf = g.internal(f32d(nff));
@@ -1467,33 +1472,39 @@ pub(crate) fn generate_dense_cpu(
                         n: kvrow as u32,
                     }),
                 }
-                // K: fused QkNorm+RoPE when the model has K-norm (qwen3/gemma), else RoPE alone (llama).
-                match lw.k_norm {
-                    Some(kn) => g.push(Op::QkNormRope {
-                        x: k,
-                        weight: kn,
-                        positions,
-                        dst: k,
-                        rows: 1,
-                        n_head: nkv as u32,
-                        head_dim: hd as u32,
-                        rope_dim: rope_dim as u32,
-                        theta,
-                        eps,
-                        freq_factors: layer_ff,
-                    }),
-                    None => g.push(Op::Rope {
-                        x: k,
-                        positions,
-                        dst: k,
-                        rows: 1,
-                        n_head: nkv as u32,
-                        head_dim: hd as u32,
-                        rope_dim: rope_dim as u32,
-                        theta,
-                        freq_factors: layer_ff,
-                    }),
-                }
+                // K: fused QkNorm+RoPE (qwen3/gemma) → f16 `k16`, else RoPE alone (llama) in-place f32.
+                let k_write = match lw.k_norm {
+                    Some(kn) => {
+                        g.push(Op::QkNormRope {
+                            x: k,
+                            weight: kn,
+                            positions,
+                            dst: k16,
+                            rows: 1,
+                            n_head: nkv as u32,
+                            head_dim: hd as u32,
+                            rope_dim: rope_dim as u32,
+                            theta,
+                            eps,
+                            freq_factors: layer_ff,
+                        });
+                        k16
+                    }
+                    None => {
+                        g.push(Op::Rope {
+                            x: k,
+                            positions,
+                            dst: k,
+                            rows: 1,
+                            n_head: nkv as u32,
+                            head_dim: hd as u32,
+                            rope_dim: rope_dim as u32,
+                            theta,
+                            freq_factors: layer_ff,
+                        });
+                        k
+                    }
+                };
                 // gemma4 weightless per-head RMSNorm on V (= x/rms) before caching.
                 if let Some(ones) = v_ones {
                     g.push(Op::QkNorm {
@@ -1507,7 +1518,7 @@ pub(crate) fn generate_dense_cpu(
                     });
                 }
                 g.push(Op::WriteKv {
-                    src: k,
+                    src: k_write,
                     cache: k_cache[l],
                     rows: 1,
                     row_stride: kvrow as u32,
@@ -1521,35 +1532,41 @@ pub(crate) fn generate_dense_cpu(
                     pos: pos as u32,
                 });
             }
-            // Q: fused QkNorm+RoPE when the model has Q-norm (qwen3/gemma), else RoPE alone (llama).
-            match lw.q_norm {
-                Some(qn) => g.push(Op::QkNormRope {
-                    x: q,
-                    weight: qn,
-                    positions,
-                    dst: q,
-                    rows: 1,
-                    n_head: nh as u32,
-                    head_dim: hd as u32,
-                    rope_dim: rope_dim as u32,
-                    theta,
-                    eps,
-                    freq_factors: layer_ff,
-                }),
-                None => g.push(Op::Rope {
-                    x: q,
-                    positions,
-                    dst: q,
-                    rows: 1,
-                    n_head: nh as u32,
-                    head_dim: hd as u32,
-                    rope_dim: rope_dim as u32,
-                    theta,
-                    freq_factors: layer_ff,
-                }),
-            }
+            // Q: fused QkNorm+RoPE (qwen3/gemma) → f16 `q16`, else RoPE alone (llama) in-place f32.
+            let q_attn = match lw.q_norm {
+                Some(qn) => {
+                    g.push(Op::QkNormRope {
+                        x: q,
+                        weight: qn,
+                        positions,
+                        dst: q16,
+                        rows: 1,
+                        n_head: nh as u32,
+                        head_dim: hd as u32,
+                        rope_dim: rope_dim as u32,
+                        theta,
+                        eps,
+                        freq_factors: layer_ff,
+                    });
+                    q16
+                }
+                None => {
+                    g.push(Op::Rope {
+                        x: q,
+                        positions,
+                        dst: q,
+                        rows: 1,
+                        n_head: nh as u32,
+                        head_dim: hd as u32,
+                        rope_dim: rope_dim as u32,
+                        theta,
+                        freq_factors: layer_ff,
+                    });
+                    q
+                }
+            };
             g.push(Op::Attention {
-                q,
+                q: q_attn,
                 k_cache: k_cache[kv_src],
                 v_cache: v_cache[kv_src],
                 dst: attn,
