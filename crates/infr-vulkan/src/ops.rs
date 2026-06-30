@@ -331,7 +331,7 @@ impl VulkanBackend {
                 k.pipeline_layout,
                 vk::ShaderStageFlags::COMPUTE,
                 0,
-                &push,
+                push,
             );
             shared.device.cmd_dispatch(cmd, groups, 1, 1);
         })?;
