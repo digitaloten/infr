@@ -41,6 +41,7 @@ pub trait ChatGenerator: Send {
         &mut self,
         messages: &[ChatMessage],
         tools_json: Option<&str>,
+        tool_choice: Option<&str>,
         on_delta: &mut dyn FnMut(Delta),
     ) -> anyhow::Result<()>;
 }
@@ -50,6 +51,7 @@ impl ChatGenerator for Engine {
         &mut self,
         messages: &[ChatMessage],
         tools_json: Option<&str>,
+        _tool_choice: Option<&str>,
         on_delta: &mut dyn FnMut(Delta),
     ) -> anyhow::Result<()> {
         Engine::chat(self, messages, tools_json, on_delta).map_err(|e| anyhow::anyhow!("{e}"))
@@ -69,8 +71,26 @@ pub struct ChatRequest {
     pub stream: bool,
     #[serde(default)]
     pub tools: Option<serde_json::Value>,
+    /// OpenAI `tool_choice`: `"auto"` | `"required"` | `"none"` | `{"type":"function","function":
+    /// {"name":..}}`. Normalised to a string (the function name for a named choice) by [`tool_choice_str`].
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+}
+
+/// Normalise OpenAI `tool_choice` to a string the generator understands: `"auto"`/`"required"`/
+/// `"none"` pass through; a `{"type":"function","function":{"name":N}}` object becomes `N`.
+fn tool_choice_str(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Object(_) => v
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|n| n.as_str())
+            .map(str::to_owned),
+        _ => None,
+    }
 }
 
 /// A single chat message.  `content` may be a JSON string or a content-part array.
@@ -282,14 +302,33 @@ async fn chat_completions_handler(
 ) -> Response {
     let messages: Vec<ChatMessage> = req.messages.iter().map(dto_to_engine).collect();
     let tools_json: Option<String> = req.tools.as_ref().map(|v| v.to_string());
+    let tool_choice: Option<String> = req.tool_choice.as_ref().and_then(tool_choice_str);
     let model_id = state.model_id.to_string();
     let cid = make_id();
     let created = unix_ts();
 
     if req.stream {
-        streaming(state, messages, tools_json, cid, model_id, created).await
+        streaming(
+            state,
+            messages,
+            tools_json,
+            tool_choice,
+            cid,
+            model_id,
+            created,
+        )
+        .await
     } else {
-        non_streaming(state, messages, tools_json, cid, model_id, created).await
+        non_streaming(
+            state,
+            messages,
+            tools_json,
+            tool_choice,
+            cid,
+            model_id,
+            created,
+        )
+        .await
     }
 }
 
@@ -301,6 +340,7 @@ async fn non_streaming(
     state: AppState,
     messages: Vec<ChatMessage>,
     tools_json: Option<String>,
+    tool_choice: Option<String>,
     cid: String,
     model_id: String,
     created: i64,
@@ -321,19 +361,24 @@ async fn non_streaming(
         let mut tool_calls: Vec<OAIToolCall> = Vec::new();
 
         engine
-            .chat(&messages, tools_json.as_deref(), &mut |delta| match delta {
-                Delta::Reasoning(t) => reasoning.push_str(&t),
-                Delta::Content(t) => content.push_str(&t),
-                Delta::ToolCall { name, arguments } => {
-                    let idx = tool_calls.len();
-                    tool_calls.push(OAIToolCall {
-                        index: idx,
-                        id: format!("call_{cid_blk}_{idx}"),
-                        kind: "function",
-                        function: OAIFunction { name, arguments },
-                    });
-                }
-            })
+            .chat(
+                &messages,
+                tools_json.as_deref(),
+                tool_choice.as_deref(),
+                &mut |delta| match delta {
+                    Delta::Reasoning(t) => reasoning.push_str(&t),
+                    Delta::Content(t) => content.push_str(&t),
+                    Delta::ToolCall { name, arguments } => {
+                        let idx = tool_calls.len();
+                        tool_calls.push(OAIToolCall {
+                            index: idx,
+                            id: format!("call_{cid_blk}_{idx}"),
+                            kind: "function",
+                            function: OAIFunction { name, arguments },
+                        });
+                    }
+                },
+            )
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         Ok((reasoning, content, tool_calls))
@@ -396,6 +441,7 @@ async fn streaming(
     state: AppState,
     messages: Vec<ChatMessage>,
     tools_json: Option<String>,
+    tool_choice: Option<String>,
     cid: String,
     model_id: String,
     created: i64,
@@ -435,34 +481,40 @@ async fn streaming(
         let mut tc_index = 0usize;
         let mut finish: &str = "stop";
 
-        let _ = engine.chat(&messages, tools_json.as_deref(), &mut |delta| {
-            let payload = match delta {
-                Delta::Reasoning(t) => DeltaPayload {
-                    reasoning_content: Some(t),
-                    ..Default::default()
-                },
-                Delta::Content(t) => DeltaPayload {
-                    content: Some(t),
-                    ..Default::default()
-                },
-                Delta::ToolCall { name, arguments } => {
-                    let tc = OAIToolCall {
-                        index: tc_index,
-                        id: format!("call_{cid_cb}_{tc_index}"),
-                        kind: "function",
-                        function: OAIFunction { name, arguments },
-                    };
-                    tc_index += 1;
-                    finish = "tool_calls";
-                    DeltaPayload {
-                        tool_calls: Some(vec![tc]),
+        let _ = engine.chat(
+            &messages,
+            tools_json.as_deref(),
+            tool_choice.as_deref(),
+            &mut |delta| {
+                let payload = match delta {
+                    Delta::Reasoning(t) => DeltaPayload {
+                        reasoning_content: Some(t),
                         ..Default::default()
+                    },
+                    Delta::Content(t) => DeltaPayload {
+                        content: Some(t),
+                        ..Default::default()
+                    },
+                    Delta::ToolCall { name, arguments } => {
+                        let tc = OAIToolCall {
+                            index: tc_index,
+                            id: format!("call_{cid_cb}_{tc_index}"),
+                            kind: "function",
+                            function: OAIFunction { name, arguments },
+                        };
+                        tc_index += 1;
+                        finish = "tool_calls";
+                        DeltaPayload {
+                            tool_calls: Some(vec![tc]),
+                            ..Default::default()
+                        }
                     }
-                }
-            };
-            let _ = handle
-                .block_on(tx_cb.send(Ok(sse_chunk(&cid_cb, &model_cb, created, payload, None))));
-        });
+                };
+                let _ = handle.block_on(
+                    tx_cb.send(Ok(sse_chunk(&cid_cb, &model_cb, created, payload, None))),
+                );
+            },
+        );
 
         // Finish chunk: empty delta + finish_reason.
         let _ = handle.block_on(tx.send(Ok(sse_chunk(

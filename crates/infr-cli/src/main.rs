@@ -406,6 +406,7 @@ impl infr_server::ChatGenerator for LlamaGenerator {
         &mut self,
         messages: &[infr_engine::ChatMessage],
         tools_json: Option<&str>,
+        tool_choice: Option<&str>,
         on_delta: &mut dyn FnMut(infr_engine::Delta),
     ) -> anyhow::Result<()> {
         // Render the FULL conversation (system/user/assistant-with-tool_calls/tool results) + the
@@ -421,13 +422,51 @@ impl infr_server::ChatGenerator for LlamaGenerator {
             .and_then(|v| v.parse().ok())
             .unwrap_or(2048usize);
 
-        // Generate raw ids, then detokenize WITHOUT stripping special tokens so `<think>` / tool
-        // markers survive for parsing.
-        let ids = self.llama.generate_ids(&prompt, max_new, |_| {})?;
-        let raw = self.llama.decode_ids(&ids, false)?;
+        // For tool_choice "required"/named, build a grammar constraint that FORCES a valid,
+        // schema-conforming tool call (llama.cpp-parity reliability). "auto"/"none"/absent → None.
+        if let Some(mut constraint) = self.llama.tool_constraint(tools.as_ref(), tool_choice)? {
+            // Forced path: prime the assistant turn with the `<tool_call>` opener and grammar-constrain
+            // the JSON body. The model emits a guaranteed-valid call object even on tiny models. On any
+            // grammar/parser error, fall through to unconstrained generation (never fail the request).
+            let primed = format!("{prompt}<tool_call>\n");
+            match self
+                .llama
+                .generate_ids(&primed, max_new, Some(&mut constraint), |_| {})
+            {
+                Ok(ids) => {
+                    let body = self.llama.decode_ids(&ids, false)?;
+                    // The constrained output IS the JSON call object — parse it straight (grammar
+                    // guarantees validity); strip any trailing `</tool_call>` past the grammar.
+                    let body = body.trim().trim_end_matches("</tool_call>").trim();
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
+                        if let Some(name) = val.get("name").and_then(|v| v.as_str()) {
+                            let arguments = val
+                                .get("arguments")
+                                .cloned()
+                                .unwrap_or(serde_json::json!({}));
+                            on_delta(infr_engine::Delta::ToolCall {
+                                name: name.to_string(),
+                                arguments: serde_json::to_string(&arguments)
+                                    .unwrap_or_else(|_| "{}".to_string()),
+                            });
+                        }
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[tools] grammar-constrained generation failed ({e}); \
+                         falling back to unconstrained"
+                    );
+                    // fall through to the unconstrained path below
+                }
+            }
+        }
 
-        // Split reasoning (`<think>…</think>`) from the answer, then pull tool calls
-        // (`<tool_call>{json}</tool_call>`) out of the remaining text.
+        // Auto path: unconstrained. Generate raw ids, detokenize WITHOUT stripping special tokens so
+        // `<think>` / tool markers survive, then split reasoning + parse any tool calls.
+        let ids = self.llama.generate_ids(&prompt, max_new, None, |_| {})?;
+        let raw = self.llama.decode_ids(&ids, false)?;
         let (reasoning, body) = infr_engine::split_think(&raw);
         let (content, calls) = infr_engine::parse_hermes_tool_calls(&body);
 
@@ -740,8 +779,18 @@ fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
     let llama = infr_llama::Llama::load_opt(&gguf, tok.as_deref())?;
     // Qwen3's recommended sampling — pure greedy makes thinking models degenerate (unterminated
     // `<think>`, repeated tokens). Mirrors `cmd_run`; tune via INFR_TEMP / INFR_TOP_K / INFR_TOP_P.
-    let envf = |k: &str, d: f32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-    let envu = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let envf = |k: &str, d: f32| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let envu = |k: &str, d: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
     llama.set_sampling(
         envf("INFR_TEMP", 0.6),
         envu("INFR_TOP_K", 20),

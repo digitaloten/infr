@@ -21,6 +21,7 @@ pub use transformer::{ChatSession, Llama};
 mod kv;
 pub(crate) use kv::{DecodeScratch, DenseDecodeScratch, PrefillScratch, QBufs};
 pub use kv::{KvCache, MoeConfig, MoeKv};
+pub mod grammar;
 mod sampling;
 pub use config::Config;
 pub(crate) use sampling::*;

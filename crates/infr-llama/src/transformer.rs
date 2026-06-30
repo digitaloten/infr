@@ -1834,15 +1834,20 @@ impl Llama {
         on_token: impl FnMut(&str),
     ) -> Result<Vec<u32>> {
         let logits = self.prefill(new_tokens, kv)?;
-        self.decode_loop(logits, kv, max_new, on_token)
+        self.decode_loop(logits, kv, max_new, None, on_token)
     }
 
     /// Greedy/sampled decode loop from `logits` (the next-token distribution), appending to `kv`.
+    /// When `constraint` is set, each step masks the logits to the grammar's allowed tokens, then
+    /// advances the grammar by the sampled token plus any deterministically-forced fast-forward
+    /// tokens (which are appended to the output and the KV cache without being sampled). The loop
+    /// ends when the grammar reaches its accepting stop state, on EOS, or at `max_new`.
     fn decode_loop(
         &self,
         mut logits: Vec<f32>,
         kv: &mut KvCache,
         max_new: usize,
+        mut constraint: Option<&mut crate::grammar::Constraint>,
         mut on_token: impl FnMut(&str),
     ) -> Result<Vec<u32>> {
         let sampler = self.sampler.get();
@@ -1859,15 +1864,42 @@ impl Llama {
         // longer ends in the replacement char emits whole characters only. `on_token` fires once per
         // generated token (delta may be empty while a char is mid-completion), so callers can count.
         let mut stream = StreamDecoder::default();
-        for _ in 0..max_new {
-            let next = sample_logits(&logits, sampler, &mut rng);
-            if self.cfg.eos_ids.contains(&next) {
-                break;
-            }
-            generated.push(next);
+        let mut budget = max_new;
+        while budget > 0 {
+            // The tokens emitted THIS step + whether the grammar finished.
+            let (step, done): (Vec<u32>, bool) = if let Some(c) = constraint.as_deref_mut() {
+                // Drain the grammar's deterministically-forced tokens first (no sampling) — this is
+                // llguidance's intended flow and keeps compute_mask/consume consistent. Only when
+                // nothing is forced do we mask + greedily pick the most-probable grammar-legal token
+                // (argmax over the masked logits — robust, deterministic, never picks a masked token).
+                let forced = c.forced();
+                if !forced.is_empty() {
+                    c.consume(&forced)?;
+                    (forced, c.stopped())
+                } else {
+                    c.apply_mask(&mut logits)?;
+                    let next = crate::sampling::argmax(&logits) as u32;
+                    if self.cfg.eos_ids.contains(&next) {
+                        break;
+                    }
+                    c.accept_one(next)?;
+                    (vec![next], c.stopped())
+                }
+            } else {
+                let next = sample_logits(&logits, sampler, &mut rng);
+                if self.cfg.eos_ids.contains(&next) {
+                    break;
+                }
+                (vec![next], false)
+            };
+            generated.extend_from_slice(&step);
             let full = self.tokenizer.decode(&generated, true).unwrap_or_default();
             on_token(&stream.step(&full));
-            logits = self.forward_resident_kv(&[next], kv)?;
+            if done {
+                break;
+            }
+            budget = budget.saturating_sub(step.len());
+            logits = self.forward_resident_kv(&step, kv)?;
         }
         Ok(generated)
     }
@@ -1901,11 +1933,13 @@ impl Llama {
 
     /// Generate raw token ids (not a decoded string). For callers that must inspect special markers
     /// (`<think>`, `<tool_call>`) which `decode(.., skip_special=true)` would strip — e.g. the
-    /// tool-calling server path. Streams decoded pieces via `on_token` like [`generate`](Self::generate).
+    /// tool-calling server path. An optional grammar `constraint` masks decoding to valid tokens
+    /// (reliable tool calls). Streams decoded pieces via `on_token` like [`generate`](Self::generate).
     pub fn generate_ids(
         &self,
         prompt: &str,
         max_new: usize,
+        constraint: Option<&mut crate::grammar::Constraint>,
         on_token: impl FnMut(&str),
     ) -> Result<Vec<u32>> {
         let enc = self
@@ -1914,7 +1948,53 @@ impl Llama {
             .map_err(|e| anyhow!("encode: {e}"))?;
         let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
         let mut kv = self.new_kv(prompt_tokens.len() + max_new + 8)?;
-        self.run_in_cache(&prompt_tokens, &mut kv, max_new, on_token)
+        let logits = self.prefill(&prompt_tokens, &mut kv)?;
+        self.decode_loop(logits, &mut kv, max_new, constraint, on_token)
+    }
+
+    /// Build a grammar constraint that FORCES a syntactically-valid, schema-conforming tool call, for
+    /// `tool_choice` values that require one (`"required"`, or `{"function":{"name":..}}` / a bare
+    /// function name selecting a single tool). Returns `None` for `"auto"` / `"none"` / absent (the
+    /// model decides freely). `tools` is the request's OpenAI `tools` array.
+    pub fn tool_constraint(
+        &self,
+        tools: Option<&serde_json::Value>,
+        tool_choice: Option<&str>,
+    ) -> Result<Option<crate::grammar::Constraint>> {
+        let Some(tools) = tools else {
+            return Ok(None);
+        };
+        // Narrow `tools` to the chosen function when tool_choice names one; require a call only for
+        // "required" or a named choice.
+        let (force, only): (bool, Option<&str>) = match tool_choice {
+            Some("required") => (true, None),
+            Some("auto") | Some("none") | None => (false, None),
+            Some(name) => (true, Some(name.trim_matches('"'))),
+        };
+        if !force {
+            return Ok(None);
+        }
+        let filtered;
+        let tools = if let Some(name) = only {
+            let arr = tools.as_array().cloned().unwrap_or_default();
+            filtered = serde_json::Value::Array(
+                arr.into_iter()
+                    .filter(|t| {
+                        t.get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some(name)
+                    })
+                    .collect(),
+            );
+            &filtered
+        } else {
+            tools
+        };
+        let grammar = crate::grammar::forced_tool_call_grammar(tools)?;
+        let env =
+            crate::grammar::build_tok_env(&self.tokenizer, self.cfg.vocab, &self.cfg.eos_ids)?;
+        Ok(Some(crate::grammar::Constraint::new(env, grammar)?))
     }
 
     /// Detokenize ids. `skip_special=false` preserves marker tokens (`<think>`, …) for parsing.
@@ -3723,7 +3803,7 @@ impl ChatSession<'_> {
         let logits = self.llama.prefill(new, &mut self.kv)?;
         let generated = self
             .llama
-            .decode_loop(logits, &mut self.kv, max_new, on_token)?;
+            .decode_loop(logits, &mut self.kv, max_new, None, on_token)?;
         // The cache now holds the rendered prompt + the raw generation.
         self.cached = ids;
         self.cached.extend_from_slice(&generated);
