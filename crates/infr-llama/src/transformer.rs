@@ -1878,12 +1878,33 @@ impl Llama {
                     (forced, c.stopped())
                 } else {
                     c.apply_mask(&mut logits)?;
-                    let next = crate::sampling::argmax(&logits) as u32;
-                    if self.cfg.eos_ids.contains(&next) {
-                        break;
+                    // Pick the most-probable grammar-legal token. The healed mask can be a SUPERSET
+                    // (llguidance token-healing on the non-canonical GGUF tokenizer bridge), so we
+                    // validate-before-commit and drop+re-pick on rejection rather than failing the
+                    // request. EOS only terminates when the grammar is in an accepting state.
+                    let mut chosen: Option<u32> = None;
+                    loop {
+                        let cand = crate::sampling::argmax(&logits) as u32;
+                        if !logits[cand as usize].is_finite() {
+                            break; // mask exhausted — nothing grammar-legal left
+                        }
+                        if self.cfg.eos_ids.contains(&cand) {
+                            if c.accepting()? {
+                                break; // legal end of the constrained span
+                            }
+                            logits[cand as usize] = f32::NEG_INFINITY; // EOS not allowed yet
+                            continue;
+                        }
+                        if c.try_accept(cand)? {
+                            chosen = Some(cand);
+                            break;
+                        }
+                        logits[cand as usize] = f32::NEG_INFINITY; // superset member — drop + retry
                     }
-                    c.accept_one(next)?;
-                    (vec![next], c.stopped())
+                    match chosen {
+                        Some(t) => (vec![t], c.stopped()),
+                        None => break, // accepting EOS or exhausted → constrained span done
+                    }
                 }
             } else {
                 let next = sample_logits(&logits, sampler, &mut rng);

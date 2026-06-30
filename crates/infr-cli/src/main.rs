@@ -426,41 +426,46 @@ impl infr_server::ChatGenerator for LlamaGenerator {
         // schema-conforming tool call (llama.cpp-parity reliability). "auto"/"none"/absent → None.
         if let Some(mut constraint) = self.llama.tool_constraint(tools.as_ref(), tool_choice)? {
             // Forced path: prime the assistant turn with the `<tool_call>` opener and grammar-constrain
-            // the JSON body. The model emits a guaranteed-valid call object even on tiny models. On any
-            // grammar/parser error, fall through to unconstrained generation (never fail the request).
+            // the JSON body. On any grammar/parser error, OR if the constrained body is empty/unparseable
+            // (e.g. the toktrie bridge masked out the whole call), fall through to unconstrained
+            // generation rather than failing the request or returning an empty `stop`.
             let primed = format!("{prompt}<tool_call>\n");
-            match self
-                .llama
-                .generate_ids(&primed, max_new, Some(&mut constraint), |_| {})
-            {
-                Ok(ids) => {
-                    let body = self.llama.decode_ids(&ids, false)?;
-                    // The constrained output IS the JSON call object — parse it straight (grammar
-                    // guarantees validity); strip any trailing `</tool_call>` past the grammar.
-                    let body = body.trim().trim_end_matches("</tool_call>").trim();
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
-                        if let Some(name) = val.get("name").and_then(|v| v.as_str()) {
-                            let arguments = val
-                                .get("arguments")
-                                .cloned()
-                                .unwrap_or(serde_json::json!({}));
-                            on_delta(infr_engine::Delta::ToolCall {
-                                name: name.to_string(),
-                                arguments: serde_json::to_string(&arguments)
-                                    .unwrap_or_else(|_| "{}".to_string()),
-                            });
+            let emitted =
+                match self
+                    .llama
+                    .generate_ids(&primed, max_new, Some(&mut constraint), |_| {})
+                {
+                    Ok(ids) => {
+                        let body = self.llama.decode_ids(&ids, false)?;
+                        // The constrained output IS the JSON call object — parse it straight; strip any
+                        // trailing `</tool_call>` past the grammar.
+                        let body = body.trim().trim_end_matches("</tool_call>").trim();
+                        match serde_json::from_str::<serde_json::Value>(body) {
+                            Ok(val) => val.get("name").and_then(|v| v.as_str()).map(|name| {
+                                let arguments = val
+                                    .get("arguments")
+                                    .cloned()
+                                    .unwrap_or(serde_json::json!({}));
+                                on_delta(infr_engine::Delta::ToolCall {
+                                    name: name.to_string(),
+                                    arguments: serde_json::to_string(&arguments)
+                                        .unwrap_or_else(|_| "{}".to_string()),
+                                });
+                            }),
+                            Err(_) => None,
                         }
+                        .is_some()
                     }
-                    return Ok(());
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[tools] grammar-constrained generation failed ({e}); \
-                         falling back to unconstrained"
-                    );
-                    // fall through to the unconstrained path below
-                }
+                    Err(e) => {
+                        eprintln!("[tools] grammar-constrained generation failed ({e})");
+                        false
+                    }
+                };
+            if emitted {
+                return Ok(());
             }
+            eprintln!("[tools] forced tool call produced no parseable call; falling back to unconstrained");
+            // fall through to the unconstrained path below
         }
 
         // Auto path: unconstrained. Generate raw ids, detokenize WITHOUT stripping special tokens so
@@ -468,7 +473,13 @@ impl infr_server::ChatGenerator for LlamaGenerator {
         let ids = self.llama.generate_ids(&prompt, max_new, None, |_| {})?;
         let raw = self.llama.decode_ids(&ids, false)?;
         let (reasoning, body) = infr_engine::split_think(&raw);
-        let (content, calls) = infr_engine::parse_hermes_tool_calls(&body);
+        // tool_choice "none" forbids tool calls — treat all output as content (don't extract calls,
+        // even if the model emitted a `<tool_call>` block).
+        let (content, calls) = if tool_choice == Some("none") {
+            (body, Vec::new())
+        } else {
+            infr_engine::parse_hermes_tool_calls(&body)
+        };
 
         if !reasoning.is_empty() {
             on_delta(infr_engine::Delta::Reasoning(reasoning));

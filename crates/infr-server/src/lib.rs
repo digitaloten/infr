@@ -591,7 +591,7 @@ fn unix_ts() -> i64 {
 /// Mirrors the Python shim's `normalize_messages`: only `"text"` parts are kept.
 pub fn flatten_content(v: &Option<serde_json::Value>) -> String {
     match v {
-        None => String::new(),
+        None | Some(serde_json::Value::Null) => String::new(),
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(serde_json::Value::Array(parts)) => parts
             .iter()
@@ -1028,8 +1028,8 @@ mod tests {
 
     #[test]
     fn flatten_content_null_json_gives_empty_string() {
-        assert_eq!(flatten_content(&Some(serde_json::Value::Null)), "null");
-        // Null → other branch → .to_string() == "null"
-        // (This is fine; callers should not send null content)
+        // An assistant tool-call message legally has `content: null` — it must flatten to "" (not the
+        // literal "null", which would inject a stray word into the prompt).
+        assert_eq!(flatten_content(&Some(serde_json::Value::Null)), "");
     }
 }

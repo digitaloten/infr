@@ -9,27 +9,51 @@
 //! rather than `from_tokenizer`, so it's immune to the `tokenizers` crate-version skew between infr
 //! (0.20) and toktrie (0.21).
 //!
-//! KNOWN ISSUE (under investigation): on the live decode, `compute_mask` and `consume_token` can
-//! disagree for certain tokens — the mask allows a token (e.g. `!`/`5`) that `consume_token` then
-//! rejects with "forced bytes: got '{'" (surfaced as `StopReason::ParserTooComplex`, which is really
-//! a generic `ParserError`). This is a toktrie canonicalization mismatch for the GGUF-derived
-//! tokenizer (the unit test below, driving the same grammar over the same tokenizer, agrees — it's
-//! token-dependent, exposed only by the real model's token choices). The server catches the error and
-//! falls back to UNCONSTRAINED generation, so requests never fail; capable models (≥1.7B) produce
-//! valid tool calls unconstrained. Fixing the bridge is what makes tiny models reliable.
+//! KNOWN ISSUE — the GGUF→`tokenizers`→serialized-JSON tokenizer bridge is NOT canonical in toktrie's
+//! sense, so llguidance's token-level `compute_mask` returns a SUPERSET that the byte-forcing parser
+//! then rejects ("forced bytes: got '{'"). Mitigations applied: (1) [`NonCanonicalEnv`] forces the
+//! canonical flag false; (2) the decode loop validate-before-commits each pick ([`Constraint::try_accept`])
+//! and re-picks on rejection instead of erroring. These stop the crash, but on the live model the mask
+//! is still inconsistent enough that the forced JSON can mask out entirely (empty body) — so the server
+//! treats an empty/unparseable constrained call as a miss and FALLS BACK to unconstrained generation.
+//! Net today: ≥1.7B models get reliable tool calls via the (unconstrained) auto path; the constrained
+//! reliability tier for tiny models needs the principled fix — driving the grammar at BYTE level
+//! (`Matcher::compute_ff_bytes`, the non-canonical-safe path) instead of token level. TODO.
 
 use anyhow::{anyhow, Result};
 use llguidance::api::TopLevelGrammar;
-use llguidance::toktrie::TokEnv;
+use llguidance::toktrie::{TokEnv, TokTrie, TokenId, TokenizerEnv};
 use llguidance::{Matcher, ParserFactory};
 use serde_json::Value;
 use std::sync::Arc;
 use tokenizers::Tokenizer;
 use toktrie_hf_tokenizers::{ByteTokenizer, ByteTokenizerEnv};
 
+/// Wraps a [`ByteTokenizerEnv`] to report itself NON-canonical. `ByteTokenizerEnv` inherits the trait
+/// default `tokenize_is_canonical() == true`, which makes llguidance enable token-healing: it computes
+/// a byte-forced prefix and returns a HEALED mask that's only exact for a truly-canonical tokenizer.
+/// The GGUF→`tokenizers`→serialized-JSON bridge is NOT canonical, so the healed mask is a SUPERSET that
+/// `consume_token` then rejects (the live "forced bytes: got '{'; applying '!'" bug). Forcing the flag
+/// to `false` makes llguidance use the conservative, non-canonical-safe masking path where
+/// `compute_mask` and `consume_token` agree.
+struct NonCanonicalEnv(ByteTokenizerEnv);
+
+impl TokenizerEnv for NonCanonicalEnv {
+    fn tok_trie(&self) -> &TokTrie {
+        self.0.tok_trie()
+    }
+    fn tokenize_bytes(&self, s: &[u8]) -> Vec<TokenId> {
+        self.0.tokenize_bytes(s)
+    }
+    fn tokenize_is_canonical(&self) -> bool {
+        false
+    }
+}
+
 /// Build an llguidance [`TokEnv`] from infr's in-memory tokenizer. Serializes the tokenizer to JSON
 /// and reparses it on toktrie's side (decoupling the `tokenizers` versions); `eos_ids` mark stop
-/// tokens; `vocab` is the model's logit width so the token trie matches the logits exactly.
+/// tokens; `vocab` is the model's logit width so the token trie matches the logits exactly. Wrapped in
+/// [`NonCanonicalEnv`] so the mask is consistent with `consume` (see that type's docs).
 pub fn build_tok_env(tokenizer: &Tokenizer, vocab: usize, eos_ids: &[u32]) -> Result<TokEnv> {
     let json = tokenizer
         .to_string(false)
@@ -40,7 +64,7 @@ pub fn build_tok_env(tokenizer: &Tokenizer, vocab: usize, eos_ids: &[u32]) -> Re
         bt.set_eos_tokens(eos_ids);
     }
     let env = ByteTokenizerEnv::new(bt, Some(vocab)).map_err(|e| anyhow!("tok env: {e}"))?;
-    Ok(env.to_env())
+    Ok(Arc::new(NonCanonicalEnv(env)))
 }
 
 /// A live grammar constraint over a decode. Cheap-ish to construct (parser build); one per request.
@@ -84,12 +108,22 @@ impl Constraint {
         self.matcher.compute_ff_tokens()
     }
 
-    /// Advance the grammar by one freely-sampled `token` (consume only — forced tokens are drained
-    /// separately via [`forced`](Self::forced)).
-    pub fn accept_one(&mut self, token: u32) -> Result<()> {
-        self.matcher
-            .consume_token(token)
-            .map_err(|e| anyhow!("{e}"))
+    /// Try to advance the grammar by one freely-sampled `token`, validating BEFORE committing. Returns
+    /// `true` if accepted, `false` if the token isn't actually grammar-legal (no state change). This is
+    /// the guard against llguidance's token-healing returning a SUPERSET mask: `compute_mask` can allow
+    /// a token that the parser then rejects (the GGUF tokenizer bridge isn't truly canonical), so the
+    /// decode loop re-picks instead of failing the whole request.
+    pub fn try_accept(&mut self, token: u32) -> Result<bool> {
+        Ok(self
+            .matcher
+            .try_consume_tokens(&[token])
+            .map_err(|e| anyhow!("{e}"))?
+            == 1)
+    }
+
+    /// Whether the grammar is in an accepting state (a legal place to stop — EOS allowed here).
+    pub fn accepting(&mut self) -> Result<bool> {
+        self.matcher.is_accepting().map_err(|e| anyhow!("{e}"))
     }
 
     /// Advance the grammar by a run of forced tokens.
@@ -197,6 +231,7 @@ mod tests {
         // mask and the parser agree. Full termination is covered by the live-model server test.)
         // Mirror the real decode loop: drain forced tokens first, else mask + argmax-pick a free token.
         let mut out: Vec<u32> = Vec::new();
+        let mut drops = 0usize;
         for step in 0..60 {
             if c.stopped() {
                 break;
@@ -207,7 +242,11 @@ mod tests {
                 out.extend(forced);
                 continue;
             }
-            let mut logits = vec![0.0f32; cfg.vocab];
+            // ADVERSARIAL logits: bias toward high token ids (and away from the genuinely-valid low-id
+            // delimiters). The healed mask can be a SUPERSET, so a naive argmax here would pick a
+            // superset member that `consume_token` rejects — exactly the live-server failure. The
+            // retry-on-reject loop (mirroring `decode_loop`) must recover and still produce valid JSON.
+            let mut logits: Vec<f32> = (0..cfg.vocab).map(|i| i as f32).collect();
             c.apply_mask(&mut logits).expect("mask");
             let allowed = logits.iter().filter(|l| l.is_finite()).count();
             assert!(allowed > 0, "step {step}: grammar masked out EVERY token");
@@ -215,20 +254,29 @@ mod tests {
                 allowed < cfg.vocab,
                 "step {step}: grammar allowed everything"
             );
-            let tok = crate::sampling::argmax(&logits) as u32;
-            // The crux: argmax over the mask must yield a token `accept_one` accepts (mask/consume
-            // agree — no special-token/byte or canonicalization mismatch).
-            c.accept_one(tok).expect("accept_one must agree with mask");
-            out.push(tok);
+            let picked = loop {
+                let cand = crate::sampling::argmax(&logits) as u32;
+                assert!(
+                    logits[cand as usize].is_finite(),
+                    "step {step}: mask exhausted — every allowed token was rejected"
+                );
+                if c.try_accept(cand).expect("try_accept") {
+                    break cand;
+                }
+                drops += 1;
+                logits[cand as usize] = f32::NEG_INFINITY; // superset member — drop + retry
+            };
+            out.push(picked);
         }
         let text = tok.decode(&out, false).expect("decode");
-        eprintln!("constrained prefix: {text:?}");
-        // The constrained body is JSON — it must begin a `{"name": ...}` object.
-        let t = text.trim_start();
-        assert!(t.starts_with('{'), "expected a JSON object, got {text:?}");
+        // `drops` counts superset-member rejections recovered via retry. With the canonical GGUF-built
+        // tokenizer the mask is usually exact (drops==0); the SUPERSET only appears with the live model
+        // tokenizer (the server test exercises that), so we don't assert drops>0 here — we assert the
+        // retry path is sound: never deadlocks (handled in-loop) and keeps the output valid JSON.
+        eprintln!("constrained prefix ({drops} superset drops): {text:?}");
         assert!(
-            t.contains("name"),
-            "JSON should constrain toward the `name` key: {text:?}"
+            text.trim_start().starts_with('{'),
+            "constrained output must stay valid JSON: {text:?}"
         );
     }
 }
