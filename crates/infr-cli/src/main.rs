@@ -362,7 +362,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         let mode = if std::env::var("Q35_CPU").is_ok() {
             "CPU oracle"
         } else {
-            "GPU linear + SSM, CPU attention"
+            "GPU linear + SSM + attention"
         };
         eprintln!("[qwen35 Qwen3-Next — {mode}]");
         let t0 = std::time::Instant::now();

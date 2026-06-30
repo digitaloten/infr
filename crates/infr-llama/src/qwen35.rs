@@ -772,6 +772,45 @@ impl Model {
     }
 
     /// Gated full attention (one token), GQA, head_dim 256, partial sectioned RoPE, sigmoid out-gate.
+    /// GPU GQA decode attention for one token: q `[nh*hd]` against the full f16 KV cache (`kc`/`vc`
+    /// host f32, uploaded as f16), causal, scale 1/√hd. Returns the per-head attention output `[nh*hd]`
+    /// (pre output-gate). Uploads the whole cache each call — correctness-first, not perf.
+    fn gpu_attn(
+        &self,
+        be: &VulkanBackend,
+        q: &[f32],
+        kc: &[f32],
+        vc: &[f32],
+        t: usize,
+    ) -> Vec<f32> {
+        let c = &self.cfg;
+        let (nh, nkv, hd) = (c.n_head, c.n_kv, c.head_dim);
+        let qb = be.upload_weight_f16(q).expect("q f16");
+        let kb = be.upload_weight_f16(kc).expect("kc f16");
+        let vb = be.upload_weight_f16(vc).expect("vc f16");
+        let ob = be
+            .alloc(nh * hd * 4, BufferUsage::Activations)
+            .expect("alloc o");
+        let rec = be.recorder().expect("recorder");
+        // pos_offset = t-1 (this token's abs position); window 0 = full causal; scale 0 = default 1/√hd.
+        rec.attention_kv(
+            qb.as_ref(),
+            kb.as_ref(),
+            vb.as_ref(),
+            ob.as_ref(),
+            1,
+            t,
+            nh,
+            nkv,
+            hd,
+            t - 1,
+            0,
+            0.0,
+        );
+        rec.finish().expect("finish");
+        read(be, ob.as_ref(), nh * hd)
+    }
+
     fn attn_mixer(
         &self,
         w: &AttnLayer,
@@ -811,32 +850,43 @@ impl Model {
         kc.extend_from_slice(&k);
         vc.extend_from_slice(&v);
         let t = pos + 1; // cached length
-        let scale = 1.0 / (hd as f32).sqrt();
-        let g = nh / nkv;
-        let mut out = vec![0.0f32; nh * hd];
-        for h in 0..nh {
-            let kvh = h / g;
-            let qh = &q[h * hd..h * hd + hd];
-            let mut scores = vec![0.0f32; t];
-            for j in 0..t {
-                let kj = &kc[j * nkv * hd + kvh * hd..j * nkv * hd + kvh * hd + hd];
-                scores[j] = qh.iter().zip(kj).map(|(a, b)| a * b).sum::<f32>() * scale;
-            }
-            let m = scores.iter().cloned().fold(f32::MIN, f32::max);
-            let mut den = 0.0;
-            for sj in scores.iter_mut() {
-                *sj = (*sj - m).exp();
-                den += *sj;
-            }
-            let oh = &mut out[h * hd..h * hd + hd];
-            for j in 0..t {
-                let p = scores[j] / den;
-                let vj = &vc[j * nkv * hd + kvh * hd..j * nkv * hd + kvh * hd + hd];
-                for d in 0..hd {
-                    oh[d] += p * vj[d];
+                         // GQA softmax attention over the cache — GPU (attention_kv) when a backend is present, else
+                         // the CPU reference. Output gate (sigmoid) applied after, on the host.
+        let mut out = match be {
+            Some(be) => self.gpu_attn(be, &q, kc, vc, t),
+            None => {
+                let scale = 1.0 / (hd as f32).sqrt();
+                let g = nh / nkv;
+                let mut out = vec![0.0f32; nh * hd];
+                for h in 0..nh {
+                    let kvh = h / g;
+                    let qh = &q[h * hd..h * hd + hd];
+                    let mut scores = vec![0.0f32; t];
+                    for j in 0..t {
+                        let kj = &kc[j * nkv * hd + kvh * hd..j * nkv * hd + kvh * hd + hd];
+                        scores[j] = qh.iter().zip(kj).map(|(a, b)| a * b).sum::<f32>() * scale;
+                    }
+                    let m = scores.iter().cloned().fold(f32::MIN, f32::max);
+                    let mut den = 0.0;
+                    for sj in scores.iter_mut() {
+                        *sj = (*sj - m).exp();
+                        den += *sj;
+                    }
+                    let oh = &mut out[h * hd..h * hd + hd];
+                    for j in 0..t {
+                        let p = scores[j] / den;
+                        let vj = &vc[j * nkv * hd + kvh * hd..j * nkv * hd + kvh * hd + hd];
+                        for d in 0..hd {
+                            oh[d] += p * vj[d];
+                        }
+                    }
                 }
+                out
             }
-            // per-head sigmoid output gate
+        };
+        // per-head sigmoid output gate (host; tiny)
+        for h in 0..nh {
+            let oh = &mut out[h * hd..h * hd + hd];
             let gh = &gate[h * hd..h * hd + hd];
             for d in 0..hd {
                 oh[d] *= sigmoid(gh[d]);
