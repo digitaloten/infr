@@ -3831,7 +3831,6 @@ fn attention(
 #[cfg(test)]
 mod gpu_affine_tests {
     use super::*;
-    use crate::*;
     use infr_core::backend::BufferUsage;
     use infr_core::Backend;
     use infr_vulkan::VulkanBackend;
