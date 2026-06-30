@@ -7,7 +7,7 @@ use crate::linear::native_dense_supported;
 use crate::{be, VulkanBackend};
 use infr_core::backend::{Bindings, Buffer, BufferUsage, Plan};
 use infr_core::error::Result;
-use infr_core::graph::{Activation, Graph, Op, TensorKind};
+use infr_core::graph::{Activation, AttnMask, Graph, Op, TensorKind};
 use infr_core::{Backend, TensorId};
 
 /// Compiled plan: the `Graph` replayed each `execute` (buffers re-bound per step, no recompile). A
@@ -65,6 +65,24 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
         }
     }
     let r = |id: TensorId| resolve(&scratch, bindings, id);
+
+    // RoPE position: the static `qk_norm_rope`/`rope` kernels take a scalar `rope_pos`, but the IR
+    // carries a `positions` i32 tensor. Read `positions[0]` (decode rows=1, or the start of a
+    // consecutive-prefill run) up front — `download` syncs, so it must precede the recorder.
+    let mut rope_pos: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for op in &graph.ops {
+        let pid = match op {
+            Op::Rope { positions, .. } | Op::QkNormRope { positions, .. } => Some(*positions),
+            _ => None,
+        };
+        if let Some(pid) = pid {
+            if let std::collections::hash_map::Entry::Vacant(e) = rope_pos.entry(pid.0) {
+                let mut b = [0u8; 4];
+                be_.download(r(pid)?, &mut b)?;
+                e.insert(i32::from_le_bytes(b) as usize);
+            }
+        }
+    }
 
     let rec = be_.recorder()?;
     for op in &graph.ops {
@@ -182,6 +200,103 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
                     infr_core::DType::F16 => rec.copy(s, 0, c, pos * rs * 2, n * 2),
                     _ => rec.store_f16(s, c, n, pos * rs),
                 }
+            }
+            // Fused per-head RMSNorm + RoPE → the GPU's fused kernel (f32 in → f16 out, so `dst` is an
+            // f16 tensor). `freq_factors` = gemma4 proportional RoPE.
+            Op::QkNormRope {
+                x,
+                weight,
+                positions,
+                dst,
+                rows,
+                n_head,
+                head_dim,
+                rope_dim,
+                theta,
+                eps,
+                freq_factors,
+            } => {
+                let ff = match freq_factors {
+                    Some(f) => Some(r(*f)?),
+                    None => None,
+                };
+                rec.qk_norm_rope(
+                    r(*x)?,
+                    r(*weight)?,
+                    r(*dst)?,
+                    *rows as usize,
+                    *n_head as usize,
+                    *head_dim as usize,
+                    *rope_dim as usize,
+                    *theta,
+                    rope_pos[&positions.0],
+                    0,
+                    *eps,
+                    ff,
+                );
+            }
+            // Standalone RoPE (llama: no q/k-norm). The basic kernel has no freq_factors — gemma4's
+            // proportional RoPE always rides on QkNormRope, so a lone freq_factors RoPE is unexpected.
+            Op::Rope {
+                x,
+                positions,
+                dst,
+                rows,
+                n_head,
+                head_dim,
+                rope_dim,
+                theta,
+                freq_factors,
+            } => {
+                if freq_factors.is_some() {
+                    return Err(be(
+                        "vulkan adapter: standalone Rope with freq_factors unsupported",
+                    ));
+                }
+                rec.rope(
+                    r(*x)?,
+                    r(*dst)?,
+                    *rows as usize,
+                    *n_head as usize,
+                    *head_dim as usize,
+                    *rope_dim as usize,
+                    *theta,
+                    rope_pos[&positions.0],
+                );
+            }
+            // GQA scaled-dot-product attention over the f16 KV cache (causal / sliding-window).
+            Op::Attention {
+                q,
+                k_cache,
+                v_cache,
+                dst,
+                rows,
+                kv_len,
+                n_head,
+                n_kv,
+                head_dim,
+                scale,
+                mask,
+                pos,
+            } => {
+                let window = match mask {
+                    AttnMask::Causal => 0,
+                    AttnMask::SlidingWindow(w) => *w as usize,
+                };
+                rec.attention_kv(
+                    r(*q)?,
+                    r(*k_cache)?,
+                    r(*v_cache)?,
+                    r(*dst)?,
+                    *rows as usize,
+                    *kv_len as usize,
+                    *n_head as usize,
+                    *n_kv as usize,
+                    *head_dim as usize,
+                    *pos as usize,
+                    window,
+                    *scale,
+                );
             }
             other => {
                 return Err(be(format!(
@@ -386,6 +501,85 @@ mod tests {
             assert!(
                 (got[i] - want[i]).abs() < 1e-3,
                 "gated_act mismatch at {i}: got {} want {}",
+                got[i],
+                want[i]
+            );
+        }
+    }
+
+    /// A one-op `QkNormRope` graph (per-head RMSNorm + RoPE, f32 in → f16 out, positions tensor) must
+    /// match a host reference (f16 tolerance).
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn qk_norm_rope_graph_matches_host() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        let (nh, hd, pos) = (2usize, 8usize, 3usize);
+        let (eps, theta, rope_dim) = (1e-6f32, 10000.0f32, 8usize);
+        let x: Vec<f32> = (0..nh * hd).map(|i| i as f32 * 0.1 - 0.5).collect();
+        let w: Vec<f32> = (0..hd).map(|i| 1.0 + i as f32 * 0.05).collect();
+        // host reference: per-head rmsnorm (×w) then split-half NEOX rope
+        let mut want = vec![0f32; nh * hd];
+        let hf = rope_dim / 2;
+        for h in 0..nh {
+            let b = h * hd;
+            let ss = (0..hd).map(|i| x[b + i] * x[b + i]).sum::<f32>() / hd as f32;
+            let s = 1.0 / (ss + eps).sqrt();
+            let nrm: Vec<f32> = (0..hd).map(|i| x[b + i] * s * w[i]).collect();
+            for i in 0..hd {
+                want[b + i] = nrm[i];
+            }
+            for p in 0..hf {
+                let ang = pos as f32 * theta.powf(-2.0 * p as f32 / rope_dim as f32);
+                let (sn, c) = (ang.sin(), ang.cos());
+                want[b + p] = nrm[p] * c - nrm[p + hf] * sn;
+                want[b + p + hf] = nrm[p] * sn + nrm[p + hf] * c;
+            }
+        }
+        let mut g = Graph::new();
+        let xi = g.input(TensorDesc::new(vec![1, nh, hd], DType::F32));
+        let wi = g.weight(TensorDesc::new(vec![hd], DType::F32));
+        let pi = g.input(TensorDesc::new(vec![1], DType::I32));
+        let yi = g.output(TensorDesc::new(vec![1, nh, hd], DType::F16));
+        g.push(Op::QkNormRope {
+            x: xi,
+            weight: wi,
+            positions: pi,
+            dst: yi,
+            rows: 1,
+            n_head: nh as u32,
+            head_dim: hd as u32,
+            rope_dim: rope_dim as u32,
+            theta,
+            eps,
+            freq_factors: None,
+        });
+        let xb = be_.alloc(nh * hd * 4, BufferUsage::Activations).unwrap();
+        let wb = be_.alloc(hd * 4, BufferUsage::Weights).unwrap();
+        let pb = be_.alloc(4, BufferUsage::Activations).unwrap();
+        let yb = be_.alloc(nh * hd * 2, BufferUsage::Activations).unwrap();
+        be_.upload(xb.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+        be_.upload(wb.as_ref(), bytemuck::cast_slice(&w)).unwrap();
+        be_.upload(pb.as_ref(), &(pos as i32).to_le_bytes())
+            .unwrap();
+        let plan = be_.compile(&g).unwrap();
+        let mut bind = Bindings::new();
+        bind.bind(xi, xb.as_ref());
+        bind.bind(wi, wb.as_ref());
+        bind.bind(pi, pb.as_ref());
+        bind.bind(yi, yb.as_ref());
+        be_.execute(plan.as_ref(), &bind).unwrap();
+        let mut y16 = vec![0u8; nh * hd * 2];
+        be_.download(yb.as_ref(), &mut y16).unwrap();
+        let got: Vec<f32> = y16
+            .chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect();
+        for i in 0..nh * hd {
+            assert!(
+                (got[i] - want[i]).abs() < 2e-2,
+                "qk_norm_rope mismatch at {i}: got {} want {}",
                 got[i],
                 want[i]
             );
