@@ -7,7 +7,7 @@ use crate::linear::native_dense_supported;
 use crate::{be, VulkanBackend};
 use infr_core::backend::{Bindings, Buffer, BufferUsage, Plan};
 use infr_core::error::Result;
-use infr_core::graph::{Graph, Op, TensorKind};
+use infr_core::graph::{Activation, Graph, Op, TensorKind};
 use infr_core::{Backend, TensorId};
 
 /// Compiled plan: the `Graph` replayed each `execute` (buffers re-bound per step, no recompile). A
@@ -131,6 +131,57 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
                     *dst_off as usize * eb,
                     *n as usize * eb,
                 );
+            }
+            // Gated FFN activation: `act(gate) * up[+up_off]`. up_off (E2B per-layer slice) only
+            // arises with Gelu (gemma); silu/sigmoid are always up_off==0.
+            Op::GatedAct {
+                gate,
+                up,
+                dst,
+                rows,
+                nff,
+                act,
+                up_off,
+            } => {
+                let n = *rows as usize * *nff as usize;
+                let (g_, u_, y) = (r(*gate)?, r(*up)?, r(*dst)?);
+                match act {
+                    Activation::Silu => {
+                        if *up_off != 0 {
+                            return Err(be("vulkan adapter: GatedAct Silu up_off!=0 unsupported"));
+                        }
+                        rec.silu_mul(g_, u_, y, n);
+                    }
+                    Activation::Sigmoid => {
+                        if *up_off != 0 {
+                            return Err(be(
+                                "vulkan adapter: GatedAct Sigmoid up_off!=0 unsupported",
+                            ));
+                        }
+                        rec.mul_sigmoid(g_, u_, y, n);
+                    }
+                    Activation::Gelu => {
+                        let eb = graph.desc(*up).dtype.dense_bytes(1).unwrap_or(4);
+                        rec.gelu_mul_off(g_, u_, *up_off as usize * eb, y, n);
+                    }
+                }
+            }
+            // Append a row into the persistent KV cache at row `pos`. store_f16 casts f32→f16 (the
+            // common case: V / f32 K); an already-f16 source is a straight copy.
+            Op::WriteKv {
+                src,
+                cache,
+                rows,
+                row_stride,
+                pos,
+            } => {
+                let (rows, rs, pos) = (*rows as usize, *row_stride as usize, *pos as usize);
+                let n = rows * rs;
+                let (s, c) = (r(*src)?, r(*cache)?);
+                match graph.desc(*src).dtype {
+                    infr_core::DType::F16 => rec.copy(s, 0, c, pos * rs * 2, n * 2),
+                    _ => rec.store_f16(s, c, n, pos * rs),
+                }
             }
             other => {
                 return Err(be(format!(
@@ -287,6 +338,56 @@ mod tests {
                 "linear mismatch at {o}: got {} want {}",
                 got[o],
                 want[o]
+            );
+        }
+    }
+
+    /// A one-op `GatedAct` (SwiGLU: silu(gate)·up) graph through the seam must match a host loop.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn gated_act_silu_matches_host() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        let nff = 8usize;
+        let gate: Vec<f32> = (0..nff).map(|i| i as f32 * 0.2 - 0.7).collect();
+        let up: Vec<f32> = (0..nff).map(|i| 1.0 - i as f32 * 0.1).collect();
+        let silu = |x: f32| x / (1.0 + (-x).exp());
+        let want: Vec<f32> = (0..nff).map(|i| silu(gate[i]) * up[i]).collect();
+        let mut g = Graph::new();
+        let gi = g.input(TensorDesc::new(vec![1, nff], DType::F32));
+        let ui = g.input(TensorDesc::new(vec![1, nff], DType::F32));
+        let yi = g.output(TensorDesc::new(vec![1, nff], DType::F32));
+        g.push(Op::GatedAct {
+            gate: gi,
+            up: ui,
+            dst: yi,
+            rows: 1,
+            nff: nff as u32,
+            act: Activation::Silu,
+            up_off: 0,
+        });
+        let gb = be_.alloc(nff * 4, BufferUsage::Activations).unwrap();
+        let ub = be_.alloc(nff * 4, BufferUsage::Activations).unwrap();
+        let yb = be_.alloc(nff * 4, BufferUsage::Activations).unwrap();
+        be_.upload(gb.as_ref(), bytemuck::cast_slice(&gate))
+            .unwrap();
+        be_.upload(ub.as_ref(), bytemuck::cast_slice(&up)).unwrap();
+        let plan = be_.compile(&g).unwrap();
+        let mut bind = Bindings::new();
+        bind.bind(gi, gb.as_ref());
+        bind.bind(ui, ub.as_ref());
+        bind.bind(yi, yb.as_ref());
+        be_.execute(plan.as_ref(), &bind).unwrap();
+        let mut got = vec![0f32; nff];
+        be_.download(yb.as_ref(), bytemuck::cast_slice_mut(&mut got))
+            .unwrap();
+        for i in 0..nff {
+            assert!(
+                (got[i] - want[i]).abs() < 1e-3,
+                "gated_act mismatch at {i}: got {} want {}",
+                got[i],
+                want[i]
             );
         }
     }
