@@ -9,6 +9,7 @@
 #![allow(clippy::needless_range_loop)]
 
 pub mod cpu_backend;
+mod mixers;
 mod quant;
 pub mod qwen35;
 mod tokenizer;
@@ -2765,25 +2766,20 @@ impl Llama {
                     ne,
                     c.rms_eps,
                 );
-                rec_linear(
+                mixers::ffn::record_swiglu(
                     &rec,
-                    layer.wgateup(),
                     hn.as_ref(),
-                    gu.as_ref(),
-                    1,
-                    ne,
-                    2 * nff,
-                );
-                rec.silu_mul_fused(gu.as_ref(), act.as_ref(), 1, nff);
-                rec_linear_add(
-                    &rec,
+                    mixers::ffn::GateUp::Fused(layer.wgateup()),
                     layer.wdown(),
+                    gu.as_ref(),
+                    gu.as_ref(), // g unused for Fused
+                    gu.as_ref(), // u unused for Fused
                     act.as_ref(),
                     hidden.as_ref(),
-                    hidden.as_ref(),
+                    Some(hidden.as_ref()), // fused residual add (in-place)
                     1,
-                    nff,
                     ne,
+                    nff,
                 );
             }
             // final norm + vocab GEMV on the single row (hidden row 0 → hlast).

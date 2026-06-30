@@ -52,6 +52,14 @@ impl Lin {
             Lin::Cpu(_) => panic!("Lin::record requires a GPU weight (not the Q35_CPU oracle)"),
         }
     }
+
+    /// The shared GPU weight (panics on the Q35_CPU oracle) — for passing into shared mixer blocks.
+    fn gpu_wt(&self) -> &crate::Wt {
+        match self {
+            Lin::Gpu(w) => w,
+            Lin::Cpu(_) => panic!("gpu_wt requires a GPU weight (not the Q35_CPU oracle)"),
+        }
+    }
 }
 
 /// Parsed `qwen35` hyper-parameters (subset needed for the 0.8B dense model).
@@ -618,10 +626,25 @@ impl Model {
         {
             let rec = be.recorder().expect("recorder");
             rec.rmsnorm(hb.as_ref(), norm_buf, h2.as_ref(), 1, ne, eps);
-            gate.record(&rec, h2.as_ref(), g.as_ref(), ne, n_ff);
-            up.record(&rec, h2.as_ref(), u.as_ref(), ne, n_ff);
-            rec.silu_mul(g.as_ref(), u.as_ref(), act.as_ref(), n_ff);
-            down.record(&rec, act.as_ref(), out.as_ref(), n_ff, ne);
+            // SwiGLU channel-mixer via the shared block (qwen35 carries split gate/up weights).
+            crate::mixers::ffn::record_swiglu(
+                &rec,
+                h2.as_ref(),
+                crate::mixers::ffn::GateUp::Split {
+                    gate: gate.gpu_wt(),
+                    up: up.gpu_wt(),
+                },
+                down.gpu_wt(),
+                u.as_ref(), // gu unused for Split
+                g.as_ref(),
+                u.as_ref(),
+                act.as_ref(),
+                out.as_ref(),
+                None, // qwen35 adds the residual itself in forward()
+                1,
+                ne,
+                n_ff,
+            );
             rec.finish().expect("finish");
         }
         read(be, out.as_ref(), ne)
