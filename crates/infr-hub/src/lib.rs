@@ -10,13 +10,14 @@ mod pull;
 mod store;
 
 pub use model_ref::ModelRef;
-pub use pull::pull;
+pub use pull::{pull, pull_latest};
 pub use store::Store;
 
 use infr_core::error::Result;
 use std::path::PathBuf;
 
-/// Resolve from the store if present, otherwise pull.  Used by `infr run` / `infr serve`.
+/// Resolve from the store if present, otherwise pull. Cache-first — does NOT check HF for updates, so
+/// it stays fast and works offline. Used by `infr run` / `infr serve`.
 ///
 /// - `Path(p)` → returned immediately.
 /// - Everything else → [`Store::discover`] + [`Store::resolve`]; if not cached → [`pull`].
@@ -29,4 +30,14 @@ pub fn ensure(r: &ModelRef) -> Result<PathBuf> {
         return Ok(p);
     }
     pull(r)
+}
+
+/// Like [`ensure`] but checks HF for the repo's latest commit and updates the cache when it's stale
+/// (falling back to the cached copy when offline). Used by `infr pull` so a re-pull picks up repo
+/// updates instead of silently serving the first-pulled snapshot forever.
+pub fn ensure_latest(r: &ModelRef) -> Result<PathBuf> {
+    if let ModelRef::Path(p) = r {
+        return Ok(p.clone());
+    }
+    pull_latest(r)
 }

@@ -23,12 +23,100 @@ use tracing::{debug, info};
 // ---------------------------------------------------------------------------
 
 /// Download a model into the HF Hub cache, returning the resolved GGUF path (a `snapshots/` symlink).
-/// Idempotent: a model already cached is returned without re-downloading.
+/// Idempotent: a model already cached is returned without re-downloading. Does NOT check for updates —
+/// any cached snapshot satisfies it (the fast path for `infr run`). For an update check see
+/// [`pull_latest`].
 pub fn pull(r: &ModelRef) -> Result<PathBuf> {
     match r {
         ModelRef::Path(p) => Ok(p.clone()),
         ModelRef::Repo { repo, sel } => pull_repo(repo, sel.as_deref()),
     }
+}
+
+/// Like [`pull`] but ALWAYS queries HF for the repo's current `main` commit first and downloads when
+/// the cached snapshot is missing or stale (the remote commit moved). A no-op when already up to date
+/// (one cheap API call). On any network/API error, falls back to the cached copy if there is one
+/// (offline-friendly). This is what `infr pull` runs so a re-pull actually picks up repo updates.
+pub fn pull_latest(r: &ModelRef) -> Result<PathBuf> {
+    match r {
+        ModelRef::Path(p) => Ok(p.clone()),
+        ModelRef::Repo { repo, sel } => pull_repo_latest(repo, sel.as_deref()),
+    }
+}
+
+fn pull_repo_latest(repo: &str, sel: Option<&str>) -> Result<PathBuf> {
+    let store = Store::discover()?;
+    // Ask HF for the current commit + concrete gguf filename. If the API is unreachable (offline),
+    // serve whatever is cached rather than failing.
+    let (commit, filename) = match repo_info(repo, sel) {
+        Ok(x) => x,
+        Err(e) => {
+            return match store.resolve_repo(repo, sel) {
+                Some(p) => {
+                    info!("hf:{repo}: update check failed ({e}); using cached copy");
+                    Ok(p)
+                }
+                None => Err(e),
+            };
+        }
+    };
+
+    let repo_dir = store.repo_dir(repo);
+    // Up to date when the snapshot for THIS commit already links a present blob for `filename`.
+    let link = repo_dir.join("snapshots").join(&commit).join(&filename);
+    if link.exists() {
+        info!("hf:{repo}:{filename} already up to date ({commit})");
+        return Ok(link);
+    }
+
+    let blobs = repo_dir.join("blobs");
+    let url = format!("https://huggingface.co/{repo}/resolve/main/{filename}");
+    // The commit moved but the FILE may be byte-identical (e.g. the repo only added a sibling like an
+    // mmproj). Blobs are content-addressed by sha256, so if the file's sha is already cached we just
+    // relink — no multi-GB re-download. A HEAD gives the LFS sha (`X-Linked-Etag`) without the body.
+    let hex = match head_blob_sha(repo, &filename) {
+        Ok(sha) if blobs.join(&sha).exists() => {
+            info!("hf:{repo}:{filename} content unchanged; relinking → {commit}");
+            sha
+        }
+        _ => {
+            info!("Updating hf:{repo}:{filename} → {commit}");
+            download_to_blob(&http_client()?, &url, token().as_deref(), &blobs, &filename)?.1
+        }
+    };
+
+    // Repoint refs/main + create the new commit's snapshot symlink (old snapshots are left in place).
+    write_text(&repo_dir.join("refs").join("main"), &commit)?;
+    fs::create_dir_all(link.parent().unwrap()).map_err(Error::from)?;
+    let _ = fs::remove_file(&link); // replace a stale/dangling link
+    symlink(format!("../../blobs/{hex}"), &link).map_err(Error::from)?;
+    debug!("linked {link:?} -> blobs/{hex}");
+    Ok(link)
+}
+
+/// HEAD the resolve URL to read the file's LFS sha256 (HF's `X-Linked-Etag`) WITHOUT downloading the
+/// body — so a commit bump that left the file unchanged can relink the cached blob. Redirects are
+/// disabled because the sha header is on huggingface.co's 302, not the CDN's final 200.
+fn head_blob_sha(repo: &str, filename: &str) -> Result<String> {
+    let client = Client::builder()
+        .user_agent("infr-hub/0.1")
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| Error::Other(format!("building HTTP client: {e}")))?;
+    let url = format!("https://huggingface.co/{repo}/resolve/main/{filename}");
+    let mut req = client.head(&url);
+    if let Some(t) = token() {
+        req = req.bearer_auth(t);
+    }
+    let resp = req
+        .send()
+        .map_err(|e| Error::Other(format!("HEAD {url}: {e}")))?;
+    let h = resp.headers();
+    h.get("x-linked-etag")
+        .or_else(|| h.get("etag"))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim_matches('"').to_string())
+        .ok_or_else(|| Error::Other("no etag in HEAD response".into()))
 }
 
 fn http_client() -> Result<Client> {

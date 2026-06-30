@@ -151,7 +151,9 @@ fn resolve(model: &str) -> anyhow::Result<(PathBuf, Option<PathBuf>)> {
 
 fn cmd_pull(model: &str) -> anyhow::Result<()> {
     let r = infr_hub::ModelRef::parse(model).map_err(|e| anyhow!("{e}"))?;
-    let path = infr_hub::ensure(&r).map_err(|e| anyhow!("{e}"))?;
+    // `pull` checks HF for the repo's latest commit and updates a stale cache (run/serve stay
+    // cache-first via `ensure`). Offline → falls back to the cached copy.
+    let path = infr_hub::ensure_latest(&r).map_err(|e| anyhow!("{e}"))?;
     println!("{}", path.display());
     Ok(())
 }
