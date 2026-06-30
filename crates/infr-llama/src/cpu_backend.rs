@@ -1209,6 +1209,157 @@ fn vec_dot_q4k_batch2(
     vec_dot_q4k_batch(row_b, q8s, in_f, out_b);
 }
 
+// ── Q4_K 8-row tiled batch ────────────────────────────────────────────────────
+//
+// Process EIGHT output rows simultaneously: the Q8 activation zmm is loaded ONCE
+// per (block, nibble-pair) and reused across all 8 row dots. This is 4× less
+// activation traffic than the 2-row path and 8× less than the single-row path.
+//
+// `outs[i][r]` == `vec_dot_q4k(rows[i], &q8s[r], in_f)` — bit-identical to the
+// single-token kernel (same per-block accumulation order; tiling only changes which
+// rows are computed together, not the per-(row,token) arithmetic).
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+unsafe fn vec_dot_q4k_batch8_avx512bw(
+    rows: [&[u8]; 8],
+    q8s: &[Q8],
+    in_f: usize,
+    outs: [&mut [f32]; 8],
+) {
+    use std::arch::x86_64::*;
+    let m = q8s.len();
+    let nb = in_f / 256;
+    let mask_lo = _mm256_set1_epi8(0x0F_u8 as i8);
+    let ones512 = _mm512_set1_epi16(1i16);
+
+    // Pre-expand all 8 weight rows once. Layout identical to the single-row AVX-512BW
+    // batch kernel: flat[i][b*256 + k*64 .. +64] = [lo_nib 32B, hi_nib 32B] for pair k.
+    let mut flats: [Vec<u8>; 8] = std::array::from_fn(|_| vec![0u8; nb * 256]);
+    let mut d_arr: [Vec<f32>; 8] = std::array::from_fn(|_| vec![0f32; nb]);
+    let mut dmin_arr: [Vec<f32>; 8] = std::array::from_fn(|_| vec![0f32; nb]);
+    let mut sc_arr: [Vec<[u32; 8]>; 8] = std::array::from_fn(|_| vec![[0u32; 8]; nb]);
+    let mut m_arr: [Vec<[u32; 8]>; 8] = std::array::from_fn(|_| vec![[0u32; 8]; nb]);
+
+    for i in 0..8 {
+        for b in 0..nb {
+            let blk = &rows[i][b * 144..b * 144 + 144];
+            d_arr[i][b] = crate::rdf16(&blk[0..2]);
+            dmin_arr[i][b] = crate::rdf16(&blk[2..4]);
+            let scales = &blk[4..16];
+            let qs = &blk[16..144];
+            for s in 0..8usize {
+                let (sc, mv) = crate::k4(s, scales);
+                sc_arr[i][b][s] = sc;
+                m_arr[i][b][s] = mv;
+            }
+            let f = &mut flats[i][b * 256..b * 256 + 256];
+            for k in 0..4usize {
+                let nibs = _mm256_loadu_si256(qs[k * 32..].as_ptr() as *const __m256i);
+                let lo = _mm256_and_si256(nibs, mask_lo);
+                let hi = _mm256_and_si256(_mm256_srli_epi16(nibs, 4), mask_lo);
+                _mm256_storeu_si256(f[k * 64..].as_mut_ptr() as *mut __m256i, lo);
+                _mm256_storeu_si256(f[k * 64 + 32..].as_mut_ptr() as *mut __m256i, hi);
+            }
+        }
+    }
+
+    // Destructure outs so we can write to 8 independent &mut [f32] without aliasing.
+    let [o0, o1, o2, o3, o4, o5, o6, o7] = outs;
+
+    // Per-token dot: for each token r, load the Q8 activation zmm ONCE per (b, k) pair
+    // and reuse it across all 8 weight rows — 8× the FMAs per activation load.
+    for r in 0..m {
+        let q8 = &q8s[r];
+        let mut sumf = [0f32; 8];
+
+        for b in 0..nb {
+            // ── Deferred-hadd accumulation ──────────────────────────────────────────
+            // Instead of hadd_i32_ymm inside the k loop (8 rows × 2 hadd × 4 k = 64
+            // hadd calls/block, all on port 5), we accumulate scaled ymm vectors and
+            // hadd once per row after all k-pairs are done (16 hadd calls/block).
+            //
+            // Bit-identical: hadd(Σ_k scale[k]·v[k]) = Σ_k scale[k]·hadd(v[k])
+            // because hadd is a linear sum and integer mullo is exact (no overflow for
+            // our value ranges: sc≤63, per-element sum≤4×15×127 ≈ 7620 → product ≤ ~480k
+            // → fits i32; 8-element accumulation ≤ ~3.8M → fits i32).
+            //
+            // acc_lo[i] = Σ_k ( sc_e[k] × lo_ymm[k] )   — 8 × i32 lanes
+            // acc_hi[i] = Σ_k ( sc_o[k] × hi_ymm[k] )   — 8 × i32 lanes
+            // sd_i     = hadd(acc_lo[i]) + hadd(acc_hi[i])
+            let mut acc_lo = [_mm256_setzero_si256(); 8];
+            let mut acc_hi = [_mm256_setzero_si256(); 8];
+            let mut sm = [0i32; 8];
+            let q8b = &q8.qs[b * 256..b * 256 + 256];
+
+            for k in 0..4usize {
+                // ── ONE activation load for pair k, shared by all 8 weight rows ──
+                let q8_zmm = _mm512_loadu_si512(q8b[k * 64..].as_ptr() as *const __m512i);
+                let isum_e = q8.bsums[b * 8 + 2 * k];
+                let isum_o = q8.bsums[b * 8 + 2 * k + 1];
+
+                // ── 8 weight row dots against the shared q8_zmm ──
+                for i in 0..8usize {
+                    let (sc_e, ma_e) = (sc_arr[i][b][2 * k], m_arr[i][b][2 * k]);
+                    let (sc_o, ma_o) = (sc_arr[i][b][2 * k + 1], m_arr[i][b][2 * k + 1]);
+                    let qi_zmm =
+                        _mm512_loadu_si512(flats[i][b * 256 + k * 64..].as_ptr() as *const __m512i);
+                    let prod = _mm512_maddubs_epi16(qi_zmm, q8_zmm);
+                    let sum32 = _mm512_madd_epi16(prod, ones512);
+                    let lo_ymm = _mm512_castsi512_si256(sum32);
+                    let hi_ymm = _mm512_extracti64x4_epi64::<1>(sum32);
+                    // Scale each 8×i32 sub-block by its per-sub-block scale and
+                    // accumulate into ymm registers — no hadd in the hot path.
+                    acc_lo[i] = _mm256_add_epi32(
+                        acc_lo[i],
+                        _mm256_mullo_epi32(lo_ymm, _mm256_set1_epi32(sc_e as i32)),
+                    );
+                    acc_hi[i] = _mm256_add_epi32(
+                        acc_hi[i],
+                        _mm256_mullo_epi32(hi_ymm, _mm256_set1_epi32(sc_o as i32)),
+                    );
+                    sm[i] += ma_e as i32 * isum_e + ma_o as i32 * isum_o;
+                }
+            }
+            // ── 2 hadd per row per block (vs 8 in eager version) ──────────────────
+            for i in 0..8 {
+                let sd_i = hadd_i32_ymm(acc_lo[i]) + hadd_i32_ymm(acc_hi[i]);
+                sumf[i] += q8.d[b] * (d_arr[i][b] * sd_i as f32 - dmin_arr[i][b] * sm[i] as f32);
+            }
+        }
+        o0[r] = sumf[0];
+        o1[r] = sumf[1];
+        o2[r] = sumf[2];
+        o3[r] = sumf[3];
+        o4[r] = sumf[4];
+        o5[r] = sumf[5];
+        o6[r] = sumf[6];
+        o7[r] = sumf[7];
+    }
+}
+
+/// Batch Q4_K 8-row tile: `outs[i][r] = vec_dot_q4k(rows[i], &q8s[r], in_f)` for all i,r.
+/// Bit-identical to the single-token kernel. On AVX-512BW machines the Q8 activation is
+/// loaded once per (block, nibble-pair) and dotted against all 8 weight rows — 8× activation
+/// reuse over single-row, 4× over 2-row. Falls back to 8× `vec_dot_q4k_batch` on older CPUs.
+fn vec_dot_q4k_batch8(rows: [&[u8]; 8], q8s: &[Q8], in_f: usize, outs: [&mut [f32]; 8]) {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx512bw") {
+        return unsafe { vec_dot_q4k_batch8_avx512bw(rows, q8s, in_f, outs) };
+    }
+    // Fallback: call the per-row batch kernel (avx2/scalar dispatch) for each of the 8 rows.
+    let [row0, row1, row2, row3, row4, row5, row6, row7] = rows;
+    let [out0, out1, out2, out3, out4, out5, out6, out7] = outs;
+    vec_dot_q4k_batch(row0, q8s, in_f, out0);
+    vec_dot_q4k_batch(row1, q8s, in_f, out1);
+    vec_dot_q4k_batch(row2, q8s, in_f, out2);
+    vec_dot_q4k_batch(row3, q8s, in_f, out3);
+    vec_dot_q4k_batch(row4, q8s, in_f, out4);
+    vec_dot_q4k_batch(row5, q8s, in_f, out5);
+    vec_dot_q4k_batch(row6, q8s, in_f, out6);
+    vec_dot_q4k_batch(row7, q8s, in_f, out7);
+}
+
 // ── Q6_K batch ────────────────────────────────────────────────────────────────
 
 fn vec_dot_q6k_batch_scalar(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
@@ -2349,13 +2500,66 @@ impl Backend for CpuBackend {
                                 Vec::new()
                             };
                         let mut out_t = vec![0f32; out_f * m];
-                        // For Q4_K, use 2-row tiling: each rayon task handles two consecutive
-                        // output rows and shares the Q8 activation loads between them.
-                        // This halves the L3 bandwidth for activation reads (dominant bottleneck).
-                        if dt == DType::Q4K && out_f >= 2 {
+                        // For Q4_K, use 8-row tiling: each rayon task handles 8 consecutive
+                        // output rows and loads the Q8 activation zmm ONCE per (block, nibble-pair),
+                        // reusing it across all 8 weight rows. This is 4× less activation traffic
+                        // than the 2-row path and 8× less than the single-row path. Remainder rows
+                        // (out_f % 8) fall through to the 2-row tile then the 1-row batch.
+                        if dt == DType::Q4K && out_f >= 8 {
+                            let groups8 = out_f / 8;
+                            let rem = out_f % 8;
+                            let (g8_t, rest_t) = out_t.split_at_mut(groups8 * 8 * m);
+                            // 8-row groups (parallel over rayon).
+                            g8_t.par_chunks_mut(8 * m).enumerate().for_each(|(g, dc)| {
+                                let o = g * 8;
+                                let (r0, rest) = dc.split_at_mut(m);
+                                let (r1, rest) = rest.split_at_mut(m);
+                                let (r2, rest) = rest.split_at_mut(m);
+                                let (r3, rest) = rest.split_at_mut(m);
+                                let (r4, rest) = rest.split_at_mut(m);
+                                let (r5, rest) = rest.split_at_mut(m);
+                                let (r6, r7) = rest.split_at_mut(m);
+                                vec_dot_q4k_batch8(
+                                    [
+                                        &wbytes[o * bpr..o * bpr + bpr],
+                                        &wbytes[(o + 1) * bpr..(o + 1) * bpr + bpr],
+                                        &wbytes[(o + 2) * bpr..(o + 2) * bpr + bpr],
+                                        &wbytes[(o + 3) * bpr..(o + 3) * bpr + bpr],
+                                        &wbytes[(o + 4) * bpr..(o + 4) * bpr + bpr],
+                                        &wbytes[(o + 5) * bpr..(o + 5) * bpr + bpr],
+                                        &wbytes[(o + 6) * bpr..(o + 6) * bpr + bpr],
+                                        &wbytes[(o + 7) * bpr..(o + 7) * bpr + bpr],
+                                    ],
+                                    &q8s,
+                                    in_f,
+                                    [r0, r1, r2, r3, r4, r5, r6, r7],
+                                );
+                            });
+                            // Remainder: up to 7 rows → 2-row pairs, then at most 1 odd tail.
+                            let pairs_rem = rem / 2;
+                            let (g2_t, odd_t) = rest_t.split_at_mut(pairs_rem * 2 * m);
+                            if pairs_rem > 0 {
+                                g2_t.par_chunks_mut(2 * m)
+                                    .enumerate()
+                                    .for_each(|(pair, dc)| {
+                                        let o = groups8 * 8 + pair * 2;
+                                        let (chunk_a, chunk_b) = dc.split_at_mut(m);
+                                        let row_a = &wbytes[o * bpr..o * bpr + bpr];
+                                        let row_b = &wbytes[(o + 1) * bpr..(o + 1) * bpr + bpr];
+                                        vec_dot_q4k_batch2(
+                                            row_a, row_b, &q8s, in_f, chunk_a, chunk_b,
+                                        );
+                                    });
+                            }
+                            if rem % 2 != 0 {
+                                let o = out_f - 1;
+                                let row = &wbytes[o * bpr..o * bpr + bpr];
+                                vec_dot_q4k_batch(row, &q8s, in_f, odd_t);
+                            }
+                        } else if dt == DType::Q4K && out_f >= 2 {
+                            // Small out_f < 8: fall back to 2-row tile.
                             let pairs = out_f / 2;
                             let (even_t, odd_t) = out_t.split_at_mut(pairs * 2 * m);
-                            // Process pairs of output rows together.
                             even_t
                                 .par_chunks_mut(2 * m)
                                 .enumerate()
@@ -2366,7 +2570,6 @@ impl Backend for CpuBackend {
                                     let row_b = &wbytes[(o + 1) * bpr..(o + 1) * bpr + bpr];
                                     vec_dot_q4k_batch2(row_a, row_b, &q8s, in_f, chunk_a, chunk_b);
                                 });
-                            // Handle last row if out_f is odd.
                             if out_f % 2 != 0 {
                                 let o = out_f - 1;
                                 let row = &wbytes[o * bpr..o * bpr + bpr];
@@ -4234,6 +4437,82 @@ mod kernel_tests {
                 batch_out[r],
                 want,
             );
+        }
+    }
+
+    /// Assert the 8-row tile produces bit-identical results to `vec_dot_q4k` per (row, token).
+    /// Uses 11 rows to exercise the full remainder path: 8-row tile + 2-row pair + 1-row tail.
+    #[test]
+    fn q4k_batch8_bit_identical_to_single() {
+        let n_rows = 11usize; // 8 + 2-row-pair + 1-row-tail
+        let in_f = 512; // 2 super-blocks
+        let nb = in_f / 256;
+        let m = 9usize; // non-power-of-2 token count
+
+        // Build n_rows random weight rows with valid f16 d/dmin.
+        let ws: Vec<Vec<u8>> = (0..n_rows)
+            .map(|i| {
+                let mut w = det_bytes(nb * 144, 100 + i as u64);
+                for k in 0..nb {
+                    put_f16(&mut w[k * 144..k * 144 + 2], 0.05);
+                    put_f16(&mut w[k * 144 + 2..k * 144 + 4], 0.015);
+                }
+                w
+            })
+            .collect();
+
+        let q8s: Vec<Q8> = (0..m)
+            .map(|r| quantize_q8(&det_x(in_f, 200 + r as u64)))
+            .collect();
+
+        // Reference: vec_dot_q4k per (row, token) — the scalar single-token oracle.
+        let want: Vec<Vec<f32>> = (0..n_rows)
+            .map(|i| (0..m).map(|r| vec_dot_q4k(&ws[i], &q8s[r], in_f)).collect())
+            .collect();
+
+        // Test the 8-row tile for rows 0..8.
+        let mut got0 = vec![0f32; m];
+        let mut got1 = vec![0f32; m];
+        let mut got2 = vec![0f32; m];
+        let mut got3 = vec![0f32; m];
+        let mut got4 = vec![0f32; m];
+        let mut got5 = vec![0f32; m];
+        let mut got6 = vec![0f32; m];
+        let mut got7 = vec![0f32; m];
+        vec_dot_q4k_batch8(
+            [
+                &ws[0], &ws[1], &ws[2], &ws[3], &ws[4], &ws[5], &ws[6], &ws[7],
+            ],
+            &q8s,
+            in_f,
+            [
+                &mut got0, &mut got1, &mut got2, &mut got3, &mut got4, &mut got5, &mut got6,
+                &mut got7,
+            ],
+        );
+
+        // Test 2-row remainder (rows 8..10) — same path as the dispatch remainder.
+        let mut got8 = vec![0f32; m];
+        let mut got9 = vec![0f32; m];
+        vec_dot_q4k_batch2(&ws[8], &ws[9], &q8s, in_f, &mut got8, &mut got9);
+
+        // Test 1-row tail (row 10).
+        let mut got10 = vec![0f32; m];
+        vec_dot_q4k_batch(&ws[10], &q8s, in_f, &mut got10);
+
+        let got_all: [&Vec<f32>; 11] = [
+            &got0, &got1, &got2, &got3, &got4, &got5, &got6, &got7, &got8, &got9, &got10,
+        ];
+        for i in 0..n_rows {
+            for r in 0..m {
+                assert_eq!(
+                    got_all[i][r].to_bits(),
+                    want[i][r].to_bits(),
+                    "q4k_batch8 row {i} token {r}: got {}, want {}",
+                    got_all[i][r],
+                    want[i][r],
+                );
+            }
         }
     }
 }
