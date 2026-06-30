@@ -161,6 +161,46 @@ fn gpu_golden_qwen3() {
     check_gpu_golden(|p, n| gpu_gen(&llama, p, n), QWEN3_GPU_GOLDEN);
 }
 
+// GPU quant coverage: the SAME prompt through every downloaded Qwen3-0.6B quant, all via the raw
+// native-block upload — affine (Q4_0, Q2_K/Q4_K/Q5_K/Q6_K, Q8_0) AND the IQ4_XS codebook i-quant,
+// which now decodes natively in-shader (no host→f16). BF16 is float → the plain f16 GEMV. Hashes are
+// GPU-specific; captured INFR_BLESS=1 and read coherent ("…Paris"). Missing quants are skipped.
+const QWEN3_QUANT_GPU_GOLDEN: &[(&str, usize, u64)] = &[
+    ("IQ4_XS", 32, 0xd028ff03b524cb28),
+    ("Q2_K", 32, 0x6442c2818c12ca56),
+    ("Q4_0", 32, 0x88221dcfca820246),
+    ("Q4_K_M", 32, 0xfd63781ea3bfa785),
+    ("Q5_K_M", 32, 0x4e510646d603bc03),
+    ("Q6_K", 32, 0xb68f96c3aa8d22fe),
+    ("Q8_0", 32, 0xb68f96c3aa8d22fe),
+    ("BF16", 32, 0xb68f96c3aa8d22fe),
+];
+
+/// GPU native-upload coverage across quant formats: every available Qwen3-0.6B quant generated on the
+/// GPU, locked by golden hash. Proves the codebook IQ4_XS path runs natively alongside the affine
+/// k-quants. Refresh with `INFR_BLESS=1`.
+#[test]
+#[ignore = "needs a Vulkan GPU + the Qwen3-0.6B GGUFs in several quants"]
+fn gpu_golden_qwen3_quants() {
+    std::env::set_var("INFR_TEMP", "0");
+    let bless = std::env::var("INFR_BLESS").is_ok();
+    let prompt = "The capital of France is";
+    for (quant, n, want) in QWEN3_QUANT_GPU_GOLDEN {
+        let Some(path) = qwen3_quant(quant) else {
+            eprintln!("(skip {quant}: not downloaded)");
+            continue;
+        };
+        let llama = infr_llama::Llama::load_opt(&path, None).expect("load");
+        let out = gpu_gen(&llama, prompt, *n);
+        let h = fnv1a(&out);
+        if bless {
+            println!("    ({quant:?}, {n}, 0x{h:016x}),  // {out:?}");
+        } else {
+            assert_eq!(h, *want, "GPU quant {quant} golden changed\n  out: {out:?}");
+        }
+    }
+}
+
 fn gemma3_1b() -> PathBuf {
     let hub = std::env::var("HOME").unwrap() + "/.cache/huggingface/hub";
     let base = format!("{hub}/models--unsloth--gemma-3-1b-it-GGUF/snapshots");

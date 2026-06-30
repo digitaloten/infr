@@ -148,6 +148,44 @@ pub fn native_gemm_kernel_name(dtype: infr_core::DType) -> &'static str {
     }
 }
 
+/// True if `dtype` has the full dense native-block pipeline — a decode GEMV (`native_*`, see
+/// [`native_kernel_name`]) AND a prefill coopmat GEMM (`native_gemm_*`, see
+/// [`native_gemm_kernel_name`]). When true, the weight can be uploaded as raw GGUF block bytes and
+/// run on the GPU with in-shader dequant — no host dequant → f16. Covers every quant format
+/// (affine k-quants, legacy round, codebook i-quants, fp4, ternary, and grid i-quants). Float types
+/// (F16/F32/BF16) are not quants and stay on the plain f16 GEMV.
+///
+/// The MoE *stacked/id-indexed* path (`native_id_*`/`native_idm_*`) is narrower — affine only; use
+/// [`native_id_kernel_name`] for that.
+pub fn native_dense_supported(dtype: infr_core::DType) -> bool {
+    use infr_core::DType::*;
+    matches!(
+        dtype,
+        Q8_0 | Q4_0
+            | Q4_1
+            | Q5_0
+            | Q5_1
+            | Q2K
+            | Q3K
+            | Q4K
+            | Q5K
+            | Q6K
+            | Iq4Nl
+            | Iq4Xs
+            | Mxfp4
+            | Nvfp4
+            | Tq1_0
+            | Tq2_0
+            | Iq2Xxs
+            | Iq2Xs
+            | Iq2S
+            | Iq3Xxs
+            | Iq3S
+            | Iq1S
+            | Iq1M
+    )
+}
+
 /// Pad raw GGUF block bytes to the next multiple of 4 for upload as `array<u32>`.
 /// Appends zero bytes; the final u32 word's padding bytes are never read (they
 /// contain only out-of-block data which the shader never accesses for valid g).
