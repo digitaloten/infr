@@ -39,6 +39,12 @@ pub struct CpuStats {
 struct Q8 {
     qs: Vec<i8>,
     d: Vec<f32>,
+    /// Sub-block sums: `bsums[b*8+s]` = Σ `qs[b*256 + s*32 .. +32]` as i32.
+    /// One entry per 32-element sub-block (8 per 256-element super-block).
+    /// Precomputed once at quantization time; reused across all weight rows so the
+    /// `sm` accumulation in `vec_dot_q4k` (Σ m·Σq8) avoids O(rows·256) re-summation.
+    /// Mirrors llama.cpp's `block_q8_K.bsums`.
+    bsums: Vec<i32>,
 }
 
 fn quantize_q8(x: &[f32]) -> Q8 {
@@ -55,12 +61,39 @@ fn quantize_q8(x: &[f32]) -> Q8 {
             qs[b * 256 + i] = (v * id).round().clamp(-127.0, 127.0) as i8;
         }
     }
-    Q8 { qs, d }
+    // Precompute per-32-elem-sub-block sums (used by vec_dot_q4k for the min-scale term).
+    let mut bsums = vec![0i32; nb * 8];
+    for b in 0..nb {
+        for s in 0..8usize {
+            bsums[b * 8 + s] = qs[b * 256 + s * 32..b * 256 + s * 32 + 32]
+                .iter()
+                .map(|&q| q as i32)
+                .sum();
+        }
+    }
+    Q8 { qs, d, bsums }
 }
 
 /// `Σ weight·x` for one Q4_K row (144 bytes / 256 elems) against the Q8 activation. Weight value is
-/// `d·sc_s·q4 − dmin·m_s` over 8 sub-blocks of 32; the integer sub-block dot `Σ q4·q8` autovectorizes.
+/// `d·sc_s·q4 − dmin·m_s` over 8 sub-blocks of 32; dispatches to the best SIMD path available at
+/// runtime (avx512bw → avx2 → scalar). The `sm` term uses `q8.bsums` (precomputed in `quantize_q8`)
+/// instead of re-summing q8 values per row.
 fn vec_dot_q4k(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512bw") {
+            // SAFETY: avx512bw detected at runtime; pointer bounds checked by slice indexing.
+            return unsafe { vec_dot_q4k_avx512bw(row, q8, in_f) };
+        }
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { vec_dot_q4k_avx2(row, q8, in_f) };
+        }
+    }
+    vec_dot_q4k_scalar(row, q8, in_f)
+}
+
+/// Scalar fallback for `vec_dot_q4k`; also used on non-x86 targets. Uses `q8.bsums` for `isum`.
+fn vec_dot_q4k_scalar(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     let nb = in_f / 256;
     let mut sumf = 0f32;
     for b in 0..nb {
@@ -71,24 +104,137 @@ fn vec_dot_q4k(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
         let qs = &blk[16..144];
         let q8b = &q8.qs[b * 256..b * 256 + 256];
         let (mut sd, mut sm) = (0i32, 0i32);
-        for s in 0..8 {
+        for s in 0..8usize {
             let (sc, m) = crate::k4(s, scales);
             let (half, hi) = (s / 2, s % 2 == 1);
             let qbyte = &qs[half * 32..half * 32 + 32];
             let q8s = &q8b[s * 32..s * 32 + 32];
-            let (mut iprod, mut isum) = (0i32, 0i32);
+            let mut iprod = 0i32;
             for l in 0..32 {
                 let q4 = if hi {
                     (qbyte[l] >> 4) as i32
                 } else {
                     (qbyte[l] & 0xF) as i32
                 };
-                let v = q8s[l] as i32;
-                iprod += q4 * v;
-                isum += v;
+                iprod += q4 * q8s[l] as i32;
             }
+            // isum = Σ q8s — precomputed in Q8::bsums, avoids re-summing per weight row.
+            let isum = q8.bsums[b * 8 + s];
             sd += sc as i32 * iprod;
             sm += m as i32 * isum;
+        }
+        sumf += q8.d[b] * (d * sd as f32 - dmin * sm as f32);
+    }
+    sumf
+}
+
+/// Horizontal reduction: sum 8 × i32 in a ymm register to a scalar i32.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn hadd_i32_ymm(v: std::arch::x86_64::__m256i) -> i32 {
+    use std::arch::x86_64::*;
+    let h1 = _mm256_hadd_epi32(v, v);
+    let h2 = _mm256_hadd_epi32(h1, h1);
+    let lo = _mm256_castsi256_si128(h2);
+    let hi = _mm256_extracti128_si256::<1>(h2);
+    _mm_cvtsi128_si32(_mm_add_epi32(lo, hi))
+}
+
+/// AVX2 kernel for `vec_dot_q4k`: one 32-element sub-block per iteration with 256-bit SIMD.
+/// Nibbles are unpacked with `_mm256_maddubs_epi16` (unsigned×signed → i16 pair-sum) then widened
+/// to i32 via `_mm256_madd_epi16`. `isum` comes from `q8.bsums`, not the inner loop.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn vec_dot_q4k_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let nb = in_f / 256;
+    let mut sumf = 0f32;
+    let mask_lo = _mm256_set1_epi8(0x0F_u8 as i8);
+    let ones = _mm256_set1_epi16(1i16);
+    for b in 0..nb {
+        let blk = &row[b * 144..b * 144 + 144];
+        let d = crate::rdf16(&blk[0..2]);
+        let dmin = crate::rdf16(&blk[2..4]);
+        let scales = &blk[4..16];
+        let qs = &blk[16..144];
+        let q8b = &q8.qs[b * 256..b * 256 + 256];
+        let (mut sd, mut sm) = (0i32, 0i32);
+        for s in 0..8usize {
+            let (sc, m) = crate::k4(s, scales);
+            let hi = s % 2 == 1;
+            let half = s / 2;
+            // 32-byte nibble chunk shared by sub-blocks `2*half` (lo) and `2*half+1` (hi).
+            let nibbles = _mm256_loadu_si256(qs[half * 32..].as_ptr() as *const __m256i);
+            // Unpack nibbles: low or high 4 bits of each byte → u8 values 0–15.
+            let q4 = if hi {
+                _mm256_and_si256(_mm256_srli_epi16(nibbles, 4), mask_lo)
+            } else {
+                _mm256_and_si256(nibbles, mask_lo)
+            };
+            // Load 32 signed Q8 bytes for this sub-block.
+            let q8v = _mm256_loadu_si256(q8b[s * 32..].as_ptr() as *const __m256i);
+            // maddubs: a=u8 (q4, 0–15), b=i8 (q8) → 16×i16 pair-sums. No i16 overflow:
+            // max pair = 15·127 + 15·127 = 3810 < 32767.
+            let prod = _mm256_maddubs_epi16(q4, q8v);
+            // madd with 1: widen 16×i16 → 8×i32 (pairs summed).
+            let sum32 = _mm256_madd_epi16(prod, ones);
+            let iprod = hadd_i32_ymm(sum32);
+            let isum = q8.bsums[b * 8 + s];
+            sd += sc as i32 * iprod;
+            sm += m as i32 * isum;
+        }
+        sumf += q8.d[b] * (d * sd as f32 - dmin * sm as f32);
+    }
+    sumf
+}
+
+/// AVX-512BW kernel for `vec_dot_q4k`: processes TWO sub-blocks per iteration (64 elements) with
+/// 512-bit SIMD. For each pair (s=2k even, s=2k+1 odd), the 32-byte nibble chunk is unpacked into
+/// a zmm (low nibbles in lower 256 bits, high nibbles in upper 256 bits) and multiplied against the
+/// corresponding 64 contiguous Q8 bytes. The zmm result is split back to two ymm sums, giving both
+/// `iprod_even` and `iprod_odd` in one pass — half the memory traffic of the avx2 path.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+unsafe fn vec_dot_q4k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let nb = in_f / 256;
+    let mut sumf = 0f32;
+    let mask_lo = _mm256_set1_epi8(0x0F_u8 as i8);
+    let ones512 = _mm512_set1_epi16(1i16);
+    for b in 0..nb {
+        let blk = &row[b * 144..b * 144 + 144];
+        let d = crate::rdf16(&blk[0..2]);
+        let dmin = crate::rdf16(&blk[2..4]);
+        let scales = &blk[4..16];
+        let qs = &blk[16..144];
+        let q8b = &q8.qs[b * 256..b * 256 + 256];
+        let (mut sd, mut sm) = (0i32, 0i32);
+        // k=0..4 covers sub-block pairs (0,1), (2,3), (4,5), (6,7).
+        for k in 0..4usize {
+            let (sc_e, m_e) = crate::k4(2 * k, scales);
+            let (sc_o, m_o) = crate::k4(2 * k + 1, scales);
+            // Load 32 nibble bytes serving both sub-blocks 2k (low) and 2k+1 (high).
+            let nibbles = _mm256_loadu_si256(qs[k * 32..].as_ptr() as *const __m256i);
+            let lo_nib = _mm256_and_si256(nibbles, mask_lo); // sub-block 2k  (u8, 0–15)
+            let hi_nib = _mm256_and_si256(_mm256_srli_epi16(nibbles, 4), mask_lo); // sub-block 2k+1
+                                                                                   // Pack into zmm: lower 256 = lo_nib (for 2k), upper 256 = hi_nib (for 2k+1).
+            let q4_zmm = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(lo_nib), hi_nib);
+            // Load 64 Q8 bytes: [2k*32..(2k+1)*32] in lower, [(2k+1)*32..(2k+2)*32] in upper.
+            let q8_zmm = _mm512_loadu_si512(q8b[k * 64..].as_ptr() as *const __m512i);
+            // maddubs 512-bit: u8(q4)×i8(q8) → 32×i16 pair-sums.
+            let prod = _mm512_maddubs_epi16(q4_zmm, q8_zmm);
+            // madd with 1: widen 32×i16 → 16×i32.
+            let sum32 = _mm512_madd_epi16(prod, ones512);
+            // Lower 256 = 8×i32 for sub-block 2k; upper 256 = 8×i32 for sub-block 2k+1.
+            let lo_ymm = _mm512_castsi512_si256(sum32);
+            let hi_ymm = _mm512_extracti64x4_epi64::<1>(sum32);
+            let iprod_e = hadd_i32_ymm(lo_ymm);
+            let iprod_o = hadd_i32_ymm(hi_ymm);
+            let isum_e = q8.bsums[b * 8 + 2 * k];
+            let isum_o = q8.bsums[b * 8 + 2 * k + 1];
+            sd += sc_e as i32 * iprod_e + sc_o as i32 * iprod_o;
+            sm += m_e as i32 * isum_e + m_o as i32 * isum_o;
         }
         sumf += q8.d[b] * (d * sd as f32 - dmin * sm as f32);
     }
