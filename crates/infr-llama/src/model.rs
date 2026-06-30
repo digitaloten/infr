@@ -7,7 +7,8 @@
 //! borrow-based `ChatSession` (which borrows `&Llama`) needs no ownership change — the caller owns
 //! the `Llama`, the box borrows it.
 
-use crate::{ChatSession, Llama};
+use crate::cpu_backend::CpuStats;
+use crate::{ChatSession, CpuModel, Llama};
 use anyhow::Result;
 use std::time::Instant;
 
@@ -149,5 +150,74 @@ impl ChatTurn for Qwen35Chat {
         })?;
         stats.n_prompt = n_prompt;
         Ok(stats)
+    }
+}
+
+impl From<CpuStats> for GenStats {
+    fn from(s: CpuStats) -> Self {
+        GenStats {
+            n_prompt: s.n_prompt,
+            prompt_secs: s.prompt_secs,
+            n_gen: s.n_gen,
+            decode_secs: s.decode_secs,
+        }
+    }
+}
+
+/// CPU reference backend (`INFR_CPU=1`) for dense/MoE: the agnostic compute-graph forward, no GPU.
+/// Each turn is independent (no cross-turn KV context on the CPU path yet), but the REPL is allowed.
+pub struct CpuDenseChat {
+    model: CpuModel,
+}
+
+impl CpuDenseChat {
+    pub fn new(model: CpuModel) -> Self {
+        Self { model }
+    }
+}
+
+impl ChatTurn for CpuDenseChat {
+    fn turn(
+        &mut self,
+        message: &str,
+        max_new: usize,
+        on_piece: &mut dyn FnMut(&str),
+    ) -> Result<GenStats> {
+        let prompt = self.model.render_chat(message)?;
+        Ok(self
+            .model
+            .generate_cpu(&prompt, max_new, |p| on_piece(p))?
+            .into())
+    }
+
+    fn supports_repl(&self) -> bool {
+        true
+    }
+}
+
+/// CPU reference backend (`INFR_CPU=1`) for qwen35 / Qwen3-Next (the bespoke per-token oracle).
+pub struct CpuQwen35Chat {
+    path: std::path::PathBuf,
+}
+
+impl CpuQwen35Chat {
+    pub fn new(path: std::path::PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl ChatTurn for CpuQwen35Chat {
+    fn turn(
+        &mut self,
+        message: &str,
+        max_new: usize,
+        on_piece: &mut dyn FnMut(&str),
+    ) -> Result<GenStats> {
+        let prompt = crate::qwen35::render_chat(&self.path, message)?;
+        Ok(crate::qwen35::generate_cpu(&self.path, &prompt, max_new, |p| on_piece(p))?.into())
+    }
+
+    fn supports_repl(&self) -> bool {
+        true
     }
 }

@@ -289,76 +289,26 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     let max_new = envu("INFR_MAX_NEW", 2048);
     let (gguf, tok) = resolve(model)?;
 
-    // CPU backend (INFR_CPU=1): run entirely on the CPU through the backend-agnostic compute graph —
-    // NO Vulkan init, NO VRAM. Intercepted before any GPU loader. One-shot (pass a message) or an
-    // interactive REPL (no args). Covers dense Qwen3/Llama, Gemma 3/4 (+E2B), qwen3moe, qwen35.
-    // (Each turn is independent — no cross-turn KV context on the CPU path yet.)
-    if std::env::var("INFR_CPU").is_ok() {
-        let is_q35 = infr_llama::qwen35::is_qwen35(&gguf);
-        let dense = if is_q35 {
+    // Dispatch every run mode behind one ChatTurn interface (infr_llama::model) + the one run loop
+    // below: INFR_CPU (dense/MoE or qwen35 on the agnostic compute graph, no Vulkan/VRAM), qwen35 GPU
+    // (one-shot), qwen3moe (one-shot), dense Qwen3/Llama/Gemma (multi-turn session). The CLI owns the
+    // Llama; the boxed trait object borrows it (so the borrow-based ChatSession needs no ownership
+    // change).
+    let is_q35 = infr_llama::qwen35::is_qwen35(&gguf);
+    let llama; // declared here so a borrowing ChatSession / MoeChat outlives `chat`
+    let mut chat: Box<dyn infr_llama::model::ChatTurn + '_> = if std::env::var("INFR_CPU").is_ok() {
+        if is_q35 {
             eprintln!("[cpu backend — qwen35/Qwen3-Next on the agnostic seam, no GPU]");
-            None
+            Box::new(infr_llama::model::CpuQwen35Chat::new(gguf.clone()))
         } else {
             eprintln!(
                 "[cpu backend — dense/MoE forward on CPU via the agnostic compute graph, no GPU]"
             );
-            Some(infr_llama::CpuModel::load(&gguf, tok.as_deref())?)
-        };
-        let run_turn = |m: &str| -> anyhow::Result<()> {
-            let mut render = ThinkRender::new();
-            let stats = if let Some(model) = &dense {
-                let prompt = model.render_chat(m)?;
-                model.generate_cpu(&prompt, max_new, |p| render.feed(p))?
-            } else {
-                let prompt = infr_llama::qwen35::render_chat(&gguf, m)?;
-                infr_llama::qwen35::generate_cpu(&gguf, &prompt, max_new, |p| render.feed(p))?
-            };
-            render.finish();
-            let rate = |n: usize, s: f64| if s > 0.0 { n as f64 / s } else { 0.0 };
-            eprintln!(
-                "[prefill {} tok @ {:.0} tok/s ({:.0} ms) | decode {} tok @ {:.1} tok/s]",
-                stats.n_prompt,
-                rate(stats.n_prompt, stats.prompt_secs),
-                stats.prompt_secs * 1000.0,
-                stats.n_gen,
-                rate(stats.n_gen, stats.decode_secs),
-            );
-            Ok(())
-        };
-        if let Some(m) = message {
-            run_turn(m)?;
-        } else {
-            // Interactive REPL: read a line, generate, repeat. Ctrl-D / exit / quit to leave.
-            let stdin = std::io::stdin();
-            loop {
-                print!("\n> ");
-                std::io::stdout().flush().ok();
-                let mut line = String::new();
-                if stdin.read_line(&mut line)? == 0 {
-                    break;
-                }
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                if matches!(line, "exit" | "quit" | ":q" | ":quit") {
-                    break;
-                }
-                if let Err(e) = run_turn(line) {
-                    eprintln!("error: {e}");
-                }
-            }
+            Box::new(infr_llama::model::CpuDenseChat::new(
+                infr_llama::CpuModel::load(&gguf, tok.as_deref())?,
+            ))
         }
-        return Ok(());
-    }
-
-    // Dispatch every architecture behind one ChatTurn interface (infr_llama::model): qwen35 and
-    // qwen3moe are one-shot, dense Qwen3/Llama/Gemma is a multi-turn session. The CLI owns the Llama;
-    // the boxed trait object borrows it (so the borrow-based ChatSession needs no ownership change).
-    let llama; // declared here so a borrowing ChatSession / MoeChat outlives `chat`
-    let mut chat: Box<dyn infr_llama::model::ChatTurn + '_> = if infr_llama::qwen35::is_qwen35(
-        &gguf,
-    ) {
+    } else if is_q35 {
         let mode = if std::env::var("Q35_CPU").is_ok() {
             "CPU oracle"
         } else {
