@@ -19,49 +19,26 @@ use infr_core::{DType, TensorId, WeightSource};
 use infr_gguf::Gguf;
 use infr_vulkan::VulkanBackend;
 
-/// GPU weight storage dtype. Chosen from the GGUF source dtype by the shared loader policy
-/// ([`Model::upload_lin`]): quant → `Native` (raw GGUF blocks, in-shader dequant — no host dequant,
-/// native bit-width in VRAM); F16 → `F16`; BF16 → `Bf16` (preserves f32 exponent range — no f16
-/// overflow clip); F32 → `F32` (full precision, the rare large-magnitude tensor). Each maps to a GPU
-/// GEMV kernel.
-#[derive(Clone, Copy)]
-enum WDtype {
-    Native(DType),
-    F16,
-    Bf16,
-    F32,
-}
-
-/// A linear-projection weight on whichever device has a kernel for it: GPU (dtype-tagged, the fast
-/// path) or CPU f32 (the fallback / `Q35_CPU=1` oracle). One call site, [`Lin::mul`], hides which.
-/// This is how a hand-written forward gets per-op CPU fallback without a graph scheduler.
+/// A linear-projection weight on whichever device has a kernel for it: GPU (the shared
+/// [`crate::Wt`] — native-quant blocks or f16, with the same dispatch the dense `Llama` path uses)
+/// or CPU f32 (the `Q35_CPU=1` oracle). One call site, [`Lin::mul`]/[`Lin::record`], hides which.
 enum Lin {
     Cpu(Vec<f32>),
-    Gpu { buf: Box<dyn Buffer>, dt: WDtype },
+    Gpu(crate::Wt),
 }
 
 impl Lin {
-    /// `y[out] = W[out,in] · x[in]` (single row). GPU path is a GEMV in the weight's dtype; CPU path
-    /// the naive matvec.
-    fn mul(&self, be: Option<&VulkanBackend>, x: &[f32], in_f: usize, out_f: usize) -> Vec<f32> {
+    /// `y[out] = W[out,in] · x[in]` (single row), CPU reference only. The GPU forward records via
+    /// [`Lin::record`]; a GPU weight never reaches here (all `mul` call sites are the oracle).
+    fn mul(&self, _be: Option<&VulkanBackend>, x: &[f32], in_f: usize, out_f: usize) -> Vec<f32> {
         match self {
             Lin::Cpu(w) => matvec(w, in_f, out_f, x),
-            Lin::Gpu { buf, dt } => {
-                let be = be.expect("gpu Lin without backend");
-                let w = buf.as_ref();
-                match dt {
-                    WDtype::Native(d) => be.linear_native(*d, w, x, 1, in_f, out_f),
-                    WDtype::F16 => be.linear_f16(w, x, 1, in_f, out_f),
-                    WDtype::Bf16 => be.linear_bf16(w, x, 1, in_f, out_f),
-                    WDtype::F32 => be.linear(w, x, 1, in_f, out_f),
-                }
-                .expect("gpu linear")
-            }
+            Lin::Gpu(_) => unreachable!("qwen35 GPU weights record via Lin::record, not mul"),
         }
     }
 
-    /// Record a single-row GEMV `y = x·Wᵀ` into a command buffer (the GPU-resident forward, no
-    /// host round-trip). Requires a GPU weight; the recorder covers native quant + f16.
+    /// Record a single-row GEMV `y = x·Wᵀ` into a command buffer via the shared [`crate::rec_linear`]
+    /// dispatch (native quant + f16). Requires a GPU weight.
     fn record(
         &self,
         rec: &infr_vulkan::Recorder,
@@ -71,13 +48,7 @@ impl Lin {
         out_f: usize,
     ) {
         match self {
-            Lin::Gpu { buf, dt } => match dt {
-                WDtype::Native(d) => rec.linear_native(*d, buf.as_ref(), x, y, 1, in_f, out_f),
-                WDtype::F16 => rec.linear(buf.as_ref(), x, y, 1, in_f, out_f),
-                WDtype::Bf16 | WDtype::F32 => {
-                    unimplemented!("qwen35 GPU forward needs a quant or f16 model (got bf16/f32)")
-                }
-            },
+            Lin::Gpu(w) => crate::rec_linear(rec, w, x, y, 1, in_f, out_f),
             Lin::Cpu(_) => panic!("Lin::record requires a GPU weight (not the Q35_CPU oracle)"),
         }
     }
@@ -260,46 +231,19 @@ pub struct Model {
 }
 
 impl Model {
-    /// Shared loader policy: map a GGUF projection tensor to a GPU [`Lin`] in the dtype matching its
-    /// source, or CPU f32 when `be` is `None` (`Q35_CPU=1`). quant/F16 → f16 (dequant once); BF16 →
-    /// native bf16 (range-preserving, round-trips exactly through the f32 host buffer); F32 → f32.
-    /// This is the single place the "correct dtype per source" decision lives.
+    /// Map a GGUF projection tensor to a GPU [`Lin`] via the SHARED dense loader ([`crate::upload_wt`]:
+    /// native-quant blocks stay in-VRAM, float → f16), or CPU f32 when `be` is `None` (`Q35_CPU=1`).
     fn upload_lin(g: &Gguf, be: Option<&VulkanBackend>, name: &str) -> Result<Lin> {
-        let be = match be {
-            Some(b) => b,
-            None => {
-                return Ok(Lin::Cpu(
-                    load_tensor_dequant(g, name)
-                        .map(|x| x.0)
-                        .with_context(|| name.to_string())?,
-                ))
-            }
-        };
-        let src = g.tensors().iter().find(|t| t.name == name).map(|t| t.dtype);
-        let up =
-            |r: infr_core::Result<Box<dyn Buffer>>| r.map_err(|e| anyhow!("upload {name}: {e}"));
-        // Quant with the native pipeline → raw GGUF blocks, in-shader dequant (no host dequant).
-        if let Some(dt) = src {
-            if infr_vulkan::linear::native_dense_supported(dt) {
-                let bytes = g.tensor_bytes(name).map_err(|e| anyhow!("{name}: {e}"))?;
-                let padded = infr_vulkan::linear::pad_to_u32_align(bytes);
-                let buf = up(be.upload_weight_bytes(&padded))?;
-                return Ok(Lin::Gpu {
-                    buf,
-                    dt: WDtype::Native(dt),
-                });
-            }
+        match be {
+            None => Ok(Lin::Cpu(
+                load_tensor_dequant(g, name)
+                    .map(|x| x.0)
+                    .with_context(|| name.to_string())?,
+            )),
+            Some(be) => Ok(Lin::Gpu(
+                crate::upload_wt(be, g, name).with_context(|| name.to_string())?,
+            )),
         }
-        // Float types → dequant to f32 host buffer, upload in the source-matched dtype.
-        let w = load_tensor_dequant(g, name)
-            .map(|x| x.0)
-            .with_context(|| name.to_string())?;
-        let (buf, dt) = match src {
-            Some(DType::Bf16) => (up(be.upload_weight_bf16(&w))?, WDtype::Bf16),
-            Some(DType::F32) => (up(be.upload_weight(&w))?, WDtype::F32),
-            _ => (up(be.upload_weight_f16(&w))?, WDtype::F16), // F16 / other floats → f16
-        };
-        Ok(Lin::Gpu { buf, dt })
     }
 
     pub fn load(g: &Gguf) -> Result<Self> {

@@ -665,7 +665,7 @@ impl Default for Sampler {
 /// - `Native`: raw GGUF block bytes, padded to u32 alignment, dequantized in-shader (decode-once
 ///   GEMV + tiled coopmat GEMM). The DEFAULT for optimized affine quants — faster decode + prefill
 ///   and smaller VRAM (see [`is_native_default`]); `INFR_NATIVE=1` extends it to all formats.
-enum Wt {
+pub(crate) enum Wt {
     F16(Box<dyn Buffer>),
     /// Raw native-block bytes on the GPU; `dtype` identifies the dequant shader.
     Native {
@@ -2317,7 +2317,7 @@ fn is_native_default(d: infr_core::DType) -> bool {
 ///   decode GEMV shaders ([`is_native_default`]).
 /// - Codebook quants (IQ*/TQ*/fp4) and float types (F16/F32/BF16) → host dequant → f16 → `Wt::F16`.
 ///   The i-quants have no decode-GEMV shader yet, so they stay on f16 until those land.
-fn upload_wt(be: &VulkanBackend, g: &Gguf, name: &str) -> Result<Wt> {
+pub(crate) fn upload_wt(be: &VulkanBackend, g: &Gguf, name: &str) -> Result<Wt> {
     let dtype = g
         .tensors()
         .iter()
@@ -2330,7 +2330,11 @@ fn upload_wt(be: &VulkanBackend, g: &Gguf, name: &str) -> Result<Wt> {
 
 /// Like [`upload_wt`] but from a raw byte slice + dtype — lets a stacked MoE expert tensor be sliced
 /// per expert (each expert is a contiguous block of the `*_exps` tensor) and uploaded individually.
-fn upload_wt_bytes(be: &VulkanBackend, dtype: infr_core::DType, bytes: &[u8]) -> Result<Wt> {
+pub(crate) fn upload_wt_bytes(
+    be: &VulkanBackend,
+    dtype: infr_core::DType,
+    bytes: &[u8],
+) -> Result<Wt> {
     // Native-block path: raw upload + in-shader dequant — for every quant format with the dense
     // native pipeline (decode GEMV + prefill GEMM; see `native_dense_supported`). Only float types
     // (F16/F32/BF16, not quants) fall to the host dequant → f16 path.
@@ -6137,7 +6141,7 @@ fn rec_linear_expert(
     }
 }
 
-fn rec_linear(
+pub(crate) fn rec_linear(
     rec: &infr_vulkan::Recorder,
     w: &Wt,
     x: &dyn Buffer,
