@@ -1172,7 +1172,7 @@ pub fn generate_cpu(
     prompt: &str,
     n: usize,
     mut on_piece: impl FnMut(&str),
-) -> Result<crate::cpu_backend::CpuStats> {
+) -> Result<crate::GenStats> {
     let gg = Gguf::open(path).map_err(|e| anyhow!("open gguf: {e}"))?;
     let g = &gg;
     let c = Cfg::from_gguf(g)?;
@@ -1755,7 +1755,7 @@ pub fn generate_cpu(
         }
     }
     // The text streamed out via `on_piece`; return only timing/counts.
-    Ok(crate::cpu_backend::CpuStats {
+    Ok(crate::GenStats {
         n_prompt: prompt_ids.len(),
         prompt_secs: prompt_t.as_secs_f64(),
         n_gen: decode_n,

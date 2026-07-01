@@ -7,18 +7,9 @@
 //! borrow-based `ChatSession` (which borrows `&Llama`) needs no ownership change — the caller owns
 //! the `Llama`, the box borrows it.
 
-use crate::cpu_backend::CpuStats;
-use crate::{ChatSession, CpuModel, Llama};
+use crate::{ChatSession, CpuModel, GenStats, Llama};
 use anyhow::Result;
 use std::time::Instant;
-
-/// Per-turn generation stats (mirrors `cpu_backend::CpuStats`).
-pub struct GenStats {
-    pub n_prompt: usize,
-    pub prompt_secs: f64,
-    pub n_gen: usize,
-    pub decode_secs: f64,
-}
 
 /// One chat turn, arch-agnostic: render the prompt, generate, stream decoded text pieces, report
 /// stats. The boxed form is `Box<dyn ChatTurn + '_>` so it may borrow a caller-owned `Llama`.
@@ -153,17 +144,6 @@ impl ChatTurn for Qwen35Chat {
     }
 }
 
-impl From<CpuStats> for GenStats {
-    fn from(s: CpuStats) -> Self {
-        GenStats {
-            n_prompt: s.n_prompt,
-            prompt_secs: s.prompt_secs,
-            n_gen: s.n_gen,
-            decode_secs: s.decode_secs,
-        }
-    }
-}
-
 /// CPU reference backend (`INFR_CPU=1`) for dense/MoE: the agnostic compute-graph forward, no GPU.
 /// Each turn is independent (no cross-turn KV context on the CPU path yet), but the REPL is allowed.
 pub struct CpuDenseChat {
@@ -184,10 +164,7 @@ impl ChatTurn for CpuDenseChat {
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
         let prompt = self.model.render_chat(message)?;
-        Ok(self
-            .model
-            .generate_cpu(&prompt, max_new, |p| on_piece(p))?
-            .into())
+        self.model.generate_cpu(&prompt, max_new, |p| on_piece(p))
     }
 
     fn supports_repl(&self) -> bool {
@@ -214,7 +191,7 @@ impl ChatTurn for CpuQwen35Chat {
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
         let prompt = crate::qwen35::render_chat(&self.path, message)?;
-        Ok(crate::qwen35::generate_cpu(&self.path, &prompt, max_new, |p| on_piece(p))?.into())
+        crate::qwen35::generate_cpu(&self.path, &prompt, max_new, |p| on_piece(p))
     }
 
     fn supports_repl(&self) -> bool {

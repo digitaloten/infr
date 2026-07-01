@@ -3,7 +3,7 @@
 //! assembles the layer graph, uploads weights, and steps the KV cache.
 #![allow(clippy::too_many_arguments)]
 
-use crate::{dequant_block, Config, PerLayerEmbd};
+use crate::{dequant_block, Config, GenStats, PerLayerEmbd};
 use anyhow::{anyhow, Result as AResult};
 use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage};
 use infr_core::graph::{Activation, AttnMask, Graph, Op};
@@ -11,15 +11,6 @@ use infr_core::tensor::{DType, TensorDesc, TensorId};
 use infr_core::WeightSource;
 use infr_cpu::CpuBackend;
 use infr_gguf::{Gguf, TensorBytes};
-
-/// Timing/counts from a CPU generation, for the caller's stats line.
-#[derive(Debug, Clone, Copy)]
-pub struct CpuStats {
-    pub n_prompt: usize,
-    pub prompt_secs: f64,
-    pub n_gen: usize,
-    pub decode_secs: f64,
-}
 
 // ─── Qwen3 dense CPU decode runner ───────────────────────────────────────────────
 //
@@ -89,7 +80,7 @@ pub(crate) fn generate_dense_cpu(
     prompt: &[u32],
     max_new: usize,
     on_token: impl FnMut(u32),
-) -> AResult<(Vec<u32>, CpuStats)> {
+) -> AResult<(Vec<u32>, GenStats)> {
     // Thin CPU wrapper over the backend-generic runner: a CpuBackend + a zero-copy weight binder
     // (maps each tensor straight from the GGUF mmap — no alloc, no memcpy).
     let cpu_be = CpuBackend::new();
@@ -122,7 +113,7 @@ pub(crate) fn generate_dense_backend(
     prompt: &[u32],
     max_new: usize,
     mut on_token: impl FnMut(u32),
-) -> AResult<(Vec<u32>, CpuStats)> {
+) -> AResult<(Vec<u32>, GenStats)> {
     let c = cfg;
     let (ne, nh) = (c.n_embd, c.n_head);
     // gemma4: per-layer SWA/full dims differ; size shared scratch + KV by the max over layers.
@@ -1033,7 +1024,7 @@ pub(crate) fn generate_dense_backend(
             ts(decode_t, decode_n),
         );
     }
-    let stats = CpuStats {
+    let stats = GenStats {
         n_prompt: prompt.len(),
         prompt_secs: prompt_t.as_secs_f64(),
         n_gen: decode_n,

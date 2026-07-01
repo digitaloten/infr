@@ -35,3 +35,13 @@ pub mod qwen35;
 mod tokenizer;
 pub(crate) use quant::*;
 pub(crate) use tokenizer::*;
+
+/// Per-turn generation timing — backend-agnostic (shared by the CPU runner and the GPU
+/// `ChatTurn` path). `prompt_secs` = prefill (time to first token), `decode_secs` = generation.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GenStats {
+    pub n_prompt: usize,
+    pub prompt_secs: f64,
+    pub n_gen: usize,
+    pub decode_secs: f64,
+}

@@ -48,10 +48,10 @@ impl CpuModel {
     }
 
     /// Token-level bench on the CPU reference backend (no GPU): prefill `n_prompt` dummy tokens, then
-    /// decode `n_gen`, returning the timing ([`CpuStats`] has `prompt_secs`/`decode_secs`). Lets
+    /// decode `n_gen`, returning the timing ([`crate::GenStats`] has `prompt_secs`/`decode_secs`). Lets
     /// `infr bench -ngl 0` measure prefill (pp = n_prompt/prompt_secs) and decode (tg = n_gen/decode_secs)
     /// directly comparable to `llama-bench -ngl 0`. Dummy tokens — timing is data-independent.
-    pub fn bench(&self, n_prompt: usize, n_gen: usize) -> Result<crate::cpu_backend::CpuStats> {
+    pub fn bench(&self, n_prompt: usize, n_gen: usize) -> Result<crate::GenStats> {
         let prompt: Vec<u32> = (0..n_prompt.max(1)).map(|i| (i % 100) as u32).collect();
         let (_, stats) = crate::cpu_backend::generate_dense_cpu(
             &self.gguf,
@@ -116,7 +116,7 @@ impl CpuModel {
     }
 
     /// Greedy generation on the CPU reference backend (no GPU). Returns the decoded text plus
-    /// timing/counts ([`crate::cpu_backend::CpuStats`]) for the caller's stats line.
+    /// timing/counts ([`crate::GenStats`]) for the caller's stats line.
     /// The generated text is delivered through `on_piece` as it streams; only timing/counts are
     /// returned.
     pub fn generate_cpu(
@@ -124,7 +124,7 @@ impl CpuModel {
         prompt: &str,
         max_new: usize,
         mut on_piece: impl FnMut(&str),
-    ) -> Result<crate::cpu_backend::CpuStats> {
+    ) -> Result<crate::GenStats> {
         let enc = self
             .tokenizer
             .encode(prompt, false)
