@@ -1197,13 +1197,21 @@ impl<'a> Recorder<'a> {
         nkv: usize,
         hd: usize,
         pos_offset: usize,
+        window: usize,
+        scale: f32,
     ) {
         let mpad = (n.div_ceil(64) * 64) as u32;
         // kv padded to 256 (the 8-warp attn_qk's BN); extra cols are masked in softmax. Still %64 so
         // the 4-warp fallback + softmax + attn_pv are unaffected.
         let kv_pad = (kv_len.div_ceil(256) * 256) as u32;
         let hdu = hd as u32;
-        let scale = 1.0f32 / (hd as f32).sqrt();
+        // scale override: >0 uses the caller's value (gemma4 = 1.0, QK-norm controls magnitude);
+        // 0 keeps the default 1/√hd (qwen3, gemma3).
+        let scale = if scale > 0.0 {
+            scale
+        } else {
+            1.0f32 / (hd as f32).sqrt()
+        };
 
         // stage 1: S = scale·Q·Kᵀ. 8-warp/256-thread warptile (BN=256, matches ollama's mul_mm)
         // unless INFR_NO_QK_WARP forces the 4-warp/2×2 attn_qk.
@@ -1233,16 +1241,17 @@ impl<'a> Recorder<'a> {
             nh as u32,
         );
 
-        // stage 2: row softmax (causal), in place S → P
+        // stage 2: row softmax (causal + optional sliding window), in place S → P
         self.stamp("attn_softmax");
         let ksm = self
             .be
-            .kernel("attn_softmax", crate::gemm::attn_softmax_spv(), 1, 16);
-        let mut ps = [0u8; 16];
+            .kernel("attn_softmax", crate::gemm::attn_softmax_spv(), 1, 20);
+        let mut ps = [0u8; 20];
         ps[0..4].copy_from_slice(&mpad.to_ne_bytes());
         ps[4..8].copy_from_slice(&kv_pad.to_ne_bytes());
         ps[8..12].copy_from_slice(&(kv_len as u32).to_ne_bytes());
         ps[12..16].copy_from_slice(&(pos_offset as u32).to_ne_bytes());
+        ps[16..20].copy_from_slice(&(window as u32).to_ne_bytes());
         self.dispatch3(ksm, &[Self::vkb(s)], 1, &ps, mpad, 1, nh as u32);
 
         // stage 3: O = P·V  (one coopmat GEMM per head). Split-K when under-occupied: at high ctx
@@ -2795,6 +2804,9 @@ mod tests {
         b
     }
 
+    // Reference attention. `window`>0 = sliding-window lower bound (gemma SWA); `scale_in`>0 overrides
+    // the default 1/√hd (gemma4 = 1.0). Matches attention_kv.comp and attn_softmax.comp semantics.
+    #[allow(clippy::too_many_arguments)]
     fn attn_kv_cpu(
         q: &[f32],
         k: &[f32],
@@ -2804,18 +2816,29 @@ mod tests {
         nkv: usize,
         hd: usize,
         pos_offset: usize,
+        window: usize,
+        scale_in: f32,
     ) -> Vec<f32> {
-        let scale = 1.0 / (hd as f32).sqrt();
+        let scale = if scale_in > 0.0 {
+            scale_in
+        } else {
+            1.0 / (hd as f32).sqrt()
+        };
         let mut o = vec![0f32; q_len * nh * hd];
         for ti in 0..q_len {
             let abs = pos_offset + ti;
+            let lo = if window > 0 && abs + 1 > window {
+                abs + 1 - window
+            } else {
+                0
+            };
             for h in 0..nh {
                 let kvh = h / (nh / nkv);
                 let qb = (ti * nh + h) * hd;
-                let mut sc = vec![0f32; abs + 1];
+                let mut sc = vec![0f32; abs + 1 - lo]; // valid keys [lo, abs]
                 let mut mx = f32::NEG_INFINITY;
-                for (j, scj) in sc.iter_mut().enumerate() {
-                    let kb = (j * nkv + kvh) * hd;
+                for (jj, scj) in sc.iter_mut().enumerate() {
+                    let kb = ((lo + jj) * nkv + kvh) * hd;
                     let d: f32 = (0..hd).map(|x| q[qb + x] * k[kb + x]).sum();
                     *scj = d * scale;
                     mx = mx.max(*scj);
@@ -2825,9 +2848,9 @@ mod tests {
                     l += (s - mx).exp();
                 }
                 let ob = (ti * nh + h) * hd;
-                for (j, s) in sc.iter().enumerate() {
+                for (jj, s) in sc.iter().enumerate() {
                     let p = (s - mx).exp() / l;
-                    let vb = (j * nkv + kvh) * hd;
+                    let vb = ((lo + jj) * nkv + kvh) * hd;
                     for x in 0..hd {
                         o[ob + x] += p * v[vb + x];
                     }
@@ -2875,7 +2898,7 @@ mod tests {
         let mut bytes = vec![0u8; q_len * nh * hd * 4];
         be.download(bo.as_ref(), &mut bytes).unwrap();
         let got: &[f32] = bytemuck::cast_slice(&bytes);
-        let want = attn_kv_cpu(&q, &k, &v, q_len, nh, nkv, hd, pos_offset);
+        let want = attn_kv_cpu(&q, &k, &v, q_len, nh, nkv, hd, pos_offset, 0, 0.0);
         let err = got
             .iter()
             .zip(&want)
@@ -2931,7 +2954,7 @@ mod tests {
         let mut bytes = vec![0u8; nh * hd * 4];
         be.download(bo.as_ref(), &mut bytes).unwrap();
         let got: &[f32] = bytemuck::cast_slice(&bytes);
-        let want = attn_kv_cpu(&q, &k, &v, 1, nh, nkv, hd, pos_offset);
+        let want = attn_kv_cpu(&q, &k, &v, 1, nh, nkv, hd, pos_offset, 0, 0.0);
         let err = got
             .iter()
             .zip(&want)
@@ -3113,19 +3136,37 @@ mod tests {
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn attention_prefill_nonfa_matches_cpu() {
-        run_attn_prefill_nonfa(64, 64, 2, 1, 128);
-        run_attn_prefill_nonfa(128, 200, 4, 2, 128);
-        run_attn_prefill_nonfa(70, 70, 2, 2, 128);
-        run_attn_prefill_nonfa(192, 500, 2, 1, 128);
-        run_attn_prefill_nonfa(80, 300, 9, 3, 64);
-        // force the split-K PV path (n_splits>1) and verify the partial-sum reduce is correct
+        // hd=128 (qwen3), full causal, default scale — the pre-existing regression cases.
+        run_attn_prefill_nonfa(64, 64, 2, 1, 128, 0, 0.0);
+        run_attn_prefill_nonfa(128, 200, 4, 2, 128, 0, 0.0);
+        run_attn_prefill_nonfa(70, 70, 2, 2, 128, 0, 0.0);
+        run_attn_prefill_nonfa(192, 500, 2, 1, 128, 0, 0.0);
+        run_attn_prefill_nonfa(80, 300, 9, 3, 64, 0, 0.0);
+        // gemma: hd=256 (SWA, GQA 16:8) and hd=512 (full, GQA 16:1), with the sliding-window mask
+        // and the scale override (gemma4 = 1.0). These are the paths the new routing exercises.
+        run_attn_prefill_nonfa(128, 300, 16, 8, 256, 100, 1.0); // gemma4 SWA (window)
+        run_attn_prefill_nonfa(128, 300, 16, 1, 512, 0, 1.0); // gemma4 full (scale=1)
+        run_attn_prefill_nonfa(128, 300, 16, 8, 256, 100, 0.0); // gemma3 SWA (window, 1/√hd)
+        run_attn_prefill_nonfa(70, 400, 16, 8, 256, 64, 1.0); // SWA, non-64-aligned q
+                                                              // force the split-K PV path (n_splits>1) and verify the partial-sum reduce is correct, incl.
+                                                              // with a window (split reduce must respect the softmax mask) and hd=512.
         std::env::set_var("INFR_PV_SPLITS", "4");
-        run_attn_prefill_nonfa(70, 300, 4, 2, 128);
-        run_attn_prefill_nonfa(128, 500, 2, 1, 128);
+        run_attn_prefill_nonfa(70, 300, 4, 2, 128, 0, 0.0);
+        run_attn_prefill_nonfa(128, 500, 2, 1, 128, 0, 0.0);
+        run_attn_prefill_nonfa(128, 3000, 16, 8, 256, 200, 1.0); // SWA, long kv, split-K
+        run_attn_prefill_nonfa(128, 3000, 16, 1, 512, 0, 1.0); // full hd=512, long kv, split-K
         std::env::remove_var("INFR_PV_SPLITS");
     }
 
-    fn run_attn_prefill_nonfa(q_len: usize, kv_len: usize, nh: usize, nkv: usize, hd: usize) {
+    fn run_attn_prefill_nonfa(
+        q_len: usize,
+        kv_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        window: usize,
+        scale: f32,
+    ) {
         let be = VulkanBackend::new().unwrap();
         let pos_offset = kv_len - q_len;
         let mpad = q_len.div_ceil(64) * 64;
@@ -3169,12 +3210,14 @@ mod tests {
             nkv,
             hd,
             pos_offset,
+            window,
+            scale,
         );
         rec.finish().unwrap();
         let mut bytes = vec![0u8; mpad * nh * hd * 4];
         be.download(bo.as_ref(), &mut bytes).unwrap();
+        let want = attn_kv_cpu(&q, &k, &v, q_len, nh, nkv, hd, pos_offset, window, scale);
         let got: &[f32] = bytemuck::cast_slice(&bytes);
-        let want = attn_kv_cpu(&q, &k, &v, q_len, nh, nkv, hd, pos_offset);
         let err = got[..q_len * nh * hd]
             .iter()
             .zip(&want)
@@ -3267,7 +3310,7 @@ mod tests {
         let mut bytes = vec![0u8; mpad * nh * hd * 4];
         be.download(bo.as_ref(), &mut bytes).unwrap();
         let got: &[f32] = bytemuck::cast_slice(&bytes);
-        let want = attn_kv_cpu(&q, &k, &v, q_len, nh, nkv, hd, pos_offset);
+        let want = attn_kv_cpu(&q, &k, &v, q_len, nh, nkv, hd, pos_offset, 0, 0.0);
         let err = got[..q_len * nh * hd]
             .iter()
             .zip(&want)
@@ -3346,7 +3389,7 @@ mod tests {
         let mut bytes = vec![0u8; mpad * nh * hd * 4];
         be.download(bo.as_ref(), &mut bytes).unwrap();
         let got: &[f32] = bytemuck::cast_slice(&bytes);
-        let want = attn_kv_cpu(&q, &k, &v, q_len, nh, nkv, hd, pos_offset);
+        let want = attn_kv_cpu(&q, &k, &v, q_len, nh, nkv, hd, pos_offset, 0, 0.0);
         let err = got[..q_len * nh * hd]
             .iter()
             .zip(&want)

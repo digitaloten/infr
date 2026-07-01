@@ -937,9 +937,15 @@ impl Llama {
             && hd == 128
             && self.be.max_shared_memory_bytes() >= 58880
             && std::env::var("INFR_FLASH_REG").is_ok();
+        // gemma prefill attention: the flash warptile is hd=128-only, but the non-FA coopmat path
+        // (attn_qk → softmax → attn_pv) is hd-general (256/512), so route gemma's attention through
+        // it instead of the scalar `attention_kv` GEMV. gemma4 keeps GEMV *projections*
+        // (use_gemm=false) but still gets coopmat *attention* here. Per-layer hd (256 SWA / 512 full)
+        // flows via push constants — no compiled variants. INFR_GEMMA_NOFA restores the fallback.
+        let gemma_prefill_attn = c.gemma && n >= 64 && std::env::var("INFR_GEMMA_NOFA").is_err();
         let mpad = if use_flash_reg {
             n.div_ceil(128) * 128
-        } else if use_gemm {
+        } else if use_gemm || gemma_prefill_attn {
             n.div_ceil(64) * 64
         } else {
             n
@@ -962,9 +968,9 @@ impl Llama {
             && hd == 128
             && self.be.max_shared_memory_bytes() >= 29056
             && std::env::var("INFR_NO_FLASH").is_err();
-        // gemma (hd=256) has no flash/nonfa prefill kernel (those tile on hd=128); keep its GEMM
-        // projections but route attention through the hd-general `attention_kv` path (fall-through).
-        let nonfa = use_gemm && !use_flash && !c.gemma;
+        // non-FA coopmat attention: qwen3's hd≠128 / INFR_NO_FLASH fallback, OR gemma prefill
+        // (hd=256/512). gemma4 has no use_gemm, so the `gemma_prefill_attn` term brings it in.
+        let nonfa = (use_gemm && !use_flash && !c.gemma) || gemma_prefill_attn;
         let hidden = alloc(n * ne, BufferUsage::Staging)?;
         self.be
             .upload(hidden.as_ref(), bytemuck::cast_slice(&hidden_host))
@@ -1365,11 +1371,13 @@ impl Llama {
                     pos,
                 );
             } else if let Some(s) = &nonfa_s {
-                // prefill: non-FA clean GEMMs (QK → softmax → PV).
+                // prefill: non-FA clean coopmat GEMMs (QK → softmax → PV). Handles hd=128 (qwen3),
+                // hd=256/512 (gemma), the SWA window, and the scale override (gemma4 = 1.0). kv_src
+                // == li except gemma4-E2B KV-sharing layers.
                 rec.attention_prefill_nonfa(
                     q.as_ref(),
-                    kv.k[li].as_ref(),
-                    kv.v[li].as_ref(),
+                    kv.k[kv_src].as_ref(),
+                    kv.v[kv_src].as_ref(),
                     attn.as_ref(),
                     s.as_ref(),
                     nonfa_pv.as_ref().unwrap().as_ref(),
@@ -1379,6 +1387,8 @@ impl Llama {
                     nkv,
                     hd,
                     pos,
+                    if c.is_swa_layer(li) { c.swa_window } else { 0 },
+                    attn_scale,
                 );
             } else if let Some((pm, pl, pacc)) = &split_bufs {
                 rec.attention_kv_split(
