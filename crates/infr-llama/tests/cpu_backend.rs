@@ -224,6 +224,35 @@ fn gpu_seam_golden_qwen3() {
     );
 }
 
+/// Flash-attention prefill parity: a prompt LONG ENOUGH (>64 tokens) that the seam's batched prefill
+/// takes the FlashAttention-2 path (`attention_prefill_flash`, rows≥64) + the tiled GEMM/mmq Linear,
+/// must generate the SAME greedy continuation as the CPU reference oracle (which uses the naive
+/// per-token attention). Guards the m>1 prefill kernels the short-prompt goldens never exercise.
+#[test]
+fn gpu_seam_flash_matches_cpu() {
+    let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
+    need_gpu!();
+    std::env::set_var("INFR_TEMP", "0");
+    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    // ~100+ tokens → pf_m ≥ 64 → flash prefill on the seam.
+    let long = "Photosynthesis is the process by which green plants, algae, and some bacteria \
+        convert light energy into chemical energy stored in glucose, using carbon dioxide and water \
+        and releasing oxygen as a byproduct. It happens in two connected stages: the light-dependent \
+        reactions in the thylakoid membranes, and the light-independent Calvin cycle in the stroma. \
+        Explain each stage carefully, name the key molecules involved, and then summarize in one \
+        sentence why this process is essential for life on Earth.";
+    let mut cpu_txt = String::new();
+    model
+        .generate_cpu(long, 24, |p| cpu_txt.push_str(p))
+        .expect("cpu gen");
+    let gpu_txt = model.generate_dense_vulkan(long, 24).expect("seam gen");
+    assert_eq!(
+        cpu_txt.trim(),
+        gpu_txt.trim(),
+        "flash-prefill seam diverged from the CPU oracle"
+    );
+}
+
 // CPU quant coverage: the SAME prompt through every available quantization of Qwen3-0.6B — legacy
 // round (Q4_0), k-quants (Q2_K/Q4_K/Q5_K/Q6_K), high-bit (Q8_0), i-quant codebook (IQ4_XS), and float
 // (BF16). Each exercises a different dequant/dot path; the per-quant golden hash is locked (each

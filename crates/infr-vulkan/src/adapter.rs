@@ -306,24 +306,65 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
                 mask,
                 pos,
             } => {
-                let window = match mask {
-                    AttnMask::Causal => 0,
-                    AttnMask::SlidingWindow(w) => *w,
-                };
-                rec.attention_kv(
-                    r(*q)?,
-                    r(*k_cache)?,
-                    r(*v_cache)?,
-                    r(*dst)?,
+                let (rows, kv_len, nh, nkv, hd, pos) = (
                     *rows as usize,
                     *kv_len as usize,
                     *n_head as usize,
                     *n_kv as usize,
                     *head_dim as usize,
                     *pos as usize,
-                    window,
-                    *scale,
                 );
+                // Prefill (rows≥64), causal, hd==128, standard 1/√hd scale: FlashAttention-2 (split-K
+                // online softmax, no materialized [m,kv] scores) instead of the decode `attention_kv`
+                // over the whole batch — the prefill attention win. The flash kernel hardcodes 1/√hd
+                // and writes ceil(rows/64)*64 output rows, so guard the scale and copy the real rows.
+                let flash_ok = rows >= 64
+                    && hd == 128
+                    && matches!(mask, AttnMask::Causal)
+                    && (*scale - 1.0 / (hd as f32).sqrt()).abs() < 1e-6;
+                if flash_ok {
+                    let mpad = rows.div_ceil(64) * 64;
+                    let attn_tmp = be_.alloc(mpad * nh * hd * 4, BufferUsage::Activations)?;
+                    let po = be_.alloc(8 * mpad * nh * hd * 4, BufferUsage::Activations)?;
+                    let pm = be_.alloc(8 * mpad * nh * 4, BufferUsage::Activations)?;
+                    let pl = be_.alloc(8 * mpad * nh * 4, BufferUsage::Activations)?;
+                    rec.attention_prefill_flash(
+                        r(*q)?,
+                        r(*k_cache)?,
+                        r(*v_cache)?,
+                        attn_tmp.as_ref(),
+                        po.as_ref(),
+                        pm.as_ref(),
+                        pl.as_ref(),
+                        rows,
+                        kv_len,
+                        nh,
+                        nkv,
+                        hd,
+                        pos,
+                    );
+                    rec.copy(attn_tmp.as_ref(), 0, r(*dst)?, 0, rows * nh * hd * 4);
+                    transient.extend([attn_tmp, po, pm, pl]);
+                } else {
+                    let window = match mask {
+                        AttnMask::Causal => 0,
+                        AttnMask::SlidingWindow(w) => *w,
+                    };
+                    rec.attention_kv(
+                        r(*q)?,
+                        r(*k_cache)?,
+                        r(*v_cache)?,
+                        r(*dst)?,
+                        rows,
+                        kv_len,
+                        nh,
+                        nkv,
+                        hd,
+                        pos,
+                        window,
+                        *scale,
+                    );
+                }
             }
             // Per-head RMSNorm == rmsnorm over rows*n_head rows of head_dim (gemma4's weightless
             // V-norm passes a ones weight → out = x/rms).
