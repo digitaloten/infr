@@ -1364,12 +1364,20 @@ impl<'a> Recorder<'a> {
         // 64 KB, e.g. RADV); bm=32 → 29056 B (fits NVIDIA 48 KB / MoltenVK 32 KB). The transformer
         // skips flash entirely when even bm=32 won't fit, so one of these always fits here.
         let shared_limit = self.be.shared.caps.max_shared_memory_bytes;
-        let bm: u32 = if shared_limit >= 64 * 908 { 64 } else { 32 };
+        // INFR_FLASH_BM=32 forces the small (29056 B) tile even on a 64 KB device, so the bm=32
+        // shaders get numeric-parity coverage on any GPU (they otherwise only run on sub-64 KB ones).
+        let force_bm32 = std::env::var("INFR_FLASH_BM").ok().as_deref() == Some("32");
+        let bm: u32 = if !force_bm32 && shared_limit >= 64 * 908 {
+            64
+        } else {
+            32
+        };
         // Each workgroup covers `bm` query rows → mpad/bm×nh groups (mpad is 64-aligned → /32 exact).
         let tile_wg = (mpad / bm) * nh as u32;
-        // INFR_NO_FLASH_WARP A/Bs the non-warp partial (BM=64, 58112 B); ignored where it won't fit.
-        let warp =
-            hd == 128 && (std::env::var("INFR_NO_FLASH_WARP").is_err() || shared_limit < 58112);
+        // INFR_NO_FLASH_WARP routes to the non-warp partial. Both warp and non-warp paths have a
+        // bm=32 build (29056 B) that fits sub-64 KB devices, so the knob is honored everywhere —
+        // no longer forced back to warp on NVIDIA / MoltenVK.
+        let warp = hd == 128 && std::env::var("INFR_NO_FLASH_WARP").is_err();
         if n_splits == 1 && !warp {
             self.stamp("attn_flash");
             let (fname, fspv): (&'static str, &[u32]) = if bm == 32 {
@@ -3194,6 +3202,18 @@ mod tests {
         run_attn_prefill_flash(64, 2000, 16, 8, 128);
         run_attn_prefill_flash(128, 500, 2, 1, 128);
         std::env::remove_var("INFR_FLASH_SPLITS");
+        // Force the bm=32 tile (otherwise only selected on sub-64 KB-shared devices like NVIDIA /
+        // MoltenVK) so the small shaders get numeric-parity coverage on any GPU: the fused kernel
+        // (hd=64), the warp split-K partial+combine (hd=128), and the non-warp partial
+        // (INFR_NO_FLASH_WARP). Without this, a 64 KB device only ever exercises the bm=64 build.
+        std::env::set_var("INFR_FLASH_BM", "32");
+        run_attn_prefill_flash(80, 300, 9, 3, 64); // fused attn_flash_bm32
+        run_attn_prefill_flash(128, 200, 4, 2, 128); // warp partial+combine (bm32)
+        run_attn_prefill_flash(448, 2000, 16, 8, 128); // warp, multi-block kv
+        std::env::set_var("INFR_NO_FLASH_WARP", "1");
+        run_attn_prefill_flash(128, 500, 2, 1, 128); // non-warp attn_flash_partial_bm32
+        std::env::remove_var("INFR_NO_FLASH_WARP");
+        std::env::remove_var("INFR_FLASH_BM");
     }
 
     fn run_attn_prefill_flash(q_len: usize, kv_len: usize, nh: usize, nkv: usize, hd: usize) {

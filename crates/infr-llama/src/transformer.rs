@@ -930,7 +930,13 @@ impl Llama {
         let use_gemm = c.qk_norm && n >= 64 && !c.gemma4 && std::env::var("INFR_NOGEMM").is_err();
         // Register-O flash (FlashAttention-2 layout, Br=128) is opt-in (INFR_FLASH_REG) while it's
         // A/B'd vs the BM=64 flash; it needs mpad padded to 128 (q/attn/scratch).
-        let use_flash_reg = use_gemm && hd == 128 && std::env::var("INFR_FLASH_REG").is_ok();
+        // The register-O tile statically allocates 58880 B of shared memory (BR=128); skip it when
+        // the device can't fit that (NVIDIA 48 KB / MoltenVK) so it falls back to the size-aware
+        // flash path instead of over-committing shared memory → device-lost. RADV (64 KB) fits.
+        let use_flash_reg = use_gemm
+            && hd == 128
+            && self.be.max_shared_memory_bytes() >= 58880
+            && std::env::var("INFR_FLASH_REG").is_ok();
         let mpad = if use_flash_reg {
             n.div_ceil(128) * 128
         } else if use_gemm {
