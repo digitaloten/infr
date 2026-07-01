@@ -171,6 +171,23 @@ impl MetalBackend {
         params: &[u8],
         threads: usize,
     ) {
+        // Auto threadgroup: as wide as the pipeline allows (good for the big elementwise grids).
+        self.encode_tg(r, pso, bufs, params, threads, 0);
+    }
+
+    /// As `encode`, but with an explicit threadgroup width (`tg`; 0 = auto). The simdgroup-GEMV
+    /// kernels pass 32 (one simdgroup per threadgroup) so a matvec launches `out_f` threadgroups
+    /// instead of a handful of wide ones — far more threadgroups for the GPU's cores to interleave,
+    /// which hides the memory latency the tiny per-output dot would otherwise stall on.
+    fn encode_tg(
+        &self,
+        r: &mut Resident,
+        pso: &ComputePipelineState,
+        bufs: &[&MtlBuffer],
+        params: &[u8],
+        threads: usize,
+        tg: usize,
+    ) {
         if threads == 0 {
             return;
         }
@@ -192,7 +209,8 @@ impl MetalBackend {
                 params.as_ptr() as *const c_void,
             );
         }
-        let tg = (pso.max_total_threads_per_threadgroup() as usize).min(threads.max(1)) as u64;
+        let cap = pso.max_total_threads_per_threadgroup() as usize;
+        let tg = if tg == 0 { cap } else { tg.min(cap) }.min(threads.max(1)) as u64;
         enc.dispatch_threads(MTLSize::new(threads as u64, 1, 1), MTLSize::new(tg, 1, 1));
     }
 
@@ -501,23 +519,25 @@ impl MetalBackend {
                     // Native quant: decode the compact unified weight inline — no f32 blow-up.
                     let qw = self.weight_qui(weight, g, bindings);
                     let pso = self.pipelines.get("linear_qui")?;
-                    self.encode(
+                    self.encode_tg(
                         r,
                         &pso,
                         &[bx.as_ref(), &qw.codes, &qw.sm, bd.as_ref()],
                         &p,
                         m * out_f * 32,
+                        32,
                     );
                 } else {
                     // f16/f32/bf16 weight: dequant-to-f32 device buffer, cached.
                     let bw = self.weight_buf(weight, g, bindings);
                     let pso = self.pipelines.get("linear_f32")?;
-                    self.encode(
+                    self.encode_tg(
                         r,
                         &pso,
                         &[bx.as_ref(), bw.as_ref(), bd.as_ref()],
                         &p,
                         m * out_f * 32,
+                        32,
                     );
                 }
                 r.loc[dst.0 as usize] = Loc::Device;

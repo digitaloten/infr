@@ -145,8 +145,13 @@ kernel void linear_f32(device const float* x   [[buffer(0)]],
 // code per element and one (scale,min) per 16-element block. Same simdgroup GEMV as linear_f32, but
 // the weight is decoded inline — ~12 bpw read instead of a 32 bpw dequant-to-f32 blow-up. The
 // reconstruction is bit-for-bit what infr_gguf::dequant produces, so parity with the CPU stays exact.
+//
+// Codes are read as `uchar4` (in_f is a multiple of 256, so /4 is exact and `wbase` is 4-aligned):
+// one 4-byte load per lane instead of four 1-byte loads, and consecutive lanes cover 128 contiguous
+// bytes per step — a full cache line — so the weight stream is read at memory bandwidth. All four
+// codes in a uchar4 fall in the same 16-block, so their (scale,min) is a single `sm` load.
 kernel void linear_qui(device const float*  x     [[buffer(0)]],
-                       device const uchar*  codes [[buffer(1)]],
+                       device const uchar4* codes [[buffer(1)]],
                        device const float2* sm    [[buffer(2)]],
                        device float*        dst   [[buffer(3)]],
                        constant LinearParams& p   [[buffer(4)]],
@@ -157,13 +162,18 @@ kernel void linear_qui(device const float*  x     [[buffer(0)]],
     uint r = sg / p.out_f;
     uint o = sg % p.out_f;
     ulong xbase = (ulong)r * p.in_f;
-    ulong wbase = (ulong)o * p.in_f;
+    ulong wbase4 = (ulong)o * (p.in_f / 4u);          // uchar4 index of this weight row's start
+    uint n4 = p.in_f / 4u;
     float acc = 0.0f;
-    for (uint i = lane; i < p.in_f; i += 32u) {
-        ulong gpos = wbase + i;
-        float2 s = sm[gpos >> 4];                 // (scale, min) for this element's 16-block
-        float w = s.x * (float)codes[gpos] + s.y;
-        acc += x[xbase + i] * w;
+    for (uint b = lane; b < n4; b += 32u) {
+        uchar4 c = codes[wbase4 + b];
+        uint i = b * 4u;
+        float2 s = sm[((ulong)o * p.in_f + i) >> 4];  // (scale, min) — shared by all 4 codes
+        device const float* xr = x + xbase + i;
+        acc += xr[0] * (s.x * (float)c.x + s.y)
+             + xr[1] * (s.x * (float)c.y + s.y)
+             + xr[2] * (s.x * (float)c.z + s.y)
+             + xr[3] * (s.x * (float)c.w + s.y);
     }
     acc = simd_sum(acc);
     if (lane == 0u) dst[sg] = acc;
