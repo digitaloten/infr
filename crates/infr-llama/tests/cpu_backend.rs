@@ -44,6 +44,16 @@ macro_rules! need_gpu {
     };
 }
 
+/// Serialize the model-gated generation tests. They mutate PROCESS-GLOBAL env that generation reads
+/// (`INFR_TEMP`, and `INFR_THINK` in the KV-reuse test — read at render time in infr-chat), and cargo
+/// runs tests in parallel; without this, one test's env leaks into another's generation (e.g.
+/// `INFR_THINK=0` flipping a Qwen3 golden's thinking off → hash mismatch). Poison-tolerant so a
+/// failing test doesn't cascade-poison the rest.
+fn test_serial_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 // ─── CPU-only correctness (no GPU) ───────────────────────────────────────────────
 //
 // The CPU and GPU goldens use SEPARATE hashes: the CPU does the math in f32 while the GPU uses f16 +
@@ -166,6 +176,7 @@ const QWEN3_GOLDEN: &[(&str, usize, u64)] = &[
 #[test]
 fn cpu_golden_qwen3() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
+    let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
     check_golden(&model, QWEN3_GOLDEN);
@@ -186,9 +197,53 @@ const QWEN3_GPU_GOLDEN: &[(&str, usize, u64)] = &[
 fn gpu_golden_qwen3() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
     need_gpu!();
+    let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     let llama = infr_llama::Llama::load_opt(&path, None).expect("load");
     check_gpu_golden(|p, n| gpu_gen(&llama, p, n), QWEN3_GPU_GOLDEN);
+}
+
+/// Dense multi-turn through the shared `Chat` MUST reuse the KV cache: turn 2 re-renders the whole
+/// conversation but prefills only the NEW suffix (incremental prefill), not the whole thing. So the
+/// tokens prefilled on turn 2 (`GenStats.n_prompt`) must be FAR fewer than turn 1's long prompt —
+/// if the refactor had broken KV reuse, turn 2 would re-prefill turn 1 + its reply + turn 2 and be
+/// LARGER. `INFR_THINK=0` keeps the reply think-free so the cached tokens match the re-rendered
+/// history cleanly (no `<think>` divergence), making the suffix just the turn-2 wrapper.
+#[test]
+fn dense_chat_reuses_kv() {
+    let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
+    need_gpu!();
+    let _tlk = test_serial_lock();
+    std::env::set_var("INFR_TEMP", "0");
+    std::env::set_var("INFR_THINK", "0");
+    let llama = infr_llama::Llama::load_opt(&path, None).expect("load");
+    let session = llama.chat_session(4096).expect("session");
+    let mut chat = infr_llama::model::Chat::new(Box::new(session));
+    // A deliberately long turn-1 prompt so its prefill dwarfs the short turn-2 suffix.
+    let s1 = chat
+        .turn(
+            "Hello there. Please remember this fact for later: my favorite color is teal. \
+             Acknowledge in one short sentence.",
+            24,
+            &mut |_| {},
+        )
+        .expect("turn 1");
+    let s2 = chat
+        .turn("What is my favorite color?", 24, &mut |_| {})
+        .expect("turn 2");
+    // Restore BEFORE the asserts so a failure can't leak INFR_THINK=0 to another test (the lock is
+    // still held until this fn returns, so no concurrent test observes the interim mutation anyway).
+    std::env::remove_var("INFR_THINK");
+    assert!(
+        s1.n_prompt > 0 && s2.n_prompt > 0,
+        "prompts must be non-empty"
+    );
+    assert!(
+        s2.n_prompt < s1.n_prompt,
+        "KV reuse broken: turn 2 prefilled {} tok (should be just the new suffix), turn 1 was {}",
+        s2.n_prompt,
+        s1.n_prompt,
+    );
 }
 
 // Captured + verified coherent on the Vulkan backend via the agnostic compute seam (the SAME dense
@@ -212,6 +267,7 @@ const QWEN3_SEAM_GOLDEN: &[(&str, usize, u64)] = &[
 fn gpu_seam_golden_qwen3() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
     need_gpu!();
+    let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
     check_gpu_golden(
@@ -232,6 +288,7 @@ fn gpu_seam_golden_qwen3() {
 fn gpu_seam_flash_matches_cpu() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
     need_gpu!();
+    let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
     // ~100+ tokens → pf_m ≥ 64 → flash prefill on the seam.
@@ -269,6 +326,7 @@ fn gpu_seam_bf16_matches_cpu() {
         return;
     }
     need_gpu!();
+    let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
     let prompt = model
@@ -305,6 +363,7 @@ const QWEN3_QUANT_GOLDEN: &[(&str, usize, u64)] = &[
 
 #[test]
 fn cpu_golden_qwen3_quants() {
+    let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     let bless = std::env::var("INFR_BLESS").is_ok();
     let prompt = "The capital of France is";
@@ -344,6 +403,7 @@ const QWEN3_QUANT_GPU_GOLDEN: &[(&str, usize, u64)] = &[
 #[test]
 fn gpu_golden_qwen3_quants() {
     need_gpu!();
+    let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     let bless = std::env::var("INFR_BLESS").is_ok();
     let prompt = "The capital of France is";
@@ -383,6 +443,7 @@ const GEMMA3_GOLDEN: &[(&str, usize, u64)] = &[
 #[test]
 fn cpu_golden_gemma3() {
     let path = need_model!(gemma3_1b(), "gemma-3-1b");
+    let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
     check_golden(&model, GEMMA3_GOLDEN);
@@ -403,6 +464,7 @@ const GEMMA3_GPU_GOLDEN: &[(&str, usize, u64)] = &[
 fn gpu_golden_gemma3() {
     let path = need_model!(gemma3_1b(), "gemma-3-1b");
     need_gpu!();
+    let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     let llama = infr_llama::Llama::load_opt(&path, None).expect("load");
     check_gpu_golden(|p, n| gpu_gen(&llama, p, n), GEMMA3_GPU_GOLDEN);
@@ -431,6 +493,7 @@ const QWEN35_GOLDEN: &[(&str, usize, u64)] = &[
 #[test]
 fn cpu_golden_qwen35() {
     let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
+    let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     let bless = std::env::var("INFR_BLESS").is_ok();
     for (prompt, n, want) in QWEN35_GOLDEN {
@@ -464,6 +527,7 @@ const QWEN3MOE_GOLDEN: &[(&str, usize, u64)] =
 #[test]
 fn cpu_golden_qwen3moe() {
     let path = need_model!(qwen3moe_30b(), "Qwen3-30B-A3B");
+    let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
     check_golden(&model, QWEN3MOE_GOLDEN);
@@ -479,6 +543,7 @@ const QWEN3MOE_GPU_GOLDEN: &[(&str, usize, u64)] =
 fn gpu_golden_qwen3moe() {
     let path = need_model!(qwen3moe_30b(), "Qwen3-30B-A3B");
     need_gpu!();
+    let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     let llama = infr_llama::Llama::load_opt(&path, None).expect("load");
     check_gpu_golden(|p, n| gpu_gen_moe(&llama, p, n), QWEN3MOE_GPU_GOLDEN);
@@ -505,6 +570,7 @@ const GEMMA4_E2B_GOLDEN: &[(&str, usize, u64)] = &[
 #[test]
 fn cpu_golden_gemma4_e2b() {
     let path = need_model!(gemma4_e2b(), "gemma-4-E2B");
+    let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
     check_golden(&model, GEMMA4_E2B_GOLDEN);
@@ -520,6 +586,7 @@ const GEMMA4_E2B_GPU_GOLDEN: &[(&str, usize, u64)] =
 fn gpu_golden_gemma4_e2b() {
     let path = need_model!(gemma4_e2b(), "gemma-4-E2B");
     need_gpu!();
+    let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     let llama = infr_llama::Llama::load_opt(&path, None).expect("load");
     check_gpu_golden(|p, n| gpu_gen(&llama, p, n), GEMMA4_E2B_GPU_GOLDEN);
@@ -543,6 +610,7 @@ const GEMMA4_12B_GPU_GOLDEN: &[(&str, usize, u64)] =
 fn gpu_golden_gemma4() {
     let path = need_model!(gemma4_12b(), "gemma-4-12b");
     need_gpu!();
+    let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     let llama = infr_llama::Llama::load_opt(&path, None).expect("load");
     check_gpu_golden(|p, n| gpu_gen(&llama, p, n), GEMMA4_12B_GPU_GOLDEN);

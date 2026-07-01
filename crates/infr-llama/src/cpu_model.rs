@@ -2,7 +2,7 @@
 //! from the GGUF mmap at forward time). Split out of `lib.rs` (no logic change).
 use crate::*;
 use anyhow::{anyhow, Result};
-use infr_chat::render_chat_user;
+use infr_chat::{render_chat_jinja, render_chat_user};
 use infr_gguf::Gguf;
 use std::path::Path;
 use tokenizers::Tokenizer;
@@ -117,6 +117,15 @@ impl CpuModel {
     /// to render — infr only supports models that ship one (no fabricated-ChatML fallback).
     pub fn render_chat(&self, user: &str) -> Result<String> {
         render_chat_user(&self.gguf, &self.tokenizer, self.cfg.eos, user)
+            .ok_or_else(no_template_err)
+    }
+
+    /// Render a multi-turn conversation `(role, content)` through the model's OWN embedded chat
+    /// template — the [`crate::model::ChatModel::render`] primitive for the CPU dense/MoE path, so the
+    /// shared [`crate::model::Chat`] can drive a history-based REPL. Same template + error contract as
+    /// [`render_chat`](Self::render_chat), generalized past a single user turn.
+    pub fn render_chat_messages(&self, messages: &[(&str, &str)]) -> Result<String> {
+        render_chat_jinja(&self.gguf, &self.tokenizer, self.cfg.eos, messages, true)
             .ok_or_else(no_template_err)
     }
 

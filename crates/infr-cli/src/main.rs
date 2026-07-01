@@ -322,14 +322,15 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     let max_new = envu("INFR_MAX_NEW", 2048);
     let (gguf, tok) = resolve(model)?;
 
-    // Dispatch every run mode behind one ChatTurn interface (infr_llama::model) + the one run loop
-    // below: INFR_CPU (dense/MoE or qwen35 on the agnostic compute graph, no Vulkan/VRAM), qwen35 GPU
-    // (one-shot), qwen3moe (one-shot), dense Qwen3/Llama/Gemma (multi-turn session). The CLI owns the
-    // Llama; the boxed trait object borrows it (so the borrow-based ChatSession needs no ownership
-    // change).
+    // Build the per-backend generation primitive (`ChatModel`), then wrap it in the ONE shared `Chat`
+    // (infr_llama::model) that owns history + `<think>`-stripping and drives the single REPL below:
+    // INFR_CPU (dense/MoE or qwen35 on the agnostic compute graph, no Vulkan/VRAM), qwen35 GPU,
+    // qwen3moe, dense Qwen3/Llama/Gemma. Every backend now does history-based multi-turn — no
+    // per-arch one-shot special-case. The CLI owns the Llama; the boxed trait object borrows it (so
+    // the borrow-based dense `ChatSession` needs no ownership change).
     let is_q35 = infr_llama::qwen35::is_qwen35(&gguf);
     let llama; // declared here so a borrowing ChatSession / MoeChat outlives `chat`
-    let mut chat: Box<dyn infr_llama::model::ChatTurn + '_> = if std::env::var("INFR_CPU").is_ok() {
+    let model: Box<dyn infr_llama::model::ChatModel + '_> = if std::env::var("INFR_CPU").is_ok() {
         if is_q35 {
             eprintln!("[cpu backend — qwen35/Qwen3-Next on the agnostic seam, no GPU]");
             Box::new(infr_llama::model::CpuQwen35Chat::new(gguf.clone()))
@@ -375,14 +376,12 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
             Box::new(llama.chat_session(max_ctx)?)
         }
     };
+    let mut chat = infr_llama::model::Chat::new(model);
 
-    // One-shot (a message) or, if the backend supports it, an interactive multi-turn REPL.
+    // One-shot (a message) or an interactive multi-turn REPL (every backend now supports it).
     if let Some(m) = message {
-        run_chat_turn(&mut *chat, m, max_new)?;
+        run_chat_turn(&mut chat, m, max_new)?;
         return Ok(());
-    }
-    if !chat.supports_repl() {
-        anyhow::bail!("this model currently supports one-shot only: pass a message");
     }
     let stdin = std::io::stdin();
     loop {
@@ -402,17 +401,17 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         if matches!(line, "exit" | "quit" | ":q" | ":quit") {
             break;
         }
-        if let Err(e) = run_chat_turn(&mut *chat, line, max_new) {
+        if let Err(e) = run_chat_turn(&mut chat, line, max_new) {
             eprintln!("error: {e}");
         }
     }
     Ok(())
 }
 
-/// Run one chat turn through any [`ChatTurn`] backend: stream pieces via the `<think>` renderer, then
+/// Run one chat turn through the shared [`Chat`]: stream pieces via the `<think>` renderer, then
 /// print the prefill/decode stats line.
 fn run_chat_turn(
-    chat: &mut dyn infr_llama::model::ChatTurn,
+    chat: &mut infr_llama::model::Chat,
     message: &str,
     max_new: usize,
 ) -> anyhow::Result<()> {

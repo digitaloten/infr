@@ -485,7 +485,7 @@ impl Llama {
     /// Returns `None` if the GGUF has no template or it fails to render (the caller errors — there is
     /// no hardcoded fallback). `messages` are `(role, content)`; `bos_token`/`eos_token`
     /// come from the GGUF special-token ids.
-    fn render_chat_messages(
+    pub(crate) fn render_chat_messages(
         &self,
         messages: &[(&str, &str)],
         add_generation_prompt: bool,
@@ -3739,22 +3739,21 @@ impl Llama {
             kv: self.new_kv(max_ctx)?,
             started: false,
             last_prompt_tokens: 0,
-            messages: Vec::new(),
             cached: Vec::new(),
         })
     }
 }
 
 /// A stateful multi-turn chat over a persistent KV cache (so the model sees prior turns). Create via
-/// [`Llama::chat_session`]; call [`ChatSession::turn`] per user message.
+/// [`Llama::chat_session`]. The shared [`crate::model::Chat`] owns the conversation history and
+/// `<think>`-stripping; this session only owns the KV cache: it [`render`](Self::render)s the
+/// caller-supplied message list through the model's template and [`generate`](Self::generate)s the
+/// reply, prefilling only the token suffix that differs from what's already cached.
 pub struct ChatSession<'a> {
     llama: &'a Llama,
     kv: KvCache,
     started: bool,
     pub(crate) last_prompt_tokens: usize,
-    /// Conversation history `(role, content)`, re-rendered through the model's embedded chat
-    /// template every turn. Empty when the GGUF has no template (the hardcoded fallback is used).
-    messages: Vec<(String, String)>,
     /// The token sequence currently materialized in the KV cache, so each turn can prefill only the
     /// new suffix (common-prefix diff vs the freshly-rendered prompt).
     cached: Vec<u32>,
@@ -3777,28 +3776,28 @@ impl ChatSession<'_> {
         self.kv.max_ctx
     }
 
-    /// Run one user turn: append the message, decode the assistant reply (streamed to `on_token`),
-    /// and keep it all in the cache for the next turn. Returns the reply text. The prompt is built
-    /// from the model's OWN embedded chat template (re-rendered over the full history each turn);
-    /// only the new token suffix vs the cached prefix is prefilled. Falls back to the hardcoded
-    /// per-arch template ([`turn_tokens`]) for GGUFs without an embedded one.
-    pub fn turn(
+    /// Render `messages` `(role, content)` through the model's OWN embedded chat template — the
+    /// [`crate::model::ChatModel::render`] primitive for the dense/Gemma GPU path. Errors if the GGUF
+    /// has no `tokenizer.chat_template` or it fails to render (no hardcoded fallback).
+    pub fn render(&self, messages: &[(&str, &str)]) -> Result<String> {
+        self.llama
+            .render_chat_messages(messages, true)
+            .ok_or_else(no_template_err)
+    }
+
+    /// Generate the assistant reply for an already-rendered `prompt`, streaming decoded pieces to
+    /// `on_token`. Keeps the persistent KV cache warm: only the token suffix that differs from the
+    /// cached prefix is prefilled (incremental prefill), so a multi-turn REPL re-prefills just the
+    /// new turn's markers + the model's prior answer, not the whole conversation. Returns per-turn
+    /// [`GenStats`] (`n_prompt` = the suffix actually prefilled this turn).
+    pub fn generate(
         &mut self,
-        user: &str,
+        prompt: &str,
         max_new: usize,
-        on_token: impl FnMut(&str),
-    ) -> Result<String> {
-        self.messages.push(("user".into(), user.to_string()));
-        let refs: Vec<(&str, &str)> = self
-            .messages
-            .iter()
-            .map(|(r, c)| (r.as_str(), c.as_str()))
-            .collect();
-        let Some(rendered) = self.llama.render_chat_messages(&refs, true) else {
-            self.messages.pop();
-            return Err(no_template_err());
-        };
-        let ids = self.llama.encode_special(&rendered)?;
+        mut on_token: impl FnMut(&str),
+    ) -> Result<crate::GenStats> {
+        let t0 = std::time::Instant::now();
+        let ids = self.llama.encode_special(prompt)?;
         if std::env::var("INFR_DEBUG_TOKENS").is_ok() {
             let dump: Vec<(u32, String)> = ids
                 .iter()
@@ -3809,7 +3808,8 @@ impl ChatSession<'_> {
         // Prefill only the suffix that differs from what's already in the cache.
         let p = common_prefix_len(&self.cached, &ids);
         let new = &ids[p..];
-        let room = self.kv.max_ctx.saturating_sub(p + new.len() + 1);
+        let n_new = new.len();
+        let room = self.kv.max_ctx.saturating_sub(p + n_new + 1);
         if room == 0 {
             bail!(
                 "context full: {} prompt vs {} cap — start a new session",
@@ -3820,31 +3820,31 @@ impl ChatSession<'_> {
         let max_new = max_new.min(room);
         self.started = true;
         self.kv.len = p; // rewind the cache to the shared prefix
-        self.last_prompt_tokens = new.len();
+        self.last_prompt_tokens = n_new;
         let logits = self.llama.prefill(new, &mut self.kv)?;
+        // Split prefill vs decode time at the first streamed piece (matches the other backends).
+        let mut t_first: Option<std::time::Instant> = None;
+        let mut n_gen = 0usize;
         let generated = self
             .llama
-            .decode_loop(logits, &mut self.kv, max_new, None, on_token)?;
+            .decode_loop(logits, &mut self.kv, max_new, None, |piece| {
+                if t_first.is_none() {
+                    t_first = Some(std::time::Instant::now());
+                }
+                n_gen += 1;
+                on_token(piece);
+            })?;
         // The cache now holds the rendered prompt + the raw generation.
         self.cached = ids;
         self.cached.extend_from_slice(&generated);
-
-        // History keeps only the ANSWER, not the model's <think>…</think> reasoning (Qwen3 excludes
-        // prior-turn thinking; keeping it degrades the model). On the next turn the re-render omits
-        // the think, and the prefix-diff naturally re-prefills the think-free answer. Answer = tokens
-        // after the last </think>; unterminated-think → keep none; no <think> → keep everything.
-        let tk = &self.llama.tokenizer;
-        let close = tk.token_to_id("</think>");
-        let open = tk.token_to_id("<think>");
-        let answer: &[u32] = match close.and_then(|c| generated.iter().rposition(|&t| t == c)) {
-            Some(pos) => &generated[pos + 1..],
-            None if open.is_some_and(|o| generated.contains(&o)) => &[],
-            None => &generated,
-        };
-        let answer_text = tk.decode(answer, true).unwrap_or_default();
-        self.messages.push(("assistant".into(), answer_text));
-        tk.decode(&generated, true)
-            .map_err(|e| anyhow!("decode: {e}"))
+        let now = std::time::Instant::now();
+        let tf = t_first.unwrap_or(now);
+        Ok(crate::GenStats {
+            n_prompt: n_new,
+            prompt_secs: tf.duration_since(t0).as_secs_f64(),
+            n_gen,
+            decode_secs: now.duration_since(tf).as_secs_f64(),
+        })
     }
 }
 

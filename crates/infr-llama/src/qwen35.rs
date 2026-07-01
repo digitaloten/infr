@@ -1154,10 +1154,18 @@ enum Q35LayerH {
 /// Render a plain user message through the qwen35 GGUF's own jinja chat template (falls back to
 /// ChatML — qwen35's native format — if there's no template). So `infr run` / tests pass plain text.
 pub fn render_chat(path: &std::path::Path, user: &str) -> Result<String> {
+    render_chat_messages(path, &[("user", user)])
+}
+
+/// Render a multi-turn conversation `(role, content)` through the qwen35 GGUF's own jinja chat
+/// template — the [`crate::model::ChatModel::render`] primitive for the qwen35 GPU + CPU paths, so
+/// the shared [`crate::model::Chat`] can drive a history-based REPL. Errors if the GGUF has no usable
+/// `tokenizer.chat_template`.
+pub fn render_chat_messages(path: &std::path::Path, messages: &[(&str, &str)]) -> Result<String> {
     let g = Gguf::open(path).map_err(|e| anyhow!("open gguf: {e}"))?;
     let tok = crate::build_tokenizer(&g)?;
     let eos = g.metadata().u64("tokenizer.ggml.eos_token_id").unwrap_or(2) as u32;
-    infr_chat::render_chat_user(&g, &tok, eos, user).ok_or_else(|| {
+    infr_chat::render_chat_jinja(&g, &tok, eos, messages, true).ok_or_else(|| {
         anyhow!(
             "model GGUF has no usable chat template (no `tokenizer.chat_template`, or it failed to \
              render — set INFR_DEBUG_CHAT=1 for details)."
@@ -1774,9 +1782,17 @@ pub fn is_qwen35(path: &std::path::Path) -> bool {
 /// One-shot chat generation on the CPU reference: applies the Qwen chat template, greedy-decodes
 /// until `<|im_end|>`/eos or `max_new`, streaming each decoded piece to `on_piece`. Returns
 /// (prompt_tokens, generated_tokens). For Qwen3.5/3.6 (no GPU path — see docs/QWEN35.md).
+/// Generate the assistant reply for an already-rendered `prompt` on the qwen35 / Qwen3-Next GPU path
+/// (the bespoke per-token hybrid forward). Returns `(n_prompt, n_gen)`; text streams via `on_piece`.
+/// This is the [`crate::model::ChatModel::generate`] primitive for the qwen35 GPU backend — rendering
+/// happens in [`render_chat_messages`], so the shared [`crate::model::Chat`] owns the history.
+///
+/// FOLLOW-UP: this reloads the GGUF + rebuilds the model on every turn (a pre-existing wart carried
+/// over from the one-shot path). A load-once persistent qwen35 model behind the trait would drop the
+/// per-turn reload; deferred to keep this refactor scoped to the shared orchestration.
 pub fn generate_chat(
     path: &std::path::Path,
-    message: &str,
+    prompt: &str,
     max_new: usize,
     mut on_piece: impl FnMut(&str),
 ) -> Result<(usize, usize)> {
@@ -1788,15 +1804,6 @@ pub fn generate_chat(
         .u64("tokenizer.ggml.eos_token_id")
         .map(|x| x as u32);
     let im_end = tok.token_to_id("<|im_end|>");
-    // Render through the model's OWN jinja chat template (Qwen3.5's controls thinking). No ChatML
-    // fallback — a GGUF without a template is a hard error. Mirrors the CPU path (`render_chat`).
-    let prompt =
-        infr_chat::render_chat_user(&g, &tok, eos.unwrap_or(2), message).ok_or_else(|| {
-            anyhow!(
-            "model GGUF has no usable chat template (no `tokenizer.chat_template`, or it failed to \
-             render — set INFR_DEBUG_CHAT=1 for details)."
-        )
-        })?;
     let enc = tok
         .encode(prompt, false)
         .map_err(|e| anyhow!("encode: {e}"))?;
