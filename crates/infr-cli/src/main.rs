@@ -563,6 +563,33 @@ fn cmd_bench(
         })
         .transpose()?;
     let (gguf, tok) = resolve(model)?;
+    // INFR_GPU_SEAM=1: bench the dense forward on the Vulkan backend THROUGH THE AGNOSTIC SEAM
+    // (per-token graph recompile) instead of the production Recorder path — the baseline the
+    // record-once replay optimization must close. Reuses -p/-n/-r; reports pp/tg like the others.
+    if std::env::var("INFR_GPU_SEAM").is_ok() {
+        let model = infr_llama::CpuModel::load(&gguf, tok.as_deref())?;
+        let mut pps = Vec::new();
+        let mut tgs = Vec::new();
+        for _ in 0..reps.max(1) {
+            let s = model.bench_vulkan(n_prompt, n_gen)?;
+            if s.prompt_secs > 0.0 {
+                pps.push(s.n_prompt as f64 / s.prompt_secs);
+            }
+            if s.decode_secs > 0.0 {
+                tgs.push(s.n_gen as f64 / s.decode_secs);
+            }
+        }
+        let med = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v.get(v.len() / 2).copied().unwrap_or(0.0)
+        };
+        println!(
+            "seam (per-token recompile): pp={:.1} tok/s  tg={:.1} tok/s  (p={n_prompt} n={n_gen} r={reps})",
+            med(pps),
+            med(tgs),
+        );
+        return Ok(());
+    }
     // -ngl 0: run on the CPU reference backend (no GPU), comparable to `llama-bench -ngl 0`.
     if ngl == 0 {
         return cmd_bench_cpu(

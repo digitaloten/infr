@@ -97,6 +97,45 @@ pub(crate) fn generate_dense_cpu(
     )
 }
 
+/// GPU seam runner: the SAME dense forward as [`generate_dense_cpu`], but on the Vulkan backend
+/// through the agnostic [`Graph`] adapter (weights padded + uploaded to VRAM instead of mmap-mapped).
+/// This is the end-to-end GPU parity/perf path — running it and diffing the CPU oracle proves the
+/// adapter, and its decode tok/s (still recompiling the graph per token) is the baseline
+/// record-once replay must close. Prefill's batched attention is decode-only on the seam, so the
+/// caller may pass short prompts to force the per-token path.
+pub(crate) fn generate_dense_gpu(
+    vk: &infr_vulkan::VulkanBackend,
+    g: &Gguf,
+    cfg: &Config,
+    token_embd: &[f32],
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    max_new: usize,
+    on_token: impl FnMut(u32),
+) -> AResult<(Vec<u32>, GenStats)> {
+    generate_dense_backend(
+        vk,
+        &|tb, _dt, _n| {
+            // Native GGUF block bytes → VRAM (u32-padded, in-shader dequant — the adapter's Linear
+            // dispatches native-quant vs f16 by dtype). One `Weights` buffer per tensor.
+            let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
+            let buf = vk
+                .alloc(padded.len(), BufferUsage::Weights)
+                .map_err(|e| anyhow!("{e}"))?;
+            vk.upload(buf.as_ref(), &padded)
+                .map_err(|e| anyhow!("{e}"))?;
+            Ok(buf)
+        },
+        g,
+        cfg,
+        token_embd,
+        ple,
+        prompt,
+        max_new,
+        on_token,
+    )
+}
+
 /// Backend-generic dense decode runner. Builds the agnostic decode [`Graph`] per token and runs it
 /// on `be` (CPU reference or Vulkan). `bind_weight` turns each native-dtype GGUF tensor into a
 /// backend buffer: the CPU maps it zero-copy from the mmap; the GPU pads + uploads it to VRAM. This

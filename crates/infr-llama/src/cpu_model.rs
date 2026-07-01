@@ -71,29 +71,14 @@ impl CpuModel {
     /// compiled + executed by `VulkanBackend`; greedy tokens are detokenized. Same graph, two
     /// backends — this is the end-to-end dense CPU↔GPU parity path.
     pub fn generate_dense_vulkan(&self, prompt: &str, max_new: usize) -> Result<String> {
-        use infr_core::backend::{Backend, Buffer, BufferUsage};
-        use infr_core::tensor::DType;
-        use infr_gguf::TensorBytes;
         let enc = self
             .tokenizer
             .encode(prompt, false)
             .map_err(|e| anyhow!("encode: {e}"))?;
         let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
         let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
-        // GPU weight binder: pad each native tensor to u32 alignment (what `linear_native` reads) and
-        // upload it to a VRAM `Weights` buffer.
-        let bind = |tb: TensorBytes, _dt: DType, _n: usize| -> Result<Box<dyn Buffer>> {
-            let padded = infr_vulkan::linear::pad_to_u32_align(tb.as_ref());
-            let b = vk
-                .alloc(padded.len(), BufferUsage::Weights)
-                .map_err(|e| anyhow!("alloc weight: {e}"))?;
-            vk.upload(b.as_ref(), &padded)
-                .map_err(|e| anyhow!("upload weight: {e}"))?;
-            Ok(b)
-        };
-        let (generated, _stats) = crate::cpu_backend::generate_dense_backend(
+        let (generated, _stats) = crate::cpu_backend::generate_dense_gpu(
             &vk,
-            &bind,
             &self.gguf,
             &self.cfg,
             &self.token_embd,
@@ -105,6 +90,26 @@ impl CpuModel {
         self.tokenizer
             .decode(&generated, true)
             .map_err(|e| anyhow!("decode: {e}"))
+    }
+
+    /// Token-level bench on the **Vulkan** backend through the agnostic seam (the GPU twin of
+    /// [`bench`](Self::bench)): prefill `n_prompt` dummy tokens, decode `n_gen`, return the timing.
+    /// The decode tok/s here (per-token graph recompile) is the baseline the record-once replay
+    /// optimization must close toward the production Recorder path.
+    pub fn bench_vulkan(&self, n_prompt: usize, n_gen: usize) -> Result<crate::GenStats> {
+        let prompt: Vec<u32> = (0..n_prompt.max(1)).map(|i| (i % 100) as u32).collect();
+        let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
+        let (_, stats) = crate::cpu_backend::generate_dense_gpu(
+            &vk,
+            &self.gguf,
+            &self.cfg,
+            &self.token_embd,
+            self.per_layer_embd.as_ref(),
+            &prompt,
+            n_gen,
+            |_| {},
+        )?;
+        Ok(stats)
     }
 
     /// Render a user turn with the model's OWN embedded chat template (so an instruct model — Gemma,
