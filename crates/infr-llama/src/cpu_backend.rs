@@ -906,6 +906,10 @@ pub(crate) fn generate_dense_backend(
     let mut prompt_t = std::time::Duration::ZERO;
     let mut decode_t = std::time::Duration::ZERO;
     let mut decode_n = 0usize;
+    // INFR_PROF_DEC: split decode per-token wall time into host setup (build graph + compile + bind)
+    // vs execute (record + submit + GPU + wait) to guide the record-once-replay decision.
+    let mut dec_setup = std::time::Duration::ZERO;
+    let mut dec_exec = std::time::Duration::ZERO;
 
     // ── batched prefill (dense non-MoE non-E2B models only) ──────────────────────────────────
     // Process all-but-the-last prompt tokens in a single graph execution: each Op::Linear runs
@@ -1027,6 +1031,7 @@ pub(crate) fn generate_dense_backend(
                 .map_err(|e| anyhow!("{e}"))?;
         }
 
+        let t_setup = std::time::Instant::now();
         let (g, h) = build(1, pos);
         let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
         let mut b = Bindings::new();
@@ -1046,7 +1051,14 @@ pub(crate) fn generate_dense_backend(
             b.bind(*wid, wbufs[i].as_ref());
         }
         b.bind(h.logits, logits_buf.as_ref());
+        let setup_el = t_setup.elapsed();
+        let t_exec = std::time::Instant::now();
         be.execute(plan.as_ref(), &b).map_err(|e| anyhow!("{e}"))?;
+        let exec_el = t_exec.elapsed();
+        if std::env::var("INFR_PROF_DEC").is_ok() && pos + 1 >= prompt.len() {
+            dec_setup += setup_el;
+            dec_exec += exec_el;
+        }
 
         // Only sample once we're past the prompt (decode position = last prompt token onward).
         let is_decode = pos + 1 >= prompt.len();
@@ -1087,6 +1099,14 @@ pub(crate) fn generate_dense_backend(
             decode_n,
             decode_t.as_secs_f64(),
             ts(decode_t, decode_n),
+        );
+    }
+    if std::env::var("INFR_PROF_DEC").is_ok() && decode_n > 0 {
+        eprintln!(
+            "[dec prof] {} decode tok | setup(build+compile+bind) {:.3}ms/tok | exec(record+submit+gpu) {:.3}ms/tok",
+            decode_n,
+            dec_setup.as_secs_f64() * 1e3 / decode_n as f64,
+            dec_exec.as_secs_f64() * 1e3 / decode_n as f64,
         );
     }
     let stats = GenStats {
