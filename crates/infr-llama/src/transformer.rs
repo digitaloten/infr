@@ -817,6 +817,19 @@ impl Llama {
                     .map_err(|e| anyhow!("{e}"))?,
             );
         }
+        // Zero the freshly-allocated KV cache: it comes from RECYCLED VRAM, and the prefill attention
+        // reads the KV padded up to a tile boundary (kv_len → next multiple of the kernel's KV tile),
+        // so the padding rows beyond the real tokens are attended. On a reused buffer those rows hold a
+        // PRIOR forward's stale K/V (a same-size 2nd request — e.g. the server's 2nd turn) → the
+        // attention mixes in garbage → repeated-token output. Fresh/one-shot runs got zeroed memory so
+        // they were fine. (This is the ROOT CAUSE of the `infr serve` garbage.)
+        {
+            let rec = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
+            for buf in k.iter().chain(v.iter()) {
+                rec.zero(buf.as_ref(), buf.len_bytes() / 4);
+            }
+            rec.finish().map_err(|e| anyhow!("{e}"))?;
+        }
         // Record-once decode scratch for Qwen3-style dense models (the path reuses the `_dyn` kernels).
         let dec = if c.qk_norm {
             Some(self.build_dense_decode_scratch(max_ctx)?)
@@ -1968,7 +1981,7 @@ impl Llama {
             .encode(prompt, false)
             .map_err(|e| anyhow!("encode: {e}"))?;
         let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
-        let mut kv = self.new_kv(kv_ctx(prompt_tokens.len() + max_new + 8))?;
+        let mut kv = self.new_kv(prompt_tokens.len() + max_new + 8)?;
         let logits = self.prefill(&prompt_tokens, &mut kv)?;
         self.decode_loop(logits, &mut kv, max_new, constraint, on_token)
     }
@@ -2038,7 +2051,7 @@ impl Llama {
             .encode(prompt, false)
             .map_err(|e| anyhow!("encode: {e}"))?;
         let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
-        let mut kv = self.new_kv(kv_ctx(prompt_tokens.len() + max_new + 8))?;
+        let mut kv = self.new_kv(prompt_tokens.len() + max_new + 8)?;
         let generated = self.run_in_cache(&prompt_tokens, &mut kv, max_new, on_token)?;
         self.tokenizer
             .decode(&generated, true)
@@ -3845,19 +3858,6 @@ impl ChatSession<'_> {
             decode_secs: now.duration_since(tf).as_secs_f64(),
         })
     }
-}
-
-/// KV-cache capacity for a one-shot generation (`generate`/`generate_ids`), given the tight
-/// `prompt + max_new + slack` requirement. WORKAROUND for a not-yet-root-caused latent bug: the GPU
-/// dense forward degenerates into repeated-token garbage when `max_ctx` is small (measured: garbage
-/// at ≤4096, coherent at ≥8192 on Qwen3-8B, independent of prompt length) — so the server, which
-/// sized the KV tight per request (`prompt+max_new+8`), returned garbage for any prompt of ~130+
-/// tokens (e.g. a short tool-calling request). Floor the capacity to 8192 so one-shot generation
-/// matches the always-large `ChatSession` (`infr run`) path, which never hit this. The floor costs a
-/// little idle KV VRAM (~0.8 GB on the 8B); the real fix is in the prefill/forward. See the
-/// `serve-garbage-streaming-bug` note.
-fn kv_ctx(want: usize) -> usize {
-    want.max(8192)
 }
 
 /// Length of the shared leading run of two token sequences (for incremental prefill).

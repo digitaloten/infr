@@ -451,6 +451,24 @@ impl infr_server::ChatGenerator for LlamaGenerator {
             .transpose()
             .context("parsing request `tools`")?;
         let prompt = self.llama.render_chat_oai(messages, tools.as_ref())?;
+        // INFR_DUMP_REQ=<file>: append the exact rendered prompt for each request (debugging the
+        // serve-only garbage). Replay it verbatim to reproduce/root-cause outside the server.
+        if let Ok(path) = std::env::var("INFR_DUMP_REQ") {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = write!(
+                    f,
+                    "===REQ n_msgs={} has_tools={} chars={}===\n{prompt}\n===END===\n",
+                    messages.len(),
+                    tools.is_some(),
+                    prompt.len(),
+                );
+            }
+        }
         let max_new = std::env::var("INFR_MAX_NEW")
             .ok()
             .and_then(|v| v.parse().ok())

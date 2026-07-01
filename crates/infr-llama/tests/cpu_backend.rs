@@ -203,6 +203,79 @@ fn gpu_golden_qwen3() {
     check_gpu_golden(|p, n| gpu_gen(&llama, p, n), QWEN3_GPU_GOLDEN);
 }
 
+/// A BIG prompt (~1000+ tokens): large enough that the dense prefill's padded-KV attention reads the
+/// padding rows beyond the real tokens. Short prompts don't reproduce the KV-cache bug.
+fn repeat_prompt() -> String {
+    "Explain how a CPU instruction pipeline works and list its common hazards. ".repeat(90)
+}
+
+/// A greedy generation is degenerate if it collapsed to one repeated token (the KV-padding bug's
+/// "!!!!"/"5555" signature): a non-trivial length with ≤2 distinct chars.
+fn is_degenerate(s: &str) -> bool {
+    let t = s.trim();
+    t.chars().count() >= 8 && t.chars().collect::<std::collections::HashSet<char>>().len() <= 2
+}
+
+/// REGRESSION (Vulkan backend): repeated forwards on the same model must NOT degenerate. The GPU KV
+/// cache is allocated from RECYCLED VRAM; before the fix (`new_kv` zeroes the cache), the prefill
+/// attention read STALE K/V in the padding rows beyond the prompt → repeated-token garbage. This hit
+/// the `infr serve` path (a session's 2nd request reused the 1st's freed KV buffers → "5555…"). Two
+/// greedy generations of the same big prompt must be non-degenerate AND identical (greedy is
+/// deterministic; a stale-KV corruption makes the 2nd differ / collapse). With the fix removed this
+/// test produces garbage; with it, coherent.
+#[test]
+fn gpu_no_garbage_on_repeated_forward() {
+    let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
+    need_gpu!();
+    let _tlk = test_serial_lock();
+    std::env::set_var("INFR_TEMP", "0");
+    let llama = infr_llama::Llama::load_opt(&path, None).expect("load");
+    let p = repeat_prompt();
+    let g1 = gpu_gen(&llama, &p, 20);
+    let g2 = gpu_gen(&llama, &p, 20); // 2nd fresh KV reuses the 1st's freed (recycled) VRAM
+    let head = |s: &str| s.chars().take(48).collect::<String>();
+    assert!(
+        !is_degenerate(&g1),
+        "1st GPU forward degenerate: {:?}",
+        head(&g1)
+    );
+    assert!(
+        !is_degenerate(&g2),
+        "2nd GPU forward degenerate (stale-KV regression): {:?}",
+        head(&g2)
+    );
+    assert_eq!(
+        g1, g2,
+        "repeated GPU forward diverged (greedy must be deterministic)"
+    );
+}
+
+/// REGRESSION (CPU reference backend): the same repeated-forward invariant on the no-GPU
+/// compute-graph path. The CPU backend uses host buffers (no recycled-VRAM hazard), so this guards
+/// CPU coherence + determinism across repeated big-prompt forwards.
+#[test]
+fn cpu_no_garbage_on_repeated_forward() {
+    let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
+    let _tlk = test_serial_lock();
+    std::env::set_var("INFR_TEMP", "0");
+    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let p = repeat_prompt();
+    let g1 = cpu_gen(&model, &p, 20);
+    let g2 = cpu_gen(&model, &p, 20);
+    let head = |s: &str| s.chars().take(48).collect::<String>();
+    assert!(
+        !is_degenerate(&g1),
+        "1st CPU forward degenerate: {:?}",
+        head(&g1)
+    );
+    assert!(
+        !is_degenerate(&g2),
+        "2nd CPU forward degenerate: {:?}",
+        head(&g2)
+    );
+    assert_eq!(g1, g2, "repeated CPU forward diverged");
+}
+
 /// Dense multi-turn through the shared `Chat` MUST reuse the KV cache: turn 2 re-renders the whole
 /// conversation but prefills only the NEW suffix (incremental prefill), not the whole thing. So the
 /// tokens prefilled on turn 2 (`GenStats.n_prompt`) must be FAR fewer than turn 1's long prompt —
