@@ -2057,6 +2057,83 @@ impl Llama {
         self.decode_loop(logits, &mut kv, max_new, constraint, on_token)
     }
 
+    /// Like [`generate_ids`] but REUSES a persistent KV cache across calls (for `infr serve`): only
+    /// the token suffix that differs from `cached` (what's already materialized in `kv`) is
+    /// prefilled, so a repeated prompt prefix — a coding agent's stable system prompt + growing
+    /// history — is NOT re-prefilled every request. This collapses time-to-first-token from
+    /// "prefill the whole prompt" to "prefill just the new turn". `kv` is lazily created sized to
+    /// `INFR_MAX_CTX` / the model's trained context. Returns the generated token ids. On overflow
+    /// or `INFR_NO_KV_REUSE`, prefills fresh; on any error the cache is invalidated so the next call
+    /// starts clean (the cache must exactly mirror the KV, so never leave it inconsistent).
+    pub fn generate_ids_cached(
+        &self,
+        prompt: &str,
+        max_new: usize,
+        constraint: Option<&mut crate::grammar::Constraint>,
+        on_token: impl FnMut(&str),
+        kv: &mut Option<KvCache>,
+        cached: &mut Vec<u32>,
+    ) -> Result<Vec<u32>> {
+        let enc = self
+            .tokenizer
+            .encode(prompt, false)
+            .map_err(|e| anyhow!("encode: {e}"))?;
+        let ids: Vec<u32> = enc.get_ids().to_vec();
+
+        // Lazily size the persistent cache to the model's context (once per server lifetime).
+        if kv.is_none() {
+            let max_ctx = std::env::var("INFR_MAX_CTX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(self.cfg.n_ctx_train);
+            *kv = Some(self.new_kv(max_ctx)?);
+            cached.clear();
+        }
+
+        let gen_result = {
+            let k = kv.as_mut().unwrap();
+            if ids.is_empty() {
+                bail!("empty prompt");
+            }
+            if ids.len() + 1 > k.max_ctx {
+                bail!(
+                    "prompt {} tokens exceeds KV capacity {} (raise INFR_MAX_CTX)",
+                    ids.len(),
+                    k.max_ctx
+                );
+            }
+            // Shared-prefix reuse: rewind the cache to the common prefix, prefill only the suffix.
+            // Disabled (or the prompt won't fit alongside the reply) → prefill the whole prompt.
+            let no_reuse = std::env::var("INFR_NO_KV_REUSE").is_ok();
+            // Always leave ≥1 token to prefill (even a fully-cached prompt) so decode has fresh logits
+            // to sample the first token from — otherwise `prefill(&[])` yields no logits.
+            let p = if no_reuse {
+                0
+            } else {
+                common_prefix_len(cached, &ids).min(ids.len() - 1)
+            };
+            let max_new = max_new.min(k.max_ctx.saturating_sub(ids.len() + 1));
+            k.len = p;
+            self.prefill(&ids[p..], k)
+                .and_then(|logits| self.decode_loop(logits, k, max_new, constraint, on_token))
+        };
+
+        match gen_result {
+            Ok(generated) => {
+                // The cache now holds exactly `ids + generated` — record that for the next diff.
+                *cached = ids;
+                cached.extend_from_slice(&generated);
+                Ok(generated)
+            }
+            Err(e) => {
+                // Never leave `cached` out of sync with the KV; drop the cache and start fresh next time.
+                *kv = None;
+                cached.clear();
+                Err(e)
+            }
+        }
+    }
+
     /// Build a grammar constraint that FORCES a syntactically-valid, schema-conforming tool call, for
     /// `tool_choice` values that require one (`"required"`, or `{"function":{"name":..}}` / a bare
     /// function name selecting a single tool). Returns `None` for `"auto"` / `"none"` / absent (the

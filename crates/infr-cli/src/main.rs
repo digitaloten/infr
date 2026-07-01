@@ -447,6 +447,13 @@ fn run_chat_turn(
 /// Adapter: drive `infr-llama` through the server's `ChatGenerator` seam.
 struct LlamaGenerator {
     llama: infr_llama::Llama,
+    /// Persistent KV cache reused across requests (server generation is serialized by a Mutex, so a
+    /// single cache is safe). Each request prefills only the token suffix that differs from `cached`
+    /// — a coding agent's stable system prompt + history isn't re-prefilled every turn, cutting
+    /// time-to-first-token. Lazily created on the first request.
+    kv: Option<infr_llama::KvCache>,
+    /// The token sequence currently materialized in `kv` (rendered prompt + last generation).
+    cached: Vec<u32>,
 }
 
 impl infr_server::ChatGenerator for LlamaGenerator {
@@ -496,37 +503,40 @@ impl infr_server::ChatGenerator for LlamaGenerator {
             // (e.g. the toktrie bridge masked out the whole call), fall through to unconstrained
             // generation rather than failing the request or returning an empty `stop`.
             let primed = format!("{prompt}<tool_call>\n");
-            let emitted =
-                match self
-                    .llama
-                    .generate_ids(&primed, max_new, Some(&mut constraint), |_| {})
-                {
-                    Ok(ids) => {
-                        let body = self.llama.decode_ids(&ids, false)?;
-                        // The constrained output IS the JSON call object — parse it straight; strip any
-                        // trailing `</tool_call>` past the grammar.
-                        let body = body.trim().trim_end_matches("</tool_call>").trim();
-                        match serde_json::from_str::<serde_json::Value>(body) {
-                            Ok(val) => val.get("name").and_then(|v| v.as_str()).map(|name| {
-                                let arguments = val
-                                    .get("arguments")
-                                    .cloned()
-                                    .unwrap_or(serde_json::json!({}));
-                                on_delta(infr_engine::Delta::ToolCall {
-                                    name: name.to_string(),
-                                    arguments: serde_json::to_string(&arguments)
-                                        .unwrap_or_else(|_| "{}".to_string()),
-                                });
-                            }),
-                            Err(_) => None,
-                        }
-                        .is_some()
+            let emitted = match self.llama.generate_ids_cached(
+                &primed,
+                max_new,
+                Some(&mut constraint),
+                |_| {},
+                &mut self.kv,
+                &mut self.cached,
+            ) {
+                Ok(ids) => {
+                    let body = self.llama.decode_ids(&ids, false)?;
+                    // The constrained output IS the JSON call object — parse it straight; strip any
+                    // trailing `</tool_call>` past the grammar.
+                    let body = body.trim().trim_end_matches("</tool_call>").trim();
+                    match serde_json::from_str::<serde_json::Value>(body) {
+                        Ok(val) => val.get("name").and_then(|v| v.as_str()).map(|name| {
+                            let arguments = val
+                                .get("arguments")
+                                .cloned()
+                                .unwrap_or(serde_json::json!({}));
+                            on_delta(infr_engine::Delta::ToolCall {
+                                name: name.to_string(),
+                                arguments: serde_json::to_string(&arguments)
+                                    .unwrap_or_else(|_| "{}".to_string()),
+                            });
+                        }),
+                        Err(_) => None,
                     }
-                    Err(e) => {
-                        eprintln!("[tools] grammar-constrained generation failed ({e})");
-                        false
-                    }
-                };
+                    .is_some()
+                }
+                Err(e) => {
+                    eprintln!("[tools] grammar-constrained generation failed ({e})");
+                    false
+                }
+            };
             if emitted {
                 return Ok(());
             }
@@ -542,10 +552,14 @@ impl infr_server::ChatGenerator for LlamaGenerator {
         let mut stream = ChatStream::new(tool_choice != Some("none"));
         {
             let od = &mut *on_delta;
-            self.llama
-                .generate_ids(&prompt, max_new, None, |piece: &str| {
-                    stream.push(piece, &mut *od)
-                })?;
+            self.llama.generate_ids_cached(
+                &prompt,
+                max_new,
+                None,
+                |piece: &str| stream.push(piece, &mut *od),
+                &mut self.kv,
+                &mut self.cached,
+            )?;
         }
         stream.finish(on_delta);
         Ok(())
@@ -1185,7 +1199,11 @@ fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
         .unwrap_or("model")
         .to_string();
     let sockaddr: std::net::SocketAddr = addr.parse().context("invalid --addr")?;
-    let generator: Box<dyn infr_server::ChatGenerator> = Box::new(LlamaGenerator { llama });
+    let generator: Box<dyn infr_server::ChatGenerator> = Box::new(LlamaGenerator {
+        llama,
+        kv: None,
+        cached: Vec::new(),
+    });
 
     let rt = tokio::runtime::Runtime::new()?;
     println!("infr serve: {model_id} on http://{sockaddr}  (OpenAI /v1)");
