@@ -927,7 +927,10 @@ impl Llama {
         // gemma4 has per-layer heterogeneous head dims (256 SWA / 512 full); route it entirely
         // through the hd-general GEMV + attention_kv path (the GEMM/flash/nonfa prefill kernels
         // assume a uniform head dim). Correctness-first; prefill is slower but right.
-        let use_gemm = c.qk_norm && n >= 64 && !c.gemma4 && std::env::var("INFR_NOGEMM").is_err();
+        // gemma4 now included: the coopmat projection GEMM handles its per-layer heterogeneous dims
+        // (hd 256/512, nkv 8/1, wv=None → V=K, E2B per-layer FFN/KV-sharing) via the same per-layer
+        // args the GEMV path used — see the QKV/FFN blocks below. INFR_NOGEMM restores GEMV.
+        let use_gemm = c.qk_norm && n >= 64 && std::env::var("INFR_NOGEMM").is_err();
         // Register-O flash (FlashAttention-2 layout, Br=128) is opt-in (INFR_FLASH_REG) while it's
         // A/B'd vs the BM=64 flash; it needs mpad padded to 128 (q/attn/scratch).
         // The register-O tile statically allocates 58880 B of shared memory (BR=128); skip it when
@@ -1246,8 +1249,16 @@ impl Llama {
                 if use_gemm {
                     rmsnorm_qkv();
                     mm(&layer.wq, hn.as_ref(), qr.as_ref(), n, ne, nh * hd);
-                    mm(&layer.wk, hn.as_ref(), kr.as_ref(), n, ne, kvrow);
-                    mm(layer.wv(), hn.as_ref(), vr.as_ref(), n, ne, kvrow);
+                    // gemma4 E2B shared layers compute Q only (K/V come from `kv_src`'s cache); full
+                    // layers have no wv (V = the raw K projection, copied before K gets QK-norm+RoPE).
+                    // Mirror the GEMV branch so the coopmat projection handles gemma4's K/V structure.
+                    if own_kv {
+                        mm(&layer.wk, hn.as_ref(), kr.as_ref(), n, ne, kvrow);
+                        match &layer.wv {
+                            Some(wv) => mm(wv, hn.as_ref(), vr.as_ref(), n, ne, kvrow),
+                            None => rec.copy(kr.as_ref(), 0, vr.as_ref(), 0, n * kvrow * 4),
+                        }
+                    }
                 } else {
                     rmsnorm_qkv();
                     lin(&layer.wq, hn.as_ref(), qr.as_ref(), n, ne, nh * hd);
@@ -1441,13 +1452,14 @@ impl Llama {
                     ne,
                     c.rms_eps,
                 );
-                mm(layer.wgateup(), hn.as_ref(), gu.as_ref(), n, ne, 2 * nff);
+                // nff_l = this layer's FFN width (gemma4 E2B has per-layer widths; == nff otherwise).
+                mm(layer.wgateup(), hn.as_ref(), gu.as_ref(), n, ne, 2 * nff_l);
                 if c.gemma {
-                    rec.gelu_mul_fused(gu.as_ref(), act.as_ref(), n, nff);
+                    rec.gelu_mul_fused(gu.as_ref(), act.as_ref(), n, nff_l);
                 } else {
-                    rec.silu_mul_fused(gu.as_ref(), act.as_ref(), n, nff);
+                    rec.silu_mul_fused(gu.as_ref(), act.as_ref(), n, nff_l);
                 }
-                mm(layer.wdown(), act.as_ref(), down.as_ref(), n, nff, ne);
+                mm(layer.wdown(), act.as_ref(), down.as_ref(), n, nff_l, ne);
                 if let Some(pn) = &layer.post_ffw_norm_buf {
                     rec.rmsnorm(down.as_ref(), pn.as_ref(), down.as_ref(), n, ne, c.rms_eps);
                 }
@@ -1836,14 +1848,12 @@ impl Llama {
         // mmq + flash (lower per-token work) — a coding-agent turn ingests at depth, so its chunks
         // were the over-shrunk ones. 2048 chunks warmed to 32k run without tripping the watchdog on
         // this model; the budget still tapers for very long context / bigger models.
-        // gemma/gemma4 route the whole prefill attention through the hd-general `attention_kv` GEMV
-        // (the flash/mmq GEMM kernels assume a uniform hd=128), and gemma4 also disables the coopmat
-        // projection GEMM — so its prefill runs at ~10 ms/token, ~10× the flash path the big-budget
-        // branch below assumes. At the 256-token chunk that budget hands out, ONE submit runs ~2 s and
-        // trips the GPU's hang-recovery watchdog: the first overrun is soft-recovered (survives, but
-        // returns garbage), the SECOND consecutive overrun is a HARD recovery → device lost (the
-        // multi-rep prefill / 2nd serve request crash). Cap the chunk so each submit stays well under
-        // the watchdog; taper with context so the growing attention span stays bounded too.
+        // gemma3 + gemma4 now run prefill on coopmat: GEMM projections (matmul_native/mmq) + the
+        // non-FA coopmat attention (attn_qk → softmax → attn_pv, hd-general 256/512). Both are far
+        // faster than the old scalar GEMV path, but a too-large per-submit chunk still trips the GPU
+        // hang-recovery watchdog (~2 s): the first overrun soft-recovers (garbage output), the second
+        // consecutive one HARD-recovers → device lost. Cap the chunk so each submit stays well under
+        // it; taper with context so the growing attention span stays bounded.
         if self.cfg.gemma {
             // matmul_proj (the QKVO + FFN projection GEMMs) is the DOMINANT gemma prefill op and it
             // is CHUNK-BOUND — a bigger chunk amortizes each weight read across more rows. gemma3-12b
@@ -1853,14 +1863,12 @@ impl Llama {
             // device-lost). So pick the LARGEST chunk whose span stays within a proven-safe budget L:
             // chunk² + pos·chunk − L ≤ 0 → chunk ≤ (√(pos²+4L) − pos)/2. This hands out big chunks at
             // shallow depth (where the projection GEMM is most starved) and tapers exactly like the
-            // old `L/(pos+1)` budget at depth — L here (524 288) is BELOW the peak span the old
-            // ceil-128 path already ran safely (128·4223 ≈ 540 k at pos≈4096), so it's watchdog-safe
-            // at every depth. gemma3's SWA layers stay windowed, so only the 1-in-`swa_pattern` full
-            // layers grow the span; the bound covers the worst (full-attention) layer.
-            // gemma4 disables the coopmat projection GEMM (its projections run the slow hd-general
-            // GEMV, ~10 ms/token) so a 512-row submit trips the watchdog on projections alone — keep
-            // its ceiling tiny; the same span bound then tapers it further at depth.
-            let ceil = if self.cfg.gemma4 { 128 } else { 512 };
+            // old `L/(pos+1)` budget at depth. L=524 288 is BELOW the peak span the old ceil-128 path
+            // already ran safely (128·4223 ≈ 540 k at pos≈4096), so it's watchdog-safe at every depth.
+            // gemma4 now uses the SAME ceil as gemma3 (512): with GEMM projections it is no longer
+            // GEMV-projection-bound, and its hd=512 full layers stay within the span bound (verified
+            // r3 pp512/pp2048 + deep with no device-lost).
+            let ceil = 512;
             let l = 524_288f64;
             let p = pos as f64;
             let chunk = 0.5 * ((p * p + 4.0 * l).sqrt() - p);
