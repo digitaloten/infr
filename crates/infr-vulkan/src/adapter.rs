@@ -286,10 +286,18 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
                     *scale,
                 );
             }
-            other => {
+            // Not yet wired to a Recorder kernel. These are EXPLICIT arms (not a `_` catch-all) so
+            // that adding a new `Op` variant to infr-core BREAKS this build until the adapter handles
+            // it — the same compile-time exhaustiveness the CPU interpreter has. (The GPU kernels for
+            // Conv1dSilu/DeltaNet exist + are tested; only the adapter dispatch is missing.)
+            Op::QkNorm { .. }
+            | Op::Softcap { .. }
+            | Op::MoeFfn { .. }
+            | Op::Conv1dSilu { .. }
+            | Op::DeltaNet { .. } => {
                 return Err(be(format!(
-                    "vulkan adapter: op not yet implemented: {}",
-                    other.kind()
+                    "vulkan adapter: op not yet wired: {}",
+                    op.kind()
                 )))
             }
         }

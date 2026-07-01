@@ -18,4 +18,12 @@ pub enum Error {
     Other(String),
 }
 
+impl Error {
+    /// Construct a backend error from anything Display — the constructor each backend used to
+    /// reinvent (Vulkan's local `fn be`).
+    pub fn backend(msg: impl std::fmt::Display) -> Self {
+        Error::Backend(msg.to_string())
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;

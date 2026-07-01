@@ -17,7 +17,7 @@ use infr_gguf::dequant::{dequant_block, k4, rdf16};
 use infr_gguf::TensorBytes;
 use rayon::prelude::*;
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// Activation quantized to Q8 over 256-element super-blocks: `qs[i] = round(x[i]/d[blk])` (int8),
@@ -2289,28 +2289,15 @@ impl Backend for CpuBackend {
         // accessed straight from their bound buffers — `WriteKv` writes one row, `Attention` reads
         // `kv_len` rows. They're sized for the WHOLE context (`max_ctx`), so loading them into `vals`
         // (and writing them back) each token would cost O(max_ctx) memory traffic per token instead of
-        // O(kv_len) — catastrophic at a large `max_new`. Skip the round-trip for them.
-        let mut direct: HashSet<u32> = HashSet::new();
-        for op in &g.ops {
-            match op {
-                Op::WriteKv { cache, .. } => {
-                    direct.insert(cache.0);
-                }
-                Op::Attention {
-                    k_cache, v_cache, ..
-                } => {
-                    direct.insert(k_cache.0);
-                    direct.insert(v_cache.0);
-                }
-                _ => {}
-            }
-        }
+        // O(kv_len) — catastrophic at a large `max_new`. Skip the round-trip for them. Which tensors
+        // are written in place is graph semantics, computed once by `Graph::in_place_inputs`.
+        let direct = g.in_place_inputs();
         for (i, decl) in g.tensors.iter().enumerate() {
             match decl.kind {
                 TensorKind::Internal | TensorKind::Output => {
                     vals[i] = vec![0f32; decl.desc.numel()]
                 }
-                TensorKind::Input if direct.contains(&(i as u32)) => {} // read/written in place
+                TensorKind::Input if direct.contains(&TensorId(i as u32)) => {} // read/written in place
                 TensorKind::Input => {
                     let buf = bindings
                         .get(TensorId(i as u32))
@@ -3096,7 +3083,7 @@ impl Backend for CpuBackend {
             let write_back = matches!(decl.kind, TensorKind::Output)
                 || (decl.kind == TensorKind::Input
                     && decl.desc.dtype == DType::F32
-                    && !direct.contains(&(i as u32)));
+                    && !direct.contains(&TensorId(i as u32)));
             if !write_back {
                 continue;
             }

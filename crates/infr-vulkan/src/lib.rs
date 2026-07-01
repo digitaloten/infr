@@ -40,8 +40,9 @@ use infr_core::{
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
+/// Terse local shorthand for the shared [`Error::backend`] constructor.
 fn be(s: impl std::fmt::Display) -> Error {
-    Error::Backend(s.to_string())
+    Error::backend(s)
 }
 
 /// Downcast `&dyn Buffer` → `&VkBuffer`.

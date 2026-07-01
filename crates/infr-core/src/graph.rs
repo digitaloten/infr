@@ -299,6 +299,30 @@ impl Graph {
         Self::default()
     }
 
+    /// The `Input` tensors written IN PLACE by the graph's ops (the KV cache: `WriteKv`'s `cache` and
+    /// `Attention`'s `k_cache`/`v_cache`). This is pure graph semantics, so it lives here rather than
+    /// being rediscovered per backend: an eager-load backend (like the CPU interpreter) skips loading
+    /// these into its working store + skips writing them back (they're mutated directly), avoiding
+    /// O(max_ctx) copies per step.
+    pub fn in_place_inputs(&self) -> std::collections::HashSet<TensorId> {
+        let mut set = std::collections::HashSet::new();
+        for op in &self.ops {
+            match op {
+                Op::WriteKv { cache, .. } => {
+                    set.insert(*cache);
+                }
+                Op::Attention {
+                    k_cache, v_cache, ..
+                } => {
+                    set.insert(*k_cache);
+                    set.insert(*v_cache);
+                }
+                _ => {}
+            }
+        }
+        set
+    }
+
     fn decl(&mut self, desc: TensorDesc, kind: TensorKind) -> TensorId {
         let id = TensorId(self.tensors.len() as u32);
         self.tensors.push(TensorDecl {
