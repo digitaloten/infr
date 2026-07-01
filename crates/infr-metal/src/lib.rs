@@ -113,6 +113,26 @@ impl Backend for MetalBackend {
         let raw = self
             .device
             .new_buffer(len as u64, metal::MTLResourceOptions::StorageModeShared);
+        // calloc contract: MTL buffers are not guaranteed zeroed; memset the (host-visible) contents.
+        unsafe { std::ptr::write_bytes(raw.contents() as *mut u8, 0u8, len) };
+        Ok(Box::new(MetalBuffer { raw, len }))
+    }
+
+    fn alloc_uninit(
+        &self,
+        bytes: usize,
+        _usage: BufferUsage,
+    ) -> Result<Box<dyn infr_core::backend::Buffer>> {
+        // Opt-out: skip the zero-fill. Debug builds poison with 0xFF (= NaN as f32) so a misuse
+        // (read-before-write) surfaces loudly in tests instead of relying on lucky zeros.
+        let len = bytes.max(4);
+        let raw = self
+            .device
+            .new_buffer(len as u64, metal::MTLResourceOptions::StorageModeShared);
+        #[cfg(debug_assertions)]
+        unsafe {
+            std::ptr::write_bytes(raw.contents() as *mut u8, 0xFFu8, len)
+        };
         Ok(Box::new(MetalBuffer { raw, len }))
     }
 

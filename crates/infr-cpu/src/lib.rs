@@ -2263,6 +2263,17 @@ impl Backend for CpuBackend {
         ]))))
     }
 
+    fn alloc_uninit(&self, bytes: usize, _usage: BufferUsage) -> Result<Box<dyn Buffer>> {
+        // Debug: poison with 0xFF (= NaN as f32) so a read-before-write surfaces loudly in the CPU
+        // tests/oracle instead of silently working. Release: the Vec is zeroed anyway (no CPU perf
+        // win to skip it), so stay safe.
+        let fill = if cfg!(debug_assertions) { 0xFFu8 } else { 0u8 };
+        Ok(Box::new(CpuBuffer::Owned(Mutex::new(vec![
+            fill;
+            bytes.max(4)
+        ]))))
+    }
+
     fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()> {
         let mut d = cpu_buf(dst).owned();
         d[..src.len()].copy_from_slice(src);
