@@ -1284,32 +1284,31 @@ fn generate_seam(
         wraw("token_embd.weight")?;
     }
 
-    // ── persistent state buffers (f32, zero-init), one set per layer by kind ──────────────────────
+    // ── persistent state buffers, one set per layer by kind ──────────────────────
+    // The recurrence REQUIRES these start at zero (conv history, DeltaNet S, KV cache). `be.alloc`
+    // returns uninitialized memory on the GPU backends (only the CPU's Vec happens to be zeroed), so
+    // zero them explicitly via an upload — else the first token attends/accumulates garbage state.
+    let zalloc = |n: usize| -> Result<Box<dyn Buffer>> {
+        let buf = be
+            .alloc(n * 4, BufferUsage::Activations)
+            .map_err(|e| anyhow!("{e}"))?;
+        be.upload(buf.as_ref(), bytemuck::cast_slice(&vec![0f32; n]))
+            .map_err(|e| anyhow!("{e}"))?;
+        Ok(buf)
+    };
     let mut conv_bufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
     let mut s_bufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
     let mut k_bufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
     let mut v_bufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
     for i in 0..c.n_layer {
         if attn(i) {
-            k_bufs.push(Some(
-                be.alloc(max_ctx * nkv * hd * 4, BufferUsage::Activations)
-                    .map_err(|e| anyhow!("{e}"))?,
-            ));
-            v_bufs.push(Some(
-                be.alloc(max_ctx * nkv * hd * 4, BufferUsage::Activations)
-                    .map_err(|e| anyhow!("{e}"))?,
-            ));
+            k_bufs.push(Some(zalloc(max_ctx * nkv * hd)?));
+            v_bufs.push(Some(zalloc(max_ctx * nkv * hd)?));
             conv_bufs.push(None);
             s_bufs.push(None);
         } else {
-            conv_bufs.push(Some(
-                be.alloc((kk - 1) * cc * 4, BufferUsage::Activations)
-                    .map_err(|e| anyhow!("{e}"))?,
-            ));
-            s_bufs.push(Some(
-                be.alloc(nv * kd * vd * 4, BufferUsage::Activations)
-                    .map_err(|e| anyhow!("{e}"))?,
-            ));
+            conv_bufs.push(Some(zalloc((kk - 1) * cc)?));
+            s_bufs.push(Some(zalloc(nv * kd * vd)?));
             k_bufs.push(None);
             v_bufs.push(None);
         }
@@ -1886,6 +1885,38 @@ pub fn generate_metal(
     )
 }
 
+/// Qwen3-Next on the Vulkan GPU through the AGNOSTIC SEAM (weights uploaded to VRAM in their native
+/// GGUF dtype; the backend dequantizes in-kernel). Unlike the bespoke [`Model::forward`], this uses
+/// the batched/chunked prefill (the whole prompt flows through a few graph builds instead of one per
+/// token). The Vulkan twin of [`generate_cpu`].
+///
+/// EXPERIMENTAL / WIP: this runs and is FAST (~590 pp / ~280 tg t/s) but currently returns
+/// INCORRECT output — a qwen35-specific correctness bug in the Vulkan seam path (the dense seam and
+/// the bespoke qwen35 GPU path both work). Not wired into production. See `gpu_seam_qwen35` (ignored)
+/// and the qwen35-batched-prefill memory for the debug plan.
+pub fn generate_vulkan(
+    path: &std::path::Path,
+    prompt: &str,
+    n: usize,
+    on_piece: impl FnMut(&str),
+) -> Result<crate::GenStats> {
+    let be = VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
+    generate_seam(
+        &be,
+        &|tb| {
+            let buf = be
+                .alloc(tb.len().max(1), BufferUsage::Weights)
+                .map_err(|e| anyhow!("{e}"))?;
+            be.upload(buf.as_ref(), &tb).map_err(|e| anyhow!("{e}"))?;
+            Ok(buf)
+        },
+        path,
+        prompt,
+        n,
+        on_piece,
+    )
+}
+
 /// Open the GGUF at `path` and build the bespoke qwen35 [`Model`] (GPU-resident forward, or the
 /// `Q35_CPU=1` oracle). CLI/bench convenience so callers can drive the per-token [`Model::forward`]
 /// for timing without depending on `infr_gguf` directly.
@@ -2096,5 +2127,40 @@ mod tests {
                 "qwen35 GPU golden changed\n  out: {out:?}"
             );
         }
+    }
+
+    /// The batched/chunked-prefill SEAM on Vulkan (vs the bespoke per-token `generate` above).
+    /// FAST (~590 pp / ~280 tg t/s vs the bespoke ~65/71) but currently produces INCORRECT output
+    /// ("!!!!") — a qwen35-specific correctness bug in the Vulkan seam path (the dense seam +
+    /// bespoke qwen35 GPU path both work, so it's isolated to qwen35's ops on the seam). #[ignore]'d
+    /// until debugged (op-by-op seam-CPU vs seam-Vulkan diff). See the qwen35-batched-prefill memory.
+    #[test]
+    #[ignore = "WIP: qwen35 seam-on-Vulkan produces incorrect output — known bug, see memory"]
+    fn gpu_seam_qwen35() {
+        let Some(path) = model_path() else {
+            eprintln!("skip: Qwen3.5-0.8B not present");
+            return;
+        };
+        if !crate::gpu_available() {
+            eprintln!("skip: no Vulkan GPU");
+            return;
+        }
+        let prompt = render_chat(&path, "What is bash? Answer briefly.").unwrap();
+        let mut out = String::new();
+        let stats = generate_vulkan(&path, &prompt, 48, |p| out.push_str(p)).unwrap();
+        eprintln!(
+            "seam-vulkan: prefill {} tok @ {:.0} t/s | decode {} tok @ {:.1} t/s",
+            stats.n_prompt,
+            stats.n_prompt as f64 / stats.prompt_secs.max(1e-9),
+            stats.n_gen,
+            stats.n_gen as f64 / stats.decode_secs.max(1e-9),
+        );
+        eprintln!("seam-vulkan out: {out:?}");
+        let distinct = out
+            .trim()
+            .chars()
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        assert!(distinct > 5, "seam-vulkan output degenerate: {out:?}");
     }
 }
