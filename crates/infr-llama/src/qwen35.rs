@@ -1316,12 +1316,12 @@ fn generate_seam(
     }
 
     // ── per-step IO ───────────────────────────────────────────────────────────────
-    let hidden_buf = be
-        .alloc(ne * 4, BufferUsage::Staging)
-        .map_err(|e| anyhow!("{e}"))?;
-    let pos_buf = be
-        .alloc(4, BufferUsage::Staging)
-        .map_err(|e| anyhow!("{e}"))?;
+    // Prompt tokens are ingested in chunks of up to CHUNK through ONE graph build each (instead of
+    // one build per token); the recurrent conv/DeltaNet ops scan the chunk internally and the KV
+    // cache is written for the whole chunk. Decode then runs one token (rows=1) at a time. The
+    // hidden/pos input buffers are allocated per call sized to the chunk (the CPU backend writes
+    // F32 inputs back, so their length must match the graph input exactly).
+    const CHUNK: usize = 128;
     let logits_buf = be
         .alloc(vocab * 4, BufferUsage::Readback)
         .map_err(|e| anyhow!("{e}"))?;
@@ -1329,11 +1329,15 @@ fn generate_seam(
     let f32d = |x: usize| TensorDesc::new(vec![x], DType::F32);
     let scale = 1.0 / (hd as f32).sqrt();
 
-    // Build the decode graph for absolute position `pos` (kv_len = pos+1).
-    let build = |pos: usize| -> Result<(Graph, TensorId, TensorId, Vec<TensorId>, TensorId)> {
+    // Build the graph that ingests `rows` tokens starting at absolute position `pos`
+    // (kv_len = pos+rows). rows=1 is one decode token; rows>1 is a prefill chunk. Only the LAST
+    // row's logits are produced (the next-token prediction).
+    let build = |pos: usize,
+                 rows: usize|
+     -> Result<(Graph, TensorId, TensorId, Vec<TensorId>, TensorId)> {
         let mut gr = Graph::new();
-        let hidden = gr.input(f32d(ne));
-        let positions = gr.input(TensorDesc::new(vec![1], DType::I32));
+        let hidden = gr.input(f32d(rows * ne));
+        let positions = gr.input(TensorDesc::new(vec![rows], DType::I32));
         // weights in upload order
         let mut weights: Vec<TensorId> = Vec::new();
         let mut wi = 0usize;
@@ -1418,41 +1422,42 @@ fn generate_seam(
         let w_lm = wpush(&mut gr, &mut weights);
         let logits = gr.output(f32d(vocab));
 
-        // scratch
-        let xn = gr.internal(f32d(ne));
-        let hn = gr.internal(f32d(ne));
-        let sub = gr.internal(f32d(ne));
+        // scratch — every activation buffer holds the whole `rows`-token chunk.
+        let xn = gr.internal(f32d(rows * ne));
+        let hn = gr.internal(f32d(rows * ne));
+        let sub = gr.internal(f32d(rows * ne));
         let max_ff = (0..c.n_layer)
             .map(|i| n_ff_of(i).unwrap_or(0))
             .max()
             .unwrap_or(0);
-        let gbuf = gr.internal(f32d(max_ff));
-        let ubuf = gr.internal(f32d(max_ff));
-        let actbuf = gr.internal(f32d(max_ff));
+        let gbuf = gr.internal(f32d(rows * max_ff));
+        let ubuf = gr.internal(f32d(rows * max_ff));
+        let actbuf = gr.internal(f32d(rows * max_ff));
         // linear-mixer scratch
-        let qkvbuf = gr.internal(f32d(cc));
-        let zbuf = gr.internal(f32d(di));
-        let convout = gr.internal(f32d(cc));
-        let qbuf = gr.internal(f32d(key_dim));
-        let kbuf = gr.internal(f32d(key_dim));
-        let vbuf = gr.internal(f32d(nv * vd));
-        let bbuf = gr.internal(f32d(nv));
-        let abuf = gr.internal(f32d(nv));
-        let dnout = gr.internal(f32d(nv * vd));
+        let qkvbuf = gr.internal(f32d(rows * cc));
+        let zbuf = gr.internal(f32d(rows * di));
+        let convout = gr.internal(f32d(rows * cc));
+        let qbuf = gr.internal(f32d(rows * key_dim));
+        let kbuf = gr.internal(f32d(rows * key_dim));
+        let vbuf = gr.internal(f32d(rows * nv * vd));
+        let bbuf = gr.internal(f32d(rows * nv));
+        let abuf = gr.internal(f32d(rows * nv));
+        let dnout = gr.internal(f32d(rows * nv * vd));
         // attn scratch
-        let qg = gr.internal(f32d(nh * 2 * hd));
-        let qa = gr.internal(f32d(nh * hd));
-        let gate_a = gr.internal(f32d(nh * hd));
-        let ka = gr.internal(f32d(nkv * hd));
-        let va = gr.internal(f32d(nkv * hd));
-        let attno = gr.internal(f32d(nh * hd));
+        let qg = gr.internal(f32d(rows * nh * 2 * hd));
+        let qa = gr.internal(f32d(rows * nh * hd));
+        let gate_a = gr.internal(f32d(rows * nh * hd));
+        let ka = gr.internal(f32d(rows * nkv * hd));
+        let va = gr.internal(f32d(rows * nkv * hd));
+        let attno = gr.internal(f32d(rows * nh * hd));
 
+        // rmsn/lin run over the whole `rows`-token chunk (RmsNorm.rows / Linear.m = rows).
         let rmsn = |gr: &mut Graph, x: TensorId, w: TensorId, dst: TensorId| {
             gr.push(Op::RmsNorm {
                 x,
                 weight: w,
                 dst,
-                rows: 1,
+                rows: rows as u32,
                 dim: ne as u32,
                 eps,
             });
@@ -1463,7 +1468,7 @@ fn generate_seam(
                     x,
                     weight: w,
                     dst,
-                    m: 1,
+                    m: rows as u32,
                     in_f: inf as u32,
                     out_f: outf as u32,
                 });
@@ -1480,30 +1485,39 @@ fn generate_seam(
                         weight: w.conv1d,
                         state: w.conv_state,
                         dst: convout,
-                        rows: 1,
+                        rows: rows as u32,
                         channels: cc as u32,
                         kernel: kk as u32,
                     });
-                    // split conv_out → q | k | v
-                    gr.push(Op::Copy {
+                    // split conv_out [rows, cc=q|k|v] → packed [rows, *] q / k / v (strided per token).
+                    gr.push(Op::CopyStrided {
                         src: convout,
                         src_off: 0,
+                        src_stride: cc as u32,
                         dst: qbuf,
                         dst_off: 0,
+                        dst_stride: key_dim as u32,
+                        rows: rows as u32,
                         n: key_dim as u32,
                     });
-                    gr.push(Op::Copy {
+                    gr.push(Op::CopyStrided {
                         src: convout,
                         src_off: key_dim as u32,
+                        src_stride: cc as u32,
                         dst: kbuf,
                         dst_off: 0,
+                        dst_stride: key_dim as u32,
+                        rows: rows as u32,
                         n: key_dim as u32,
                     });
-                    gr.push(Op::Copy {
+                    gr.push(Op::CopyStrided {
                         src: convout,
                         src_off: 2 * key_dim as u32,
+                        src_stride: cc as u32,
                         dst: vbuf,
                         dst_off: 0,
+                        dst_stride: (nv * vd) as u32,
+                        rows: rows as u32,
                         n: (nv * vd) as u32,
                     });
                     lin(&mut gr, xn, w.beta, bbuf, ne, nv);
@@ -1518,7 +1532,7 @@ fn generate_seam(
                         dt_bias: w.dt_bias,
                         state: w.s_state,
                         dst: dnout,
-                        rows: 1,
+                        rows: rows as u32,
                         n_vhead: nv as u32,
                         n_khead: nk as u32,
                         head_k: kd as u32,
@@ -1530,7 +1544,7 @@ fn generate_seam(
                         x: dnout,
                         weight: w.ssm_norm,
                         dst: dnout,
-                        rows: 1,
+                        rows: rows as u32,
                         n_head: nv as u32,
                         head_dim: vd as u32,
                         eps,
@@ -1539,7 +1553,7 @@ fn generate_seam(
                         gate: zbuf,
                         up: dnout,
                         dst: dnout,
-                        rows: 1,
+                        rows: rows as u32,
                         nff: (nv * vd) as u32,
                         act: Activation::Silu,
                         up_off: 0,
@@ -1549,7 +1563,7 @@ fn generate_seam(
                         a: hidden,
                         b: sub,
                         dst: hidden,
-                        n: ne as u32,
+                        n: (rows * ne) as u32,
                     });
                     // FFN
                     rmsn(&mut gr, hidden, w.post_norm, hn);
@@ -1559,7 +1573,7 @@ fn generate_seam(
                         gate: gbuf,
                         up: ubuf,
                         dst: actbuf,
-                        rows: 1,
+                        rows: rows as u32,
                         nff: w.n_ff as u32,
                         act: Activation::Silu,
                         up_off: 0,
@@ -1569,26 +1583,33 @@ fn generate_seam(
                         a: hidden,
                         b: sub,
                         dst: hidden,
-                        n: ne as u32,
+                        n: (rows * ne) as u32,
                     });
                 }
                 Q35LayerH::Attn(w) => {
                     rmsn(&mut gr, hidden, w.attn_norm, xn);
                     // q proj outputs q+gate interleaved per head [h: q(hd), gate(hd)].
                     lin(&mut gr, xn, w.q, qg, ne, nh * 2 * hd);
+                    // split interleaved per-head [q(hd) | gate(hd)] → packed qa / gate_a (strided).
                     for h in 0..nh {
-                        gr.push(Op::Copy {
+                        gr.push(Op::CopyStrided {
                             src: qg,
                             src_off: (h * 2 * hd) as u32,
+                            src_stride: (nh * 2 * hd) as u32,
                             dst: qa,
                             dst_off: (h * hd) as u32,
+                            dst_stride: (nh * hd) as u32,
+                            rows: rows as u32,
                             n: hd as u32,
                         });
-                        gr.push(Op::Copy {
+                        gr.push(Op::CopyStrided {
                             src: qg,
                             src_off: (h * 2 * hd + hd) as u32,
+                            src_stride: (nh * 2 * hd) as u32,
                             dst: gate_a,
                             dst_off: (h * hd) as u32,
+                            dst_stride: (nh * hd) as u32,
+                            rows: rows as u32,
                             n: hd as u32,
                         });
                     }
@@ -1600,7 +1621,7 @@ fn generate_seam(
                         weight: w.q_norm,
                         positions,
                         dst: qa,
-                        rows: 1,
+                        rows: rows as u32,
                         n_head: nh as u32,
                         head_dim: hd as u32,
                         rope_dim: c.rope_dim as u32,
@@ -1613,7 +1634,7 @@ fn generate_seam(
                         weight: w.k_norm,
                         positions,
                         dst: ka,
-                        rows: 1,
+                        rows: rows as u32,
                         n_head: nkv as u32,
                         head_dim: hd as u32,
                         rope_dim: c.rope_dim as u32,
@@ -1624,14 +1645,14 @@ fn generate_seam(
                     gr.push(Op::WriteKv {
                         src: ka,
                         cache: w.k_cache,
-                        rows: 1,
+                        rows: rows as u32,
                         row_stride: (nkv * hd) as u32,
                         pos: pos as u32,
                     });
                     gr.push(Op::WriteKv {
                         src: va,
                         cache: w.v_cache,
-                        rows: 1,
+                        rows: rows as u32,
                         row_stride: (nkv * hd) as u32,
                         pos: pos as u32,
                     });
@@ -1640,8 +1661,8 @@ fn generate_seam(
                         k_cache: w.k_cache,
                         v_cache: w.v_cache,
                         dst: attno,
-                        rows: 1,
-                        kv_len: (pos + 1) as u32,
+                        rows: rows as u32,
+                        kv_len: (pos + rows) as u32,
                         n_head: nh as u32,
                         n_kv: nkv as u32,
                         head_dim: hd as u32,
@@ -1654,7 +1675,7 @@ fn generate_seam(
                         gate: gate_a,
                         up: attno,
                         dst: attno,
-                        rows: 1,
+                        rows: rows as u32,
                         nff: (nh * hd) as u32,
                         act: Activation::Sigmoid,
                         up_off: 0,
@@ -1664,7 +1685,7 @@ fn generate_seam(
                         a: hidden,
                         b: sub,
                         dst: hidden,
-                        n: ne as u32,
+                        n: (rows * ne) as u32,
                     });
                     // FFN
                     rmsn(&mut gr, hidden, w.post_norm, hn);
@@ -1674,7 +1695,7 @@ fn generate_seam(
                         gate: gbuf,
                         up: ubuf,
                         dst: actbuf,
-                        rows: 1,
+                        rows: rows as u32,
                         nff: w.n_ff as u32,
                         act: Activation::Silu,
                         up_off: 0,
@@ -1684,14 +1705,38 @@ fn generate_seam(
                         a: hidden,
                         b: sub,
                         dst: hidden,
-                        n: ne as u32,
+                        n: (rows * ne) as u32,
                     });
                     let _ = li;
                 }
             }
         }
-        rmsn(&mut gr, hidden, w_out_norm, hn);
-        lin(&mut gr, hn, w_lm, logits, ne, vocab);
+        // Only the LAST token's logits are needed (the next-token prediction). Extract its hidden
+        // row, then output-norm + lm_head at rows=1 (avoids a wasteful [rows, vocab] projection).
+        let last = gr.internal(f32d(ne));
+        gr.push(Op::Copy {
+            src: hidden,
+            src_off: ((rows - 1) * ne) as u32,
+            dst: last,
+            dst_off: 0,
+            n: ne as u32,
+        });
+        gr.push(Op::RmsNorm {
+            x: last,
+            weight: w_out_norm,
+            dst: hn,
+            rows: 1,
+            dim: ne as u32,
+            eps,
+        });
+        gr.push(Op::Linear {
+            x: hn,
+            weight: w_lm,
+            dst: logits,
+            m: 1,
+            in_f: ne as u32,
+            out_f: vocab as u32,
+        });
 
         // collect state-input handles per layer for binding (interleaved by kind)
         let mut state_ids: Vec<TensorId> = Vec::new();
@@ -1711,31 +1756,27 @@ fn generate_seam(
     };
 
     // ── drive ───────────────────────────────────────────────────────────────────
-    let mut cur = prompt_ids.clone();
-    let mut outs: Vec<u32> = Vec::new();
-    let mut logits = vec![0f32; vocab];
-    let mut prompt_t = std::time::Duration::ZERO;
-    let mut decode_t = std::time::Duration::ZERO;
-    let mut decode_n = 0usize;
-    let mut printed = 0usize; // streaming detok cursor
-    for pos in 0..(prompt_ids.len() + n) {
-        let step_t0 = std::time::Instant::now();
-        let t = cur[pos] as usize;
-        be.upload(
-            hidden_buf.as_ref(),
-            bytemuck::cast_slice(&token_embd[t * ne..t * ne + ne]),
-        )
-        .map_err(|e| anyhow!("{e}"))?;
-        be.upload(pos_buf.as_ref(), bytemuck::cast_slice(&[pos as i32]))
+    // Build + compile + bind + execute the graph for the `rows` tokens whose embeddings/positions
+    // are `emb` (rows*ne) / `posv` (rows), at absolute start position `pos`. Binds fresh hidden/pos
+    // input buffers (sized to the chunk), the shared logits buffer, weights, and recurrent state.
+    let run_graph = |pos: usize, emb: &[f32], posv: &[i32]| -> Result<()> {
+        let rows = posv.len();
+        let hidden_buf = be
+            .alloc(emb.len() * 4, BufferUsage::Staging)
             .map_err(|e| anyhow!("{e}"))?;
-
-        let (gr, h_hidden, h_pos, h_bind, h_logits) = build(pos)?;
+        be.upload(hidden_buf.as_ref(), bytemuck::cast_slice(emb))
+            .map_err(|e| anyhow!("{e}"))?;
+        let pos_buf = be
+            .alloc(posv.len() * 4, BufferUsage::Staging)
+            .map_err(|e| anyhow!("{e}"))?;
+        be.upload(pos_buf.as_ref(), bytemuck::cast_slice(posv))
+            .map_err(|e| anyhow!("{e}"))?;
+        let (gr, h_hidden, h_pos, h_bind, h_logits) = build(pos, rows)?;
         let plan = be.compile(&gr).map_err(|e| anyhow!("{e}"))?;
         let mut b = Bindings::new();
         b.bind(h_hidden, hidden_buf.as_ref());
         b.bind(h_pos, pos_buf.as_ref());
         b.bind(h_logits, logits_buf.as_ref());
-        // h_bind = [weights.., state_ids..]; bind weights then state in declaration order.
         let nw = wbufs.len();
         for (i, id) in h_bind.iter().take(nw).enumerate() {
             b.bind(*id, wbufs[i].as_ref());
@@ -1752,28 +1793,56 @@ fn generate_seam(
             }
             si += 2;
         }
-        be.execute(plan.as_ref(), &b).map_err(|e| anyhow!("{e}"))?;
+        be.execute(plan.as_ref(), &b).map_err(|e| anyhow!("{e}"))
+    };
 
-        if pos + 1 >= prompt_ids.len() {
-            be.download(logits_buf.as_ref(), bytemuck::cast_slice_mut(&mut logits))
-                .map_err(|e| anyhow!("{e}"))?;
-            let next = argmax(&logits);
-            crate::stream_token(&tok, &mut outs, &mut printed, next, &mut on_piece);
-            decode_t += step_t0.elapsed();
-            decode_n += 1;
-            if outs.len() >= n {
-                break;
-            }
-            if cur.len() <= pos + 1 {
-                cur.push(next);
-            }
-        } else {
-            prompt_t += step_t0.elapsed();
+    let mut outs: Vec<u32> = Vec::new();
+    let mut logits = vec![0f32; vocab];
+    let mut printed = 0usize; // streaming detok cursor
+    let plen = prompt_ids.len();
+
+    // ── prefill: ingest the prompt in chunks of ≤CHUNK (one graph per chunk) ──
+    let prompt_t0 = std::time::Instant::now();
+    let mut cpos = 0usize;
+    while cpos < plen {
+        let rows = (plen - cpos).min(CHUNK);
+        let mut emb = vec![0f32; rows * ne];
+        for r in 0..rows {
+            let tid = prompt_ids[cpos + r] as usize;
+            emb[r * ne..r * ne + ne].copy_from_slice(&token_embd[tid * ne..tid * ne + ne]);
         }
+        let posv: Vec<i32> = (0..rows).map(|r| (cpos + r) as i32).collect();
+        run_graph(cpos, &emb, &posv)?;
+        cpos += rows;
     }
+    let prompt_t = prompt_t0.elapsed();
+    // The last chunk's last row predicts the first generated token.
+    be.download(logits_buf.as_ref(), bytemuck::cast_slice_mut(&mut logits))
+        .map_err(|e| anyhow!("{e}"))?;
+
+    // ── decode: one token at a time (rows=1), feeding the last prediction back ──
+    let decode_t0 = std::time::Instant::now();
+    let mut pos = plen;
+    let mut decode_n = 0usize;
+    loop {
+        let next = argmax(&logits);
+        crate::stream_token(&tok, &mut outs, &mut printed, next, &mut on_piece);
+        decode_n += 1;
+        if outs.len() >= n {
+            break;
+        }
+        // feed `next` at absolute position `pos`, predict the following token.
+        let emb = &token_embd[next as usize * ne..next as usize * ne + ne];
+        run_graph(pos, emb, &[pos as i32])?;
+        be.download(logits_buf.as_ref(), bytemuck::cast_slice_mut(&mut logits))
+            .map_err(|e| anyhow!("{e}"))?;
+        pos += 1;
+    }
+    let decode_t = decode_t0.elapsed();
+
     // The text streamed out via `on_piece`; return only timing/counts.
     Ok(crate::GenStats {
-        n_prompt: prompt_ids.len(),
+        n_prompt: plen,
         prompt_secs: prompt_t.as_secs_f64(),
         n_gen: decode_n,
         decode_secs: decode_t.as_secs_f64(),
