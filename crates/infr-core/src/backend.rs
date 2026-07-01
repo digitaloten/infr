@@ -25,6 +25,11 @@ pub struct Capabilities {
     pub cooperative_matrix: bool,
     pub max_buffer_bytes: u64,
     pub unified_memory: bool,
+    /// The backend records a single-token decode graph ONCE and replays it per token, reading the
+    /// position from a device-side params buffer (Vulkan seam) instead of the graph's baked `pos`.
+    /// When set, the runner may compile the decode graph once (pos=0) and reuse it across the whole
+    /// decode loop. Backends that read the baked `pos`/`kv_len` (CPU interpreter) leave this false.
+    pub decode_replay: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

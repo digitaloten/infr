@@ -564,8 +564,9 @@ fn cmd_bench(
         .transpose()?;
     let (gguf, tok) = resolve(model)?;
     // INFR_GPU_SEAM=1: bench the dense forward on the Vulkan backend THROUGH THE AGNOSTIC SEAM
-    // (per-token graph recompile) instead of the production Recorder path — the baseline the
-    // record-once replay optimization must close. Reuses -p/-n/-r; reports pp/tg like the others.
+    // instead of the production Recorder path. An eligible qwen3-style dense decode now records the
+    // graph ONCE and replays it per token (params-driven `_dyn` kernels), matching the production
+    // Recorder's record-once behavior. Reuses -p/-n/-r; reports pp/tg like the others.
     if std::env::var("INFR_GPU_SEAM").is_ok() {
         let model = infr_llama::CpuModel::load(&gguf, tok.as_deref())?;
         let mut pps = Vec::new();
@@ -584,7 +585,7 @@ fn cmd_bench(
             v.get(v.len() / 2).copied().unwrap_or(0.0)
         };
         println!(
-            "seam (per-token recompile): pp={:.1} tok/s  tg={:.1} tok/s  (p={n_prompt} n={n_gen} r={reps})",
+            "seam (record-once replay): pp={:.1} tok/s  tg={:.1} tok/s  (p={n_prompt} n={n_gen} r={reps})",
             med(pps),
             med(tgs),
         );

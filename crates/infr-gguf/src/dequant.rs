@@ -30,7 +30,6 @@ pub fn dequant_block(dtype: infr_core::DType, bytes: &[u8]) -> Result<Vec<f32>> 
     })
 }
 
-
 /// f32 → f16, saturating to ±65504 (f16 max) instead of overflowing to ±inf. Preserves NaN. Used
 /// when down-converting bf16/f32 weights for the f16 fused path so a large-magnitude weight clips
 /// to the largest finite f16 rather than corrupting the matmul with inf/NaN.
@@ -61,10 +60,7 @@ pub fn k4(j: usize, q: &[u8]) -> (u32, u32) {
 /// Dequant any supported quant into the UNIFIED form: per-element u8 index + per-element
 /// (scale, min) such that `weight = scale*u8 + min` (filled in natural tensor order). Scale/min are
 /// constant across each consecutive 16-element block, which the kernel exploits.
-pub fn dequant_unified(
-    dtype: infr_core::DType,
-    bytes: &[u8],
-) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
+pub fn dequant_unified(dtype: infr_core::DType, bytes: &[u8]) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
     use infr_core::DType::*;
     let (qpb, bpb) = match dtype {
         Q4_0 => (32, 18),
@@ -350,8 +346,7 @@ pub const IQ1S_DELTA: f32 = 0.125;
 
 /// MXFP4 / NVFP4 signed 4-bit codebook (E2M1 format × 2).
 /// Ref: llama.cpp ggml-common.h l.1116: `kvalues_mxfp4`
-pub const KVALUES_MXFP4: [i8; 16] =
-    [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+pub const KVALUES_MXFP4: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
 
 /// Decode an E8M0 exponent byte to float32, halved (= 2^(x-128)).
 /// Matches llama.cpp `ggml_e8m0_to_fp32_half` (ggml-impl.h l.477).

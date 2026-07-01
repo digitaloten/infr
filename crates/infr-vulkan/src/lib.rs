@@ -433,6 +433,9 @@ impl VulkanBackend {
             cooperative_matrix: has_coop_matrix,
             max_buffer_bytes: props.limits.max_storage_buffer_range as u64,
             unified_memory: false, // discrete GPU
+            // The seam adapter records the decode graph once and replays it (params-driven `_dyn`
+            // kernels); the runner compiles the eligible qwen3 decode graph once.
+            decode_replay: true,
         };
 
         // ── gpu-allocator ──────────────────────────────────────────────────────

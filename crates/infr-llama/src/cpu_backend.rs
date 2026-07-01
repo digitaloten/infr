@@ -976,6 +976,42 @@ pub(crate) fn generate_dense_backend(
         0 // fall through to per-token loop for MoE / E2B / short prompts
     };
 
+    // Record-once decode: for an eligible qwen3-style dense decode on a backend that supports replay
+    // (the Vulkan seam), build+compile+bind ONE plan here and reuse it across the whole decode loop.
+    // The adapter records the graph once and replays it per token, reading `pos` from the bound
+    // positions buffer + a params SSBO — so the baked pos=0 here is irrelevant, and the per-token host
+    // cost drops to just the emb/pos uploads. The gate is a strict subset of the adapter's graph
+    // eligibility (qwen3 dense: qk-norm, causal 1/√hd attention, no softcap / SWA / MoE / E2B /
+    // proportional-RoPE), so an eligible plan here is guaranteed to take the adapter's replay path.
+    // Backends without `decode_replay` (CPU interpreter, which reads the baked `pos`) and every
+    // ineligible model keep rebuilding + recompiling per token below.
+    let dyn_replay = be.capabilities().decode_replay
+        && qk_norm
+        && !gemma
+        && !gemma4
+        && c.moe.is_none()
+        && !e2b
+        && rope_freqs.is_none()
+        && c.final_softcap <= 0.0;
+    let ro = if dyn_replay {
+        let (g, h) = build(1, 0);
+        let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
+        let mut b = Bindings::new();
+        b.bind(h.hidden, hidden_buf.as_ref());
+        b.bind(h.positions, pos_buf.as_ref());
+        for l in 0..c.n_layer {
+            b.bind(h.k_cache[l], kbufs[l].as_ref());
+            b.bind(h.v_cache[l], vbufs[l].as_ref());
+        }
+        for (i, wid) in h.weights.iter().enumerate() {
+            b.bind(*wid, wbufs[i].as_ref());
+        }
+        b.bind(h.logits, logits_buf.as_ref());
+        Some((plan, b))
+    } else {
+        None
+    };
+
     for pos in decode_start..(prompt.len() + max_new) {
         if out.len() >= max_new {
             break;
@@ -1032,29 +1068,38 @@ pub(crate) fn generate_dense_backend(
         }
 
         let t_setup = std::time::Instant::now();
-        let (g, h) = build(1, pos);
-        let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
-        let mut b = Bindings::new();
-        b.bind(h.hidden, hidden_buf.as_ref());
-        b.bind(h.positions, pos_buf.as_ref());
-        if let (Some(rid), Some((rb, _))) = (h.rope_freqs, &rf_buf) {
-            b.bind(rid, rb.as_ref());
+        let (setup_el, exec_el);
+        if let Some((plan, b)) = &ro {
+            // Record-once path: reuse the single compiled plan + bindings (no per-token rebuild).
+            setup_el = t_setup.elapsed();
+            let t_exec = std::time::Instant::now();
+            be.execute(plan.as_ref(), b).map_err(|e| anyhow!("{e}"))?;
+            exec_el = t_exec.elapsed();
+        } else {
+            let (g, h) = build(1, pos);
+            let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
+            let mut b = Bindings::new();
+            b.bind(h.hidden, hidden_buf.as_ref());
+            b.bind(h.positions, pos_buf.as_ref());
+            if let (Some(rid), Some((rb, _))) = (h.rope_freqs, &rf_buf) {
+                b.bind(rid, rb.as_ref());
+            }
+            if let (Some(pid), Some(ib)) = (h.per_layer_inp, &ipl_buf) {
+                b.bind(pid, ib.as_ref());
+            }
+            for l in 0..c.n_layer {
+                b.bind(h.k_cache[l], kbufs[l].as_ref());
+                b.bind(h.v_cache[l], vbufs[l].as_ref());
+            }
+            for (i, wid) in h.weights.iter().enumerate() {
+                b.bind(*wid, wbufs[i].as_ref());
+            }
+            b.bind(h.logits, logits_buf.as_ref());
+            setup_el = t_setup.elapsed();
+            let t_exec = std::time::Instant::now();
+            be.execute(plan.as_ref(), &b).map_err(|e| anyhow!("{e}"))?;
+            exec_el = t_exec.elapsed();
         }
-        if let (Some(pid), Some(ib)) = (h.per_layer_inp, &ipl_buf) {
-            b.bind(pid, ib.as_ref());
-        }
-        for l in 0..c.n_layer {
-            b.bind(h.k_cache[l], kbufs[l].as_ref());
-            b.bind(h.v_cache[l], vbufs[l].as_ref());
-        }
-        for (i, wid) in h.weights.iter().enumerate() {
-            b.bind(*wid, wbufs[i].as_ref());
-        }
-        b.bind(h.logits, logits_buf.as_ref());
-        let setup_el = t_setup.elapsed();
-        let t_exec = std::time::Instant::now();
-        be.execute(plan.as_ref(), &b).map_err(|e| anyhow!("{e}"))?;
-        let exec_el = t_exec.elapsed();
         if std::env::var("INFR_PROF_DEC").is_ok() && pos + 1 >= prompt.len() {
             dec_setup += setup_el;
             dec_exec += exec_el;

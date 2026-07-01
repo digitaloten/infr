@@ -2249,6 +2249,9 @@ impl Backend for CpuBackend {
             cooperative_matrix: false,
             max_buffer_bytes: u64::MAX,
             unified_memory: true,
+            // The interpreter reads the baked `pos`/`kv_len` from the graph ops, so the decode graph
+            // must be rebuilt per token — no record-once replay.
+            decode_replay: false,
         }
     }
 
