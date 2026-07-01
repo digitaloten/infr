@@ -96,8 +96,10 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
                     *eps,
                 );
             }
-            // `dst = x · Wᵀ` — dispatch by weight dtype: native-quant blocks (in-shader dequant GEMV)
-            // or f16. (Prefill GEMM / mmq tuning is a later perf pass; this is the decode GEMV.)
+            // `dst = x · Wᵀ` — dispatch by weight dtype AND row count. Decode (m=1) uses the native
+            // GEMV (or f16 GEMV). Prefill (m>1) with a native-quant weight uses the TILED coopmat GEMM
+            // `matmul_native` (decode each weight element ONCE, reuse across the 64-row tile) instead
+            // of the GEMV (which re-reads every weight row per output row) — the prefill perf win.
             Op::Linear {
                 x,
                 weight,
@@ -109,7 +111,40 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
                 let (m, in_f, out_f) = (*m as usize, *in_f as usize, *out_f as usize);
                 let (w, xb, y) = (r(*weight)?, r(*x)?, r(*dst)?);
                 let dt = graph.desc(*weight).dtype;
-                if native_dense_supported(dt) {
+                // GEMM (m>1) needs a u32-block dtype + n%64==0, k%32==0, and writes ceil(m/64)*64
+                // output rows — so GEMM into a padded temp, then copy the m real rows into dst. (a is
+                // read row<m-guarded, so the exact-size input is fine.) Q4_K uses the mmq (dp4a int8)
+                // GEMM — the u4 prefill default, faster than coopmat; others use coopmat matmul_native.
+                if m > 1 && native_dense_supported(dt) && out_f % 64 == 0 && in_f % 32 == 0 {
+                    let eb = graph.desc(*dst).dtype.dense_bytes(1).unwrap_or(4);
+                    let mpad = m.div_ceil(64) * 64;
+                    let tmp = be_.alloc((mpad * out_f * eb).max(4), BufferUsage::Activations)?;
+                    if matches!(dt, infr_core::DType::Q4K) {
+                        // Quantize activations to int8 once (Q8 per 32-block), then integer dp4a GEMM
+                        // against the raw Q4_K blocks (no per-GEMM weight dequant).
+                        let nblk = in_f / 32;
+                        let qa = be_.alloc((m * in_f).max(4), BufferUsage::Activations)?;
+                        let dact = be_.alloc((m * nblk * 2).max(4), BufferUsage::Activations)?;
+                        let sact = be_.alloc((m * nblk * 2).max(4), BufferUsage::Activations)?;
+                        rec.quant_q8(xb, qa.as_ref(), dact.as_ref(), sact.as_ref(), m, in_f);
+                        rec.matmul_mmq_q4k(
+                            qa.as_ref(),
+                            dact.as_ref(),
+                            sact.as_ref(),
+                            w,
+                            0,
+                            tmp.as_ref(),
+                            m,
+                            in_f,
+                            out_f,
+                        );
+                        transient.extend([qa, dact, sact]);
+                    } else {
+                        rec.matmul_native(dt, xb, w, tmp.as_ref(), m, in_f, out_f);
+                    }
+                    rec.copy(tmp.as_ref(), 0, y, 0, m * out_f * eb);
+                    transient.push(tmp);
+                } else if native_dense_supported(dt) {
                     rec.linear_native(dt, w, xb, y, m, in_f, out_f);
                 } else {
                     rec.linear(w, xb, y, m, in_f, out_f);
