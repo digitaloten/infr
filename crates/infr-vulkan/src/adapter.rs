@@ -286,15 +286,83 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
                     *scale,
                 );
             }
-            // Not yet wired to a Recorder kernel. These are EXPLICIT arms (not a `_` catch-all) so
-            // that adding a new `Op` variant to infr-core BREAKS this build until the adapter handles
-            // it — the same compile-time exhaustiveness the CPU interpreter has. (The GPU kernels for
-            // Conv1dSilu/DeltaNet exist + are tested; only the adapter dispatch is missing.)
-            Op::QkNorm { .. }
-            | Op::Softcap { .. }
-            | Op::MoeFfn { .. }
-            | Op::Conv1dSilu { .. }
-            | Op::DeltaNet { .. } => {
+            // Per-head RMSNorm == rmsnorm over rows*n_head rows of head_dim (gemma4's weightless
+            // V-norm passes a ones weight → out = x/rms).
+            Op::QkNorm {
+                x,
+                weight,
+                dst,
+                rows,
+                n_head,
+                head_dim,
+                eps,
+            } => {
+                rec.rmsnorm(
+                    r(*x)?,
+                    r(*weight)?,
+                    r(*dst)?,
+                    (*rows * *n_head) as usize,
+                    *head_dim as usize,
+                    *eps,
+                );
+            }
+            // Qwen3-Next SSM: depthwise causal conv + SiLU (rolling conv `state` mutated in place).
+            Op::Conv1dSilu {
+                x,
+                weight,
+                state,
+                dst,
+                channels,
+                kernel,
+            } => {
+                rec.conv1d_silu(
+                    r(*x)?,
+                    r(*weight)?,
+                    r(*state)?,
+                    r(*dst)?,
+                    *channels as usize,
+                    *kernel as usize,
+                );
+            }
+            // Qwen3-Next gated DeltaNet recurrence (persistent `state` S mutated in place).
+            Op::DeltaNet {
+                q,
+                k,
+                v,
+                b,
+                a,
+                a_coef,
+                dt_bias,
+                state,
+                dst,
+                n_vhead,
+                n_khead,
+                head_k,
+                head_v,
+                eps,
+            } => {
+                rec.deltanet(
+                    r(*q)?,
+                    r(*k)?,
+                    r(*v)?,
+                    r(*b)?,
+                    r(*a)?,
+                    r(*a_coef)?,
+                    r(*dt_bias)?,
+                    r(*state)?,
+                    r(*dst)?,
+                    *n_vhead as usize,
+                    *n_khead as usize,
+                    *head_k as usize,
+                    *head_v as usize,
+                    *eps,
+                );
+            }
+            // Not yet wired to a Recorder kernel. EXPLICIT arms (not a `_` catch-all) so adding a new
+            // `Op` to infr-core BREAKS this build until the adapter handles it — the compile-time
+            // exhaustiveness the CPU interpreter has. Softcap needs a new GPU kernel; MoeFfn is a
+            // multi-kernel sequence (router matmul → top-k → per-expert SwiGLU → accumulate).
+            Op::Softcap { .. } | Op::MoeFfn { .. } => {
                 return Err(be(format!(
                     "vulkan adapter: op not yet wired: {}",
                     op.kind()
