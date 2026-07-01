@@ -9,6 +9,8 @@
 //!   `~/Projects/llama.cpp/ggml/include/ggml.h`  (ggml_type enum)
 //!   `~/Projects/llama.cpp/conversion/diffusion_gemma.py` (tensor names / keys)
 
+pub mod dequant;
+
 use infr_core::{
     error::{Error, Result},
     loader::{MetaValue, Metadata, TensorInfo},

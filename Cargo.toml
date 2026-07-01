@@ -5,6 +5,7 @@ members = [
     "crates/infr-vulkan",
     "crates/infr-hub",
     "crates/infr-gguf",
+    "crates/infr-cpu",
     "crates/infr-model",
     "crates/infr-decode",
     "crates/infr-chat",
@@ -26,6 +27,7 @@ infr-core = { path = "crates/infr-core" }
 infr-vulkan = { path = "crates/infr-vulkan" }
 infr-hub = { path = "crates/infr-hub" }
 infr-gguf = { path = "crates/infr-gguf" }
+infr-cpu = { path = "crates/infr-cpu" }
 infr-model = { path = "crates/infr-model" }
 infr-decode = { path = "crates/infr-decode" }
 infr-chat = { path = "crates/infr-chat" }

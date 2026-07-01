@@ -9,7 +9,7 @@
 //! kernels, each CPU block is swapped for a `be.<op>` call with no structural change. Set
 //! `Q35_CPU=1` to force the pure-CPU path (the correctness oracle, no Vulkan init).
 
-use crate::cpu_backend::CpuBackend;
+use infr_cpu::CpuBackend;
 use crate::load_tensor_dequant;
 use anyhow::{anyhow, bail, Context, Result};
 use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage};

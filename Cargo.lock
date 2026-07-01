@@ -1024,6 +1024,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "infr-cpu"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "half",
+ "infr-core",
+ "infr-gguf",
+ "rayon",
+]
+
+[[package]]
 name = "infr-decode"
 version = "0.0.0"
 dependencies = [
@@ -1053,6 +1065,7 @@ dependencies = [
 name = "infr-gguf"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "bytemuck",
  "half",
  "infr-core",
@@ -1087,6 +1100,7 @@ dependencies = [
  "half",
  "infr-chat",
  "infr-core",
+ "infr-cpu",
  "infr-gguf",
  "infr-vulkan",
  "llguidance",
