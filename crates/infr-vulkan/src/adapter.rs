@@ -402,7 +402,9 @@ fn lower_op(
                     if *up_off != 0 {
                         return Err(be("vulkan adapter: GatedAct Sigmoid up_off!=0 unsupported"));
                     }
-                    rec.mul_sigmoid(g_, u_, y, n);
+                    // GatedAct semantics: `act(gate) * up` = sigmoid(gate) * up. mul_sigmoid computes
+                    // `a * sigmoid(b)`, so pass (up, gate) — NOT (gate, up), which would sigmoid `up`.
+                    rec.mul_sigmoid(u_, g_, y, n);
                 }
                 Activation::Gelu => {
                     let eb = graph.desc(*up).dtype.dense_bytes(1).unwrap_or(4);

@@ -1204,6 +1204,11 @@ fn generate_seam(
     let eps = c.eps;
     let kk = c.d_conv;
     let tok = crate::build_tokenizer(g)?;
+    let eos = g
+        .metadata()
+        .u64("tokenizer.ggml.eos_token_id")
+        .map(|x| x as u32);
+    let im_end = tok.token_to_id("<|im_end|>");
     let enc = tok
         .encode(prompt, false)
         .map_err(|e| anyhow!("encode: {e}"))?;
@@ -1447,6 +1452,11 @@ fn generate_seam(
         let qa = gr.internal(f32d(rows * nh * hd));
         let gate_a = gr.internal(f32d(rows * nh * hd));
         let ka = gr.internal(f32d(rows * nkv * hd));
+        // K-norm output MUST be a dedicated F16 scratch so the Vulkan `kv_write_peephole` fuses the
+        // QkNormRope+WriteKv into a direct-to-cache write (the peephole only fires on an F16 Internal
+        // dst). Reusing the F32 `ka` here would make QkNormRope write f16 into an f32 buffer with NO
+        // fusion, so the following WriteKv's `store_f16` reads those f16 bytes AS f32 → garbage cache.
+        let k16 = gr.internal(TensorDesc::new(vec![rows * nkv * hd], DType::F16));
         let va = gr.internal(f32d(rows * nkv * hd));
         let attno = gr.internal(f32d(rows * nh * hd));
 
@@ -1473,7 +1483,14 @@ fn generate_seam(
                 });
             };
 
+        let __maxl = std::env::var("INFR_Q35_MAXLAYERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(usize::MAX);
         for (li, lh) in layers.iter().enumerate() {
+            if li >= __maxl {
+                break;
+            }
             match lh {
                 Q35LayerH::Lin(w) => {
                     rmsn(&mut gr, hidden, w.attn_norm, xn);
@@ -1632,7 +1649,8 @@ fn generate_seam(
                         x: ka,
                         weight: w.k_norm,
                         positions,
-                        dst: ka,
+                        dst: k16, // F16 scratch → peephole fuses this + the WriteKv below into a
+                        // single direct-to-cache qk-norm+rope (see the k16 decl).
                         rows: rows as u32,
                         n_head: nkv as u32,
                         head_dim: hd as u32,
@@ -1642,7 +1660,7 @@ fn generate_seam(
                         freq_factors: None,
                     });
                     gr.push(Op::WriteKv {
-                        src: ka,
+                        src: k16,
                         cache: w.k_cache,
                         rows: rows as u32,
                         row_stride: (nkv * hd) as u32,
@@ -1818,6 +1836,15 @@ fn generate_seam(
     // The last chunk's last row predicts the first generated token.
     be.download(logits_buf.as_ref(), bytemuck::cast_slice_mut(&mut logits))
         .map_err(|e| anyhow!("{e}"))?;
+    if std::env::var("INFR_Q35_DUMP").is_ok() {
+        let am = argmax(&logits);
+        let s: f32 = logits.iter().map(|x| x.abs()).sum::<f32>() / logits.len() as f32;
+        eprintln!(
+            "[q35dump] argmax={am} logit[am]={:.4} mean|logit|={s:.4} first6={:?}",
+            logits[am as usize],
+            &logits[..6]
+        );
+    }
 
     // ── decode: one token at a time (rows=1), feeding the last prediction back ──
     let decode_t0 = std::time::Instant::now();
@@ -1825,6 +1852,10 @@ fn generate_seam(
     let mut decode_n = 0usize;
     loop {
         let next = argmax(&logits);
+        // Stop on EOS / <|im_end|> before emitting the stop token (chat turn boundary).
+        if Some(next) == eos || (im_end.is_some() && Some(next) == im_end) {
+            break;
+        }
         crate::stream_token(&tok, &mut outs, &mut printed, next, &mut on_piece);
         decode_n += 1;
         if outs.len() >= n {
@@ -1950,6 +1981,21 @@ pub fn generate_chat(
     max_new: usize,
     mut on_piece: impl FnMut(&str),
 ) -> Result<(usize, usize)> {
+    // Fast path: the batched/chunked GPU seam (full-GPU forward incl. attention) — ~7x prefill over
+    // the bespoke per-token loop below. Escape hatch INFR_Q35_BESPOKE=1 forces the per-token path.
+    if std::env::var("INFR_Q35_BESPOKE").is_err() {
+        if let Ok(be) = VulkanBackend::new() {
+            let bind = |tb: TensorBytes| -> Result<Box<dyn Buffer>> {
+                let buf = be
+                    .alloc(tb.len().max(1), BufferUsage::Weights)
+                    .map_err(|e| anyhow!("{e}"))?;
+                be.upload(buf.as_ref(), &tb).map_err(|e| anyhow!("{e}"))?;
+                Ok(buf)
+            };
+            let stats = generate_seam(&be, &bind, path, prompt, max_new, on_piece)?;
+            return Ok((stats.n_prompt, stats.n_gen));
+        }
+    }
     let g = Gguf::open(path).map_err(|e| anyhow!("{e}"))?;
     let m = Model::load(&g)?;
     let tok = crate::build_tokenizer(&g)?;
@@ -2129,13 +2175,32 @@ mod tests {
         }
     }
 
-    /// The batched/chunked-prefill SEAM on Vulkan (vs the bespoke per-token `generate` above).
-    /// FAST (~590 pp / ~280 tg t/s vs the bespoke ~65/71) but currently produces INCORRECT output
-    /// ("!!!!") — a qwen35-specific correctness bug in the Vulkan seam path (the dense seam +
-    /// bespoke qwen35 GPU path both work, so it's isolated to qwen35's ops on the seam). #[ignore]'d
-    /// until debugged (op-by-op seam-CPU vs seam-Vulkan diff). See the qwen35-batched-prefill memory.
+    /// Bisection: run the seam on CPU (correct) then Vulkan with INFR_Q35_DUMP=1 and a chosen
+    /// INFR_Q35_MAXLAYERS=N — compare the two `[q35dump]` argmax/logit lines to find the first layer
+    /// count at which Vulkan diverges from CPU (localizes the wiring bug).
     #[test]
-    #[ignore = "WIP: qwen35 seam-on-Vulkan produces incorrect output — known bug, see memory"]
+    #[ignore = "manual bisection (set INFR_Q35_DUMP + INFR_Q35_MAXLAYERS)"]
+    fn q35_bisect() {
+        let Some(path) = model_path() else {
+            return;
+        };
+        if !crate::gpu_available() {
+            return;
+        }
+        let prompt = render_chat(&path, "Hi").unwrap();
+        eprintln!("=== CPU seam ===");
+        let _ = generate_cpu(&path, &prompt, 1, |_| {});
+        eprintln!("=== Vulkan seam ===");
+        let _ = generate_vulkan(&path, &prompt, 1, |_| {});
+    }
+
+    /// The batched/chunked-prefill SEAM on Vulkan (vs the bespoke per-token `generate` above). FAST
+    /// (~450 pp / ~250 tg t/s vs the bespoke ~65/71) AND correct — the K-norm output now writes an
+    /// F16 scratch so the Vulkan kv_write_peephole fuses QkNormRope+WriteKv (an F32 K-norm dst broke
+    /// fusion → store_f16 read the f16 bytes as f32 → garbage K cache). This is the production GPU
+    /// path (see `generate_chat`). See the qwen35-batched-prefill memory.
+    #[test]
+    #[ignore = "requires the Qwen3.5-0.8B GGUF + a Vulkan GPU"]
     fn gpu_seam_qwen35() {
         let Some(path) = model_path() else {
             eprintln!("skip: Qwen3.5-0.8B not present");
@@ -2145,9 +2210,17 @@ mod tests {
             eprintln!("skip: no Vulkan GPU");
             return;
         }
-        let prompt = render_chat(&path, "What is bash? Answer briefly.").unwrap();
+        // Larger-prompt bench sample (~hundreds of tokens) so prefill t/s isn't dominated by fixed
+        // per-chunk overhead. INFR_Q35_BENCH=1 blows the prompt up + skips the coherence assert.
+        let (msg, ntok): (String, usize) = if std::env::var("INFR_Q35_BENCH").is_ok() {
+            let filler = "The quick brown fox jumps over the lazy dog. ".repeat(80);
+            (format!("Summarize this text in one word:\n{filler}"), 128)
+        } else {
+            ("What is bash? Answer briefly.".into(), 48)
+        };
+        let prompt = render_chat(&path, &msg).unwrap();
         let mut out = String::new();
-        let stats = generate_vulkan(&path, &prompt, 48, |p| out.push_str(p)).unwrap();
+        let stats = generate_vulkan(&path, &prompt, ntok, |p| out.push_str(p)).unwrap();
         eprintln!(
             "seam-vulkan: prefill {} tok @ {:.0} t/s | decode {} tok @ {:.1} t/s",
             stats.n_prompt,
@@ -2156,6 +2229,9 @@ mod tests {
             stats.n_gen as f64 / stats.decode_secs.max(1e-9),
         );
         eprintln!("seam-vulkan out: {out:?}");
+        if std::env::var("INFR_Q35_BENCH").is_ok() {
+            return;
+        }
         let distinct = out
             .trim()
             .chars()
