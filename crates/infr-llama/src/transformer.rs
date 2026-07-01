@@ -1009,39 +1009,52 @@ impl Llama {
                 .gguf
                 .tensor_bytes("per_layer_token_embd.weight")
                 .map_err(|e| anyhow!("{e}"))?;
+            // per_layer_token_embd is a VOCAB table — look up each token's row by token ID (not
+            // sequence position; matches llama.cpp `ggml_get_rows`). Dequant all rows once up front so
+            // the parallel matmul below doesn't redo the dequant per layer.
+            let pl_tok_all: Vec<Vec<f32>> = new_tokens[..n]
+                .iter()
+                .map(|&tok| {
+                    let r0 = tok as usize * ple.tok_embd_row_bytes;
+                    dequant_block(
+                        ple.tok_embd_dtype,
+                        &te_bytes[r0..r0 + ple.tok_embd_row_bytes],
+                    )
+                })
+                .collect::<Result<_>>()?;
+            // inp_per_layer is layer-major [nl][n][npl], so each layer's [n*npl] slice is contiguous
+            // and disjoint → parallelize the big model_proj·emb matmul across layers. This is
+            // ~n·nl·npl·nem MACs; single-threaded it dominated E2B prefill (~2 s at pp512). Math is
+            // bit-identical to the serial version (same per-dot accumulation order).
             let mut ipl = vec![0f32; nl * n * npl];
-            for t in 0..n {
-                let emb = &hidden_host[t * ne..t * ne + ne]; // scaled token embedding (√n_embd applied)
-                                                             // Per-layer token embedding is a VOCAB table — look it up by token ID, not by
-                                                             // sequence position (matches llama.cpp `ggml_get_rows(per_layer_tok_embd, tokens)`).
-                let r0 = new_tokens[t] as usize * ple.tok_embd_row_bytes;
-                let pl_tok = dequant_block(
-                    ple.tok_embd_dtype,
-                    &te_bytes[r0..r0 + ple.tok_embd_row_bytes],
-                )?;
-                for layer in 0..nl {
-                    // pl_proj = (model_proj · emb) * 1/√n_embd, then RMSNorm over npl with proj_norm.
-                    let mut proj = vec![0f32; npl];
-                    let mut ss = 0f32;
-                    for (j, pj) in proj.iter_mut().enumerate() {
-                        let wrow =
-                            &ple.model_proj[(layer * npl + j) * nem..(layer * npl + j) * nem + nem];
-                        let mut acc = 0f32;
-                        for i in 0..nem {
-                            acc += wrow[i] * emb[i];
+            {
+                use rayon::prelude::*;
+                let (mp, pn, eps) = (&ple.model_proj, &ple.proj_norm, c.rms_eps);
+                ipl.par_chunks_mut(n * npl)
+                    .enumerate()
+                    .for_each(|(layer, lslice)| {
+                        let mut proj = vec![0f32; npl];
+                        for t in 0..n {
+                            let emb = &hidden_host[t * ne..t * ne + ne]; // scaled token embd (√n_embd)
+                                                                         // proj = (model_proj · emb) * 1/√n_embd, then RMSNorm over npl.
+                            let mut ss = 0f32;
+                            for (j, pj) in proj.iter_mut().enumerate() {
+                                let wrow =
+                                    &mp[(layer * npl + j) * nem..(layer * npl + j) * nem + nem];
+                                let acc: f32 = wrow.iter().zip(emb).map(|(a, b)| a * b).sum();
+                                let v = acc * inv_sqrt_ne;
+                                *pj = v;
+                                ss += v * v;
+                            }
+                            let rms = 1.0 / (ss / npl as f32 + eps).sqrt();
+                            let pl_tok = &pl_tok_all[t];
+                            for j in 0..npl {
+                                let normed = proj[j] * rms * pn[j];
+                                let tok = pl_tok[layer * npl + j] * sqrt_npl;
+                                lslice[t * npl + j] = (normed + tok) * inv_sqrt2;
+                            }
                         }
-                        let v = acc * inv_sqrt_ne;
-                        *pj = v;
-                        ss += v * v;
-                    }
-                    let rms = 1.0 / (ss / npl as f32 + c.rms_eps).sqrt();
-                    let dst = layer * (n * npl) + t * npl;
-                    for j in 0..npl {
-                        let normed = proj[j] * rms * ple.proj_norm[j];
-                        let tok = pl_tok[layer * npl + j] * sqrt_npl;
-                        ipl[dst + j] = (normed + tok) * inv_sqrt2;
-                    }
-                }
+                    });
             }
             let buf = alloc(nl * n * npl, BufferUsage::Staging)?;
             self.be
