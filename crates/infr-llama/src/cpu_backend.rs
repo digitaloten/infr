@@ -476,6 +476,14 @@ pub(crate) fn generate_dense_backend(
             dt("ffn_gate.weight").is_some() && dt("ffn_gate.weight") == dt("ffn_up.weight")
         });
 
+    // INFR_KV_Q8=1 stores the KV cache as Q8_0 blocks (34 bytes / 32 elems — half the f16
+    // footprint and bandwidth); the CPU reference and the Metal backend read/write it, other
+    // backends keep f16. The graph decl carries the dtype either way, and the env is stable for
+    // the process, so a warm session and its rebuilt graphs always agree.
+    let kv_q8 = std::env::var("INFR_KV_Q8").is_ok()
+        && matches!(be.name(), "metal" | "cpu-reference")
+        && (0..c.n_layer).all(|l| (c.layer_n_kv(l) * c.layer_head_dim(l)) % 32 == 0);
+
     // ── one-time session init: weights, KV cache, per-step IO (skipped when `state` is warm) ──
     if state.is_none() {
         // ── upload weights in their NATIVE GGUF dtype (no host pre-dequant — the backend dequants
@@ -584,18 +592,24 @@ pub(crate) fn generate_dense_backend(
             wspecs.push((DType::F32, max_hd));
         }
 
-        // ── persistent KV cache buffers (f32), sized per-layer (gemma4 SWA layers are narrower) ───────
+        // ── persistent KV cache buffers, sized per-layer (gemma4 SWA layers are narrower) ───────
+        let kv_bytes = |elems: usize| {
+            if kv_q8 {
+                elems / 32 * 34
+            } else {
+                elems * 2
+            }
+        };
         let mut kbufs: Vec<Box<dyn Buffer>> = Vec::new();
         let mut vbufs: Vec<Box<dyn Buffer>> = Vec::new();
         for l in 0..c.n_layer {
             let kvrow_l = c.layer_n_kv(l) * c.layer_head_dim(l);
-            // f16 KV cache (2 bytes/elem) — matches the graph's f16 k_cache/v_cache decls.
             kbufs.push(
-                be.alloc(want_ctx * kvrow_l * 2, BufferUsage::Activations)
+                be.alloc(kv_bytes(want_ctx * kvrow_l), BufferUsage::Activations)
                     .map_err(|e| anyhow!("{e}"))?,
             );
             vbufs.push(
-                be.alloc(want_ctx * kvrow_l * 2, BufferUsage::Activations)
+                be.alloc(kv_bytes(want_ctx * kvrow_l), BufferUsage::Activations)
                     .map_err(|e| anyhow!("{e}"))?,
             );
         }
@@ -678,8 +692,10 @@ pub(crate) fn generate_dense_backend(
     let build = |batch: usize, start_pos: usize| -> (Graph, DecodeHandles) {
         let mut g = Graph::new();
         let f32d = |n: usize| TensorDesc::new(vec![n], DType::F32);
-        // KV cache is f16 — matches the GPU's f16 cache (halves memory, tightens CPU↔GPU parity).
-        let f16d = |n: usize| TensorDesc::new(vec![n], DType::F16);
+        // KV cache dtype: f16 by default (halves memory vs f32, tightens CPU↔GPU parity);
+        // Q8_0 when the runner enabled it (see `kv_q8` at the cache alloc).
+        let kvd = |n: usize| TensorDesc::new(vec![n], if kv_q8 { DType::Q8_0 } else { DType::F16 });
+        let f16d = kvd;
         let hidden = g.input(f32d(batch * ne));
         let positions = g.input(TensorDesc::new(vec![batch], DType::I32));
         let rope_freqs = rf_buf.as_ref().map(|(_, n)| g.input(f32d(*n)));

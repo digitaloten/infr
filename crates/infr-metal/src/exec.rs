@@ -1259,22 +1259,30 @@ impl MetalBackend {
                 );
                 let base = pos * rs;
                 let n = rows * rs;
+                let q8 = g.desc(cache).dtype == DType::Q8_0;
                 if let Some(posbuf) = r.posbuf.clone() {
                     // Recording a replay tape: the row offset must come from the positions buffer
-                    // (the baked `pos` is this token's only) — f16 cache guaranteed by the gate.
-                    let pso = self.pipelines.get("writekv_dyn_f16")?;
+                    // (the baked `pos` is this token's only) — f16/q8 cache guaranteed by the gate.
+                    let pso = self.pipelines.get(if q8 {
+                        "writekv_dyn_q8"
+                    } else {
+                        "writekv_dyn_f16"
+                    })?;
                     let mut p = (n as u32).to_ne_bytes().to_vec();
                     p.extend_from_slice(&(rs as u32).to_ne_bytes());
-                    self.encode(r, &pso, &[bsrc.as_ref(), &cbuf.raw, &posbuf], &p, n);
+                    let threads = if q8 { n / 32 } else { n };
+                    self.encode(r, &pso, &[bsrc.as_ref(), &cbuf.raw, &posbuf], &p, threads);
                 } else {
                     let kern = match g.desc(cache).dtype {
+                        DType::Q8_0 => "writekv_q8",
                         DType::F16 => "writekv_f16",
                         _ => "writekv_f32",
                     };
                     let pso = self.pipelines.get(kern)?;
                     let mut p = (n as u32).to_ne_bytes().to_vec();
                     p.extend_from_slice(&(base as u32).to_ne_bytes());
-                    self.encode(r, &pso, &[bsrc.as_ref(), &cbuf.raw], &p, n);
+                    let threads = if q8 { n / 32 } else { n };
+                    self.encode(r, &pso, &[bsrc.as_ref(), &cbuf.raw], &p, threads);
                 }
             }
             Op::Attention {
@@ -1347,6 +1355,54 @@ impl MetalBackend {
                         &p,
                         rows * nh * 32 * 32,
                         32 * 32,
+                    );
+                    r.loc[dst.0 as usize] = Loc::Device;
+                    return Ok(());
+                }
+                // Q8_0 cache: rows==1 decode takes the q8 vector kernel (hd 64/128); every
+                // other shape the scalar dequant-on-read fallback (prefill lives here until a
+                // q8 flash port). Both dequantize exactly — reassociation-only vs the f16 math.
+                if g.desc(k_cache).dtype == DType::Q8_0 {
+                    // Any row count: the vector kernel runs one threadgroup per (row, head),
+                    // so prefill rides it too (no q8 flash port yet — this is the split-KV
+                    // class, ~3-5x slower than flash2 at depth but 100x the scalar fallback).
+                    let vq8 = matches!(hd, 64 | 128) && kv_len >= 128 && {
+                        let kn = if hd == 64 {
+                            "attnvec_q8kv_hd64"
+                        } else {
+                            "attnvec_q8kv_hd128"
+                        };
+                        self.pipelines
+                            .get(kn)
+                            .map(|pl| pl.max_total_threads_per_threadgroup() >= 1024)
+                            .unwrap_or(false)
+                    };
+                    let kern = if vq8 {
+                        if hd == 64 {
+                            "attnvec_q8kv_hd64"
+                        } else {
+                            "attnvec_q8kv_hd128"
+                        }
+                    } else {
+                        "attention_q8kv"
+                    };
+                    let pso = self.pipelines.get(kern)?;
+                    let mut p = (rows as u32).to_ne_bytes().to_vec();
+                    p.extend_from_slice(&(kv_len as u32).to_ne_bytes());
+                    p.extend_from_slice(&(nh as u32).to_ne_bytes());
+                    p.extend_from_slice(&(nkv as u32).to_ne_bytes());
+                    p.extend_from_slice(&(hd as u32).to_ne_bytes());
+                    p.extend_from_slice(&scale.to_ne_bytes());
+                    p.extend_from_slice(&window.to_ne_bytes());
+                    p.extend_from_slice(&pos.to_ne_bytes());
+                    let nsg = if vq8 { 32 } else { 1 };
+                    self.encode_tg(
+                        r,
+                        &pso,
+                        &[bq.as_ref(), &kbuf.raw, &vbuf.raw, bd.as_ref()],
+                        &p,
+                        rows * nh * nsg * 32,
+                        nsg * 32,
                     );
                     r.loc[dst.0 as usize] = Loc::Device;
                     return Ok(());

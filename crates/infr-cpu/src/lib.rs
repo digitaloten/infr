@@ -2237,6 +2237,22 @@ fn cpu_buf(b: &dyn Buffer) -> &CpuBuffer {
         .expect("cpu backend: buffer is not a CpuBuffer (mixed backends?)")
 }
 
+/// Dequantize the first `need` elements of a Q8_0-block buffer (34 B / 32 elems, y = d*q).
+pub(crate) fn dequant_prefix_q8_0(bytes: &[u8], need: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(need);
+    for b in 0..need.div_ceil(32) {
+        let off = b * 34;
+        let d = half::f16::from_le_bytes([bytes[off], bytes[off + 1]]).to_f32();
+        for i in 0..32 {
+            if out.len() == need {
+                break;
+            }
+            out.push(d * (bytes[off + 2 + i] as i8) as f32);
+        }
+    }
+    out
+}
+
 impl Backend for CpuBackend {
     fn name(&self) -> &str {
         "cpu"
@@ -2706,6 +2722,26 @@ impl Backend for CpuBackend {
                                 df[base + i] = half::f16::from_f32(s[i]).to_bits();
                             }
                         }
+                        DType::Q8_0 => {
+                            // Q8_0 blocks (34 B / 32 elems): d = amax/127 (stored f16), q =
+                            // round(x/d) — the llama.cpp quantize_row_q8_0 reference formula.
+                            // `base`/`n` are element counts and rows are 32-aligned (the runner
+                            // gates on it), so blocks never straddle a write.
+                            debug_assert!(base % 32 == 0 && n % 32 == 0);
+                            for b in 0..n / 32 {
+                                let src32 = &s[b * 32..b * 32 + 32];
+                                let amax = src32.iter().fold(0f32, |m, &v| m.max(v.abs()));
+                                let dq = amax / 127.0;
+                                let id = if dq != 0.0 { 1.0 / dq } else { 0.0 };
+                                let off = (base / 32 + b) * 34;
+                                let dh = half::f16::from_f32(dq).to_bits().to_le_bytes();
+                                d[off] = dh[0];
+                                d[off + 1] = dh[1];
+                                for (i, &v) in src32.iter().enumerate() {
+                                    d[off + 2 + i] = (v * id).round_ties_even() as i32 as i8 as u8;
+                                }
+                            }
+                        }
                         _ => {
                             let df: &mut [f32] = bytemuck::cast_slice_mut(&mut d);
                             df[base..base + n].copy_from_slice(&s[..n]);
@@ -2751,6 +2787,11 @@ impl Backend for CpuBackend {
                                     .map(|&x| half::f16::from_bits(x).to_f32())
                                     .collect()
                             };
+                            (f(&kguard), f(&vguard))
+                        }
+                        DType::Q8_0 => {
+                            // Dequant the valid prefix's Q8_0 blocks (y = d * q).
+                            let f = |b: &[u8]| -> Vec<f32> { crate::dequant_prefix_q8_0(b, need) };
                             (f(&kguard), f(&vguard))
                         }
                         _ => (

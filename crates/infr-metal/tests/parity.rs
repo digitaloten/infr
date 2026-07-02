@@ -784,6 +784,101 @@ fn writekv_f16_parity() {
     assert_eq!(cpu, mtl, "WriteKv f16 cache bytes must be identical");
 }
 
+// Q8_0 KV cache (INFR_KV_Q8): the quantization on write must be BYTE-identical between the CPU
+// reference and the Metal kernel (d = amax/127 as f16, q = rint(x/d)).
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn writekv_q8_parity() {
+    let (rows, row_stride, max_ctx, pos) = (2usize, 256usize, 8usize, 3usize);
+    let cache_bytes = max_ctx * row_stride / 32 * 34;
+    let mut g = Graph::new();
+    let src = g.input(TensorDesc::new(vec![rows, row_stride], DType::F32));
+    let cache = g.input(TensorDesc::new(vec![max_ctx * row_stride], DType::Q8_0));
+    g.push(Op::WriteKv {
+        src,
+        cache,
+        rows: rows as u32,
+        row_stride: row_stride as u32,
+        pos: pos as u32,
+    });
+    let bound = vec![
+        (src, f32_bytes(&rand_f32(rows * row_stride, 44))),
+        (cache, vec![0u8; cache_bytes]),
+    ];
+    let cpu = run_readback(&CpuBackend::new(), &g, &bound, cache, cache_bytes);
+    let mtl = run_readback(
+        &MetalBackend::new().expect("metal backend"),
+        &g,
+        &bound,
+        cache,
+        cache_bytes,
+    );
+    assert_eq!(cpu, mtl, "WriteKv q8 cache bytes must be identical");
+}
+
+// Attention over a Q8_0 cache: WriteKv quantizes, Attention dequantizes on read. Both routes:
+// the scalar fallback (prefill shape) and the rows==1 vector kernel (decode at depth).
+fn q8_attention_test(rows: usize, kv_len: usize, hd: usize, pos: usize, tol: f32, seed: u64) {
+    let (nh, nkv) = (8usize, 2usize);
+    let mut g = Graph::new();
+    let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::Q8_0));
+    let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::Q8_0));
+    let ksrc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F32));
+    let vsrc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F32));
+    let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let row = (nkv * hd) as u32;
+    g.push(Op::WriteKv {
+        src: ksrc,
+        cache: kc,
+        rows: kv_len as u32,
+        row_stride: row,
+        pos: 0,
+    });
+    g.push(Op::WriteKv {
+        src: vsrc,
+        cache: vc,
+        rows: kv_len as u32,
+        row_stride: row,
+        pos: 0,
+    });
+    g.push(Op::Attention {
+        q,
+        k_cache: kc,
+        v_cache: vc,
+        dst,
+        rows: rows as u32,
+        kv_len: kv_len as u32,
+        n_head: nh as u32,
+        n_kv: nkv as u32,
+        head_dim: hd as u32,
+        scale: 1.0 / (hd as f32).sqrt(),
+        mask: infr_core::graph::AttnMask::Causal,
+        pos: pos as u32,
+    });
+    let nkv_elems = kv_len * nkv * hd;
+    let bound = vec![
+        (q, f32_bytes(&rand_f32(rows * nh * hd, seed))),
+        (kc, vec![0u8; nkv_elems / 32 * 34]),
+        (vc, vec![0u8; nkv_elems / 32 * 34]),
+        (ksrc, f32_bytes(&rand_f32(nkv_elems, seed + 1))),
+        (vsrc, f32_bytes(&rand_f32(nkv_elems, seed + 2))),
+    ];
+    assert_parity(&g, &bound, dst, rows * nh * hd, tol);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_q8_scalar_parity() {
+    q8_attention_test(3, 6, 64, 3, 1e-4, 240);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_q8_vec_parity() {
+    q8_attention_test(1, 200, 128, 199, 1e-4, 250);
+}
+
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn attention_gqa_causal_parity() {

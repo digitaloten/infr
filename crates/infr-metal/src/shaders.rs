@@ -1822,4 +1822,250 @@ kernel void writekv_dyn_f16(device const float* src   [[buffer(0)]],
     if (gid >= p.n) return;
     cache[(uint)posb[0] * p.row_stride + gid] = (half)src[gid];
 }
+
+// ---- Q8_0 KV cache (INFR_KV_Q8): 34-byte blocks of 32 codes — half the f16 footprint and
+// bandwidth. Quantization matches the CPU reference bit-for-bit: d = amax/127 stored as f16,
+// q = rint(x/d) (ties to even, matching Rust's round_ties_even). Rows are 32-aligned (the
+// runner gates on it), so a written row never straddles a block.
+inline float q8_at(device const uchar* c, ulong e) {
+    device const uchar* blk = c + (e >> 5) * 34ul;
+    float d = (float)*(device const half*)blk; /* 34*b is even — the f16 d is always aligned */
+    return d * (float)(char)blk[2u + (e & 31u)];
+}
+inline float4 q8_float4(device const uchar* c, ulong e) { /* e % 4 == 0: never straddles */
+    device const uchar* blk = c + (e >> 5) * 34ul;
+    float d = (float)*(device const half*)blk;
+    device const uchar* q = blk + 2u + (e & 31u);
+    return d * float4((float)(char)q[0], (float)(char)q[1], (float)(char)q[2], (float)(char)q[3]);
+}
+kernel void writekv_q8(device const float* src   [[buffer(0)]],
+                       device uchar*       cache [[buffer(1)]],
+                       constant WriteKvParams& p [[buffer(2)]],
+                       uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.n / 32u) return;   // one thread per 32-elem block; p.base is in elements
+    device const float* s = src + gid * 32u;
+    float amax = 0.0f;
+    for (uint i = 0; i < 32u; i++) amax = max(amax, fabs(s[i]));
+    float d = amax / 127.0f;
+    float id = d != 0.0f ? 1.0f / d : 0.0f;
+    device uchar* blk = cache + ((ulong)(p.base >> 5) + gid) * 34ul;
+    *(device half*)blk = (half)d;
+    for (uint i = 0; i < 32u; i++) blk[2u + i] = (uchar)(char)(int)rint(s[i] * id);
+}
+kernel void writekv_dyn_q8(device const float* src   [[buffer(0)]],
+                           device uchar*       cache [[buffer(1)]],
+                           device const int*   posb  [[buffer(2)]],
+                           constant WriteKvDynParams& p [[buffer(3)]],
+                           uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.n / 32u) return;
+    device const float* s = src + gid * 32u;
+    float amax = 0.0f;
+    for (uint i = 0; i < 32u; i++) amax = max(amax, fabs(s[i]));
+    float d = amax / 127.0f;
+    float id = d != 0.0f ? 1.0f / d : 0.0f;
+    ulong base_blk = (ulong)(uint)posb[0] * (p.row_stride >> 5);
+    device uchar* blk = cache + (base_blk + gid) * 34ul;
+    *(device half*)blk = (half)d;
+    for (uint i = 0; i < 32u; i++) blk[2u + i] = (uchar)(char)(int)rint(s[i] * id);
+}
+
+// Scalar attention over a Q8_0 cache — the attention_f16kv shape with dequant-on-read. The
+// catch-all q8 route (prefill + odd shapes); the vector kernel below covers rows==1 decode.
+kernel void attention_q8kv(device const float* q   [[buffer(0)]],
+                           device const uchar* k   [[buffer(1)]],
+                           device const uchar* v   [[buffer(2)]],
+                           device float*       dst [[buffer(3)]],
+                           constant AttnParams& p  [[buffer(4)]],
+                           uint gid  [[thread_position_in_grid]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    uint sg = gid / 32u;
+    if (sg >= p.rows * p.n_head) return;
+    uint ti = sg / p.n_head;
+    uint h = sg % p.n_head;
+    uint group = p.n_head / p.n_kv;
+    uint kvh = h / group;
+    uint qb = sg * p.head_dim;
+    uint abs = p.pos + ti;
+    uint lo = (p.window > 0u && abs + 1u > p.window) ? (abs + 1u - p.window) : 0u;
+
+    float acc[MAX_DPL];
+    for (uint t = 0; t < MAX_DPL; t++) acc[t] = 0.0f;
+    float m = -INFINITY, l = 0.0f;
+    for (uint j = lo; j <= abs; j++) {
+        ulong kb = ((ulong)j * p.n_kv + kvh) * p.head_dim;
+        float part = 0.0f;
+        for (uint d = lane; d < p.head_dim; d += 32u) part += q[qb + d] * q8_at(k, kb + d);
+        float sc = simd_sum(part) * p.scale;
+        float mnew = max(m, sc);
+        float corr = exp(m - mnew);
+        float pw = exp(sc - mnew);
+        l = l * corr + pw;
+        uint t = 0;
+        for (uint d = lane; d < p.head_dim; d += 32u) {
+            acc[t] = acc[t] * corr + pw * q8_at(v, kb + d);
+            t++;
+        }
+        m = mnew;
+    }
+    uint t = 0;
+    for (uint d = lane; d < p.head_dim; d += 32u) { dst[qb + d] = acc[t] / l; t++; }
+}
+
+// Vector flash attention over a Q8_0 cache — the attnvec structure with dequant-on-read
+// (see attnvec_body; kept as a sibling body because the KV accessor type differs). Same
+// numeric class: f32 dots over exactly-dequantized q8 values, reassociation only.
+template<uint hd, uint NSG>
+inline void attnvec_q8_body(device const float* q,
+                            device const uchar* k,
+                            device const uchar* v,
+                            device float*       dst,
+                            constant AttnParams& p,
+                            uint abs, uint kvl,
+                            threadgroup float* sq,
+                            threadgroup float* ssc,
+                            threadgroup float* so,
+                            uint3  tgpig,
+                            ushort sgitg,
+                            ushort tiisg) {
+    constexpr uint C = 32, NE = 4, NL = 32u / NE;
+    constexpr uint hd4 = hd / 4u;
+    constexpr uint NI = hd4 / NL;
+
+    uint tg = tgpig.x;
+    uint ti = tg / p.n_head;
+    uint h  = tg % p.n_head;
+    uint kvh = h / (p.n_head / p.n_kv);
+    uint lo = (p.window > 0u && abs + 1u > p.window) ? (abs + 1u - p.window) : 0u;
+    uint tx = tiisg % NL, ty = tiisg / NL;
+
+    {
+        device const float4* q4 = (device const float4*)(q + ((ulong)ti * p.n_head + h) * hd);
+        threadgroup float4* sq4 = (threadgroup float4*)sq;
+        for (uint i = sgitg * 32u + tiisg; i < hd4; i += NSG * 32u) sq4[i] = q4[i];
+    }
+    threadgroup float* ss = ssc + sgitg * C;
+    threadgroup float4* so4 = (threadgroup float4*)so + sgitg * hd4;
+    if (ty == 0) {
+        for (uint ii = 0; ii < NI; ii++) so4[ii * NL + tx] = float4(0.0f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float S = 0.0f, M = -MAXFLOAT / 2;
+    threadgroup const float4* sq4 = (threadgroup const float4*)sq;
+
+    for (uint ic = sgitg * C; ic <= abs; ic += NSG * C) {
+        if (ic + C <= lo) continue;
+        {
+            float mqk[C / NE];
+            for (uint cc = 0; cc < C / NE; cc++) {
+                uint rc = min(ic + NE * cc + ty, kvl - 1u);
+                ulong eb = ((ulong)rc * p.n_kv + kvh) * hd;
+                float acc = 0.0f;
+                for (uint ii = 0; ii < NI; ii++)
+                    acc += dot(q8_float4(k, eb + (ii * NL + tx) * 4u), sq4[ii * NL + tx]);
+                acc += simd_shuffle_down(acc, 4);
+                acc += simd_shuffle_down(acc, 2);
+                acc += simd_shuffle_down(acc, 1);
+                mqk[cc] = simd_shuffle(acc, NL * ty);
+            }
+            ss[NE * tx + ty] = mqk[tx];
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            float sv = ss[tiisg] * p.scale;
+            uint jkv = ic + tiisg;
+            bool valid = (jkv >= lo) && (jkv <= abs);
+            float m = M;
+            M = simd_max(max(M, valid ? sv : -MAXFLOAT / 2));
+            float ms = exp(m - M);
+            float vs = valid ? exp(sv - M) : 0.0f;
+            S = S * ms + simd_sum(vs);
+            ss[tiisg] = vs;
+            if (ty == 0) {
+                for (uint ii = 0; ii < NI; ii++) so4[ii * NL + tx] *= ms;
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            float4 lov[NI];
+            for (uint ii = 0; ii < NI; ii++) lov[ii] = float4(0.0f);
+            for (uint cc = 0; cc < C / NE; cc++) {
+                uint rc = min(ic + NE * cc + ty, kvl - 1u);
+                ulong eb = ((ulong)rc * p.n_kv + kvh) * hd;
+                float pw = ss[NE * cc + ty];
+                for (uint ii = 0; ii < NI; ii++)
+                    lov[ii] += q8_float4(v, eb + (ii * NL + tx) * 4u) * pw;
+            }
+            for (uint ii = 0; ii < NI; ii++) {
+                lov[ii] += simd_shuffle_down(lov[ii], 16);
+                lov[ii] += simd_shuffle_down(lov[ii], 8);
+            }
+            if (ty == 0) {
+                for (uint ii = 0; ii < NI; ii++) so4[ii * NL + tx] += lov[ii];
+            }
+        }
+    }
+
+    if (tiisg == 0) { ss[0] = S; ss[1] = M; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint rr = NSG / 2u; rr > 0u; rr >>= 1u) {
+        if (sgitg < rr) {
+            float s0 = ss[0], s1 = ssc[(sgitg + rr) * C + 0];
+            float m0 = ss[1], m1 = ssc[(sgitg + rr) * C + 1];
+            float mm = max(m0, m1);
+            float ms0 = exp(m0 - mm), ms1 = exp(m1 - mm);
+            if (tiisg == 0) { ss[0] = s0 * ms0 + s1 * ms1; ss[1] = mm; }
+            threadgroup float4* sob = (threadgroup float4*)so + (sgitg + rr) * hd4;
+            for (uint i = tiisg; i < hd4; i += 32u) so4[i] = so4[i] * ms0 + sob[i] * ms1;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (sgitg == 0) {
+        float sinv = ssc[0] == 0.0f ? 0.0f : 1.0f / ssc[0];
+        device float4* out = (device float4*)(dst + ((ulong)ti * p.n_head + h) * hd);
+        for (uint i = tiisg; i < hd4; i += 32u) out[i] = so4[i] * sinv;
+    }
+}
+
+template<uint hd, uint NSG>
+kernel void attnvec_q8kv_t(device const float* q   [[buffer(0)]],
+                           device const uchar* k   [[buffer(1)]],
+                           device const uchar* v   [[buffer(2)]],
+                           device float*       dst [[buffer(3)]],
+                           constant AttnParams& p  [[buffer(4)]],
+                           uint3  tgpig [[threadgroup_position_in_grid]],
+                           ushort sgitg [[simdgroup_index_in_threadgroup]],
+                           ushort tiisg [[thread_index_in_simdgroup]]) {
+    threadgroup float sq[hd];
+    threadgroup float ssc[NSG * 32];
+    threadgroup float so[NSG * hd];
+    uint abs = p.pos + tgpig.x / p.n_head;
+    attnvec_q8_body<hd, NSG>(q, k, v, dst, p, abs, p.kv_len, sq, ssc, so, tgpig, sgitg, tiisg);
+}
+
+template<uint hd, uint NSG>
+kernel void attnvec_dyn_q8kv_t(device const float* q    [[buffer(0)]],
+                               device const uchar* k    [[buffer(1)]],
+                               device const uchar* v    [[buffer(2)]],
+                               device float*       dst  [[buffer(3)]],
+                               device const int*   posb [[buffer(4)]],
+                               constant AttnParams& p   [[buffer(5)]],
+                               uint3  tgpig [[threadgroup_position_in_grid]],
+                               ushort sgitg [[simdgroup_index_in_threadgroup]],
+                               ushort tiisg [[thread_index_in_simdgroup]]) {
+    threadgroup float sq[hd];
+    threadgroup float ssc[NSG * 32];
+    threadgroup float so[NSG * hd];
+    uint abs = (uint)posb[0];
+    attnvec_q8_body<hd, NSG>(q, k, v, dst, p, abs, abs + 1u, sq, ssc, so, tgpig, sgitg, tiisg);
+}
+
+typedef decltype(attnvec_q8kv_t<64, 32>) attnvec_q8_t;
+template [[host_name("attnvec_q8kv_hd64")]]  kernel attnvec_q8_t attnvec_q8kv_t<64, 32>;
+template [[host_name("attnvec_q8kv_hd128")]] kernel attnvec_q8_t attnvec_q8kv_t<128, 32>;
+typedef decltype(attnvec_dyn_q8kv_t<64, 32>) attnvec_dyn_q8_t;
+template [[host_name("attnvec_dyn_q8kv_hd64")]]  kernel attnvec_dyn_q8_t attnvec_dyn_q8kv_t<64, 32>;
+template [[host_name("attnvec_dyn_q8kv_hd128")]] kernel attnvec_dyn_q8_t attnvec_dyn_q8kv_t<128, 32>;
 "#;
