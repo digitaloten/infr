@@ -846,6 +846,30 @@ impl Llama {
         })
     }
 
+    /// Seed `dst`'s KV cache with the first `p` tokens of `src`'s (a per-layer device buffer copy),
+    /// so a NEW conversation that shares a prefix (e.g. the system prompt) with an existing slot
+    /// reuses that prefix's already-computed K/V instead of re-prefilling it — a cheap bandwidth copy
+    /// vs. `p` expensive forward passes. Sets `dst.len = p`; the caller sets `dst.cached` to `src`'s
+    /// matching prefix. `p` must be ≤ both caches' capacity (guaranteed: same model → same max_ctx).
+    pub fn kv_copy_prefix(&self, dst: &mut KvCache, src: &KvCache, p: usize) -> Result<()> {
+        let c = &self.cfg;
+        if p > 0 {
+            let rec = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
+            for li in 0..c.n_layer {
+                // f16 KV, per-layer row (gemma4's SWA/full layers differ).
+                let bytes = p * c.layer_n_kv(li) * c.layer_head_dim(li) * 2;
+                rec.copy(src.k[li].as_ref(), 0, dst.k[li].as_ref(), 0, bytes);
+                rec.copy(src.v[li].as_ref(), 0, dst.v[li].as_ref(), 0, bytes);
+            }
+            rec.finish().map_err(|e| anyhow!("{e}"))?;
+        }
+        dst.len = p;
+        // The record-once decode buffer replays this slot's PRIOR conversation's commands; drop it so
+        // decode re-records against the seeded state.
+        dst.rec_decode = None;
+        Ok(())
+    }
+
     /// Allocate the persistent dense-decode scratch (single token; split-K buffers sized for the
     /// worst-case chunk count).
     fn build_dense_decode_scratch(&self, max_ctx: usize) -> Result<DenseDecodeScratch> {
@@ -2055,6 +2079,83 @@ impl Llama {
         let mut kv = self.new_kv(prompt_tokens.len() + max_new + 8)?;
         let logits = self.prefill(&prompt_tokens, &mut kv)?;
         self.decode_loop(logits, &mut kv, max_new, constraint, on_token)
+    }
+
+    /// Like [`generate_ids`] but REUSES a persistent KV cache across calls (for `infr serve`): only
+    /// the token suffix that differs from `cached` (what's already materialized in `kv`) is
+    /// prefilled, so a repeated prompt prefix — a coding agent's stable system prompt + growing
+    /// history — is NOT re-prefilled every request. This collapses time-to-first-token from
+    /// "prefill the whole prompt" to "prefill just the new turn". `kv` is lazily created sized to
+    /// `INFR_MAX_CTX` / the model's trained context. Returns the generated token ids. On overflow
+    /// or `INFR_NO_KV_REUSE`, prefills fresh; on any error the cache is invalidated so the next call
+    /// starts clean (the cache must exactly mirror the KV, so never leave it inconsistent).
+    pub fn generate_ids_cached(
+        &self,
+        prompt: &str,
+        max_new: usize,
+        constraint: Option<&mut crate::grammar::Constraint>,
+        on_token: impl FnMut(&str),
+        kv: &mut Option<KvCache>,
+        cached: &mut Vec<u32>,
+    ) -> Result<Vec<u32>> {
+        let enc = self
+            .tokenizer
+            .encode(prompt, false)
+            .map_err(|e| anyhow!("encode: {e}"))?;
+        let ids: Vec<u32> = enc.get_ids().to_vec();
+
+        // Lazily size the persistent cache to the model's context (once per server lifetime).
+        if kv.is_none() {
+            let max_ctx = std::env::var("INFR_MAX_CTX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(self.cfg.n_ctx_train);
+            *kv = Some(self.new_kv(max_ctx)?);
+            cached.clear();
+        }
+
+        let gen_result = {
+            let k = kv.as_mut().unwrap();
+            if ids.is_empty() {
+                bail!("empty prompt");
+            }
+            if ids.len() + 1 > k.max_ctx {
+                bail!(
+                    "prompt {} tokens exceeds KV capacity {} (raise INFR_MAX_CTX)",
+                    ids.len(),
+                    k.max_ctx
+                );
+            }
+            // Shared-prefix reuse: rewind the cache to the common prefix, prefill only the suffix.
+            // Disabled (or the prompt won't fit alongside the reply) → prefill the whole prompt.
+            let no_reuse = std::env::var("INFR_NO_KV_REUSE").is_ok();
+            // Always leave ≥1 token to prefill (even a fully-cached prompt) so decode has fresh logits
+            // to sample the first token from — otherwise `prefill(&[])` yields no logits.
+            let p = if no_reuse {
+                0
+            } else {
+                common_prefix_len(cached, &ids).min(ids.len() - 1)
+            };
+            let max_new = max_new.min(k.max_ctx.saturating_sub(ids.len() + 1));
+            k.len = p;
+            self.prefill(&ids[p..], k)
+                .and_then(|logits| self.decode_loop(logits, k, max_new, constraint, on_token))
+        };
+
+        match gen_result {
+            Ok(generated) => {
+                // The cache now holds exactly `ids + generated` — record that for the next diff.
+                *cached = ids;
+                cached.extend_from_slice(&generated);
+                Ok(generated)
+            }
+            Err(e) => {
+                // Never leave `cached` out of sync with the KV; drop the cache and start fresh next time.
+                *kv = None;
+                cached.clear();
+                Err(e)
+            }
+        }
     }
 
     /// Build a grammar constraint that FORCES a syntactically-valid, schema-conforming tool call, for
@@ -3939,6 +4040,165 @@ impl ChatSession<'_> {
 /// Length of the shared leading run of two token sequences (for incremental prefill).
 fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+struct CacheSlot {
+    kv: Option<KvCache>,
+    cached: Vec<u32>,
+    /// Tokens of the last rendered PROMPT that was prefilled (before generation). A request
+    /// CONTINUES this slot only if it shares this whole prompt — not merely the system prefix — which
+    /// distinguishes a real follow-up turn from a different conversation that reuses the same system
+    /// prompt but a different (possibly short) user message.
+    prompt_len: usize,
+    lru: u64,
+}
+
+/// Multi-slot prefix cache for `infr serve`: up to `max_slots` persistent KV caches so
+/// concurrent / interleaved conversations don't thrash a single cache. Each request is routed to
+/// the slot it CONTINUES (that slot's whole cached sequence is a prefix of the request, within a
+/// small slack for reply re-tokenization); a genuinely new conversation takes a free slot, or evicts
+/// the least-recently-used one. Slots are allocated lazily (a single client only ever uses one, so
+/// VRAM is unchanged for that case). `INFR_KV_SLOTS` sets the slot count (default 4); the per-slot
+/// KV is sized like the single-cache path (`INFR_MAX_CTX` / the model's trained context). Reuse math
+/// per slot is the tested [`Llama::generate_ids_cached`]; this only adds the routing.
+pub struct ServeCache {
+    slots: Vec<CacheSlot>,
+    max_slots: usize,
+    tick: u64,
+}
+
+impl ServeCache {
+    /// Build from the environment: `INFR_KV_SLOTS` slots (default 4, min 1).
+    pub fn from_env() -> Self {
+        let max_slots = std::env::var("INFR_KV_SLOTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4usize)
+            .max(1);
+        Self {
+            slots: Vec::new(),
+            max_slots,
+            tick: 0,
+        }
+    }
+
+    /// Generate a reply for `prompt`, routing to the right slot and prefilling only the divergent
+    /// suffix (see [`Llama::generate_ids_cached`]). Returns the generated token ids.
+    pub fn generate(
+        &mut self,
+        llama: &Llama,
+        prompt: &str,
+        max_new: usize,
+        constraint: Option<&mut crate::grammar::Constraint>,
+        on_token: impl FnMut(&str),
+    ) -> Result<Vec<u32>> {
+        self.tick += 1;
+        let ids: Vec<u32> = llama
+            .tokenizer
+            .encode(prompt, false)
+            .map_err(|e| anyhow!("encode: {e}"))?
+            .get_ids()
+            .to_vec();
+        let idx = self.select(llama, &ids)?;
+        self.slots[idx].lru = self.tick;
+        let slot = &mut self.slots[idx];
+        let res = llama.generate_ids_cached(
+            prompt,
+            max_new,
+            constraint,
+            on_token,
+            &mut slot.kv,
+            &mut slot.cached,
+        );
+        // Record the prompt length for the continuation test; on error the cache was invalidated.
+        self.slots[idx].prompt_len = if res.is_ok() { ids.len() } else { 0 };
+        res
+    }
+
+    /// Pick the slot index to use. In priority: (1) an existing conversation this request CONTINUES
+    /// (its whole cache is a near-prefix of the request); (2) a new conversation → a free/LRU slot,
+    /// RADIX-SEEDED by copying the longest shared-prefix KV from another slot (e.g. the system prompt)
+    /// so that prefix isn't re-prefilled. Returns the chosen (possibly seeded) slot index.
+    fn select(&mut self, llama: &Llama, ids: &[u32]) -> Result<usize> {
+        // MIN_SEED: below this, a cross-slot KV copy (recorder + submit) isn't worth vs. re-prefill.
+        const MIN_SEED: usize = 64;
+        if std::env::var("INFR_NO_KV_REUSE").is_ok() {
+            return Ok(self.grow_or_lru(None));
+        }
+        // One pass: find the continuation slot AND the best radix donor (max shared prefix).
+        let mut cont: Option<(usize, usize)> = None; // (idx, prompt_len) — deepest continued prompt
+        let mut donor: Option<(usize, usize)> = None; // (idx, shared_prefix) — best KV to copy
+        for (i, s) in self.slots.iter().enumerate() {
+            if s.cached.is_empty() {
+                continue;
+            }
+            let cp = common_prefix_len(&s.cached, ids);
+            // CONTINUATION = the request shares this slot's WHOLE prompt (not just the system prefix),
+            // so it's a follow-up turn. Using prompt_len (not cached.len) is robust to reply
+            // re-tokenization drift AND doesn't misfire when a *different* conversation reuses the same
+            // system prompt but a shorter user message.
+            if cp >= s.prompt_len && s.prompt_len > 0 && cont.is_none_or(|(_, l)| s.prompt_len > l)
+            {
+                cont = Some((i, s.prompt_len));
+            }
+            let dp = cp.min(ids.len().saturating_sub(1)); // always leave ≥1 token to prefill
+            if s.kv.is_some() && donor.is_none_or(|(_, p)| dp > p) {
+                donor = Some((i, dp));
+            }
+        }
+        if let Some((i, _)) = cont {
+            return Ok(i);
+        }
+        // New conversation: pick a free/LRU slot (not the donor), then seed it from the donor's prefix.
+        let target = self.grow_or_lru(donor.map(|(i, _)| i));
+        if let Some((di, p)) = donor {
+            if p >= MIN_SEED && di != target && std::env::var("INFR_NO_RADIX").is_err() {
+                if self.slots[target].kv.is_none() {
+                    let max_ctx = self.max_ctx(llama);
+                    self.slots[target].kv = Some(llama.new_kv(max_ctx)?);
+                }
+                // Copy donor.kv[0..p] → target.kv and adopt the matching prefix as target's cache;
+                // the ensuing generate then prefills only ids[p..]. (Sequential borrows: di != target.)
+                let donor_kv = self.slots[di].kv.take().expect("donor has a KV");
+                let prefix = self.slots[di].cached[..p].to_vec();
+                llama.kv_copy_prefix(self.slots[target].kv.as_mut().unwrap(), &donor_kv, p)?;
+                self.slots[di].kv = Some(donor_kv);
+                self.slots[target].cached = prefix;
+            }
+        }
+        Ok(target)
+    }
+
+    /// A free slot (grow up to `max_slots`) or the LRU one (evicted: clear its cache, keep its KV
+    /// alloc → no VRAM churn). `exclude` is kept out of eviction (the radix donor we're copying from).
+    fn grow_or_lru(&mut self, exclude: Option<usize>) -> usize {
+        if self.slots.len() < self.max_slots {
+            self.slots.push(CacheSlot {
+                kv: None,
+                cached: Vec::new(),
+                prompt_len: 0,
+                lru: self.tick,
+            });
+            return self.slots.len() - 1;
+        }
+        let lru = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| Some(*i) != exclude)
+            .min_by_key(|(_, s)| s.lru)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        self.slots[lru].cached.clear();
+        lru
+    }
+
+    fn max_ctx(&self, llama: &Llama) -> usize {
+        std::env::var("INFR_MAX_CTX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(llama.cfg.n_ctx_train)
+    }
 }
 
 // ---- host ops ----

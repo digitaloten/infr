@@ -82,6 +82,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::Scale { .. } => "Scale",
         Op::Softcap { .. } => "Softcap",
         Op::Copy { .. } => "Copy",
+        Op::CopyStrided { .. } => "CopyStrided",
         Op::MoeFfn { .. } => "MoeFfn",
         Op::Conv1dSilu { .. } => "Conv1dSilu",
         Op::DeltaNet { .. } => "DeltaNet",
@@ -971,32 +972,36 @@ impl MetalBackend {
                 weight,
                 state,
                 dst,
+                rows,
                 channels,
                 kernel,
             } => {
-                let (cc, kk) = (channels as usize, kernel as usize);
+                let (rr, cc, kk) = (rows as usize, channels as usize, kernel as usize);
                 self.ensure_host(r, g, x);
                 self.ensure_host(r, g, state);
-                let xs = r.vals[x.0 as usize].clone();
+                let xs = r.vals[x.0 as usize].clone(); // [rows, channels]
                 let ws = self.weight_host(weight, g, bindings); // [channels, kernel]
                 let st = &mut r.vals[state.0 as usize]; // [(kernel-1), channels], oldest first
-                let mut out = vec![0f32; cc];
-                for ch in 0..cc {
-                    let mut acc = 0f32;
-                    for j in 0..kk - 1 {
-                        acc += st[j * cc + ch] * ws[ch * kk + j];
-                    }
-                    acc += xs[ch] * ws[ch * kk + (kk - 1)];
-                    out[ch] = acc / (1.0 + (-acc).exp()); // silu
-                }
-                for j in 0..kk.saturating_sub(2) {
+                let mut out = vec![0f32; rr * cc];
+                for t in 0..rr {
+                    let xt = &xs[t * cc..t * cc + cc];
                     for ch in 0..cc {
-                        st[j * cc + ch] = st[(j + 1) * cc + ch];
+                        let mut acc = 0f32;
+                        for j in 0..kk - 1 {
+                            acc += st[j * cc + ch] * ws[ch * kk + j];
+                        }
+                        acc += xt[ch] * ws[ch * kk + (kk - 1)];
+                        out[t * cc + ch] = acc / (1.0 + (-acc).exp()); // silu
                     }
-                }
-                if kk >= 2 {
-                    for ch in 0..cc {
-                        st[(kk - 2) * cc + ch] = xs[ch];
+                    for j in 0..kk.saturating_sub(2) {
+                        for ch in 0..cc {
+                            st[j * cc + ch] = st[(j + 1) * cc + ch];
+                        }
+                    }
+                    if kk >= 2 {
+                        for ch in 0..cc {
+                            st[(kk - 2) * cc + ch] = xt[ch];
+                        }
                     }
                 }
                 r.vals[dst.0 as usize] = out;
@@ -1012,13 +1017,15 @@ impl MetalBackend {
                 dt_bias,
                 state,
                 dst,
+                rows,
                 n_vhead,
                 n_khead,
                 head_k,
                 head_v,
                 eps,
             } => {
-                let (nv, nk, kd, vd) = (
+                let (rr, nv, nk, kd, vd) = (
+                    rows as usize,
                     n_vhead as usize,
                     n_khead as usize,
                     head_k as usize,
@@ -1027,64 +1034,68 @@ impl MetalBackend {
                 for id in [q, k, v, b, a, state] {
                     self.ensure_host(r, g, id);
                 }
-                let qf = r.vals[q.0 as usize].clone();
+                let qf = r.vals[q.0 as usize].clone(); // [rows, nk*kd]
                 let kf = r.vals[k.0 as usize].clone();
-                let vf = r.vals[v.0 as usize].clone();
-                let bf = r.vals[b.0 as usize].clone();
+                let vf = r.vals[v.0 as usize].clone(); // [rows, nv*vd]
+                let bf = r.vals[b.0 as usize].clone(); // [rows, nv]
                 let af = r.vals[a.0 as usize].clone();
                 let acoef = self.weight_host(a_coef, g, bindings);
                 let dtb = self.weight_host(dt_bias, g, bindings);
                 let st = &mut r.vals[state.0 as usize]; // [nv, kd, vd]
-                let mut out = vec![0f32; nv * vd];
+                let mut out = vec![0f32; rr * nv * vd];
                 let qscale = 1.0 / (kd as f32).sqrt();
                 let l2 = |slice: &[f32]| -> f32 {
                     (slice.iter().map(|x| x * x).sum::<f32>() + eps).sqrt()
                 };
-                for h in 0..nv {
-                    let kh_idx = h % nk; // GQA: q/k heads tiled to nv value heads
-                    let mut qh = qf[kh_idx * kd..kh_idx * kd + kd].to_vec();
-                    let mut kh = kf[kh_idx * kd..kh_idx * kd + kd].to_vec();
-                    let vh = &vf[h * vd..h * vd + vd];
-                    let qn = l2(&qh);
-                    let kn = l2(&kh);
-                    for x in qh.iter_mut() {
-                        *x = *x / qn * qscale;
-                    }
-                    for x in kh.iter_mut() {
-                        *x /= kn;
-                    }
-                    let beta = 1.0 / (1.0 + (-bf[h]).exp());
-                    let sp = {
-                        let z = af[h] + dtb[h];
-                        z.max(0.0) + (-z.abs()).exp().ln_1p()
-                    };
-                    let decay = (acoef[h] * sp).exp();
-                    let sh = &mut st[h * kd * vd..(h + 1) * kd * vd]; // [kd, vd]
-                    for x in sh.iter_mut() {
-                        *x *= decay;
-                    }
-                    let mut kv = vec![0f32; vd];
-                    for kk in 0..kd {
-                        let kkv = kh[kk];
-                        let row = &sh[kk * vd..kk * vd + vd];
-                        for d in 0..vd {
-                            kv[d] += kkv * row[d];
+                // Sequential scan over rows, carrying the per-head state S across tokens.
+                for t in 0..rr {
+                    let (qb, vb, bb) = (t * nk * kd, t * nv * vd, t * nv);
+                    for h in 0..nv {
+                        let kh_idx = h % nk; // GQA: q/k heads tiled to nv value heads
+                        let mut qh = qf[qb + kh_idx * kd..qb + kh_idx * kd + kd].to_vec();
+                        let mut kh = kf[qb + kh_idx * kd..qb + kh_idx * kd + kd].to_vec();
+                        let vh = &vf[vb + h * vd..vb + h * vd + vd];
+                        let qn = l2(&qh);
+                        let kn = l2(&kh);
+                        for x in qh.iter_mut() {
+                            *x = *x / qn * qscale;
                         }
-                    }
-                    let delta: Vec<f32> = (0..vd).map(|d| (vh[d] - kv[d]) * beta).collect();
-                    for kk in 0..kd {
-                        let kkv = kh[kk];
-                        let row = &mut sh[kk * vd..kk * vd + vd];
-                        for d in 0..vd {
-                            row[d] += kkv * delta[d];
+                        for x in kh.iter_mut() {
+                            *x /= kn;
                         }
-                    }
-                    let oh = &mut out[h * vd..h * vd + vd];
-                    for kk in 0..kd {
-                        let qv = qh[kk];
-                        let row = &sh[kk * vd..kk * vd + vd];
-                        for d in 0..vd {
-                            oh[d] += qv * row[d];
+                        let beta = 1.0 / (1.0 + (-bf[bb + h]).exp());
+                        let sp = {
+                            let z = af[bb + h] + dtb[h];
+                            z.max(0.0) + (-z.abs()).exp().ln_1p()
+                        };
+                        let decay = (acoef[h] * sp).exp();
+                        let sh = &mut st[h * kd * vd..(h + 1) * kd * vd]; // [kd, vd]
+                        for x in sh.iter_mut() {
+                            *x *= decay;
+                        }
+                        let mut kv = vec![0f32; vd];
+                        for kk in 0..kd {
+                            let kkv = kh[kk];
+                            let row = &sh[kk * vd..kk * vd + vd];
+                            for d in 0..vd {
+                                kv[d] += kkv * row[d];
+                            }
+                        }
+                        let delta: Vec<f32> = (0..vd).map(|d| (vh[d] - kv[d]) * beta).collect();
+                        for kk in 0..kd {
+                            let kkv = kh[kk];
+                            let row = &mut sh[kk * vd..kk * vd + vd];
+                            for d in 0..vd {
+                                row[d] += kkv * delta[d];
+                            }
+                        }
+                        let oh = &mut out[vb + h * vd..vb + h * vd + vd];
+                        for kk in 0..kd {
+                            let qv = qh[kk];
+                            let row = &sh[kk * vd..kk * vd + vd];
+                            for d in 0..vd {
+                                oh[d] += qv * row[d];
+                            }
                         }
                     }
                 }
@@ -1104,6 +1115,33 @@ impl MetalBackend {
                 self.ensure_host(r, g, dst);
                 let s = r.vals[src.0 as usize].clone();
                 r.vals[dst.0 as usize][dof..dof + n].copy_from_slice(&s[so..so + n]);
+                r.loc[dst.0 as usize] = Loc::Host;
+            }
+            Op::CopyStrided {
+                src,
+                src_off,
+                src_stride,
+                dst,
+                dst_off,
+                dst_stride,
+                rows,
+                n,
+            } => {
+                let (so, ss, dof, ds, n) = (
+                    src_off as usize,
+                    src_stride as usize,
+                    dst_off as usize,
+                    dst_stride as usize,
+                    n as usize,
+                );
+                self.ensure_host(r, g, src);
+                self.ensure_host(r, g, dst);
+                let s = r.vals[src.0 as usize].clone();
+                let d = &mut r.vals[dst.0 as usize];
+                for rr in 0..rows as usize {
+                    d[dof + rr * ds..dof + rr * ds + n]
+                        .copy_from_slice(&s[so + rr * ss..so + rr * ss + n]);
+                }
                 r.loc[dst.0 as usize] = Loc::Host;
             }
         }

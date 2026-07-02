@@ -204,16 +204,51 @@ impl ChatModel for MoeChat<'_> {
     }
 }
 
-/// qwen35 / Qwen3-Next GPU: the bespoke per-token hybrid forward. Stateless full-prefill each turn.
-/// FOLLOW-UP: `qwen35::generate_chat` reloads the GGUF + rebuilds the model per turn (pre-existing
-/// wart); a load-once persistent qwen35 model behind this trait would drop that reload.
+/// Which compute backend a [`Qwen35Chat`] loads its [`crate::qwen35::SeamModel`] on. All variants
+/// run the SAME agnostic seam graph — only the executor differs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SeamBackend {
+    /// Production GPU path (native-dtype weights in VRAM, in-kernel dequant).
+    Vulkan,
+    /// Reference CPU interpreter (`INFR_CPU=1`, zero-copy mmap weights).
+    Cpu,
+    /// Reference Apple-GPU backend (`INFR_METAL=1`, macOS only).
+    Metal,
+}
+
+/// qwen35 / Qwen3-Next on the agnostic batched/chunked seam ([`crate::qwen35::SeamModel`]), loaded
+/// ONCE on the first turn and reused after (weights stay resident across turns). One struct serves
+/// every backend — Vulkan (production), CPU and Metal (reference) — and it is the same engine
+/// `infr bench` times, so run and bench cannot drift apart. `INFR_Q35_BESPOKE=1` (Vulkan only)
+/// falls back to the per-token reference forward.
 pub struct Qwen35Chat {
     path: std::path::PathBuf,
+    backend: SeamBackend,
+    seam: Option<crate::qwen35::SeamModel>,
 }
 
 impl Qwen35Chat {
+    /// Production Vulkan seam.
     pub fn new(path: std::path::PathBuf) -> Self {
-        Self { path }
+        Self::with_backend(path, SeamBackend::Vulkan)
+    }
+
+    /// Reference CPU seam (`INFR_CPU=1`).
+    pub fn new_cpu(path: std::path::PathBuf) -> Self {
+        Self::with_backend(path, SeamBackend::Cpu)
+    }
+
+    /// Reference Metal seam (`INFR_METAL=1`).
+    pub fn new_metal(path: std::path::PathBuf) -> Self {
+        Self::with_backend(path, SeamBackend::Metal)
+    }
+
+    pub fn with_backend(path: std::path::PathBuf, backend: SeamBackend) -> Self {
+        Self {
+            path,
+            backend,
+            seam: None,
+        }
     }
 }
 
@@ -228,16 +263,39 @@ impl ChatModel for Qwen35Chat {
         max_new: usize,
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
-        let mut n_prompt = 0usize;
-        timed(on_piece, 0, |cb| {
-            let (np, _ng) = crate::qwen35::generate_chat(&self.path, prompt, max_new, cb)?;
-            n_prompt = np;
-            Ok(())
-        })
-        .map(|mut s| {
-            s.n_prompt = n_prompt;
-            s
-        })
+        // Bespoke per-token reference path (per-call load; Vulkan escape hatch only).
+        if self.backend == SeamBackend::Vulkan && std::env::var("INFR_Q35_BESPOKE").is_ok() {
+            let mut n_prompt = 0usize;
+            return timed(on_piece, 0, |cb| {
+                let (np, _ng) = crate::qwen35::generate_chat(&self.path, prompt, max_new, cb)?;
+                n_prompt = np;
+                Ok(())
+            })
+            .map(|mut s| {
+                s.n_prompt = n_prompt;
+                s
+            });
+        }
+        if self.seam.is_none() {
+            self.seam = Some(match self.backend {
+                SeamBackend::Vulkan => crate::qwen35::SeamModel::load_vulkan(&self.path)?,
+                SeamBackend::Cpu => crate::qwen35::SeamModel::load_cpu(&self.path)?,
+                SeamBackend::Metal => {
+                    #[cfg(target_os = "macos")]
+                    {
+                        crate::qwen35::SeamModel::load_metal(&self.path)?
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    return Err(anyhow::anyhow!(
+                        "the Metal backend is only available on macOS"
+                    ));
+                }
+            });
+        }
+        self.seam
+            .as_ref()
+            .unwrap()
+            .generate(prompt, max_new, |p| on_piece(p))
     }
 }
 
@@ -284,48 +342,6 @@ impl ChatModel for CpuDenseChat {
             ));
         }
         self.model.generate_cpu(prompt, max_new, |p| on_piece(p))
-    }
-}
-
-/// CPU reference backend (`INFR_CPU=1`) for qwen35 / Qwen3-Next (the bespoke per-token oracle).
-/// Same follow-up as [`Qwen35Chat`]: `qwen35::generate_cpu` reloads the GGUF per turn.
-pub struct CpuQwen35Chat {
-    path: std::path::PathBuf,
-    /// Run the qwen35 decode on the reference Metal backend instead of the CPU interpreter.
-    metal: bool,
-}
-
-impl CpuQwen35Chat {
-    pub fn new(path: std::path::PathBuf) -> Self {
-        Self { path, metal: false }
-    }
-
-    /// Same qwen35 decode, driven through the reference Metal backend (`INFR_METAL`).
-    pub fn new_metal(path: std::path::PathBuf) -> Self {
-        Self { path, metal: true }
-    }
-}
-
-impl ChatModel for CpuQwen35Chat {
-    fn render(&self, messages: &[(&str, &str)]) -> Result<String> {
-        crate::qwen35::render_chat_messages(&self.path, messages)
-    }
-
-    fn generate(
-        &mut self,
-        prompt: &str,
-        max_new: usize,
-        on_piece: &mut dyn FnMut(&str),
-    ) -> Result<GenStats> {
-        if self.metal {
-            #[cfg(target_os = "macos")]
-            return crate::qwen35::generate_metal(&self.path, prompt, max_new, |p| on_piece(p));
-            #[cfg(not(target_os = "macos"))]
-            return Err(anyhow::anyhow!(
-                "the Metal backend is only available on macOS"
-            ));
-        }
-        crate::qwen35::generate_cpu(&self.path, prompt, max_new, |p| on_piece(p))
     }
 }
 

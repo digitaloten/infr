@@ -115,7 +115,21 @@ pub trait Backend: Send + Sync {
     fn capabilities(&self) -> Capabilities;
 
     // ---- memory ----
+    /// Allocate a buffer of `bytes`, **guaranteed zero-initialized** (calloc semantics). This is the
+    /// safe default: code that reads a buffer before fully writing it (accumulators, recurrent state,
+    /// KV caches, padding rows) behaves identically on every backend. GPU backends return recycled,
+    /// uninitialized VRAM otherwise, so relying on implicit zeroing is a silent CPU-works/GPU-garbage
+    /// trap — always `alloc` unless you can prove every element is written before it's read.
     fn alloc(&self, bytes: usize, usage: BufferUsage) -> Result<Box<dyn Buffer>>;
+    /// Allocate WITHOUT zero-initialization — an explicit opt-out for hot buffers whose full extent is
+    /// provably written before any read (e.g. weights, which are immediately uploaded). Faster (skips
+    /// the zero-fill) but UNSAFE if misused. In debug builds the returned memory is POISONED (filled
+    /// with a non-zero pattern) so a read-before-write surfaces loudly in tests instead of silently
+    /// working on CPU. The default forwards to [`alloc`](Self::alloc) (safe); backends override for
+    /// the perf win.
+    fn alloc_uninit(&self, bytes: usize, usage: BufferUsage) -> Result<Box<dyn Buffer>> {
+        self.alloc(bytes, usage)
+    }
     fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()>;
     fn download(&self, src: &dyn Buffer, dst: &mut [u8]) -> Result<()>;
 

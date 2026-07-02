@@ -693,6 +693,47 @@ impl VulkanBackend {
         })
     }
 
+    /// Fill a buffer with the repeated byte `byte` (0x00 = zero-init, 0xFF = poison). Host-visible
+    /// buffers are memset through the mapped pointer (no submit); device-local buffers use
+    /// `vkCmdFillBuffer` via a one-shot submit. Each `VkBuffer` owns a distinct `vk::Buffer` handle
+    /// addressing its region from offset 0 (arena buffers included), so filling `[0, size)` is correct.
+    fn fill_buf(&self, buf: &VkBuffer, byte: u8) -> Result<()> {
+        if let Some(ptr) = buf.mapped_ptr() {
+            unsafe { std::ptr::write_bytes(ptr, byte, buf.size) };
+        } else {
+            let word = u32::from_ne_bytes([byte; 4]);
+            let size = (buf.size / 4 * 4) as u64; // vkCmdFillBuffer requires a 4-byte multiple
+            if size > 0 {
+                let vkbuf = buf.buffer;
+                let shared = Arc::clone(&self.shared);
+                self.one_shot(move |cmd| unsafe {
+                    shared.device.cmd_fill_buffer(cmd, vkbuf, 0, size, word);
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The shared body of `alloc`/`alloc_uninit`: pick the memory location + tick the weight-load
+    /// progress bar. Zero/poison filling is applied by the callers.
+    fn make_alloc(&self, bytes: usize, usage: BufferUsage) -> Result<VkBuffer> {
+        let (location, label) = match usage {
+            BufferUsage::Weights => (MemoryLocation::GpuOnly, "weights"),
+            BufferUsage::Activations => (MemoryLocation::GpuOnly, "activations"),
+            BufferUsage::Staging => (MemoryLocation::CpuToGpu, "staging"),
+            BufferUsage::Readback => (MemoryLocation::GpuToCpu, "readback"),
+        };
+        let buf = self.make_buf(bytes, location, label)?;
+        // Advance the weight-load progress bar (if active) — the single funnel every weight upload
+        // passes through, so no loader can forget to account for a tensor.
+        if matches!(usage, BufferUsage::Weights) {
+            if let Some(pb) = self.shared.weight_pb.lock().unwrap().as_ref() {
+                pb.inc(bytes as u64);
+            }
+        }
+        Ok(buf)
+    }
+
     /// Record a single command into a one-shot command buffer, submit it to the
     /// compute queue, and block until idle.
     ///
@@ -751,20 +792,23 @@ impl Backend for VulkanBackend {
     }
 
     fn alloc(&self, bytes: usize, usage: BufferUsage) -> Result<Box<dyn Buffer>> {
-        let (location, label) = match usage {
-            BufferUsage::Weights => (MemoryLocation::GpuOnly, "weights"),
-            BufferUsage::Activations => (MemoryLocation::GpuOnly, "activations"),
-            BufferUsage::Staging => (MemoryLocation::CpuToGpu, "staging"),
-            BufferUsage::Readback => (MemoryLocation::GpuToCpu, "readback"),
-        };
-        let buf = self.make_buf(bytes, location, label)?;
-        // Advance the weight-load progress bar (if one is active). Ticking here — the single funnel
-        // every weight upload passes through — means no model loader can forget to account for a
-        // tensor. Activation/staging/readback allocs don't count toward the load.
-        if matches!(usage, BufferUsage::Weights) {
-            if let Some(pb) = self.shared.weight_pb.lock().unwrap().as_ref() {
-                pb.inc(bytes as u64);
-            }
+        // calloc contract: zero-init so recycled/uninitialized VRAM can't leak into a read-before-write.
+        let buf = self.make_alloc(bytes, usage)?;
+        self.fill_buf(&buf, 0x00)?;
+        Ok(Box::new(buf))
+    }
+
+    fn alloc_uninit(&self, bytes: usize, usage: BufferUsage) -> Result<Box<dyn Buffer>> {
+        // Opt-out: skip the zero-fill (caller guarantees the full extent is written before any read).
+        // Debug builds poison with 0xFF (= NaN as f32) so a misuse surfaces loudly in tests;
+        // INFR_POISON_UNINIT=1 forces the poison in release too — for hunting layout-sensitive
+        // read-before-write bugs whose output shifts with unrelated code changes.
+        let buf = self.make_alloc(bytes, usage)?;
+        #[cfg(debug_assertions)]
+        self.fill_buf(&buf, 0xFF)?;
+        #[cfg(not(debug_assertions))]
+        if std::env::var("INFR_POISON_UNINIT").is_ok() {
+            self.fill_buf(&buf, 0xFF)?;
         }
         Ok(Box::new(buf))
     }
@@ -1143,6 +1187,7 @@ mod ssm_tests {
             dtb.as_ref(),
             sbuf.as_ref(),
             ob.as_ref(),
+            1, // rows: single-token bespoke path
             nv,
             nk,
             kd,
@@ -1205,6 +1250,7 @@ mod ssm_tests {
             wb.as_ref(),
             sbuf.as_ref(),
             ob.as_ref(),
+            1, // rows: single-token bespoke path
             cc,
             kconv,
         );

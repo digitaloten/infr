@@ -426,15 +426,35 @@ impl<'a> Recorder<'a> {
         n: usize,
     ) {
         self.stamp("matmul_proj");
-        let name = crate::linear::native_gemm_kernel_name(dtype);
-        let spv = crate::gemm::native_gemm_build_spv(dtype).expect("native GEMM spv");
+        // Large-warptile variant (8-warp BM=64×BN=256): 4× the math per staged A-row / decoded
+        // W-column vs the 64×64 tile, and the extra warps hide the dequant latency. Needs n%256,
+        // k%32; only the hot formats are compiled — everything else stays on the 64×64 kernel.
+        // INFR_NO_GEMM_WARP forces the 64×64 tile (A/B).
+        let warp = if n.is_multiple_of(256)
+            && k.is_multiple_of(32)
+            && std::env::var("INFR_NO_GEMM_WARP").is_err()
+        {
+            crate::gemm::native_gemm_warp_build_spv(dtype)
+        } else {
+            None
+        };
+        let (name, spv) = match (warp, dtype) {
+            (Some(spv), infr_core::DType::Q4K) => ("native_gemm_warp_q4k", spv),
+            (Some(spv), infr_core::DType::Q6K) => ("native_gemm_warp_q6k", spv),
+            (Some(spv), infr_core::DType::Q8_0) => ("native_gemm_warp_q8_0", spv),
+            _ => (
+                crate::linear::native_gemm_kernel_name(dtype),
+                crate::gemm::native_gemm_build_spv(dtype).expect("native GEMM spv"),
+            ),
+        };
         let kern = self.be.kernel_sg(name, spv, 3, 16, 32);
+        let groups_n = if warp.is_some() { n / 256 } else { n / 64 };
         let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
-        let groups = (m.div_ceil(64) * (n / 64)) as u32;
+        let groups = (m.div_ceil(64) * groups_n) as u32;
         self.dispatch(
             kern,
             &[Self::vkb(a), Self::vkb(w), Self::vkb(c)],
@@ -1962,6 +1982,7 @@ impl<'a> Recorder<'a> {
 
     /// Fused SwiGLU over a combined `gu` `[rows, 2*nff]` → `y` `[rows, nff]`.
     pub fn silu_mul_fused(&self, gu: &dyn Buffer, y: &dyn Buffer, rows: usize, nff: usize) {
+        self.stamp("silu_mul");
         let k = self
             .be
             .kernel("silu_mul_fused", crate::gemm::silu_mul_fused_spv(), 2, 8);
@@ -1980,6 +2001,7 @@ impl<'a> Recorder<'a> {
     /// Fused GeGLU (GELU tanh-approx gate) over a combined `gu` `[rows, 2*nff]` → `y` `[rows, nff]`.
     /// Same layout/dispatch as [`silu_mul_fused`]; gemma uses GELU instead of SiLU.
     pub fn gelu_mul_fused(&self, gu: &dyn Buffer, y: &dyn Buffer, rows: usize, nff: usize) {
+        self.stamp("gelu_mul");
         let k = self
             .be
             .kernel("gelu_mul_fused", crate::gemm::gelu_mul_fused_spv(), 2, 8);
@@ -1996,6 +2018,7 @@ impl<'a> Recorder<'a> {
     }
 
     pub fn silu_mul(&self, gate: &dyn Buffer, up: &dyn Buffer, y: &dyn Buffer, n: usize) {
+        self.stamp("silu_mul");
         let k = self
             .be
             .kernel("silu_mul", crate::gemm::silu_mul_spv(), 3, 8);
@@ -2025,22 +2048,34 @@ impl<'a> Recorder<'a> {
         dtbias: &dyn Buffer,
         state: &dyn Buffer,
         out: &dyn Buffer,
+        rows: usize,
         nv: usize,
         nk: usize,
         kd: usize,
         vd: usize,
         eps: f32,
     ) {
+        self.stamp("deltanet");
+        // The shader caches each column block's state [kd, 32] in shared memory (`ss[128*32]`), so kd
+        // must be ≤ 128. Qwen3-Next uses kd=128; assert so a larger head_k_dim fails loudly instead of
+        // corrupting LDS.
+        debug_assert!(
+            kd <= 128,
+            "deltanet shared-state block assumes kd ≤ 128, got {kd}"
+        );
         let kern = self
             .be
-            .kernel("deltanet", crate::gemm::deltanet_spv(), 9, 24);
-        let mut push = [0u8; 24];
-        push[0..4].copy_from_slice(&(nv as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(nk as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(kd as u32).to_ne_bytes());
-        push[12..16].copy_from_slice(&(vd as u32).to_ne_bytes());
-        push[16..20].copy_from_slice(&eps.to_ne_bytes());
-        push[20..24].copy_from_slice(&(1.0f32 / (kd as f32).sqrt()).to_ne_bytes());
+            .kernel("deltanet", crate::gemm::deltanet_spv(), 9, 28);
+        let mut push = [0u8; 28];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(nv as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(nk as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(kd as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(vd as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&eps.to_ne_bytes());
+        push[24..28].copy_from_slice(&(1.0f32 / (kd as f32).sqrt()).to_ne_bytes());
+        // One workgroup per (value head, block of 32 state columns); local_size_x=32.
+        let n_blk = vd.div_ceil(32);
         self.dispatch(
             kern,
             &[
@@ -2056,7 +2091,185 @@ impl<'a> Recorder<'a> {
             ],
             2, // state (in/out) + out
             &push,
-            nv as u32,
+            (nv * n_blk) as u32,
+        );
+    }
+
+    /// CHUNKED gated-DeltaNet prefill (chunkwise delta rule, C=32): per 32-token chunk the
+    /// recurrence collapses to dense matmuls + one unit-lower-triangular solve, so the state is
+    /// traversed rows/32 times instead of `rows`. Same signature/bindings as `deltanet`; math
+    /// validated against the sequential form in tests/chunked_delta_math.rs. Use for rows ≥ 32
+    /// (decode keeps the sequential kernel). See shaders/deltanet_chunked.comp.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_chunked(
+        &self,
+        q: &dyn Buffer,
+        k: &dyn Buffer,
+        v: &dyn Buffer,
+        blog: &dyn Buffer,
+        alpha: &dyn Buffer,
+        acoef: &dyn Buffer,
+        dtbias: &dyn Buffer,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        rows: usize,
+        nv: usize,
+        nk: usize,
+        kd: usize,
+        vd: usize,
+        eps: f32,
+    ) {
+        self.stamp("deltanet");
+        debug_assert!(
+            kd <= 128,
+            "deltanet_chunked LDS chunk tiles assume kd ≤ 128, got {kd}"
+        );
+        let kern = self.be.kernel(
+            "deltanet_chunked",
+            crate::gemm::deltanet_chunked_spv(),
+            9,
+            28,
+        );
+        let mut push = [0u8; 28];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(nv as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(nk as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(kd as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(vd as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&eps.to_ne_bytes());
+        push[24..28].copy_from_slice(&(1.0f32 / (kd as f32).sqrt()).to_ne_bytes());
+        // One workgroup per (value head, block of 32 state columns); local_size_x=256.
+        // (COLS=16 was tried for occupancy and REGRESSED 2670→3668µs — the per-block duplicated
+        // A/Wq dots dominate; that's what the split prep+scan variant hoists out.)
+        let n_blk = vd.div_ceil(32);
+        self.dispatch(
+            kern,
+            &[
+                Self::vkb(q),
+                Self::vkb(k),
+                Self::vkb(v),
+                Self::vkb(blog),
+                Self::vkb(alpha),
+                Self::vkb(acoef),
+                Self::vkb(dtbias),
+                Self::vkb(state),
+                Self::vkb(out),
+            ],
+            2, // state (in/out) + out
+            &push,
+            (nv * n_blk) as u32,
+        );
+    }
+
+    /// Chunked gated-DeltaNet prefill, SPLIT variant (prep + gates + scan): the chunk-parallel
+    /// work (q/k normalization, intra-chunk D=K̂K̂ᵀ / Dq=Q̂K̂ᵀ dot matrices, gates) is hoisted into
+    /// two fully-parallel passes, so the sequential scan pass does ONLY state-coupled work — which
+    /// parallelizes cleanly over small column blocks (COLS=16 → nv·(vd/16) workgroups). The
+    /// monolithic `deltanet_chunked` duplicated that shared work per column block (~37% of it).
+    /// Scratch (caller-alloc'd, alloc_uninit-safe — every read slot is written by prep/gates):
+    /// kn/qn [rows·nk·kd] f32, dk/dq [nchunk·nk·C·C] f32, betag/gg [nchunk·nv·C] f32, C=32.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_chunked_split(
+        &self,
+        q: &dyn Buffer,
+        k: &dyn Buffer,
+        v: &dyn Buffer,
+        blog: &dyn Buffer,
+        alpha: &dyn Buffer,
+        acoef: &dyn Buffer,
+        dtbias: &dyn Buffer,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        kn: &dyn Buffer,
+        qn: &dyn Buffer,
+        dk: &dyn Buffer,
+        dq: &dyn Buffer,
+        betag: &dyn Buffer,
+        gg: &dyn Buffer,
+        rows: usize,
+        nv: usize,
+        nk: usize,
+        kd: usize,
+        vd: usize,
+        eps: f32,
+    ) {
+        debug_assert!(kd <= 128, "deltanet split assumes kd ≤ 128, got {kd}");
+        let nchunk = rows.div_ceil(32);
+        self.stamp("deltanet");
+        // pass 1: prep — (chunk, k-head) grid
+        let kp = self
+            .be
+            .kernel("deltanet_prep", crate::gemm::deltanet_prep_spv(), 6, 20);
+        let mut p1 = [0u8; 20];
+        p1[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        p1[4..8].copy_from_slice(&(nk as u32).to_ne_bytes());
+        p1[8..12].copy_from_slice(&(kd as u32).to_ne_bytes());
+        p1[12..16].copy_from_slice(&eps.to_ne_bytes());
+        p1[16..20].copy_from_slice(&(1.0f32 / (kd as f32).sqrt()).to_ne_bytes());
+        self.dispatch(
+            kp,
+            &[
+                Self::vkb(q),
+                Self::vkb(k),
+                Self::vkb(kn),
+                Self::vkb(qn),
+                Self::vkb(dk),
+                Self::vkb(dq),
+            ],
+            4, // kn, qn, dk, dq
+            &p1,
+            (nchunk * nk) as u32,
+        );
+        // pass 2: gates — (chunk, value-head) grid
+        self.stamp("deltanet");
+        let kg = self
+            .be
+            .kernel("deltanet_gates", crate::gemm::deltanet_gates_spv(), 6, 8);
+        let mut p2 = [0u8; 8];
+        p2[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        p2[4..8].copy_from_slice(&(nv as u32).to_ne_bytes());
+        self.dispatch(
+            kg,
+            &[
+                Self::vkb(blog),
+                Self::vkb(alpha),
+                Self::vkb(acoef),
+                Self::vkb(dtbias),
+                Self::vkb(betag),
+                Self::vkb(gg),
+            ],
+            2, // betag, gg
+            &p2,
+            (nchunk * nv) as u32,
+        );
+        // pass 3: scan — (value head, column block) grid, sequential over chunks inside
+        self.stamp("deltanet");
+        let ks = self
+            .be
+            .kernel_sg("deltanet_scan", crate::gemm::deltanet_scan_spv(), 9, 20, 32);
+        let mut p3 = [0u8; 20];
+        p3[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        p3[4..8].copy_from_slice(&(nv as u32).to_ne_bytes());
+        p3[8..12].copy_from_slice(&(nk as u32).to_ne_bytes());
+        p3[12..16].copy_from_slice(&(kd as u32).to_ne_bytes());
+        p3[16..20].copy_from_slice(&(vd as u32).to_ne_bytes());
+        let n_blk = vd.div_ceil(8); // COLS=8, keep in sync with deltanet_scan.comp
+        self.dispatch(
+            ks,
+            &[
+                Self::vkb(v),
+                Self::vkb(kn),
+                Self::vkb(qn),
+                Self::vkb(dk),
+                Self::vkb(dq),
+                Self::vkb(betag),
+                Self::vkb(gg),
+                Self::vkb(state),
+                Self::vkb(out),
+            ],
+            2, // state (in/out) + out
+            &p3,
+            (nv * n_blk) as u32,
         );
     }
 
@@ -2068,15 +2281,18 @@ impl<'a> Recorder<'a> {
         w: &dyn Buffer,
         state: &dyn Buffer,
         out: &dyn Buffer,
+        rows: usize,
         cc: usize,
         kconv: usize,
     ) {
+        self.stamp("conv1d_silu");
         let kern = self
             .be
-            .kernel("conv1d_silu", crate::gemm::conv1d_silu_spv(), 4, 8);
-        let mut push = [0u8; 8];
-        push[0..4].copy_from_slice(&(cc as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(kconv as u32).to_ne_bytes());
+            .kernel("conv1d_silu", crate::gemm::conv1d_silu_spv(), 4, 12);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(cc as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(kconv as u32).to_ne_bytes());
         self.dispatch(
             kern,
             &[
@@ -2091,8 +2307,94 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// BATCH depthwise conv1d + SiLU (rows ≥ kconv-1): pass 1 computes ALL rows·cc outputs in
+    /// parallel from the virtual sequence [state ‖ qkv] (the sequential kernel walked the rows
+    /// one by one, shuffling the history each token); pass 2 rebuilds the history from the last
+    /// kconv-1 input rows. The recorder's hazard tracking orders pass 2 after pass 1 (pass 1
+    /// reads the old state pass 2 overwrites). See shaders/conv1d_silu_par.comp / conv1d_shift.comp.
+    pub fn conv1d_silu_batch(
+        &self,
+        qkv: &dyn Buffer,
+        w: &dyn Buffer,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        rows: usize,
+        cc: usize,
+        kconv: usize,
+    ) {
+        debug_assert!(rows >= kconv - 1, "conv1d_silu_batch needs rows ≥ kconv-1");
+        self.stamp("conv1d_silu");
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(cc as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(kconv as u32).to_ne_bytes());
+        let k1 = self
+            .be
+            .kernel("conv1d_silu_par", crate::gemm::conv1d_silu_par_spv(), 4, 12);
+        self.dispatch(
+            k1,
+            &[
+                Self::vkb(qkv),
+                Self::vkb(w),
+                Self::vkb(state),
+                Self::vkb(out),
+            ],
+            1, // out only (state is read-only here)
+            &push,
+            ((rows * cc) as u32).div_ceil(256),
+        );
+        self.stamp("conv1d_shift");
+        let k2 = self
+            .be
+            .kernel("conv1d_shift", crate::gemm::conv1d_shift_spv(), 2, 12);
+        self.dispatch(
+            k2,
+            &[Self::vkb(qkv), Self::vkb(state)],
+            1, // state out
+            &push,
+            (((kconv - 1) * cc) as u32).div_ceil(256),
+        );
+    }
+
+    /// Batched strided row copy in ONE dispatch (word granularity): `rows` slices of `nw` u32
+    /// words, `dst[dst_off + r*dst_stride + ..nw] = src[src_off + r*src_stride + ..nw]` (all in
+    /// words). Replaces the per-row copy-command loop for Op::CopyStrided — at rows=512 that was
+    /// 512 vkCmdCopyBuffer + hazard checks per split op, dwarfing the bytes moved.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_strided(
+        &self,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        rows: usize,
+        nw: usize,
+        src_off: usize,
+        src_stride: usize,
+        dst_off: usize,
+        dst_stride: usize,
+    ) {
+        self.stamp("copy");
+        let kern = self
+            .be
+            .kernel("copy_strided", crate::gemm::copy_strided_spv(), 2, 24);
+        let mut push = [0u8; 24];
+        for (i, v) in [rows, nw, src_off, src_stride, dst_off, dst_stride]
+            .iter()
+            .enumerate()
+        {
+            push[i * 4..i * 4 + 4].copy_from_slice(&(*v as u32).to_ne_bytes());
+        }
+        self.dispatch(
+            kern,
+            &[Self::vkb(src), Self::vkb(dst)],
+            1,
+            &push,
+            ((rows * nw) as u32).div_ceil(256),
+        );
+    }
+
     /// Elementwise sigmoid gate: `y[i] = a[i] * sigmoid(b[i])` (Qwen3-Next attention output gate).
     pub fn mul_sigmoid(&self, a: &dyn Buffer, b: &dyn Buffer, y: &dyn Buffer, n: usize) {
+        self.stamp("mul_sigmoid");
         let kern = self
             .be
             .kernel("mul_sigmoid", crate::gemm::mul_sigmoid_spv(), 3, 4);
@@ -2499,6 +2801,7 @@ impl<'a> Recorder<'a> {
     /// the resident hidden state on the GPU (chained across experts via WAW barriers on `acc`).
     /// In-place elementwise scalar multiply: `y[i] *= scale` for `i < n` (gemma4 layer output scale).
     pub fn scale(&self, y: &dyn Buffer, scale: f32, n: usize) {
+        self.stamp("scale");
         let k = self.be.kernel("scale", crate::gemm::scale_spv(), 1, 8);
         let mut push = [0u8; 8];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
@@ -2509,6 +2812,7 @@ impl<'a> Recorder<'a> {
     /// Elementwise softcap `y[i] = cap·tanh(x[i]/cap)` (gemma final-logit / attn softcap). In-place
     /// safe — bind `x == y`.
     pub fn softcap(&self, x: &dyn Buffer, y: &dyn Buffer, cap: f32, n: usize) {
+        self.stamp("softcap");
         let k = self.be.kernel("softcap", crate::gemm::softcap_spv(), 2, 8);
         let mut push = [0u8; 8];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
@@ -2523,6 +2827,7 @@ impl<'a> Recorder<'a> {
     }
 
     pub fn add_scaled(&self, x: &dyn Buffer, acc: &dyn Buffer, scale: f32, n: usize) {
+        self.stamp("add");
         let k = self
             .be
             .kernel("add_scaled", crate::gemm::add_scaled_spv(), 2, 8);
@@ -2600,6 +2905,7 @@ impl<'a> Recorder<'a> {
 
     /// Elementwise add; in place allowed (`a` may equal `y`).
     pub fn add(&self, a: &dyn Buffer, b: &dyn Buffer, y: &dyn Buffer, n: usize) {
+        self.stamp("add");
         let k = self.be.kernel("add", crate::gemm::add_spv(), 3, 4);
         self.dispatch(
             k,
@@ -2982,6 +3288,8 @@ mod tests {
         run_attn_kv_split(600, 9, 3, 64); // 2 chunks
         run_attn_kv_split(2050, 9, 3, 64); // 5 chunks, partial last
         run_attn_kv_split(8000, 4, 2, 32); // 16 chunks
+        run_attn_kv_split(830, 16, 2, 256); // qwen35 full-attn decode (hd=256 general path)
+        run_attn_kv_split(2050, 16, 8, 256); // gemma SWA-shape decode (hd=256, GQA 16:8)
     }
 
     #[test]

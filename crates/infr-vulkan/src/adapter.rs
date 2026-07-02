@@ -287,18 +287,30 @@ fn lower_op(
                     None
                 } else {
                     let mpad = m.div_ceil(64) * 64;
-                    Some(be_.alloc((mpad * out_f * eb).max(4), BufferUsage::Activations)?)
+                    // alloc_uninit: the GEMM writes all mpad rows before the copy reads m of them.
+                    Some(be_.alloc_uninit((mpad * out_f * eb).max(4), BufferUsage::Activations)?)
                 };
                 let out: &dyn Buffer = match &tmp {
                     Some(t) => t.as_ref(),
                     None => y,
                 };
-                if matches!(dt, infr_core::DType::Q4K) {
+                // Q4_K: the 8-warp warptile coopmat GEMM (native_gemm_warp, in-shader dequant)
+                // beats mmq dp4a at prefill shapes (161 vs 417µs on [512,1024]×[1024,6144] — the
+                // wide tile amortizes staging; RADV can't use int8 WMMA). mmq stays for shapes the
+                // warp tile can't cover (n%256≠0). INFR_NO_MMQ also skips mmq for A/B.
+                let warp_ok = out_f % 256 == 0
+                    && crate::gemm::native_gemm_warp_build_spv(dt).is_some()
+                    && std::env::var("INFR_NO_GEMM_WARP").is_err();
+                if matches!(dt, infr_core::DType::Q4K)
+                    && !warp_ok
+                    && std::env::var("INFR_NO_MMQ").is_err()
+                {
                     // mmq (dp4a int8): quantize activations once, integer matmul on raw blocks.
                     let nblk = in_f / 32;
-                    let qa = be_.alloc((m * in_f).max(4), BufferUsage::Activations)?;
-                    let dact = be_.alloc((m * nblk * 2).max(4), BufferUsage::Activations)?;
-                    let sact = be_.alloc((m * nblk * 2).max(4), BufferUsage::Activations)?;
+                    // alloc_uninit: quant_q8 fills all m rows before the GEMM reads them.
+                    let qa = be_.alloc_uninit((m * in_f).max(4), BufferUsage::Activations)?;
+                    let dact = be_.alloc_uninit((m * nblk * 2).max(4), BufferUsage::Activations)?;
+                    let sact = be_.alloc_uninit((m * nblk * 2).max(4), BufferUsage::Activations)?;
                     rec.quant_q8(xb, qa.as_ref(), dact.as_ref(), sact.as_ref(), m, in_f);
                     rec.matmul_mmq_q4k(
                         qa.as_ref(),
@@ -355,6 +367,55 @@ fn lower_op(
                 *n as usize * eb,
             );
         }
+        // Batched strided copy = `rows` buffer-copy regions (cheap vkCmdCopyBuffer). Splits a
+        // batched interleaved buffer (conv q|k|v) into packed per-row slices.
+        Op::CopyStrided {
+            src,
+            src_off,
+            src_stride,
+            dst,
+            dst_off,
+            dst_stride,
+            rows,
+            n,
+        } => {
+            let eb = graph.desc(*src).dtype.dense_bytes(1).unwrap_or(4);
+            let (rows_, n_) = (*rows as usize, *n as usize);
+            let (so, ss, do_, ds) = (
+                *src_off as usize,
+                *src_stride as usize,
+                *dst_off as usize,
+                *dst_stride as usize,
+            );
+            // One compute dispatch when everything is u32-word aligned (f32 always; f16 when the
+            // element counts are even) — the per-row copy loop recorded `rows` vkCmdCopyBuffer +
+            // hazard checks per split op (thousands per prefill chunk), dwarfing the bytes moved.
+            let word_ok = [so * eb, ss * eb, do_ * eb, ds * eb, n_ * eb]
+                .iter()
+                .all(|b| b % 4 == 0);
+            if word_ok {
+                rec.copy_strided(
+                    r(*src)?,
+                    r(*dst)?,
+                    rows_,
+                    n_ * eb / 4,
+                    so * eb / 4,
+                    ss * eb / 4,
+                    do_ * eb / 4,
+                    ds * eb / 4,
+                );
+            } else {
+                for row in 0..rows_ {
+                    rec.copy(
+                        r(*src)?,
+                        (so + row * ss) * eb,
+                        r(*dst)?,
+                        (do_ + row * ds) * eb,
+                        n_ * eb,
+                    );
+                }
+            }
+        }
         // Gated FFN activation: `act(gate) * up[+up_off]`. up_off (E2B per-layer slice) only
         // arises with Gelu (gemma); silu/sigmoid are always up_off==0.
         Op::GatedAct {
@@ -379,7 +440,9 @@ fn lower_op(
                     if *up_off != 0 {
                         return Err(be("vulkan adapter: GatedAct Sigmoid up_off!=0 unsupported"));
                     }
-                    rec.mul_sigmoid(g_, u_, y, n);
+                    // GatedAct semantics: `act(gate) * up` = sigmoid(gate) * up. mul_sigmoid computes
+                    // `a * sigmoid(b)`, so pass (up, gate) — NOT (gate, up), which would sigmoid `up`.
+                    rec.mul_sigmoid(u_, g_, y, n);
                 }
                 Activation::Gelu => {
                     let eb = graph.desc(*up).dtype.dense_bytes(1).unwrap_or(4);
@@ -565,11 +628,34 @@ fn lower_op(
                     && hd == 128
                     && matches!(mask, AttnMask::Causal)
                     && (*scale - 1.0 / (hd as f32).sqrt()).abs() < 1e-6;
+                // Prefill at hd≠128 (qwen35/gemma hd=256): the non-FA coopmat pipeline
+                // (attn_qk → softmax → attn_pv) is hd-general and ~an order faster than the scalar
+                // attention_kv. Needs 64-row-padded q/dst (Internal buffers are row-padded), so
+                // require both to be Internal.
+                let nonfa_ok = !flash_ok
+                    && rows >= 64
+                    && hd % 64 == 0
+                    && hd <= 512
+                    && matches!(graph.tensors[q.0 as usize].kind, TensorKind::Internal)
+                    && matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal);
+                // Decode (rows==1), causal, default scale: flash-decoding split-K — each head's KV
+                // range splits across ~32 chunks of workgroups instead of the scalar attention_kv's
+                // rows*nh (= nh at decode, ~16 workgroups on a 96-CU GPU — the decode bottleneck).
+                // attn_partial handles any hd%4==0 ≤ 512 (hd=128 fast path, general path above).
+                let chunk = (kv_len / 32).clamp(64, 512);
+                let split_ok = rows == 1
+                    && kv_len > chunk
+                    && matches!(mask, AttnMask::Causal)
+                    && hd % 4 == 0
+                    && hd <= 512
+                    && (*scale - 1.0 / (hd as f32).sqrt()).abs() < 1e-6;
                 if flash_ok {
                     let mpad = rows.div_ceil(64) * 64;
-                    let po = be_.alloc(8 * mpad * nh * hd * 4, BufferUsage::Activations)?;
-                    let pm = be_.alloc(8 * mpad * nh * 4, BufferUsage::Activations)?;
-                    let pl = be_.alloc(8 * mpad * nh * 4, BufferUsage::Activations)?;
+                    // alloc_uninit: split partials are fully written before the combine reads them
+                    // (zero-fill would be a ~70MB host memset per op on ReBAR).
+                    let po = be_.alloc_uninit(8 * mpad * nh * hd * 4, BufferUsage::Activations)?;
+                    let pm = be_.alloc_uninit(8 * mpad * nh * 4, BufferUsage::Activations)?;
+                    let pl = be_.alloc_uninit(8 * mpad * nh * 4, BufferUsage::Activations)?;
                     rec.attention_prefill_flash(
                         r(*q)?,
                         r(*k_cache)?,
@@ -586,6 +672,59 @@ fn lower_op(
                         pos,
                     );
                     transient.extend([po, pm, pl]);
+                } else if nonfa_ok {
+                    let window = match mask {
+                        AttnMask::Causal => 0,
+                        AttnMask::SlidingWindow(w) => *w,
+                    };
+                    let mpad = rows.div_ceil(64) * 64;
+                    let kv_pad = kv_len.div_ceil(256) * 256;
+                    // scores scratch [nh, mpad, kv_pad] f16 + split-K PV partials (≤8 splits) f32.
+                    // alloc_uninit: these are ~80MB per attention op and fully written before read
+                    // (attn_qk fills every [mpad, kv_pad] row; PV partials are written per split
+                    // before the reduce) — the calloc-style alloc's zero-fill is a host memset of
+                    // the whole thing on ReBAR, ~500MB/chunk of pure overhead across 6 attn layers.
+                    let s = be_.alloc_uninit(nh * mpad * kv_pad * 2, BufferUsage::Activations)?;
+                    let pv = be_.alloc_uninit(8 * mpad * nh * hd * 4, BufferUsage::Activations)?;
+                    rec.attention_prefill_nonfa(
+                        r(*q)?,
+                        r(*k_cache)?,
+                        r(*v_cache)?,
+                        r(*dst)?,
+                        s.as_ref(),
+                        pv.as_ref(),
+                        rows,
+                        kv_len,
+                        nh,
+                        nkv,
+                        hd,
+                        pos,
+                        window,
+                        *scale,
+                    );
+                    transient.extend([s, pv]);
+                } else if split_ok {
+                    let n_chunks = kv_len.div_ceil(chunk);
+                    let pm = be_.alloc_uninit(nh * n_chunks * 4, BufferUsage::Activations)?;
+                    let pl = be_.alloc_uninit(nh * n_chunks * 4, BufferUsage::Activations)?;
+                    let pacc =
+                        be_.alloc_uninit(nh * n_chunks * hd * 4, BufferUsage::Activations)?;
+                    rec.attention_kv_split(
+                        r(*q)?,
+                        r(*k_cache)?,
+                        r(*v_cache)?,
+                        r(*dst)?,
+                        pm.as_ref(),
+                        pl.as_ref(),
+                        pacc.as_ref(),
+                        kv_len,
+                        nh,
+                        nkv,
+                        hd,
+                        chunk,
+                        n_chunks,
+                    );
+                    transient.extend([pm, pl, pacc]);
                 } else {
                     let window = match mask {
                         AttnMask::Causal => 0,
@@ -634,14 +773,24 @@ fn lower_op(
             weight,
             state,
             dst,
+            rows,
             channels,
             kernel,
         } => {
-            rec.conv1d_silu(
+            // Batch (rows ≥ kconv-1): all rows·cc outputs in parallel + a history rebuild pass,
+            // instead of the token-serial history walk. Decode keeps the sequential kernel.
+            let cv = if *rows as usize >= (*kernel as usize).saturating_sub(1).max(2) {
+                Recorder::conv1d_silu_batch
+            } else {
+                Recorder::conv1d_silu
+            };
+            cv(
+                rec,
                 r(*x)?,
                 r(*weight)?,
                 r(*state)?,
                 r(*dst)?,
+                *rows as usize,
                 *channels as usize,
                 *kernel as usize,
             );
@@ -657,28 +806,92 @@ fn lower_op(
             dt_bias,
             state,
             dst,
+            rows,
             n_vhead,
             n_khead,
             head_k,
             head_v,
             eps,
         } => {
-            rec.deltanet(
-                r(*q)?,
-                r(*k)?,
-                r(*v)?,
-                r(*b)?,
-                r(*a)?,
-                r(*a_coef)?,
-                r(*dt_bias)?,
-                r(*state)?,
-                r(*dst)?,
+            // Prefill (rows ≥ 32): the chunkwise delta rule processes 32 tokens per state
+            // traversal (matmuls + a triangular solve) instead of the token-serial recurrence —
+            // the difference between rows and rows/32 sequential state sweeps. The default is the
+            // SPLIT form (parallel prep/gates passes + a light state-coupled scan; the monolithic
+            // kernel duplicated the prep work per column block). Decode/short rows keep the
+            // sequential kernel. INFR_NO_DN_CHUNK forces sequential; INFR_NO_DN_SPLIT keeps the
+            // chunked math but in the monolithic kernel (A/B).
+            let (rows_, nv_, nk_, kd_, vd_) = (
+                *rows as usize,
                 *n_vhead as usize,
                 *n_khead as usize,
                 *head_k as usize,
                 *head_v as usize,
-                *eps,
             );
+            let chunked = rows_ >= 32 && std::env::var("INFR_NO_DN_CHUNK").is_err();
+            if chunked && std::env::var("INFR_NO_DN_SPLIT").is_err() {
+                let nchunk = rows_.div_ceil(32);
+                // alloc_uninit: every slot the scan reads is written by prep/gates first.
+                let kn =
+                    be_.alloc_uninit((rows_ * nk_ * kd_ * 4).max(4), BufferUsage::Activations)?;
+                let qn =
+                    be_.alloc_uninit((rows_ * nk_ * kd_ * 4).max(4), BufferUsage::Activations)?;
+                let dk =
+                    be_.alloc_uninit((nchunk * nk_ * 1024 * 4).max(4), BufferUsage::Activations)?;
+                let dq =
+                    be_.alloc_uninit((nchunk * nk_ * 1024 * 4).max(4), BufferUsage::Activations)?;
+                let bg =
+                    be_.alloc_uninit((nchunk * nv_ * 32 * 4).max(4), BufferUsage::Activations)?;
+                let gg =
+                    be_.alloc_uninit((nchunk * nv_ * 32 * 4).max(4), BufferUsage::Activations)?;
+                rec.deltanet_chunked_split(
+                    r(*q)?,
+                    r(*k)?,
+                    r(*v)?,
+                    r(*b)?,
+                    r(*a)?,
+                    r(*a_coef)?,
+                    r(*dt_bias)?,
+                    r(*state)?,
+                    r(*dst)?,
+                    kn.as_ref(),
+                    qn.as_ref(),
+                    dk.as_ref(),
+                    dq.as_ref(),
+                    bg.as_ref(),
+                    gg.as_ref(),
+                    rows_,
+                    nv_,
+                    nk_,
+                    kd_,
+                    vd_,
+                    *eps,
+                );
+                transient.extend([kn, qn, dk, dq, bg, gg]);
+            } else {
+                let dn = if chunked {
+                    Recorder::deltanet_chunked
+                } else {
+                    Recorder::deltanet
+                };
+                dn(
+                    rec,
+                    r(*q)?,
+                    r(*k)?,
+                    r(*v)?,
+                    r(*b)?,
+                    r(*a)?,
+                    r(*a_coef)?,
+                    r(*dt_bias)?,
+                    r(*state)?,
+                    r(*dst)?,
+                    rows_,
+                    nv_,
+                    nk_,
+                    kd_,
+                    vd_,
+                    *eps,
+                );
+            }
         }
         // Elementwise gemma logit softcap `y = cap·tanh(x/cap)` (in-place safe).
         Op::Softcap { x, dst, cap, n } => {

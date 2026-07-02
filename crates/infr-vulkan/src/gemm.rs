@@ -202,6 +202,28 @@ pub(crate) fn add_scaled_id_spv() -> &'static [u32] {
     S.get_or_init(|| spv_words(BYTES))
 }
 
+/// SPIR-V for the LARGE-WARPTILE native-block prefill GEMM (8-warp BM=64×BN=256, gemm_proj_warp
+/// structure with in-shader native dequant). Only the hot formats are compiled; `None` falls back
+/// to the 64×64 `native_gemm_build_spv` kernel.
+pub(crate) fn native_gemm_warp_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            S.get_or_init(|| {
+                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+            })
+            .as_slice()
+        }};
+    }
+    Some(match dtype {
+        Q4K => v!("native_gemm_warp_q4k"),
+        Q6K => v!("native_gemm_warp_q6k"),
+        Q8_0 => v!("native_gemm_warp_q8_0"),
+        _ => return None,
+    })
+}
+
 /// SPIR-V for the native-block prefill GEMM (`C=A·Wᵀ`, raw GGUF blocks dequantized in-shader via the
 /// coopmat tiled kernel). One specialization per quant format; `None` for unsupported dtypes.
 pub(crate) fn native_gemm_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
@@ -281,7 +303,19 @@ const ATTN_PV_REDUCE_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_pv_reduce.spv"));
 const RMSNORM_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rmsnorm.spv"));
 const DELTANET_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/deltanet.spv"));
+const DELTANET_CHUNKED_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_chunked.spv"));
+const DELTANET_PREP_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_prep.spv"));
+const DELTANET_GATES_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_gates.spv"));
+const DELTANET_SCAN_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_scan.spv"));
 const CONV1D_SILU_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/conv1d_silu.spv"));
+const CONV1D_SILU_PAR_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/conv1d_silu_par.spv"));
+const CONV1D_SHIFT_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/conv1d_shift.spv"));
+const COPY_STRIDED_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/copy_strided.spv"));
 const MUL_SIGMOID_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_sigmoid.spv"));
 const ADD_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/add.spv"));
 const SILU_MUL_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silu_mul.spv"));
@@ -486,10 +520,45 @@ pub(crate) fn deltanet_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(DELTANET_SPV_BYTES))
 }
+/// SPIR-V for the chunked-DeltaNet PREP pass (normalize + intra-chunk dot matrices).
+pub(crate) fn deltanet_prep_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(DELTANET_PREP_SPV_BYTES))
+}
+/// SPIR-V for the chunked-DeltaNet GATES pass (β + prefix log-decay per chunk/head).
+pub(crate) fn deltanet_gates_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(DELTANET_GATES_SPV_BYTES))
+}
+/// SPIR-V for the chunked-DeltaNet SCAN pass (the sequential state-coupled part).
+pub(crate) fn deltanet_scan_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(DELTANET_SCAN_SPV_BYTES))
+}
+/// SPIR-V for the CHUNKED gated-DeltaNet prefill (chunkwise delta rule, C=32).
+pub(crate) fn deltanet_chunked_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(DELTANET_CHUNKED_SPV_BYTES))
+}
 /// SPIR-V for the causal depthwise conv1d + SiLU step (Qwen3-Next SSM input conv).
 pub(crate) fn conv1d_silu_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(CONV1D_SILU_SPV_BYTES))
+}
+/// SPIR-V for the BATCH depthwise conv1d+SiLU (pass 1: all outputs in parallel).
+pub(crate) fn conv1d_silu_par_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(CONV1D_SILU_PAR_SPV_BYTES))
+}
+/// SPIR-V for the BATCH depthwise conv1d history rebuild (pass 2).
+pub(crate) fn conv1d_shift_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(CONV1D_SHIFT_SPV_BYTES))
+}
+/// SPIR-V for the batched strided row copy (Op::CopyStrided in one dispatch).
+pub(crate) fn copy_strided_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(COPY_STRIDED_SPV_BYTES))
 }
 /// SPIR-V for the elementwise sigmoid gate `y = a * sigmoid(b)`.
 pub(crate) fn mul_sigmoid_spv() -> &'static [u32] {

@@ -335,7 +335,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
             eprintln!(
                 "[metal backend — qwen35/Qwen3-Next on the agnostic seam, Apple GPU (reference)]"
             );
-            Box::new(infr_llama::model::CpuQwen35Chat::new_metal(gguf.clone()))
+            Box::new(infr_llama::model::Qwen35Chat::new_metal(gguf.clone()))
         } else {
             eprintln!(
                 "[metal backend — dense/MoE forward on Apple GPU via the agnostic compute graph (reference)]"
@@ -347,7 +347,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     } else if std::env::var("INFR_CPU").is_ok() {
         if is_q35 {
             eprintln!("[cpu backend — qwen35/Qwen3-Next on the agnostic seam, no GPU]");
-            Box::new(infr_llama::model::CpuQwen35Chat::new(gguf.clone()))
+            Box::new(infr_llama::model::Qwen35Chat::new_cpu(gguf.clone()))
         } else {
             eprintln!(
                 "[cpu backend — dense/MoE forward on CPU via the agnostic compute graph, no GPU]"
@@ -447,6 +447,11 @@ fn run_chat_turn(
 /// Adapter: drive `infr-llama` through the server's `ChatGenerator` seam.
 struct LlamaGenerator {
     llama: infr_llama::Llama,
+    /// Multi-slot prefix cache: each request prefills only the suffix that differs from the slot it
+    /// continues, so a coding agent's stable system prompt + history isn't re-prefilled every turn
+    /// (cutting time-to-first-token). Multiple slots keep concurrent/interleaved conversations from
+    /// thrashing one cache. Server generation is serialized by a Mutex, so the cache needs no lock.
+    cache: infr_llama::ServeCache,
 }
 
 impl infr_server::ChatGenerator for LlamaGenerator {
@@ -496,37 +501,39 @@ impl infr_server::ChatGenerator for LlamaGenerator {
             // (e.g. the toktrie bridge masked out the whole call), fall through to unconstrained
             // generation rather than failing the request or returning an empty `stop`.
             let primed = format!("{prompt}<tool_call>\n");
-            let emitted =
-                match self
-                    .llama
-                    .generate_ids(&primed, max_new, Some(&mut constraint), |_| {})
-                {
-                    Ok(ids) => {
-                        let body = self.llama.decode_ids(&ids, false)?;
-                        // The constrained output IS the JSON call object — parse it straight; strip any
-                        // trailing `</tool_call>` past the grammar.
-                        let body = body.trim().trim_end_matches("</tool_call>").trim();
-                        match serde_json::from_str::<serde_json::Value>(body) {
-                            Ok(val) => val.get("name").and_then(|v| v.as_str()).map(|name| {
-                                let arguments = val
-                                    .get("arguments")
-                                    .cloned()
-                                    .unwrap_or(serde_json::json!({}));
-                                on_delta(infr_engine::Delta::ToolCall {
-                                    name: name.to_string(),
-                                    arguments: serde_json::to_string(&arguments)
-                                        .unwrap_or_else(|_| "{}".to_string()),
-                                });
-                            }),
-                            Err(_) => None,
-                        }
-                        .is_some()
+            let emitted = match self.cache.generate(
+                &self.llama,
+                &primed,
+                max_new,
+                Some(&mut constraint),
+                |_| {},
+            ) {
+                Ok(ids) => {
+                    let body = self.llama.decode_ids(&ids, false)?;
+                    // The constrained output IS the JSON call object — parse it straight; strip any
+                    // trailing `</tool_call>` past the grammar.
+                    let body = body.trim().trim_end_matches("</tool_call>").trim();
+                    match serde_json::from_str::<serde_json::Value>(body) {
+                        Ok(val) => val.get("name").and_then(|v| v.as_str()).map(|name| {
+                            let arguments = val
+                                .get("arguments")
+                                .cloned()
+                                .unwrap_or(serde_json::json!({}));
+                            on_delta(infr_engine::Delta::ToolCall {
+                                name: name.to_string(),
+                                arguments: serde_json::to_string(&arguments)
+                                    .unwrap_or_else(|_| "{}".to_string()),
+                            });
+                        }),
+                        Err(_) => None,
                     }
-                    Err(e) => {
-                        eprintln!("[tools] grammar-constrained generation failed ({e})");
-                        false
-                    }
-                };
+                    .is_some()
+                }
+                Err(e) => {
+                    eprintln!("[tools] grammar-constrained generation failed ({e})");
+                    false
+                }
+            };
             if emitted {
                 return Ok(());
             }
@@ -542,8 +549,8 @@ impl infr_server::ChatGenerator for LlamaGenerator {
         let mut stream = ChatStream::new(tool_choice != Some("none"));
         {
             let od = &mut *on_delta;
-            self.llama
-                .generate_ids(&prompt, max_new, None, |piece: &str| {
+            self.cache
+                .generate(&self.llama, &prompt, max_new, None, |piece: &str| {
                     stream.push(piece, &mut *od)
                 })?;
         }
@@ -832,25 +839,32 @@ fn cmd_bench(
             }
         }
     }
-    let avg = samples.iter().sum::<f64>() / samples.len() as f64;
+    let label = if let Some((p, g)) = pg {
+        format!("pg{p}+{g}")
+    } else if measure_tg {
+        format!("tg{n_gen}")
+    } else {
+        format!("pp{n_prompt}")
+    };
+    print_bench_avg(&samples, &label, depth, "", reps, json);
+    Ok(())
+}
+
+/// Shared bench-result reporter: average the per-rep t/s samples and print either the JSON shape
+/// (`[{"avg_ts": ..}]`, llama-bench-comparable) or `label[ @ dN][tag]: X t/s (N reps)`. One
+/// implementation for the dense-CPU / qwen35 bench tails (they previously each had a copy).
+fn print_bench_avg(samples: &[f64], label: &str, depth: usize, tag: &str, reps: usize, json: bool) {
+    let avg = samples.iter().sum::<f64>() / samples.len().max(1) as f64;
     if json {
         println!("[{{\"avg_ts\": {avg:.2}}}]");
     } else {
-        let label = if let Some((p, g)) = pg {
-            format!("pg{p}+{g}")
-        } else if measure_tg {
-            format!("tg{n_gen}")
-        } else {
-            format!("pp{n_prompt}")
-        };
         let d = if depth > 0 {
             format!(" @ d{depth}")
         } else {
             String::new()
         };
-        println!("{label}{d}: {avg:.1} t/s  ({reps} reps)");
+        println!("{label}{d}{tag}: {avg:.1} t/s  ({reps} reps)");
     }
-    Ok(())
 }
 
 /// CPU-backend bench (`infr bench -ngl 0`): the GPU bench's pp/tg/pg metrics on the agnostic CPU
@@ -884,24 +898,14 @@ fn cmd_bench_cpu(
         };
         samples.push(ts);
     }
-    let avg = samples.iter().sum::<f64>() / samples.len() as f64;
-    if json {
-        println!("[{{\"avg_ts\": {avg:.2}}}]");
+    let label = if let Some((p, g)) = pg {
+        format!("pg{p}+{g}")
+    } else if measure_tg {
+        format!("tg{n_gen}")
     } else {
-        let label = if let Some((p, g)) = pg {
-            format!("pg{p}+{g}")
-        } else if measure_tg {
-            format!("tg{n_gen}")
-        } else {
-            format!("pp{n_prompt}")
-        };
-        let d = if depth > 0 {
-            format!(" @ d{depth}")
-        } else {
-            String::new()
-        };
-        println!("{label}{d} [cpu]: {avg:.1} t/s  ({reps} reps)");
-    }
+        format!("pp{n_prompt}")
+    };
+    print_bench_avg(&samples, &label, depth, " [cpu]", reps, json);
     Ok(())
 }
 
@@ -925,6 +929,55 @@ fn cmd_bench_qwen35(
     // -ngl 0: force the pure-CPU oracle forward (no Vulkan), matching `llama-bench -ngl 0`.
     if cpu {
         std::env::set_var("Q35_CPU", "1");
+    }
+    // No depth/pg: drive the PRODUCTION path through the SAME `ChatModel` structs `infr run`
+    // builds (Qwen35Chat, on the Vulkan or CPU seam backend), timing
+    // `ChatModel::generate` itself — bench and run share one engine BY CONSTRUCTION, so a
+    // production-path change can never leave the bench measuring a dead path. The seam ingests a
+    // text prompt, so synthesize one near `n_prompt` tokens and report the actual token counts
+    // from its stats. depth/pg still use the bespoke per-token forward below (the seam has no
+    // context-depth warm API yet).
+    if depth == 0 && pg.is_none() {
+        use infr_llama::model::ChatModel;
+        std::env::set_var("INFR_Q35_IGNORE_EOS", "1"); // fixed tg count, no early stop
+        let mut m: Box<dyn ChatModel> = if cpu {
+            Box::new(infr_llama::model::Qwen35Chat::new_cpu(gguf.to_path_buf()))
+        } else {
+            Box::new(infr_llama::model::Qwen35Chat::new(gguf.to_path_buf()))
+        };
+        let sentence = "The quick brown fox jumps over the lazy dog. "; // ~10 tokens
+        let prompt = if n_prompt > 0 {
+            sentence.repeat(n_prompt.div_ceil(10))
+        } else {
+            sentence.to_string()
+        };
+        let n = n_gen.max(1);
+        // untimed warmup: loads the model once (weights + pipeline compile stay warm across reps)
+        m.generate(sentence, 1, &mut |_| {})?;
+        let (mut pps, mut tgs) = (Vec::new(), Vec::new());
+        let (mut np, mut ng) = (0usize, 0usize);
+        for _ in 0..reps.max(1) {
+            let st = m.generate(&prompt, n, &mut |_| {})?;
+            pps.push(st.n_prompt as f64 / st.prompt_secs.max(1e-9));
+            tgs.push(st.n_gen as f64 / st.decode_secs.max(1e-9));
+            (np, ng) = (st.n_prompt, st.n_gen);
+        }
+        let avg = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        if json {
+            let a = if n_gen > 0 { avg(&tgs) } else { avg(&pps) };
+            println!("[{{\"avg_ts\": {a:.2}}}]");
+        } else if n_gen > 0 && n_prompt > 0 {
+            println!(
+                "pp{np}: {:.1} t/s | tg{ng}: {:.1} t/s  ({reps} reps)",
+                avg(&pps),
+                avg(&tgs)
+            );
+        } else if n_gen > 0 {
+            println!("tg{ng}: {:.1} t/s  ({reps} reps)", avg(&tgs));
+        } else {
+            println!("pp{np}: {:.1} t/s  ({reps} reps)", avg(&pps));
+        }
+        return Ok(());
     }
     let model = infr_llama::qwen35::load_path(gguf)?;
     let measure_tg = pg.is_none() && n_gen > 0;
@@ -966,25 +1019,21 @@ fn cmd_bench_qwen35(
         };
         samples.push(ts);
     }
-    let avg = samples.iter().sum::<f64>() / samples.len() as f64;
-    if json {
-        println!("[{{\"avg_ts\": {avg:.2}}}]");
+    let label = if let Some((p, g)) = pg {
+        format!("pg{p}+{g}")
+    } else if measure_tg {
+        format!("tg{n_gen}")
     } else {
-        let label = if let Some((p, g)) = pg {
-            format!("pg{p}+{g}")
-        } else if measure_tg {
-            format!("tg{n_gen}")
-        } else {
-            format!("pp{n_prompt}")
-        };
-        let d = if depth > 0 {
-            format!(" @ d{depth}")
-        } else {
-            String::new()
-        };
-        let tag = if cpu { " [cpu]" } else { "" };
-        println!("{label}{d}{tag}: {avg:.1} t/s  ({reps} reps)");
-    }
+        format!("pp{n_prompt}")
+    };
+    print_bench_avg(
+        &samples,
+        &label,
+        depth,
+        if cpu { " [cpu]" } else { "" },
+        reps,
+        json,
+    );
     Ok(())
 }
 
@@ -1185,7 +1234,10 @@ fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
         .unwrap_or("model")
         .to_string();
     let sockaddr: std::net::SocketAddr = addr.parse().context("invalid --addr")?;
-    let generator: Box<dyn infr_server::ChatGenerator> = Box::new(LlamaGenerator { llama });
+    let generator: Box<dyn infr_server::ChatGenerator> = Box::new(LlamaGenerator {
+        cache: infr_llama::ServeCache::from_env(),
+        llama,
+    });
 
     let rt = tokio::runtime::Runtime::new()?;
     println!("infr serve: {model_id} on http://{sockaddr}  (OpenAI /v1)");
