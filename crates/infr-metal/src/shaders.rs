@@ -241,15 +241,16 @@ struct QLinParams { uint m; uint in_f; uint out_f; uint dshift; };
         sc6 = (scb[jj + 4u] & 0x0Fu) | ((scb[jj - 4u] >> 6) << 4);                                \
         m6 = (scb[jj + 4u] >> 4) | ((scb[jj] >> 6) << 4);                                         \
     }                                                                                             \
-    float scale = d * (float)sc6;                                                                 \
+    /* high nibble stays in place (values 16x) and the scale absorbs the /16 — no per-element  */ \
+    /* shift/select, just a mask (the reference dequantize_q4_K trick)                         */ \
+    float scale = (hi != 0u ? d * (1.0f / 16.0f) : d) * (float)sc6;                               \
     float mn = -(dmin * (float)m6);                                                               \
+    uint nibmask = hi != 0u ? 0xF0F0F0F0u : 0x0F0F0F0Fu;                                          \
     device const uint* qw4 = (device const uint*)(blk + 16u + j * 32u + l0);                      \
     for (uint w = 0; w < 4u; w++) {                                                               \
-        uint u = qw4[w];                                                                          \
+        uint u = qw4[w] & nibmask;                                                                \
         for (uint k2 = 0; k2 < 4u; k2++) {                                                        \
-            uint byt = (u >> (8u * k2)) & 0xFFu;                                                  \
-            uint q = hi ? (byt >> 4) : (byt & 0xFu);                                              \
-            wk[w * 4u + k2] = scale * (float)q + mn;                                              \
+            wk[w * 4u + k2] = scale * (float)((u >> (8u * k2)) & 0xFFu) + mn;                     \
         }                                                                                         \
     }
 
@@ -271,16 +272,31 @@ struct QLinParams { uint m; uint in_f; uint out_f; uint dshift; };
     float d = (float)as_type<half>((ushort)(blk[208] | ((ushort)blk[209] << 8)));                 \
     float scale = d * (float)(char)scs[h6 * 8u + (off >> 4) + is];                                \
     float mn = -32.0f * scale;                                                                    \
-    uint lb = is * 16u;                                                                           \
-    /* branch-free (lanes hold different `off`s; a 4-way if would serialize the simdgroup): */    \
-    /* ql byte at l (+32 for the odd 32-groups), low/high nibble by off>=64, qh bits at off/16 */ \
+    /* uint32-lane unpack (the reference dequantize_q6_K shape): four 32-bit combines cover the */ \
+    /* 16 codes, nibble/crumb selection folded into masks and power-of-two scale variants — all */ \
+    /* exact, so the value is bit-identical to the byte-at-a-time form this replaces            */ \
     uint qlo = (off & 32u);                                                                       \
-    uint nsh = (off >= 64u) ? 4u : 0u;                                                            \
     uint qhs = off >> 4;                                                                          \
-    for (uint k = 0; k < 16u; k++) {                                                              \
-        uint l = lb + k;                                                                          \
-        uint q = ((ql[l + qlo] >> nsh) & 0xFu) | (((qh[l] >> qhs) & 3u) << 4);                    \
-        wk[k] = scale * (float)q + mn;                                                            \
+    device const ushort* ql16 = (device const ushort*)ql + (qlo != 0u ? 16u : 0u) + 8u * is;      \
+    device const ushort* qh16 = (device const ushort*)qh + 8u * is;                               \
+    uint kmask1 = (off >= 64u) ? ((qhs > 4u) ? 0xC0C0C0C0u : 0x30303030u)                         \
+                               : ((qhs > 0u) ? 0x0C0C0C0Cu : 0x03030303u);                        \
+    uint kmask2 = (off >= 64u) ? 0xF0F0F0F0u : 0x0F0F0F0Fu;                                       \
+    float dl0 = scale;                                                                            \
+    float dl1 = dl0 * (1.0f / 256.0f);                                                            \
+    float dl2 = dl1 * (1.0f / 256.0f);                                                            \
+    float dl3 = dl2 * (1.0f / 256.0f);                                                            \
+    uint shr_h = (qhs > 4u) ? 2u : 0u;                                                            \
+    uint shl_h = (off >= 64u) ? 0u : ((qhs > 0u) ? 2u : 4u);                                      \
+    uint shr_l = (off >= 64u) ? 4u : 0u;                                                          \
+    for (uint i = 0; i < 4u; i++) {                                                               \
+        uint low  = ((uint)ql16[2u * i] | ((uint)ql16[2u * i + 1u] << 16)) & kmask2;              \
+        uint high = ((uint)qh16[2u * i] | ((uint)qh16[2u * i + 1u] << 16)) & kmask1;              \
+        uint q = ((high << shl_h) >> shr_h) | (low >> shr_l);                                     \
+        wk[4u * i]      = dl0 * (float)(q & 0xFFu)       + mn;                                    \
+        wk[4u * i + 1u] = dl1 * (float)(q & 0xFF00u)     + mn;                                    \
+        wk[4u * i + 2u] = dl2 * (float)(q & 0xFF0000u)   + mn;                                    \
+        wk[4u * i + 3u] = dl3 * (float)(q & 0xFF000000u) + mn;                                    \
     }
 
 // GEMV: one simdgroup (32 lanes) per output element; each lane decodes one 16-element block per
