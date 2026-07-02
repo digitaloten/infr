@@ -169,7 +169,7 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
             Op::RmsNorm { .. } | Op::Linear { .. } | Op::GatedAct { .. } | Op::Add { .. } => {}
             Op::QkNormRope { .. } => has_rope = true,
             Op::WriteKv { cache, .. } => {
-                if g.desc(*cache).dtype != DType::F16 {
+                if !matches!(g.desc(*cache).dtype, DType::F16 | DType::Q8_0) {
                     return false;
                 }
             }
@@ -182,7 +182,7 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
                 has_attn = true;
                 if *rows != 1
                     || !matches!(*head_dim, 64 | 128)
-                    || g.desc(*k_cache).dtype != DType::F16
+                    || !matches!(g.desc(*k_cache).dtype, DType::F16 | DType::Q8_0)
                 {
                     return false;
                 }
@@ -491,8 +491,16 @@ impl MetalBackend {
         // gated on its pipeline cap — a capped device (CI paravirtual) keeps the per-token path.
         let dyn_cap_ok = || -> bool {
             let kern = g.ops.iter().find_map(|op| match op {
-                Op::Attention { head_dim: 64, .. } => Some("attnvec_dyn_f16kv_hd64"),
-                Op::Attention { head_dim: 128, .. } => Some("attnvec_dyn_f16kv_hd128"),
+                Op::Attention {
+                    head_dim: hd @ (64 | 128),
+                    k_cache,
+                    ..
+                } => Some(match (g.desc(*k_cache).dtype == DType::Q8_0, hd) {
+                    (false, 64) => "attnvec_dyn_f16kv_hd64",
+                    (false, _) => "attnvec_dyn_f16kv_hd128",
+                    (true, 64) => "attnvec_dyn_q8kv_hd64",
+                    (true, _) => "attnvec_dyn_q8kv_hd128",
+                }),
                 _ => None,
             });
             kern.is_some_and(|kn| {
@@ -1329,15 +1337,16 @@ impl MetalBackend {
                     infr_core::graph::AttnMask::SlidingWindow(w) => w as u32,
                 };
                 if let Some(posbuf) = r.posbuf.clone() {
-                    // Recording a replay tape (rows==1, f16 cache, hd 64/128 — checked by the
+                    // Recording a replay tape (rows==1, f16/q8 cache, hd 64/128 — checked by the
                     // gate): route straight to the dynamic-pos vector flash kernel, which reads
                     // pos from the positions buffer and covers every kv_len from 1 up. The usual
                     // shape routing below would bake this token's kv_len into the kernel CHOICE,
                     // which is exactly what a replayed tape can't have.
-                    let kern = if hd == 64 {
-                        "attnvec_dyn_f16kv_hd64"
-                    } else {
-                        "attnvec_dyn_f16kv_hd128"
+                    let kern = match (g.desc(k_cache).dtype == DType::Q8_0, hd) {
+                        (false, 64) => "attnvec_dyn_f16kv_hd64",
+                        (false, _) => "attnvec_dyn_f16kv_hd128",
+                        (true, 64) => "attnvec_dyn_q8kv_hd64",
+                        (true, _) => "attnvec_dyn_q8kv_hd128",
                     };
                     let pso = self.pipelines.get(kern)?;
                     let mut p = (rows as u32).to_ne_bytes().to_vec();
