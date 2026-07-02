@@ -94,6 +94,8 @@ pub(crate) fn generate_dense_cpu(
         prompt,
         max_new,
         on_token,
+        &mut None,
+        prompt.len() + max_new + 1,
     )
 }
 
@@ -112,6 +114,36 @@ pub(crate) fn generate_dense_gpu(
     prompt: &[u32],
     max_new: usize,
     on_token: impl FnMut(u32),
+) -> AResult<(Vec<u32>, GenStats)> {
+    generate_dense_gpu_session(
+        vk,
+        g,
+        cfg,
+        token_embd,
+        ple,
+        prompt,
+        max_new,
+        on_token,
+        &mut None,
+        prompt.len() + max_new + 1,
+    )
+}
+
+/// [`generate_dense_gpu`] with a caller-held [`SeamKv`]: hold `state` (+ a `want_ctx` capacity)
+/// across calls and each turn prefills only the suffix that differs from the cached tokens —
+/// ChatSession-style KV reuse on the agnostic seam.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_dense_gpu_session(
+    vk: &infr_vulkan::VulkanBackend,
+    g: &Gguf,
+    cfg: &Config,
+    token_embd: &[f32],
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    max_new: usize,
+    on_token: impl FnMut(u32),
+    state: &mut Option<SeamKv>,
+    want_ctx: usize,
 ) -> AResult<(Vec<u32>, GenStats)> {
     generate_dense_backend(
         vk,
@@ -152,6 +184,8 @@ pub(crate) fn generate_dense_gpu(
         prompt,
         max_new,
         on_token,
+        state,
+        want_ctx,
     )
 }
 
@@ -186,6 +220,8 @@ pub(crate) fn generate_dense_metal(
         prompt,
         max_new,
         on_token,
+        &mut None,
+        prompt.len() + max_new + 1,
     )
 }
 
@@ -198,6 +234,32 @@ pub(crate) fn generate_dense_metal(
 /// GPU binder may convert float weights to f16), so the graph declares the handle to match.
 type BindWeight<'a> = dyn Fn(TensorBytes, DType, usize) -> AResult<(Box<dyn Buffer>, DType)> + 'a;
 
+/// Persistent per-session seam state: the uploaded weights, the KV cache (sized to `max_ctx`
+/// once), the per-step IO buffers, and the token ids currently MATERIALIZED in the cache. A caller
+/// holding one across `generate_dense_backend` calls gets ChatSession-style KV reuse — each turn
+/// prefills only the token suffix that differs from `cached` (the common-prefix diff), so a
+/// growing conversation stops re-prefilling its whole history. Pass a fresh `None` for the old
+/// one-shot behavior.
+pub(crate) struct SeamKv {
+    wbufs: Vec<Box<dyn Buffer>>,
+    wspecs: Vec<(DType, usize)>,
+    kbufs: Vec<Box<dyn Buffer>>,
+    vbufs: Vec<Box<dyn Buffer>>,
+    hidden_buf: Box<dyn Buffer>,
+    pos_buf: Box<dyn Buffer>,
+    rf_buf: Option<(Box<dyn Buffer>, usize)>,
+    ipl_buf: Option<Box<dyn Buffer>>,
+    logits_buf: Box<dyn Buffer>,
+    max_ctx: usize,
+    /// Token ids whose KV rows are materialized (prompt + generated of the last turn).
+    cached: Vec<u32>,
+}
+
+/// Longest shared prefix of the cached tokens and the new prompt (the KV rows that stay valid).
+fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_dense_backend(
     be: &dyn Backend,
@@ -209,6 +271,8 @@ pub(crate) fn generate_dense_backend(
     prompt: &[u32],
     max_new: usize,
     mut on_token: impl FnMut(u32),
+    state: &mut Option<SeamKv>,
+    want_ctx: usize,
 ) -> AResult<(Vec<u32>, GenStats)> {
     let c = cfg;
     let (ne, nh) = (c.n_embd, c.n_head);
@@ -225,7 +289,6 @@ pub(crate) fn generate_dense_backend(
     } else {
         Activation::Silu
     };
-    let max_ctx = prompt.len() + max_new + 1;
     // gemma4 E2B (gemma3n): per-layer input embeddings + KV-layer sharing.
     let e2b = c.n_embd_per_layer > 0;
     let npl = c.n_embd_per_layer;
@@ -262,136 +325,178 @@ pub(crate) fn generate_dense_backend(
             None
         };
 
-    // ── upload weights in their NATIVE GGUF dtype (no host pre-dequant — the backend dequants
-    //    lazily in `bytes_to_f32`, so a quant weight occupies ~quant size, not 8× f32). `wspecs`
-    //    records each (dtype, numel) so `build` can declare the handle with the matching dtype; its
-    //    order MUST equal the `g.weight()` order in `build` below. ──────────────────────────────────
-    let mut wbufs: Vec<Box<dyn Buffer>> = Vec::new();
-    let mut wspecs: Vec<(DType, usize)> = Vec::new();
-    // Map a weight tensor zero-copy from the GGUF mmap (no alloc, no memcpy); record its native dtype
-    // + element count so `build` declares the handle to match.
-    let mut wraw = |name: &str| -> AResult<()> {
-        let info = g
-            .tensors()
-            .iter()
-            .find(|t| t.name == name)
-            .ok_or_else(|| anyhow!("tensor not found: {name}"))?
-            .clone();
-        let numel: usize = info.shape.iter().product();
-        let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
-        // bind_weight returns the EFFECTIVE dtype the buffer holds (the GPU binder may convert float
-        // weights to f16), so the graph declares the handle to match what the backend will read.
-        let (buf, eff_dt) = bind_weight(tb, info.dtype, numel)?;
-        wbufs.push(buf);
-        wspecs.push((eff_dt, numel));
-        Ok(())
-    };
-    for l in 0..c.n_layer {
-        let p = |s: &str| format!("blk.{l}.{s}");
-        wraw(&p("attn_norm.weight"))?;
-        wraw(&p("attn_q.weight"))?;
-        wraw(&p("attn_k.weight"))?;
-        if has_wv[l] {
-            wraw(&p("attn_v.weight"))?;
+    // ── one-time session init: weights, KV cache, per-step IO (skipped when `state` is warm) ──
+    if state.is_none() {
+        // ── upload weights in their NATIVE GGUF dtype (no host pre-dequant — the backend dequants
+        //    lazily in `bytes_to_f32`, so a quant weight occupies ~quant size, not 8× f32). `wspecs`
+        //    records each (dtype, numel) so `build` can declare the handle with the matching dtype; its
+        //    order MUST equal the `g.weight()` order in `build` below. ──────────────────────────────────
+        let mut wbufs: Vec<Box<dyn Buffer>> = Vec::new();
+        let mut wspecs: Vec<(DType, usize)> = Vec::new();
+        // Map a weight tensor zero-copy from the GGUF mmap (no alloc, no memcpy); record its native dtype
+        // + element count so `build` declares the handle to match.
+        let mut wraw = |name: &str| -> AResult<()> {
+            let info = g
+                .tensors()
+                .iter()
+                .find(|t| t.name == name)
+                .ok_or_else(|| anyhow!("tensor not found: {name}"))?
+                .clone();
+            let numel: usize = info.shape.iter().product();
+            let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
+            // bind_weight returns the EFFECTIVE dtype the buffer holds (the GPU binder may convert float
+            // weights to f16), so the graph declares the handle to match what the backend will read.
+            let (buf, eff_dt) = bind_weight(tb, info.dtype, numel)?;
+            wbufs.push(buf);
+            wspecs.push((eff_dt, numel));
+            Ok(())
+        };
+        for l in 0..c.n_layer {
+            let p = |s: &str| format!("blk.{l}.{s}");
+            wraw(&p("attn_norm.weight"))?;
+            wraw(&p("attn_q.weight"))?;
+            wraw(&p("attn_k.weight"))?;
+            if has_wv[l] {
+                wraw(&p("attn_v.weight"))?;
+            }
+            if qk_norm {
+                wraw(&p("attn_q_norm.weight"))?;
+                wraw(&p("attn_k_norm.weight"))?;
+            }
+            wraw(&p("attn_output.weight"))?;
+            if gemma {
+                wraw(&p("post_attention_norm.weight"))?;
+            }
+            wraw(&p("ffn_norm.weight"))?;
+            if c.moe.is_some() {
+                // qwen3moe: router + stacked per-expert gate/up/down banks.
+                wraw(&p("ffn_gate_inp.weight"))?;
+                wraw(&p("ffn_gate_exps.weight"))?;
+                wraw(&p("ffn_up_exps.weight"))?;
+                wraw(&p("ffn_down_exps.weight"))?;
+            } else {
+                wraw(&p("ffn_gate.weight"))?;
+                wraw(&p("ffn_up.weight"))?;
+                wraw(&p("ffn_down.weight"))?;
+            }
+            if gemma {
+                wraw(&p("post_ffw_norm.weight"))?;
+            }
+            if e2b {
+                // gemma4 E2B per-layer input-embedding application weights.
+                wraw(&p("inp_gate.weight"))?;
+                wraw(&p("proj.weight"))?;
+                wraw(&p("post_norm.weight"))?;
+            }
         }
-        if qk_norm {
-            wraw(&p("attn_q_norm.weight"))?;
-            wraw(&p("attn_k_norm.weight"))?;
-        }
-        wraw(&p("attn_output.weight"))?;
-        if gemma {
-            wraw(&p("post_attention_norm.weight"))?;
-        }
-        wraw(&p("ffn_norm.weight"))?;
-        if c.moe.is_some() {
-            // qwen3moe: router + stacked per-expert gate/up/down banks.
-            wraw(&p("ffn_gate_inp.weight"))?;
-            wraw(&p("ffn_gate_exps.weight"))?;
-            wraw(&p("ffn_up_exps.weight"))?;
-            wraw(&p("ffn_down_exps.weight"))?;
+        // Globals: output_norm, lm_head. lm_head = `output.weight`, or (tied) the quantized
+        // `token_embd.weight` mapped from the mmap and dequantized per-row by `Op::Linear` — same f32
+        // values as the host `token_embd`, but zero-copy.
+        wraw("output_norm.weight")?;
+        if g.tensors().iter().any(|t| t.name == "output.weight") {
+            wraw("output.weight")?;
         } else {
-            wraw(&p("ffn_gate.weight"))?;
-            wraw(&p("ffn_up.weight"))?;
-            wraw(&p("ffn_down.weight"))?;
+            wraw("token_embd.weight")?;
         }
-        if gemma {
-            wraw(&p("post_ffw_norm.weight"))?;
-        }
-        if e2b {
-            // gemma4 E2B per-layer input-embedding application weights.
-            wraw(&p("inp_gate.weight"))?;
-            wraw(&p("proj.weight"))?;
-            wraw(&p("post_norm.weight"))?;
-        }
-    }
-    // Globals: output_norm, lm_head. lm_head = `output.weight`, or (tied) the quantized
-    // `token_embd.weight` mapped from the mmap and dequantized per-row by `Op::Linear` — same f32
-    // values as the host `token_embd`, but zero-copy.
-    wraw("output_norm.weight")?;
-    if g.tensors().iter().any(|t| t.name == "output.weight") {
-        wraw("output.weight")?;
-    } else {
-        wraw("token_embd.weight")?;
-    }
-    // gemma4 weightless per-head V-norm = `QkNorm` with a unit weight (out = x/rms). One ones-vector
-    // of the max head dim serves every layer (a narrower layer reads its leading prefix).
-    if gemma4 {
-        let ones = vec![1.0f32; max_hd];
-        let b = be
-            .alloc(ones.len() * 4, BufferUsage::Weights)
-            .map_err(|e| anyhow!("{e}"))?;
-        be.upload(b.as_ref(), bytemuck::cast_slice(&ones))
-            .map_err(|e| anyhow!("{e}"))?;
-        wbufs.push(b);
-        wspecs.push((DType::F32, max_hd));
-    }
-
-    // ── persistent KV cache buffers (f32), sized per-layer (gemma4 SWA layers are narrower) ───────
-    let mut kbufs: Vec<Box<dyn Buffer>> = Vec::new();
-    let mut vbufs: Vec<Box<dyn Buffer>> = Vec::new();
-    for l in 0..c.n_layer {
-        let kvrow_l = c.layer_n_kv(l) * c.layer_head_dim(l);
-        // f16 KV cache (2 bytes/elem) — matches the graph's f16 k_cache/v_cache decls.
-        kbufs.push(
-            be.alloc(max_ctx * kvrow_l * 2, BufferUsage::Activations)
-                .map_err(|e| anyhow!("{e}"))?,
-        );
-        vbufs.push(
-            be.alloc(max_ctx * kvrow_l * 2, BufferUsage::Activations)
-                .map_err(|e| anyhow!("{e}"))?,
-        );
-    }
-
-    // ── per-step IO buffers ────────────────────────────────────────────────────────
-    let hidden_buf = be
-        .alloc(ne * 4, BufferUsage::Staging)
-        .map_err(|e| anyhow!("{e}"))?;
-    let pos_buf = be
-        .alloc(4, BufferUsage::Staging)
-        .map_err(|e| anyhow!("{e}"))?;
-    let rf_buf = match &rope_freqs {
-        Some(rf) => {
+        // gemma4 weightless per-head V-norm = `QkNorm` with a unit weight (out = x/rms). One ones-vector
+        // of the max head dim serves every layer (a narrower layer reads its leading prefix).
+        if gemma4 {
+            let ones = vec![1.0f32; max_hd];
             let b = be
-                .alloc(rf.len() * 4, BufferUsage::Staging)
+                .alloc(ones.len() * 4, BufferUsage::Weights)
                 .map_err(|e| anyhow!("{e}"))?;
-            be.upload(b.as_ref(), bytemuck::cast_slice(rf))
+            be.upload(b.as_ref(), bytemuck::cast_slice(&ones))
                 .map_err(|e| anyhow!("{e}"))?;
-            Some((b, rf.len()))
+            wbufs.push(b);
+            wspecs.push((DType::F32, max_hd));
         }
-        None => None,
-    };
-    // gemma4 E2B per-(token,layer) input vector `[n_layer*npl]`, recomputed + re-uploaded each step.
-    let ipl_buf = if e2b {
-        Some(
-            be.alloc(c.n_layer * npl * 4, BufferUsage::Staging)
-                .map_err(|e| anyhow!("{e}"))?,
-        )
-    } else {
-        None
-    };
-    let logits_buf = be
-        .alloc(c.vocab * 4, BufferUsage::Readback)
-        .map_err(|e| anyhow!("{e}"))?;
+
+        // ── persistent KV cache buffers (f32), sized per-layer (gemma4 SWA layers are narrower) ───────
+        let mut kbufs: Vec<Box<dyn Buffer>> = Vec::new();
+        let mut vbufs: Vec<Box<dyn Buffer>> = Vec::new();
+        for l in 0..c.n_layer {
+            let kvrow_l = c.layer_n_kv(l) * c.layer_head_dim(l);
+            // f16 KV cache (2 bytes/elem) — matches the graph's f16 k_cache/v_cache decls.
+            kbufs.push(
+                be.alloc(want_ctx * kvrow_l * 2, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+            vbufs.push(
+                be.alloc(want_ctx * kvrow_l * 2, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+        }
+
+        // ── per-step IO buffers ────────────────────────────────────────────────────────
+        let hidden_buf = be
+            .alloc(ne * 4, BufferUsage::Staging)
+            .map_err(|e| anyhow!("{e}"))?;
+        let pos_buf = be
+            .alloc(4, BufferUsage::Staging)
+            .map_err(|e| anyhow!("{e}"))?;
+        let rf_buf = match &rope_freqs {
+            Some(rf) => {
+                let b = be
+                    .alloc(rf.len() * 4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?;
+                be.upload(b.as_ref(), bytemuck::cast_slice(rf))
+                    .map_err(|e| anyhow!("{e}"))?;
+                Some((b, rf.len()))
+            }
+            None => None,
+        };
+        // gemma4 E2B per-(token,layer) input vector `[n_layer*npl]`, recomputed + re-uploaded each step.
+        let ipl_buf = if e2b {
+            Some(
+                be.alloc(c.n_layer * npl * 4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?,
+            )
+        } else {
+            None
+        };
+        let logits_buf = be
+            .alloc(c.vocab * 4, BufferUsage::Readback)
+            .map_err(|e| anyhow!("{e}"))?;
+        *state = Some(SeamKv {
+            wbufs,
+            wspecs,
+            kbufs,
+            vbufs,
+            hidden_buf,
+            pos_buf,
+            rf_buf,
+            ipl_buf,
+            logits_buf,
+            max_ctx: want_ctx,
+            cached: Vec::new(),
+        });
+    }
+    let SeamKv {
+        wbufs,
+        wspecs,
+        kbufs,
+        vbufs,
+        hidden_buf,
+        pos_buf,
+        rf_buf,
+        ipl_buf,
+        logits_buf,
+        max_ctx,
+        cached,
+    } = state.as_mut().expect("seam state just initialized");
+    let max_ctx = *max_ctx;
+    if prompt.len() + max_new + 1 > max_ctx {
+        return Err(anyhow!(
+            "prompt {} + gen {} exceeds the session KV capacity {max_ctx}",
+            prompt.len(),
+            max_new
+        ));
+    }
+    // ChatSession-style prefix reuse: KV rows 0..start are already materialized for `cached`'s
+    // shared prefix — prefill only the suffix. Always leave ≥1 prompt token to process so the
+    // first generated token samples from fresh logits.
+    let start = common_prefix_len(cached, prompt).min(prompt.len() - 1);
+    cached.truncate(start);
 
     // Build a forward graph for `batch` tokens starting at absolute position `start_pos`.
     // `batch = 1` is the normal decode path; `batch > 1` is the batched-prefill path.
@@ -956,16 +1061,17 @@ pub(crate) fn generate_dense_backend(
     // Guard: MoE uses Op::MoeFfn (per-token expert routing, no batched variant yet); E2B/gemma4
     // requires a per-(token,layer) host-side input vector that is computed in the per-step loop.
     // Both fall through to the original token-by-token loop below unchanged.
-    let decode_start = if prompt.len() > 2 && c.moe.is_none() && !e2b {
-        let pf_m = prompt.len() - 1; // process all but the last prompt token
-                                     // Concatenate embeddings for the pf_m tokens: [pf_m × ne] row-major.
+    let decode_start = if prompt.len() - start > 2 && c.moe.is_none() && !e2b {
+        // Batch-prefill the un-cached suffix, all but the last prompt token (positions
+        // start..plen-1; rows 0..start are reused from the session cache).
+        let pf_m = prompt.len() - 1 - start;
         let mut pf_hidden: Vec<f32> = Vec::with_capacity(pf_m * ne);
-        for &tok in &prompt[..pf_m] {
+        for &tok in &prompt[start..prompt.len() - 1] {
             let base = tok as usize * ne;
             pf_hidden.extend(token_embd[base..base + ne].iter().map(|&x| x * embed_scale));
         }
-        // Absolute positions [0, 1, ..., pf_m-1].
-        let pf_positions: Vec<i32> = (0..pf_m as i32).collect();
+        // Absolute positions [start, ..., plen-2].
+        let pf_positions: Vec<i32> = (start as i32..(prompt.len() - 1) as i32).collect();
         // Allocate staging buffers sized for the prefill batch.
         let pf_hidden_buf = be
             .alloc(pf_m * ne * 4, BufferUsage::Staging)
@@ -979,7 +1085,7 @@ pub(crate) fn generate_dense_backend(
             .map_err(|e| anyhow!("{e}"))?;
 
         let pf_t0 = std::time::Instant::now();
-        let (pf_g, pf_h) = build(pf_m, 0);
+        let (pf_g, pf_h) = build(pf_m, start);
         let pf_plan = be.compile(&pf_g).map_err(|e| anyhow!("{e}"))?;
         let mut pf_b = Bindings::new();
         pf_b.bind(pf_h.hidden, pf_hidden_buf.as_ref());
@@ -1002,12 +1108,11 @@ pub(crate) fn generate_dense_backend(
             .map_err(|e| anyhow!("{e}"))?;
         prompt_t += pf_t0.elapsed();
 
-        // KV cache is filled for positions 0..pf_m-1.
-        // The last prompt token (position pf_m) is handled by the decode loop below,
-        // which will write its KV, get the correct logits, and sample the first generated token.
-        pf_m
+        // KV rows are now filled through position plen-2; the last prompt token is handled by
+        // the decode loop below (writes its KV, produces the logits the first sample uses).
+        prompt.len() - 1
     } else {
-        0 // fall through to per-token loop for MoE / E2B / short prompts
+        start // fall through to per-token loop for MoE / E2B / short suffixes
     };
 
     // Record-once decode: for an eligible qwen3-style dense decode on a backend that supports replay
@@ -1191,8 +1296,18 @@ pub(crate) fn generate_dense_backend(
             dec_exec.as_secs_f64() * 1e3 / decode_n as f64,
         );
     }
+    // Record what the KV cache now holds for the next turn's prefix diff. `out` includes any
+    // sampled EOS (its KV row was written before the loop broke)... it was PUSHED to out before
+    // the break, and its KV is written only when fed back — the EOS is never fed, so the cache
+    // holds prompt + generated-minus-last-fed. Conservative: cache prompt + all fed tokens; the
+    // final sampled token's row is NOT materialized, so exclude it.
+    *cached = prompt.to_vec();
+    if !out.is_empty() {
+        cached.extend_from_slice(&out[..out.len() - 1]);
+    }
     let stats = GenStats {
-        n_prompt: prompt.len(),
+        // The tokens actually PREFILLED this call (the un-cached suffix) — the TTFT-honest count.
+        n_prompt: prompt.len() - start,
         prompt_secs: prompt_t.as_secs_f64(),
         n_gen: decode_n,
         decode_secs: decode_t.as_secs_f64(),

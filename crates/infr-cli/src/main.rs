@@ -364,6 +364,13 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         };
         eprintln!("[qwen35 Qwen3-Next — {mode}]");
         Box::new(infr_llama::model::Qwen35Chat::new(gguf.clone()))
+    } else if std::env::var("INFR_SEAM").is_ok() {
+        // Opt-in: dense/MoE on the VULKAN agnostic seam with a persistent KV session (per-turn
+        // suffix-only prefill). Becomes the default once it beats the bespoke path everywhere.
+        eprintln!("[vulkan seam — dense/MoE on the agnostic compute graph, persistent KV session]");
+        Box::new(infr_llama::model::DenseSeamChat::new(
+            infr_llama::CpuModel::load(&gguf, tok.as_deref())?,
+        ))
     } else {
         llama = infr_llama::Llama::load_opt(&gguf, tok.as_deref())?;
         // Qwen3's recommended sampling — pure greedy makes thinking models degenerate

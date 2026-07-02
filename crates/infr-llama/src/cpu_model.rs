@@ -21,6 +21,14 @@ pub struct CpuModel {
     tokenizer: Tokenizer,
 }
 
+/// A persistent Vulkan seam session (see [`CpuModel::vulkan_session`]): owns the backend, the
+/// uploaded weights + KV cache, and the token ids materialized in it.
+pub struct DenseVulkanSession {
+    vk: infr_vulkan::VulkanBackend,
+    state: Option<crate::cpu_backend::SeamKv>,
+    max_ctx: usize,
+}
+
 impl CpuModel {
     /// Load a model for CPU inference without touching the GPU. `tokenizer_path` overrides the
     /// GGUF's embedded vocab when given.
@@ -41,6 +49,51 @@ impl CpuModel {
             per_layer_embd,
             tokenizer,
         })
+    }
+
+    /// Open a persistent Vulkan seam session: weights uploaded ONCE, the KV cache sized to
+    /// `max_ctx`, and the materialized-token cache that makes every later
+    /// [`generate_vulkan_session`](Self::generate_vulkan_session) call prefill only the suffix
+    /// that differs from the previous turn (ChatSession-style KV reuse on the agnostic seam).
+    pub fn vulkan_session(&self, max_ctx: usize) -> Result<DenseVulkanSession> {
+        let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
+        Ok(DenseVulkanSession {
+            vk,
+            state: None,
+            max_ctx,
+        })
+    }
+
+    /// Greedy generation on the Vulkan seam through a persistent session (see
+    /// [`vulkan_session`](Self::vulkan_session)). `stats.n_prompt` reports the tokens actually
+    /// PREFILLED (the un-cached suffix) — the TTFT-honest count.
+    pub fn generate_vulkan_session(
+        &self,
+        session: &mut DenseVulkanSession,
+        prompt: &str,
+        max_new: usize,
+        mut on_piece: impl FnMut(&str),
+    ) -> Result<crate::GenStats> {
+        let enc = self
+            .tokenizer
+            .encode(prompt, false)
+            .map_err(|e| anyhow!("encode: {e}"))?;
+        let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
+        let mut acc: Vec<u32> = Vec::new();
+        let mut printed = 0usize;
+        let (_generated, stats) = crate::cpu_backend::generate_dense_gpu_session(
+            &session.vk,
+            &self.gguf,
+            &self.cfg,
+            &self.token_embd,
+            self.per_layer_embd.as_ref(),
+            &prompt_tokens,
+            max_new,
+            |id| stream_token(&self.tokenizer, &mut acc, &mut printed, id, &mut on_piece),
+            &mut session.state,
+            session.max_ctx,
+        )?;
+        Ok(stats)
     }
 
     pub fn config(&self) -> &Config {

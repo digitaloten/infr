@@ -299,6 +299,48 @@ impl ChatModel for Qwen35Chat {
     }
 }
 
+/// Dense/MoE on the VULKAN agnostic seam with a persistent KV session (`INFR_SEAM=1` for
+/// `infr run`): weights upload once, and every turn prefills only the token suffix that differs
+/// from the previous turn — the seam twin of the bespoke `ChatSession`'s incremental prefill.
+pub struct DenseSeamChat {
+    model: CpuModel,
+    session: Option<crate::cpu_model::DenseVulkanSession>,
+}
+
+impl DenseSeamChat {
+    pub fn new(model: CpuModel) -> Self {
+        Self {
+            model,
+            session: None,
+        }
+    }
+}
+
+impl ChatModel for DenseSeamChat {
+    fn render(&self, messages: &[(&str, &str)]) -> Result<String> {
+        self.model.render_chat_messages(messages)
+    }
+
+    fn generate(
+        &mut self,
+        prompt: &str,
+        max_new: usize,
+        on_piece: &mut dyn FnMut(&str),
+    ) -> Result<GenStats> {
+        if self.session.is_none() {
+            let max_ctx = std::env::var("INFR_MAX_CTX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(self.model.config().n_ctx_train);
+            self.session = Some(self.model.vulkan_session(max_ctx)?);
+        }
+        self.model
+            .generate_vulkan_session(self.session.as_mut().unwrap(), prompt, max_new, |p| {
+                on_piece(p)
+            })
+    }
+}
+
 /// CPU reference backend (`INFR_CPU=1`) for dense/MoE: the agnostic compute-graph forward, no GPU.
 /// Stateless full-prefill each turn (no cross-turn KV yet), but the shared `Chat` now feeds the FULL
 /// rendered history in every turn, so multi-turn context works.

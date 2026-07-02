@@ -406,6 +406,48 @@ fn seam_vulkan_matches_cpu(path: &std::path::Path, prompt: &str, n: usize) {
     );
 }
 
+/// Persistent-session KV reuse on the Vulkan seam: turn 2 extends turn 1's prompt, so the session
+/// must (a) generate EXACTLY what a fresh full-prefill of the same prompt generates, and (b)
+/// prefill only the un-cached suffix (stats.n_prompt ≪ the full prompt length). The seam twin of
+/// the bespoke ChatSession's incremental prefill.
+#[test]
+fn gpu_seam_kv_reuse_matches_fresh() {
+    let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
+    need_gpu!();
+    let _tlk = test_serial_lock();
+    std::env::set_var("INFR_TEMP", "0");
+    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let mut sess = model.vulkan_session(512).expect("session");
+
+    let p1 = "The capital of France is";
+    let mut t1 = String::new();
+    let s1 = model
+        .generate_vulkan_session(&mut sess, p1, 8, |p| t1.push_str(p))
+        .expect("turn 1");
+    assert!(s1.n_prompt > 0);
+
+    let p2 = format!("{p1}{t1} And the capital of Germany is");
+    let mut t2 = String::new();
+    let s2 = model
+        .generate_vulkan_session(&mut sess, &p2, 8, |p| t2.push_str(p))
+        .expect("turn 2");
+
+    // (a) same output as a fresh full prefill of the identical prompt
+    let fresh = model.generate_dense_vulkan(&p2, 8).expect("fresh gen");
+    assert_eq!(
+        t2.trim(),
+        fresh.trim(),
+        "session (suffix prefill) diverged from a fresh full prefill"
+    );
+    // (b) the session only prefilled the suffix — far fewer tokens than the whole prompt
+    let full_len = s1.n_prompt + t1.split_whitespace().count(); // lower bound on p2's tokens
+    assert!(
+        s2.n_prompt < full_len,
+        "turn 2 prefilled {} tokens — KV reuse didn't kick in",
+        s2.n_prompt
+    );
+}
+
 /// gemma3 (SWA + dual-rope + GeGLU + sandwich norms, hd=256) through the Vulkan seam.
 #[test]
 fn gpu_seam_matches_cpu_gemma3() {
