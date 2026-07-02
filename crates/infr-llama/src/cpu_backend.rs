@@ -260,6 +260,67 @@ pub(crate) struct SeamKv {
     cached: Vec<u32>,
 }
 
+/// gemma4 E2B: build the per-(token,layer) input vectors on the host for `rows` tokens —
+/// `ipl[r][l] = (RMSNorm(model_proj_l·emb_r/√ne)·proj_norm + per_layer_tok_embd[tok_r][l]·√npl)/√2`
+/// — returning `[rows, n_layer*npl]` row-major. The projection is a real host matmul
+/// (rows × n_layer × npl dots of length ne), so parallelize over (row, layer) with rayon
+/// (mirrors the bespoke path's parallelized per-layer-embedding matmul).
+#[allow(clippy::too_many_arguments)]
+fn e2b_ipl_rows(
+    g: &Gguf,
+    cfg: &Config,
+    ple: &PerLayerEmbd,
+    token_embd: &[f32],
+    tokens: &[u32],
+    embed_scale: f32,
+) -> AResult<Vec<f32>> {
+    use rayon::prelude::*;
+    let (npl, nl, nem) = (ple.npl, ple.n_layer, ple.n_embd);
+    let ne = cfg.n_embd;
+    let inv_sqrt_ne = 1.0 / (nem as f32).sqrt();
+    let sqrt_npl = (npl as f32).sqrt();
+    let inv_sqrt2 = 1.0 / 2f32.sqrt();
+    let te_bytes = g
+        .tensor_bytes("per_layer_token_embd.weight")
+        .map_err(|e| anyhow!("{e}"))?;
+    let mut ipl = vec![0f32; tokens.len() * nl * npl];
+    ipl.par_chunks_mut(nl * npl)
+        .zip(tokens.par_iter())
+        .try_for_each(|(row, &tok)| -> AResult<()> {
+            let tok = tok as usize;
+            let emb: Vec<f32> = token_embd[tok * ne..tok * ne + ne]
+                .iter()
+                .map(|&x| x * embed_scale)
+                .collect();
+            let r0 = tok * ple.tok_embd_row_bytes;
+            let pl_tok = dequant_block(
+                ple.tok_embd_dtype,
+                &te_bytes[r0..r0 + ple.tok_embd_row_bytes],
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+            for layer in 0..nl {
+                let mut proj = vec![0f32; npl];
+                let mut ss = 0f32;
+                for (j, pj) in proj.iter_mut().enumerate() {
+                    let wrow =
+                        &ple.model_proj[(layer * npl + j) * nem..(layer * npl + j) * nem + nem];
+                    let acc: f32 = wrow.iter().zip(&emb).map(|(a, b)| a * b).sum();
+                    let v = acc * inv_sqrt_ne;
+                    *pj = v;
+                    ss += v * v;
+                }
+                let rms = 1.0 / (ss / npl as f32 + cfg.rms_eps).sqrt();
+                for j in 0..npl {
+                    let normed = proj[j] * rms * ple.proj_norm[j];
+                    let tokv = pl_tok[layer * npl + j] * sqrt_npl;
+                    row[layer * npl + j] = (normed + tokv) * inv_sqrt2;
+                }
+            }
+            Ok(())
+        })?;
+    Ok(ipl)
+}
+
 /// Longest shared prefix of the cached tokens and the new prompt (the KV rows that stay valid).
 fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
@@ -516,9 +577,9 @@ pub(crate) fn generate_dense_backend(
         let hidden = g.input(f32d(batch * ne));
         let positions = g.input(TensorDesc::new(vec![batch], DType::I32));
         let rope_freqs = rf_buf.as_ref().map(|(_, n)| g.input(f32d(*n)));
-        // gemma4 E2B per-(token,layer) input vector `[n_layer*npl]` (computed host-side each step).
+        // gemma4 E2B per-(token,layer) input vectors `[batch, n_layer*npl]` (computed host-side).
         let per_layer_inp = if e2b {
-            Some(g.input(f32d(c.n_layer * npl)))
+            Some(g.input(f32d(batch * c.n_layer * npl)))
         } else {
             None
         };
@@ -943,15 +1004,29 @@ pub(crate) fn generate_dense_backend(
                     in_f: ne as u32,
                     out_f: npl as u32,
                 });
-                // gelu(plg) * ipl[l*npl .. l*npl+npl]  (the layer's slice of the input vector).
+                // gelu(plg) * ipl[r, l*npl .. l*npl+npl] — gather each row's layer-l slice of the
+                // [batch, n_layer*npl] input into a contiguous [batch, npl] scratch (one strided-
+                // copy dispatch), then the plain gated activation. Keeps GatedAct's semantics
+                // unchanged (its up_off has no per-row stride).
+                let ipl_l = g.internal(f32d(batch * npl));
+                g.push(Op::CopyStrided {
+                    src: ipl,
+                    src_off: (l * npl) as u32,
+                    src_stride: (c.n_layer * npl) as u32,
+                    dst: ipl_l,
+                    dst_off: 0,
+                    dst_stride: npl as u32,
+                    rows: batch as u32,
+                    n: npl as u32,
+                });
                 g.push(Op::GatedAct {
                     gate: plg,
-                    up: ipl,
+                    up: ipl_l,
                     dst: plg,
                     rows: batch as u32,
                     nff: npl as u32,
                     act: Activation::Gelu,
-                    up_off: (l * npl) as u32,
+                    up_off: 0,
                 });
                 g.push(Op::Linear {
                     x: plg,
@@ -1071,7 +1146,7 @@ pub(crate) fn generate_dense_backend(
     // Guard: MoE uses Op::MoeFfn (per-token expert routing, no batched variant yet); E2B/gemma4
     // requires a per-(token,layer) host-side input vector that is computed in the per-step loop.
     // Both fall through to the original token-by-token loop below unchanged.
-    let decode_start = if prompt.len() - start > 2 && c.moe.is_none() && !e2b {
+    let decode_start = if prompt.len() - start > 2 && c.moe.is_none() {
         // Batch-prefill the un-cached suffix, all but the last prompt token (positions
         // start..plen-1; rows 0..start are reused from the session cache).
         let pf_m = prompt.len() - 1 - start;
@@ -1094,6 +1169,25 @@ pub(crate) fn generate_dense_backend(
         be.upload(pf_pos_buf.as_ref(), bytemuck::cast_slice(&pf_positions))
             .map_err(|e| anyhow!("{e}"))?;
 
+        // gemma4 E2B: the chunk's per-(token,layer) input vectors, host-computed in parallel.
+        let pf_ipl_buf = if let Some(ple) = ple {
+            let ipl = e2b_ipl_rows(
+                g,
+                c,
+                ple,
+                token_embd,
+                &prompt[start..prompt.len() - 1],
+                embed_scale,
+            )?;
+            let b = be
+                .alloc(ipl.len() * 4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?;
+            be.upload(b.as_ref(), bytemuck::cast_slice(&ipl))
+                .map_err(|e| anyhow!("{e}"))?;
+            Some(b)
+        } else {
+            None
+        };
         let pf_t0 = std::time::Instant::now();
         let (pf_g, pf_h) = build(pf_m, start);
         let pf_plan = be.compile(&pf_g).map_err(|e| anyhow!("{e}"))?;
@@ -1105,6 +1199,9 @@ pub(crate) fn generate_dense_backend(
         // and panics. (E2B's per-layer input is excluded by the `!e2b` guard above.)
         if let (Some(rid), Some((rb, _))) = (pf_h.rope_freqs, &rf_buf) {
             pf_b.bind(rid, rb.as_ref());
+        }
+        if let (Some(pid), Some(ib)) = (pf_h.per_layer_inp, &pf_ipl_buf) {
+            pf_b.bind(pid, ib.as_ref());
         }
         for l in 0..c.n_layer {
             pf_b.bind(pf_h.k_cache[l], kbufs[l].as_ref());
@@ -1182,38 +1279,7 @@ pub(crate) fn generate_dense_backend(
         // gemma4 E2B: build this token's per-layer input vector on the host (mirrors the GPU forward):
         // `ipl[l] = ((model_proj_l·emb)/√n_embd, RMSNorm'd over npl) + (per_layer_tok_embd_row × √npl)) / √2`.
         if let (Some(ple), Some(ipl_buf)) = (ple, &ipl_buf) {
-            let (npl, nl, nem) = (ple.npl, ple.n_layer, ple.n_embd);
-            let inv_sqrt_ne = 1.0 / (nem as f32).sqrt();
-            let sqrt_npl = (npl as f32).sqrt();
-            let inv_sqrt2 = 1.0 / 2f32.sqrt();
-            let te_bytes = g
-                .tensor_bytes("per_layer_token_embd.weight")
-                .map_err(|e| anyhow!("{e}"))?;
-            let r0 = tok * ple.tok_embd_row_bytes;
-            let pl_tok = dequant_block(
-                ple.tok_embd_dtype,
-                &te_bytes[r0..r0 + ple.tok_embd_row_bytes],
-            )
-            .map_err(|e| anyhow!("{e}"))?;
-            let mut ipl = vec![0f32; nl * npl];
-            for layer in 0..nl {
-                let mut proj = vec![0f32; npl];
-                let mut ss = 0f32;
-                for (j, pj) in proj.iter_mut().enumerate() {
-                    let wrow =
-                        &ple.model_proj[(layer * npl + j) * nem..(layer * npl + j) * nem + nem];
-                    let acc: f32 = wrow.iter().zip(&emb).map(|(a, b)| a * b).sum();
-                    let v = acc * inv_sqrt_ne;
-                    *pj = v;
-                    ss += v * v;
-                }
-                let rms = 1.0 / (ss / npl as f32 + c.rms_eps).sqrt();
-                for j in 0..npl {
-                    let normed = proj[j] * rms * ple.proj_norm[j];
-                    let tokv = pl_tok[layer * npl + j] * sqrt_npl;
-                    ipl[layer * npl + j] = (normed + tokv) * inv_sqrt2;
-                }
-            }
+            let ipl = e2b_ipl_rows(g, c, ple, token_embd, &[tok as u32], embed_scale)?;
             be.upload(ipl_buf.as_ref(), bytemuck::cast_slice(&ipl))
                 .map_err(|e| anyhow!("{e}"))?;
         }
