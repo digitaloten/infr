@@ -76,6 +76,11 @@ pub(crate) fn compile(graph: &Graph) -> Result<Box<dyn Plan>> {
 /// `Conv1dSilu` / `DeltaNet` / per-head `QkNorm`. Anything else falls back to the static path — which
 /// matters for correctness: `attention_kv_dyn` is gemma-disabled (full causal, hardcoded 1/√hd).
 fn decode_eligible(graph: &Graph) -> bool {
+    // INFR_SEAM_NO_REPLAY forces the static per-execute path (INFR_PROF2 timestamps work there;
+    // the replay path can't report them).
+    if std::env::var("INFR_SEAM_NO_REPLAY").is_ok() {
+        return false;
+    }
     let mut has_qknr = false;
     let mut has_attn = false;
     for op in &graph.ops {
@@ -101,9 +106,13 @@ fn decode_eligible(graph: &Graph) -> bool {
                 }
                 has_qknr = true;
             }
+            // MoeFfn is REPLAY-SAFE: router GEMV + GPU-side top-k + id-indexed expert GEMVs are
+            // all push-constant/pos-independent, and its scratch is plan-held. The rest stay
+            // rejected (Rope/Softcap = gemma paths with per-layer params the dyn kernels lack;
+            // Conv1dSilu/DeltaNet = recurrent state the replay contract doesn't cover yet).
+            Op::MoeFfn { .. } => {}
             Op::Rope { .. }
             | Op::Softcap { .. }
-            | Op::MoeFfn { .. }
             | Op::Conv1dSilu { .. }
             | Op::DeltaNet { .. }
             | Op::QkNorm { .. } => return false,

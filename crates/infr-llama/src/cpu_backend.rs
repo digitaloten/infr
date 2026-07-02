@@ -1141,7 +1141,6 @@ pub(crate) fn generate_dense_backend(
         && qk_norm
         && !gemma
         && !gemma4
-        && c.moe.is_none()
         && !e2b
         && rope_freqs.is_none()
         && c.final_softcap <= 0.0;

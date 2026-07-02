@@ -438,7 +438,7 @@ impl<'a> Recorder<'a> {
         self.stamp("lm_head");
         let k = self
             .be
-            .kernel("linear_f32", crate::gemm::linear_f32_spv(), 3, 12);
+            .kernel("linear_f32r", crate::gemm::linear_f32r_spv(), 3, 12);
         let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
@@ -448,7 +448,7 @@ impl<'a> Recorder<'a> {
             &[Self::vkb(w), Self::vkb(x), Self::vkb(y)],
             1,
             &push,
-            ((rows * out_f) as u32).div_ceil(64),
+            (rows * out_f) as u32, // one workgroup per output (64-thread K reduce)
         );
     }
 
@@ -2693,6 +2693,7 @@ impl<'a> Recorder<'a> {
         n_used: usize,
         scale: f32,
     ) {
+        self.stamp("moe_topk");
         let k = self
             .be
             .kernel("moe_topk", crate::gemm::moe_topk_spv(), 3, 12);
@@ -2764,6 +2765,7 @@ impl<'a> Recorder<'a> {
 
     /// MoE bucketing pass 1 (count): tally assignments per expert into `counts` (pre-zeroed).
     pub fn moe_bucket_count(&self, tok_ids: &dyn Buffer, counts: &dyn Buffer, n_pairs: usize) {
+        self.stamp("moe_bucket");
         let k = self.be.kernel(
             "moe_bucket_count",
             crate::gemm::moe_bucket_count_spv(),
@@ -2787,6 +2789,7 @@ impl<'a> Recorder<'a> {
         fill: &dyn Buffer,
         n_expert: usize,
     ) {
+        self.stamp("moe_bucket");
         let k = self
             .be
             .kernel("moe_bucket_scan", crate::gemm::moe_bucket_scan_spv(), 3, 4);
@@ -2813,6 +2816,7 @@ impl<'a> Recorder<'a> {
         n_pairs: usize,
         n_used: usize,
     ) {
+        self.stamp("moe_bucket");
         let k = self.be.kernel(
             "moe_bucket_scatter",
             crate::gemm::moe_bucket_scatter_spv(),
@@ -2997,6 +3001,7 @@ impl<'a> Recorder<'a> {
         ne: usize,
         n_used: usize,
     ) {
+        self.stamp("moe_accumulate");
         let k = self
             .be
             .kernel("moe_accumulate", crate::gemm::moe_accumulate_spv(), 3, 8);
@@ -3022,6 +3027,7 @@ impl<'a> Recorder<'a> {
         acc: &dyn Buffer,
         n: usize,
     ) {
+        self.stamp("moe_accumulate");
         let k = self
             .be
             .kernel("add_scaled_id", crate::gemm::add_scaled_id_spv(), 3, 8);
@@ -3094,6 +3100,7 @@ impl<'a> Recorder<'a> {
         m: usize,
         ne: usize,
     ) {
+        self.stamp("moe_gather");
         let k = self
             .be
             .kernel("gather_rows", crate::gemm::gather_rows_spv(), 3, 12);
@@ -3124,6 +3131,7 @@ impl<'a> Recorder<'a> {
         m: usize,
         ne: usize,
     ) {
+        self.stamp("moe_scatter");
         let k = self.be.kernel(
             "scatter_add_rows",
             crate::gemm::scatter_add_rows_spv(),

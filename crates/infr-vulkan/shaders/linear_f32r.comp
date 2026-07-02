@@ -1,0 +1,31 @@
+#version 460
+// f32-weight GEMV y = x·Wᵀ, REDUCTION shape: ONE workgroup per output element, 64 threads striding
+// K with a shared tree-reduce (the f32 twin of linear_f16). The thread-per-output linear_f32 keeps
+// the eager path, but a decode-hot GEMV with few outputs (the qwen3moe router: 2048→128 per layer)
+// launches only out_f/64 workgroups there — this shape launches out_f workgroups instead.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint rows; uint in_f; uint out_f; } pc;
+layout(binding = 0) readonly buffer WB { float w[]; };     // [out, in] f32
+layout(binding = 1) readonly buffer XB { float x[]; };     // [rows, in]
+layout(binding = 2) buffer YB { float y[]; };              // [rows, out]
+
+shared float red[64];
+
+void main() {
+    uint unit = gl_WorkGroupID.x;       // = r * out_f + o
+    uint o = unit % pc.out_f;
+    uint r = unit / pc.out_f;
+    uint t = gl_LocalInvocationID.x;
+    uint wbase = o * pc.in_f;
+    uint xbase = r * pc.in_f;
+    float acc = 0.0;
+    for (uint i = t; i < pc.in_f; i += 64u) { acc += w[wbase + i] * x[xbase + i]; }
+    red[t] = acc;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride /= 2u) {
+        if (t < stride) { red[t] += red[t + stride]; }
+        barrier();
+    }
+    if (t == 0u) { y[unit] = red[0]; }
+}

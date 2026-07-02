@@ -72,6 +72,7 @@ fn main() {
         ("linear_f16", "linear_f16", &[]),
         ("linear_bf16", "linear_bf16", &[]),
         ("linear_f32", "linear_f32", &[]),
+        ("linear_f32r", "linear_f32r", &[]),
         ("matmul_f32", "matmul_f32", &[]),
         ("linear_q", "linear_q", &[]),
         ("linear_res", "linear_res", &[]),

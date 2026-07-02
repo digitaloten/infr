@@ -333,6 +333,7 @@ const STORE_F16_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sto
 const ROPE_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope.spv"));
 const LINEAR_F16_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f16.spv"));
 const LINEAR_F32_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f32.spv"));
+const LINEAR_F32R_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f32r.spv"));
 const LINEAR_BF16_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_bf16.spv"));
 const LINEAR_Q_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_q.spv"));
 const LINEAR_RES_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_res.spv"));
@@ -606,6 +607,11 @@ pub(crate) fn linear_f16_spv() -> &'static [u32] {
 pub(crate) fn linear_f32_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(LINEAR_F32_SPV_BYTES))
+}
+/// SPIR-V for the reduction-shape f32 GEMV (workgroup per output — decode-hot narrow GEMVs).
+pub(crate) fn linear_f32r_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(LINEAR_F32R_SPV_BYTES))
 }
 /// SPIR-V for the bf16-weight GEMV (`y=x·Wᵀ`).
 pub(crate) fn linear_bf16_spv() -> &'static [u32] {
