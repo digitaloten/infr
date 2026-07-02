@@ -396,10 +396,13 @@ impl MetalBackend {
         )
     }
 
-    /// Build (or fetch from cache) a quantized weight in factored device form
-    /// (`dequant_factored`), bit-packing the codes to the narrowest width the format's max code
-    /// fits (4/6/8 bits, low bits first) — decode GEMV is bound on the weight byte stream, so
-    /// every bit shaved here is throughput.
+    /// Build (or fetch from cache) a quantized weight in on-device form. Q4_K and Q6_K — the
+    /// formats real checkpoints ship — have NATIVE kernels that decode the raw GGUF block bytes,
+    /// so the bound weight buffer is used as-is: no host repack, no extra residency, and the
+    /// weight stream stays at the format's true size (~4.5 / ~6.6 bpw vs the factored form's
+    /// ~6.1 / ~8.1). Everything else goes through the factored form (`dequant_factored`), codes
+    /// bit-packed to the narrowest width the format's max code fits. Decode GEMV is bound on the
+    /// weight byte stream, so every bit shaved here is throughput.
     fn weight_qui(
         &self,
         id: TensorId,
@@ -410,6 +413,23 @@ impl MetalBackend {
         let key = buf as *const _ as usize;
         if let Some(w) = self.qui_cache.lock().unwrap().get(&key) {
             return w.clone();
+        }
+        let native_kern = match g.desc(id).dtype {
+            DType::Q4K => Some("linear_q4k"),
+            DType::Q6K => Some("linear_q6k"),
+            _ => None,
+        };
+        if let Some(kern) = native_kern {
+            // The kernel never reads scm/dd for native formats; bind tiny dummies.
+            let w = Arc::new(QuiWeight {
+                codes: buf.raw.clone(),
+                scm: self.zeros_buf(1),
+                dd: self.zeros_buf(1),
+                kern,
+                dshift: 0,
+            });
+            self.qui_cache.lock().unwrap().insert(key, w.clone());
+            return w;
         }
         let bytes = Self::read_bytes(buf);
         let f = infr_gguf::dequant::dequant_factored(g.desc(id).dtype, &bytes);
@@ -594,6 +614,8 @@ impl MetalBackend {
                     let mm_kern = match qw.kern {
                         "linear_quik4" => "linear_quik4_mm",
                         "linear_quik6" => "linear_quik6_mm",
+                        "linear_q4k" => "linear_q4k_mm",
+                        "linear_q6k" => "linear_q6k_mm",
                         _ => "linear_quik8_mm",
                     };
                     let mm_ok = m >= 16
@@ -609,6 +631,8 @@ impl MetalBackend {
                         let rt = match qw.kern {
                             "linear_quik4" => "linear_quik4_rt",
                             "linear_quik6" => "linear_quik6_rt",
+                            "linear_q4k" => "linear_q4k_rt",
+                            "linear_q6k" => "linear_q6k_rt",
                             _ => "linear_quik8_rt",
                         };
                         (rt, m.div_ceil(8) * out_f, 32)
