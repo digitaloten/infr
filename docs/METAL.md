@@ -155,6 +155,19 @@ which for these kernels means skipped KV slices and garbage merges. Every
 wide-threadgroup route checks its own pipeline's cap and degrades to the
 next-narrower kernel.
 
+## Q8_0 KV cache (`INFR_KV_Q8=1`)
+
+Opt-in: both caches stored as Q8_0 blocks (34 B / 32 elems) — **half the f16
+footprint and bandwidth**, so 16k-context sessions fit machines the f16 cache
+would swap on. Write quantization is byte-identical between the CPU reference
+and `writekv_q8` (d = amax/127 as f16, q = rint(x/d)); reads dequantize
+exactly. Decode at depth rides `attnvec_q8kv` (the vector kernel with
+dequant-on-read; also serves prefill until a q8 flash port — the named
+follow-up), everything else the scalar fallback. Throughput is
+model-dependent: the q8 read path trades bandwidth for ALU (ushort-pair code
+loads), measuring +13% on 0.6B tg128@d16384 (56.2 t/s) but ~-6% on 4B at
+d4096 — enable it for footprint or for small models at depth.
+
 ## Profiling
 
 `INFR_METAL_PROFILE=1`: per-op CPU-encode + GPU commit+wait wall, printed on

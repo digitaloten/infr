@@ -1835,8 +1835,12 @@ inline float q8_at(device const uchar* c, ulong e) {
 inline float4 q8_float4(device const uchar* c, ulong e) { /* e % 4 == 0: never straddles */
     device const uchar* blk = c + (e >> 5) * 34ul;
     float d = (float)*(device const half*)blk;
-    device const uchar* q = blk + 2u + (e & 31u);
-    return d * float4((float)(char)q[0], (float)(char)q[1], (float)(char)q[2], (float)(char)q[3]);
+    /* codes start at blk+2 (2-byte aligned): two ushort loads cover the 4 codes */
+    device const ushort* q2 = (device const ushort*)(blk + 2u + (e & 31u));
+    uint lo = q2[0];
+    uint hi = q2[1];
+    return d * float4((float)(char)(lo & 0xFFu), (float)(char)(lo >> 8),
+                      (float)(char)(hi & 0xFFu), (float)(char)(hi >> 8));
 }
 kernel void writekv_q8(device const float* src   [[buffer(0)]],
                        device uchar*       cache [[buffer(1)]],
