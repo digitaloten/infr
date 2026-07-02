@@ -1130,7 +1130,7 @@ kernel void attnflash_f16kv(device const half*  q   [[buffer(0)]],
 // P rounds through f32 shared and enters the V MMA as an f32 fragment against half V fragments.
 // Tail KV blocks read up to 7 rows past the causal limit (same in-buffer contract as above);
 // 8-row blocks entirely past it are skipped, so reads never go further.
-template<uint hd>       // compile-time head_dim: fully unrolled QK/PV loops, exact shared sizing
+template<uint hd, uint NSG>   // compile-time head_dim + simdgroup count: fully unrolled, exact shared sizing
 kernel void attnflash2_f16kv_t(device const half*  q   [[buffer(0)]],
                                device const half*  k   [[buffer(1)]],
                                device const half*  v   [[buffer(2)]],
@@ -1139,7 +1139,7 @@ kernel void attnflash2_f16kv_t(device const half*  q   [[buffer(0)]],
                                uint3  tgpig [[threadgroup_position_in_grid]],
                                ushort sgitg [[simdgroup_index_in_threadgroup]],
                                ushort tiisg [[thread_index_in_simdgroup]]) {
-    constexpr uint QT = 8, C = 64, NSG = 4, NQ = QT / NSG, SH = C;
+    constexpr uint QT = 8, C = 64, NQ = QT / NSG, SH = C;
     threadgroup half  sq[QT * hd];    // Q tile (rows x hd, half)
     threadgroup float so[QT * hd];    // O accumulator (rows x hd, f32)
     threadgroup float ss[QT * SH];    // scores, then P, per KV block (rows x C, f32)
@@ -1148,7 +1148,8 @@ kernel void attnflash2_f16kv_t(device const half*  q   [[buffer(0)]],
     uint qt = tgpig.x % ntq;          // same-head tiles adjacent (SLC — see attnflash_f16kv)
     uint h  = tgpig.x / ntq;
     constexpr uint hd4 = hd / 4u;
-    constexpr uint no = hd / (8u * NSG);   // O column fragments owned per simdgroup (2 or 4)
+    constexpr uint no = hd / (8u * NSG);   // O column fragments owned per simdgroup
+    constexpr uint NC = (C / 8u) / NSG;    // score fragments owned per simdgroup
     uint kvh = h / (p.n_head / p.n_kv);
     uint r0 = qt * QT;
     uint abs0 = p.pos + r0;
@@ -1173,8 +1174,9 @@ kernel void attnflash2_f16kv_t(device const half*  q   [[buffer(0)]],
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float S[NQ] = {0.0f, 0.0f};
-    float M[NQ] = {-MAXFLOAT / 2, -MAXFLOAT / 2};
+    float S[NQ];
+    float M[NQ];
+    for (uint jj = 0; jj < NQ; jj++) { S[jj] = 0.0f; M[jj] = -MAXFLOAT / 2; }
 
     for (uint ic = lo_min & ~(C - 1u); ic <= abs_max; ic += C) {
         // Q*K^T — 8 score fragments split across simdgroups (fragment f covers KV rows
@@ -1182,7 +1184,7 @@ kernel void attnflash2_f16kv_t(device const half*  q   [[buffer(0)]],
         {
             device const half* pk = k + ((ulong)(ic + 8u * sgitg) * p.n_kv + kvh) * hd;
             threadgroup float* ps = ss + 8u * sgitg;
-            for (uint cc = 0; cc < 2u; cc++) {
+            for (uint cc = 0; cc < NC; cc++) {
                 simdgroup_float8x8 mqk = simdgroup_float8x8(0.0f);
                 if (ic + 8u * (sgitg + cc * NSG) <= abs_max) {
                     for (uint i = 0; i < hd; i += 16u) {
@@ -1272,9 +1274,9 @@ kernel void attnflash2_f16kv_t(device const half*  q   [[buffer(0)]],
     }
 }
 
-typedef decltype(attnflash2_f16kv_t<64>) attnflash2_t;
-template [[host_name("attnflash2_f16kv_hd64")]]  kernel attnflash2_t attnflash2_f16kv_t<64>;
-template [[host_name("attnflash2_f16kv_hd128")]] kernel attnflash2_t attnflash2_f16kv_t<128>;
+typedef decltype(attnflash2_f16kv_t<64, 4>) attnflash2_t;
+template [[host_name("attnflash2_f16kv_hd64")]]  kernel attnflash2_t attnflash2_f16kv_t<64, 4>;
+template [[host_name("attnflash2_f16kv_hd128")]] kernel attnflash2_t attnflash2_f16kv_t<128, 4>;
 
 // ---- WriteKv: cast-copy `n` f32 source elems into the bound KV cache at row offset `base`, on the
 // GPU so it stays in the batch (no host round-trip that would force a per-layer flush). The (half)
