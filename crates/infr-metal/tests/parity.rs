@@ -1273,6 +1273,87 @@ fn deltanet_parity() {
     assert_close(&cpu[1], &mtl[1], 1e-4, "deltanet state");
 }
 
+// Multi-row scan at the qwen3-next head shape: the state must carry across rows exactly (the
+// device kernel loops rows with each lane owning its state column).
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn deltanet_multirow_parity() {
+    let (rows, nv, nk, kd, vd) = (5usize, 4usize, 2usize, 128usize, 128usize);
+    let mut g = Graph::new();
+    let q = g.input(TensorDesc::new(vec![rows, nk * kd], DType::F32));
+    let k = g.input(TensorDesc::new(vec![rows, nk * kd], DType::F32));
+    let v = g.input(TensorDesc::new(vec![rows, nv * vd], DType::F32));
+    let b = g.input(TensorDesc::new(vec![rows, nv], DType::F32));
+    let a = g.input(TensorDesc::new(vec![rows, nv], DType::F32));
+    let a_coef = g.weight(TensorDesc::new(vec![nv], DType::F32));
+    let dt_bias = g.weight(TensorDesc::new(vec![nv], DType::F32));
+    let state = g.input(TensorDesc::new(vec![nv * kd * vd], DType::F32));
+    let dst = g.output(TensorDesc::new(vec![rows, nv * vd], DType::F32));
+    g.push(Op::DeltaNet {
+        q,
+        k,
+        v,
+        b,
+        a,
+        a_coef,
+        dt_bias,
+        state,
+        dst,
+        rows: rows as u32,
+        n_vhead: nv as u32,
+        n_khead: nk as u32,
+        head_k: kd as u32,
+        head_v: vd as u32,
+        eps: 1e-6,
+    });
+    let bound = vec![
+        (q, f32_bytes(&rand_f32(rows * nk * kd, 300))),
+        (k, f32_bytes(&rand_f32(rows * nk * kd, 301))),
+        (v, f32_bytes(&rand_f32(rows * nv * vd, 302))),
+        (b, f32_bytes(&rand_f32(rows * nv, 303))),
+        (a, f32_bytes(&rand_f32(rows * nv, 304))),
+        (a_coef, f32_bytes(&rand_f32(nv, 305))),
+        (dt_bias, f32_bytes(&rand_f32(nv, 306))),
+        (state, f32_bytes(&rand_f32(nv * kd * vd, 307))),
+    ];
+    let reads = [(dst, rows * nv * vd), (state, nv * kd * vd)];
+    let cpu = run_multi(&CpuBackend::new(), &g, &bound, &reads);
+    let mtl = run_multi(&MetalBackend::new().expect("metal"), &g, &bound, &reads);
+    assert_close(&cpu[0], &mtl[0], 1e-4, "deltanet multirow dst");
+    assert_close(&cpu[1], &mtl[1], 1e-4, "deltanet multirow state");
+}
+
+// Multi-row conv: the rolling state shifts once per row and survives to the next.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn conv1d_silu_multirow_parity() {
+    let (rows, cc, kk) = (5usize, 256usize, 4usize);
+    let mut g = Graph::new();
+    let x = g.input(TensorDesc::new(vec![rows, cc], DType::F32));
+    let w = g.weight(TensorDesc::new(vec![cc, kk], DType::F32));
+    let state = g.input(TensorDesc::new(vec![kk - 1, cc], DType::F32));
+    let dst = g.output(TensorDesc::new(vec![rows, cc], DType::F32));
+    g.push(Op::Conv1dSilu {
+        x,
+        weight: w,
+        state,
+        dst,
+        rows: rows as u32,
+        channels: cc as u32,
+        kernel: kk as u32,
+    });
+    let bound = vec![
+        (x, f32_bytes(&rand_f32(rows * cc, 310))),
+        (w, f32_bytes(&rand_f32(cc * kk, 311))),
+        (state, f32_bytes(&rand_f32((kk - 1) * cc, 312))),
+    ];
+    let reads = [(dst, rows * cc), (state, (kk - 1) * cc)];
+    let cpu = run_multi(&CpuBackend::new(), &g, &bound, &reads);
+    let mtl = run_multi(&MetalBackend::new().expect("metal"), &g, &bound, &reads);
+    assert_close(&cpu[0], &mtl[0], 1e-4, "conv multirow dst");
+    assert_close(&cpu[1], &mtl[1], 0.0, "conv multirow state");
+}
+
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn copy_parity() {

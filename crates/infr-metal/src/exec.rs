@@ -1585,6 +1585,34 @@ impl MetalBackend {
                 kernel,
             } => {
                 let (rr, cc, kk) = (rows as usize, channels as usize, kernel as usize);
+                // Device path: each thread owns one channel and its state column — no cross-
+                // thread deps, rows loop in-kernel, state updated in the BOUND buffer (the
+                // write-back self-copy guard keeps it authoritative). kk > 8 exceeds the
+                // kernel's register window; no real conv ships that (qwen3-next uses 4).
+                if kk <= 8 && std::env::var("INFR_METAL_NODELTA").is_err() {
+                    if let Some(sb) = bindings.get(state) {
+                        let bx = self.ensure_device(r, x);
+                        let bw = self.weight_buf(weight, g, bindings);
+                        let bd = self.dev_dst(r, dst, rr * cc);
+                        let sbuf = metal_buf(sb);
+                        let i = state.0 as usize;
+                        r.dev[i] = Some(Arc::new(sbuf.raw.clone()));
+                        r.loc[i] = Loc::Device;
+                        let pso = self.pipelines.get("conv1d_silu_f32")?;
+                        let mut p = (rr as u32).to_ne_bytes().to_vec();
+                        p.extend_from_slice(&(cc as u32).to_ne_bytes());
+                        p.extend_from_slice(&(kk as u32).to_ne_bytes());
+                        self.encode(
+                            r,
+                            &pso,
+                            &[bx.as_ref(), bw.as_ref(), &sbuf.raw, bd.as_ref()],
+                            &p,
+                            cc,
+                        );
+                        r.loc[dst.0 as usize] = Loc::Device;
+                        return Ok(());
+                    }
+                }
                 self.ensure_host(r, g, x);
                 self.ensure_host(r, g, state);
                 let xs = r.vals[x.0 as usize].clone(); // [rows, channels]
@@ -1639,6 +1667,64 @@ impl MetalBackend {
                     head_k as usize,
                     head_v as usize,
                 );
+                // Device path: one threadgroup per value head, one lane per value dim — each
+                // lane owns state column S[:, d] (the delta-rule update touches only that
+                // column, so the row scan needs no state synchronization). State updates the
+                // BOUND buffer in place. Gates match the kernel's shared/thread budgets.
+                if kd <= 256
+                    && vd.is_multiple_of(32)
+                    && vd <= 1024
+                    && std::env::var("INFR_METAL_NODELTA").is_err()
+                {
+                    if let Some(sb) = bindings.get(state) {
+                        let fits = self
+                            .pipelines
+                            .get("deltanet_f32")
+                            .map(|pl| pl.max_total_threads_per_threadgroup() >= vd as u64)
+                            .unwrap_or(false);
+                        if fits {
+                            let bq = self.ensure_device(r, q);
+                            let bk = self.ensure_device(r, k);
+                            let bv = self.ensure_device(r, v);
+                            let bb = self.ensure_device(r, b);
+                            let ba = self.ensure_device(r, a);
+                            let bac = self.weight_buf(a_coef, g, bindings);
+                            let bdt = self.weight_buf(dt_bias, g, bindings);
+                            let bd = self.dev_dst(r, dst, rr * nv * vd);
+                            let sbuf = metal_buf(sb);
+                            let i = state.0 as usize;
+                            r.dev[i] = Some(Arc::new(sbuf.raw.clone()));
+                            r.loc[i] = Loc::Device;
+                            let pso = self.pipelines.get("deltanet_f32")?;
+                            let mut p = (rr as u32).to_ne_bytes().to_vec();
+                            p.extend_from_slice(&(nv as u32).to_ne_bytes());
+                            p.extend_from_slice(&(nk as u32).to_ne_bytes());
+                            p.extend_from_slice(&(kd as u32).to_ne_bytes());
+                            p.extend_from_slice(&(vd as u32).to_ne_bytes());
+                            p.extend_from_slice(&eps.to_ne_bytes());
+                            self.encode_tg(
+                                r,
+                                &pso,
+                                &[
+                                    bq.as_ref(),
+                                    bk.as_ref(),
+                                    bv.as_ref(),
+                                    bb.as_ref(),
+                                    ba.as_ref(),
+                                    bac.as_ref(),
+                                    bdt.as_ref(),
+                                    &sbuf.raw,
+                                    bd.as_ref(),
+                                ],
+                                &p,
+                                nv * vd,
+                                vd,
+                            );
+                            r.loc[dst.0 as usize] = Loc::Device;
+                            return Ok(());
+                        }
+                    }
+                }
                 for id in [q, k, v, b, a, state] {
                     self.ensure_host(r, g, id);
                 }
