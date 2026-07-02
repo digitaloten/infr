@@ -732,7 +732,15 @@ fn lower_op(
             channels,
             kernel,
         } => {
-            rec.conv1d_silu(
+            // Batch (rows ≥ kconv-1): all rows·cc outputs in parallel + a history rebuild pass,
+            // instead of the token-serial history walk. Decode keeps the sequential kernel.
+            let cv = if *rows as usize >= (*kernel as usize).saturating_sub(1).max(2) {
+                Recorder::conv1d_silu_batch
+            } else {
+                Recorder::conv1d_silu
+            };
+            cv(
+                rec,
                 r(*x)?,
                 r(*weight)?,
                 r(*state)?,

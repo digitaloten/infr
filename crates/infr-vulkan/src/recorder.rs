@@ -2170,6 +2170,55 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// BATCH depthwise conv1d + SiLU (rows ≥ kconv-1): pass 1 computes ALL rows·cc outputs in
+    /// parallel from the virtual sequence [state ‖ qkv] (the sequential kernel walked the rows
+    /// one by one, shuffling the history each token); pass 2 rebuilds the history from the last
+    /// kconv-1 input rows. The recorder's hazard tracking orders pass 2 after pass 1 (pass 1
+    /// reads the old state pass 2 overwrites). See shaders/conv1d_silu_par.comp / conv1d_shift.comp.
+    pub fn conv1d_silu_batch(
+        &self,
+        qkv: &dyn Buffer,
+        w: &dyn Buffer,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        rows: usize,
+        cc: usize,
+        kconv: usize,
+    ) {
+        debug_assert!(rows >= kconv - 1, "conv1d_silu_batch needs rows ≥ kconv-1");
+        self.stamp("conv1d_silu");
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(cc as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(kconv as u32).to_ne_bytes());
+        let k1 = self
+            .be
+            .kernel("conv1d_silu_par", crate::gemm::conv1d_silu_par_spv(), 4, 12);
+        self.dispatch(
+            k1,
+            &[
+                Self::vkb(qkv),
+                Self::vkb(w),
+                Self::vkb(state),
+                Self::vkb(out),
+            ],
+            1, // out only (state is read-only here)
+            &push,
+            ((rows * cc) as u32).div_ceil(256),
+        );
+        self.stamp("conv1d_shift");
+        let k2 = self
+            .be
+            .kernel("conv1d_shift", crate::gemm::conv1d_shift_spv(), 2, 12);
+        self.dispatch(
+            k2,
+            &[Self::vkb(qkv), Self::vkb(state)],
+            1, // state out
+            &push,
+            (((kconv - 1) * cc) as u32).div_ceil(256),
+        );
+    }
+
     /// Elementwise sigmoid gate: `y[i] = a[i] * sigmoid(b[i])` (Qwen3-Next attention output gate).
     pub fn mul_sigmoid(&self, a: &dyn Buffer, b: &dyn Buffer, y: &dyn Buffer, n: usize) {
         let kern = self

@@ -284,6 +284,9 @@ const DELTANET_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/delt
 const DELTANET_CHUNKED_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_chunked.spv"));
 const CONV1D_SILU_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/conv1d_silu.spv"));
+const CONV1D_SILU_PAR_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/conv1d_silu_par.spv"));
+const CONV1D_SHIFT_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/conv1d_shift.spv"));
 const MUL_SIGMOID_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_sigmoid.spv"));
 const ADD_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/add.spv"));
 const SILU_MUL_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silu_mul.spv"));
@@ -497,6 +500,16 @@ pub(crate) fn deltanet_chunked_spv() -> &'static [u32] {
 pub(crate) fn conv1d_silu_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(CONV1D_SILU_SPV_BYTES))
+}
+/// SPIR-V for the BATCH depthwise conv1d+SiLU (pass 1: all outputs in parallel).
+pub(crate) fn conv1d_silu_par_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(CONV1D_SILU_PAR_SPV_BYTES))
+}
+/// SPIR-V for the BATCH depthwise conv1d history rebuild (pass 2).
+pub(crate) fn conv1d_shift_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(CONV1D_SHIFT_SPV_BYTES))
 }
 /// SPIR-V for the elementwise sigmoid gate `y = a * sigmoid(b)`.
 pub(crate) fn mul_sigmoid_spv() -> &'static [u32] {
