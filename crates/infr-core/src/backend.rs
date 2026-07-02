@@ -49,6 +49,11 @@ pub enum BufferUsage {
     Staging,
     /// Device→host readback (host-visible, mapped): `download` is a direct memcpy.
     Readback,
+    /// Weights pinned in HOST memory but device-readable (GTT) — the MoE auto-fit's offloaded
+    /// expert banks. On ReBAR systems `Staging` (CpuToGpu) lands in device-local host-visible
+    /// VRAM, which defeats offloading; this class guarantees system RAM. The GPU reads it over
+    /// the bus. Backends without the distinction (CPU, unified-memory Metal) treat it as Weights.
+    HostWeights,
 }
 
 /// Opaque device-memory handle owned by a backend.

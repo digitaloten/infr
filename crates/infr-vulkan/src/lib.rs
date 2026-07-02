@@ -726,11 +726,14 @@ impl VulkanBackend {
             BufferUsage::Activations => (MemoryLocation::GpuOnly, "activations"),
             BufferUsage::Staging => (MemoryLocation::CpuToGpu, "staging"),
             BufferUsage::Readback => (MemoryLocation::GpuToCpu, "readback"),
+            // GpuToCpu = HOST_VISIBLE|HOST_CACHED system RAM (never the ReBAR device-local
+            // host-visible heap CpuToGpu prefers) — the point of the class is NOT living in VRAM.
+            BufferUsage::HostWeights => (MemoryLocation::GpuToCpu, "host-weights"),
         };
         let buf = self.make_buf(bytes, location, label)?;
         // Advance the weight-load progress bar (if active) — the single funnel every weight upload
         // passes through, so no loader can forget to account for a tensor.
-        if matches!(usage, BufferUsage::Weights) {
+        if matches!(usage, BufferUsage::Weights | BufferUsage::HostWeights) {
             if let Some(pb) = self.shared.weight_pb.lock().unwrap().as_ref() {
                 pb.inc(bytes as u64);
             }

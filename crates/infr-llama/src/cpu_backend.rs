@@ -88,7 +88,7 @@ pub(crate) fn generate_dense_cpu(
     let cpu_be = CpuBackend::new();
     generate_dense_backend(
         &cpu_be,
-        &|tb, dt, _n| match tb {
+        &|_name, tb, dt, _n| match tb {
             WBytes::Mmap(tb) => Ok((cpu_be.map_weight(tb), dt)),
             // Owned bytes (combined gate+up) never reach the CPU binder — combined_gu is false —
             // but stay correct if they ever do.
@@ -163,9 +163,59 @@ pub(crate) fn generate_dense_gpu_session(
     want_ctx: usize,
     constraint: Option<&mut crate::grammar::Constraint>,
 ) -> AResult<(Vec<u32>, GenStats)> {
+    // ── MoE expert auto-fit ──────────────────────────────────────────────────────────────────
+    // When the full weight set (+ the want_ctx KV cache + activation headroom) exceeds VRAM,
+    // keep the FIRST n_host_moe layers' stacked expert banks in HOST-VISIBLE memory instead of
+    // VRAM. The graph and lowering are untouched — the banks bind like any other weight and the
+    // GPU reads them over the bus (the seam's zero-readback GPU routing can't know active experts
+    // host-side, so per-expert streaming à la bespoke doesn't apply; resident-or-host per layer
+    // does). INFR_NCMOE overrides the automatic count.
+    let n_host_moe: usize = if cfg.moe.is_some() {
+        let explicit = std::env::var("INFR_NCMOE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok());
+        match explicit {
+            Some(n) => n.min(cfg.n_layer),
+            None => {
+                let fp = crate::weights::weight_footprint(g);
+                let vram = vk.vram();
+                let kv_bytes: u64 = (0..cfg.n_layer)
+                    .map(|l| (cfg.layer_n_kv(l) * cfg.layer_head_dim(l) * 2 * 2) as u64)
+                    .sum::<u64>()
+                    * (want_ctx as u64 + 64);
+                const ACT_HEADROOM: u64 = 512 * 1024 * 1024;
+                let budget = vram
+                    .available
+                    .saturating_sub(fp.dense + kv_bytes + ACT_HEADROOM);
+                let per_layer = (fp.expert / cfg.n_layer.max(1) as u64).max(1);
+                let gpu_layers = (budget / per_layer).min(cfg.n_layer as u64) as usize;
+                cfg.n_layer - gpu_layers
+            }
+        }
+    } else {
+        0
+    };
+    if n_host_moe > 0 {
+        eprintln!(
+            "MoE auto-fit: {}/{} expert layers on GPU, {n_host_moe} host-visible (GPU reads over \
+             the bus; ctx={want_ctx})",
+            cfg.n_layer - n_host_moe,
+            cfg.n_layer,
+        );
+    }
+    // A layer-l stacked expert bank ("blk.l.ffn_{gate,up,down}_exps.weight") of an offloaded layer.
+    let host_bank = move |name: &str| -> bool {
+        if n_host_moe == 0 || !name.contains("_exps") {
+            return false;
+        }
+        name.strip_prefix("blk.")
+            .and_then(|r| r.split('.').next())
+            .and_then(|l| l.parse::<usize>().ok())
+            .is_some_and(|l| l < n_host_moe)
+    };
     generate_dense_backend(
         vk,
-        &|tb, dt, _n| {
+        &|name, tb, dt, _n| {
             // Convert ONLY f16/bf16 weights → f16 in VRAM (mirrors the production loader): the
             // adapter's Linear then runs the f16 coopmat GEMM for prefill instead of the slow per-row
             // GEMV, and the declared dtype becomes F16 so the graph handle matches. F32 is left native
@@ -186,9 +236,20 @@ pub(crate) fn generate_dense_gpu_session(
                 }
                 _ => {
                     let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
-                    let buf = vk
-                        .alloc(padded.len(), BufferUsage::Weights)
-                        .map_err(|e| anyhow!("{e}"))?;
+                    // Auto-fit-offloaded expert banks land in HOST memory (HostWeights =
+                    // system-RAM GTT the GPU reads over the bus; it binds as an SSBO like any
+                    // weight). alloc_uninit: the upload covers the whole extent.
+                    let usage = if host_bank(name) {
+                        BufferUsage::HostWeights
+                    } else {
+                        BufferUsage::Weights
+                    };
+                    let buf = if matches!(usage, BufferUsage::HostWeights) {
+                        vk.alloc_uninit(padded.len(), usage)
+                    } else {
+                        vk.alloc(padded.len(), usage)
+                    }
+                    .map_err(|e| anyhow!("{e}"))?;
                     vk.upload(buf.as_ref(), &padded)
                         .map_err(|e| anyhow!("{e}"))?;
                     Ok((buf, dt))
@@ -225,7 +286,7 @@ pub(crate) fn generate_dense_metal(
 ) -> AResult<(Vec<u32>, GenStats)> {
     generate_dense_backend(
         mtl,
-        &|tb, dt, _n| {
+        &|_name, tb, dt, _n| {
             let buf = mtl
                 .alloc(tb.len().max(1), BufferUsage::Weights)
                 .map_err(|e| anyhow!("{e}"))?;
@@ -268,8 +329,10 @@ impl std::ops::Deref for WBytes {
 }
 
 /// Turns a native-dtype GGUF tensor into a backend buffer + the EFFECTIVE dtype it now holds (the
-/// GPU binder may convert float weights to f16), so the graph declares the handle to match.
-type BindWeight<'a> = dyn Fn(WBytes, DType, usize) -> AResult<(Box<dyn Buffer>, DType)> + 'a;
+/// GPU binder may convert float weights to f16), so the graph declares the handle to match. The
+/// tensor NAME lets a binder place specific tensors differently (the Vulkan binder puts
+/// auto-fit-offloaded MoE expert banks in host-visible memory instead of VRAM).
+type BindWeight<'a> = dyn Fn(&str, WBytes, DType, usize) -> AResult<(Box<dyn Buffer>, DType)> + 'a;
 
 /// Persistent per-session seam state: the uploaded weights, the KV cache (sized to `max_ctx`
 /// once), the per-step IO buffers, and the token ids currently MATERIALIZED in the cache. A caller
@@ -483,7 +546,7 @@ pub(crate) fn generate_dense_backend(
             };
             // bind_weight returns the EFFECTIVE dtype the buffer holds (the GPU binder may convert float
             // weights to f16), so the graph declares the handle to match what the backend will read.
-            let (buf, eff_dt) = bind_weight(bytes, dt, numel)?;
+            let (buf, eff_dt) = bind_weight(names[0], bytes, dt, numel)?;
             wbufs.push(buf);
             wspecs.push((eff_dt, numel));
             Ok(())
