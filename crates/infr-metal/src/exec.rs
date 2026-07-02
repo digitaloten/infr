@@ -946,6 +946,16 @@ impl MetalBackend {
                 // path). See `attnflash_f16kv` for why the f32 flash attempt lost and this wins.
                 let flash = f16 && rows * nh >= 128 && kv_len >= 64 && hd <= 128 && hd % 8 == 0;
                 let split = !flash && (rows * nh < 128 || kv_len >= 128);
+                // The cooperative flash kernel (4 simdgroups per query tile, llama.cpp
+                // flash_attn_ext structure) needs hd % 32 == 0 for its per-simdgroup O
+                // fragment split and a 128-thread threadgroup (pipeline-cap gated like the
+                // split kernels); otherwise the single-simdgroup flash still applies.
+                let flash2 = flash && hd % 32 == 0 && {
+                    self.pipelines
+                        .get("attnflash2_f16kv")?
+                        .max_total_threads_per_threadgroup()
+                        >= 128
+                };
                 // The split kernels REQUIRE their full NSG*32-thread threadgroup: every simdgroup
                 // owns a strided KV slice, so a smaller launch would silently skip positions and
                 // merge uninitialized partials. maxTotalThreadsPerThreadgroup is per-PIPELINE
@@ -981,6 +991,7 @@ impl MetalBackend {
                             256,
                         )?);
                 let kern = match (flash, f16, split, split32) {
+                    (true, ..) if flash2 => "attnflash2_f16kv",
                     (true, ..) => "attnflash_f16kv",
                     (_, true, false, _) => "attention_f16kv",
                     (_, true, _, true) => "attnsplit32_f16kv",
@@ -1009,13 +1020,15 @@ impl MetalBackend {
                         ));
                     let cast = self.pipelines.get("cast_f32_f16")?;
                     self.encode(r, &cast, &[bq.as_ref(), &qh], &(n as u32).to_ne_bytes(), n);
+                    // flash2 runs 4 cooperating simdgroups per (query tile, head) threadgroup
+                    let tgw = if flash2 { 128 } else { 32 };
                     self.encode_tg(
                         r,
                         &pso,
                         &[qh.as_ref(), &kbuf.raw, &vbuf.raw, bd.as_ref()],
                         &p,
-                        rows.div_ceil(8) * nh * 32,
-                        32,
+                        rows.div_ceil(8) * nh * tgw,
+                        tgw,
                     );
                 } else {
                     // One simdgroup per (query, head); split kernels use NSG simdgroups per

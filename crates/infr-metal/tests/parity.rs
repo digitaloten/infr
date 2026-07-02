@@ -821,6 +821,108 @@ fn attention_flash_matches_reference() {
     assert_parity(&g, &bound, dst, rows * nh * hd, 5e-3);
 }
 
+// Same flash shape at hd = 72 (% 8 but not % 32): routes to the single-simdgroup flash kernel
+// (`attnflash_f16kv`), which the hd % 32 == 0 tests above no longer reach (those take the
+// cooperative `attnflash2_f16kv`).
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_flash_hd72_matches_reference() {
+    let (rows, kv_len, nh, nkv, hd, pos) = (17usize, 136usize, 8usize, 2usize, 72usize, 119usize);
+    let mut g = Graph::new();
+    let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    g.push(Op::Attention {
+        q,
+        k_cache: kc,
+        v_cache: vc,
+        dst,
+        rows: rows as u32,
+        kv_len: kv_len as u32,
+        n_head: nh as u32,
+        n_kv: nkv as u32,
+        head_dim: hd as u32,
+        scale: 1.0 / (hd as f32).sqrt(),
+        mask: infr_core::graph::AttnMask::Causal,
+        pos: pos as u32,
+    });
+    let bound = vec![
+        (q, f32_bytes(&rand_f32(rows * nh * hd, 171))),
+        (kc, f16_bytes(&rand_f32(kv_len * nkv * hd, 172))),
+        (vc, f16_bytes(&rand_f32(kv_len * nkv * hd, 173))),
+    ];
+    assert_parity(&g, &bound, dst, rows * nh * hd, 5e-3);
+}
+
+// The cooperative flash kernel (`attnflash2_f16kv`) at the real model head size (hd = 128), with
+// a partial final query tile (rows = 17) and a KV length that lands mid-block (the kernel's
+// causal-skip keeps tail reads within 7 rows of the limit).
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_flash2_hd128_matches_reference() {
+    let (rows, kv_len, nh, nkv, hd, pos) = (17usize, 136usize, 8usize, 2usize, 128usize, 119usize);
+    let mut g = Graph::new();
+    let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    g.push(Op::Attention {
+        q,
+        k_cache: kc,
+        v_cache: vc,
+        dst,
+        rows: rows as u32,
+        kv_len: kv_len as u32,
+        n_head: nh as u32,
+        n_kv: nkv as u32,
+        head_dim: hd as u32,
+        scale: 1.0 / (hd as f32).sqrt(),
+        mask: infr_core::graph::AttnMask::Causal,
+        pos: pos as u32,
+    });
+    let bound = vec![
+        (q, f32_bytes(&rand_f32(rows * nh * hd, 181))),
+        (kc, f16_bytes(&rand_f32(kv_len * nkv * hd, 182))),
+        (vc, f16_bytes(&rand_f32(kv_len * nkv * hd, 183))),
+    ];
+    assert_parity(&g, &bound, dst, rows * nh * hd, 5e-3);
+}
+
+// Sliding-window masking through the cooperative flash kernel: the analytic per-row window
+// lower bound must match the CPU reference (whole leading KV blocks fall below some rows'
+// windows but not others').
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_flash2_sliding_window_parity() {
+    let (rows, kv_len, nh, nkv, hd, pos) = (17usize, 136usize, 8usize, 2usize, 128usize, 119usize);
+    let mut g = Graph::new();
+    let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    g.push(Op::Attention {
+        q,
+        k_cache: kc,
+        v_cache: vc,
+        dst,
+        rows: rows as u32,
+        kv_len: kv_len as u32,
+        n_head: nh as u32,
+        n_kv: nkv as u32,
+        head_dim: hd as u32,
+        scale: 1.0 / (hd as f32).sqrt(),
+        mask: infr_core::graph::AttnMask::SlidingWindow(64),
+        pos: pos as u32,
+    });
+    let bound = vec![
+        (q, f32_bytes(&rand_f32(rows * nh * hd, 191))),
+        (kc, f16_bytes(&rand_f32(kv_len * nkv * hd, 192))),
+        (vc, f16_bytes(&rand_f32(kv_len * nkv * hd, 193))),
+    ];
+    assert_parity(&g, &bound, dst, rows * nh * hd, 5e-3);
+}
+
 // Long-context decode shape (rows=1, kv_len >= 128, hd <= 128): routes to the 32-way split-KV
 // kernel (`attnsplit32_*`), which the short-kv tests above never reach.
 #[test]
