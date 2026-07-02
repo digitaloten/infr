@@ -441,6 +441,22 @@ fn linear_q6k_matches_dequant_reference() {
     check_quant_linear_parity(DType::Q6K, synth_q6k(out_f * in_f, 27), m, in_f, out_f);
 }
 
+// m >= 16 routes to the simdgroup_matrix GEMM kernels (`linear_quik*_mm`); m=18 also covers the
+// partial row tile's scalar fallback (18 = 2 full 8-row tiles + 2 remainder rows).
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_q4k_gemm_matches_dequant_reference() {
+    let (m, in_f, out_f) = (18usize, 256usize, 96usize);
+    check_quant_linear_parity(DType::Q4K, synth_q4k(out_f * in_f, 28), m, in_f, out_f);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_q6k_gemm_matches_dequant_reference() {
+    let (m, in_f, out_f) = (18usize, 256usize, 96usize);
+    check_quant_linear_parity(DType::Q6K, synth_q6k(out_f * in_f, 29), m, in_f, out_f);
+}
+
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn rmsnorm_parity() {

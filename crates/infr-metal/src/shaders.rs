@@ -269,6 +269,174 @@ kernel void linear_quik8(device const float*   x     [[buffer(0)]],
     if (lane == 0u) dst[sg] = acc;
 }
 
+// ---- Row-tiled quantized GEMM for prefill (m > 1): one simdgroup per (row-tile, output), RT=8
+// rows per tile. Each lane decodes a weight block ONCE into registers and applies it to all 8
+// rows — the GEMV kernels above re-stream the whole weight matrix once per row, which is what
+// made prefill weight-traffic-bound (m=600+ re-reads). Per-row summation order matches the GEMV
+// kernels exactly (same lane-strided blocks, same in-block order), so parity is unchanged.
+// DEC(wk, scale, mn): decode the current 16-element block's weights into wk[16], per code width.
+#define RT 8u
+#define DEC_K4(wk, scale, mn)                                                                     \
+    uint2 cw = ((device const uint2*)codes)[bi];                                           \
+    for (uint k = 0; k < 8u; k++) {                                                               \
+        wk[k]      = scale * (float)((cw.x >> (4u * k)) & 15u) + mn;                              \
+        wk[k + 8u] = scale * (float)((cw.y >> (4u * k)) & 15u) + mn;                              \
+    }
+#define DEC_K6(wk, scale, mn)                                                                     \
+    device const uint* cp = (device const uint*)codes + bi * 3ul;                        \
+    uint u0 = cp[0], u1 = cp[1], u2 = cp[2];                                                      \
+    wk[0]  = scale * (float)(u0 & 63u) + mn;                                                      \
+    wk[1]  = scale * (float)((u0 >> 6) & 63u) + mn;                                               \
+    wk[2]  = scale * (float)((u0 >> 12) & 63u) + mn;                                              \
+    wk[3]  = scale * (float)((u0 >> 18) & 63u) + mn;                                              \
+    wk[4]  = scale * (float)((u0 >> 24) & 63u) + mn;                                              \
+    wk[5]  = scale * (float)(((u0 >> 30) | (u1 << 2)) & 63u) + mn;                                \
+    wk[6]  = scale * (float)((u1 >> 4) & 63u) + mn;                                               \
+    wk[7]  = scale * (float)((u1 >> 10) & 63u) + mn;                                              \
+    wk[8]  = scale * (float)((u1 >> 16) & 63u) + mn;                                              \
+    wk[9]  = scale * (float)((u1 >> 22) & 63u) + mn;                                              \
+    wk[10] = scale * (float)(((u1 >> 28) | (u2 << 4)) & 63u) + mn;                                \
+    wk[11] = scale * (float)((u2 >> 2) & 63u) + mn;                                               \
+    wk[12] = scale * (float)((u2 >> 8) & 63u) + mn;                                               \
+    wk[13] = scale * (float)((u2 >> 14) & 63u) + mn;                                              \
+    wk[14] = scale * (float)((u2 >> 20) & 63u) + mn;                                              \
+    wk[15] = scale * (float)((u2 >> 26) & 63u) + mn;
+#define DEC_K8(wk, scale, mn)                                                                     \
+    device const uchar4* cp = (device const uchar4*)codes + bi * 4ul;                    \
+    for (uint q = 0; q < 4u; q++) {                                                               \
+        uchar4 cq = cp[q];                                                                        \
+        wk[q * 4u]      = scale * (float)cq.x + mn;                                               \
+        wk[q * 4u + 1u] = scale * (float)cq.y + mn;                                               \
+        wk[q * 4u + 2u] = scale * (float)cq.z + mn;                                               \
+        wk[q * 4u + 3u] = scale * (float)cq.w + mn;                                               \
+    }
+
+#define RT_KERNEL(NAME, DEC)                                                                      \
+kernel void NAME(device const float*  x     [[buffer(0)]],                                       \
+                 device const uchar*  codes [[buffer(1)]],                                       \
+                 device const short2* scm   [[buffer(2)]],                                       \
+                 device const half2*  dd    [[buffer(3)]],                                       \
+                 device float*        dst   [[buffer(4)]],                                       \
+                 constant QLinParams& p     [[buffer(5)]],                                       \
+                 uint gid  [[thread_position_in_grid]],                                          \
+                 uint lane [[thread_index_in_simdgroup]]) {                                      \
+    uint sg = gid / 32u;                                                                          \
+    uint ntile = (p.m + RT - 1u) / RT;                                                            \
+    if (sg >= ntile * p.out_f) return;                                                            \
+    uint t = sg / p.out_f;                                                                        \
+    uint o = sg % p.out_f;                                                                        \
+    uint r0 = t * RT;                                                                             \
+    uint rm = min(RT, p.m - r0);                                                                  \
+    uint nb = p.in_f >> 4;                                                                        \
+    ulong row16 = (ulong)o * nb;                                                                  \
+    ulong rowe = (ulong)o * p.in_f;                                                               \
+    float acc[RT];                                                                                \
+    for (uint rr = 0; rr < RT; rr++) acc[rr] = 0.0f;                                              \
+    for (uint b = lane; b < nb; b += 32u) {                                                       \
+        ulong bi = row16 + b;                                                                     \
+        short2 s = scm[bi];                                                                       \
+        half2 dv = dd[(rowe + ((ulong)b << 4)) >> p.dshift];                                      \
+        float scale = (float)dv.x * (float)s.x;                                                   \
+        float mn = (float)dv.y * (float)s.y;                                                      \
+        float wk[16];                                                                             \
+        DEC(wk, scale, mn)                                                                        \
+        for (uint rr = 0; rr < rm; rr++) {                                                        \
+            device const float* xb = x + (ulong)(r0 + rr) * p.in_f + (b << 4);                    \
+            for (uint k = 0; k < 16u; k++) acc[rr] += xb[k] * wk[k];                              \
+        }                                                                                         \
+    }                                                                                             \
+    for (uint rr = 0; rr < rm; rr++) {                                                            \
+        float v = simd_sum(acc[rr]);                                                              \
+        if (lane == 0u) dst[(ulong)(r0 + rr) * p.out_f + o] = v;                                  \
+    }                                                                                             \
+}
+
+RT_KERNEL(linear_quik4_rt, DEC_K4)
+RT_KERNEL(linear_quik6_rt, DEC_K6)
+RT_KERNEL(linear_quik8_rt, DEC_K8)
+
+// ---- simdgroup_matrix quantized GEMM for prefill (m >= 16): one simdgroup per 8x8 output tile
+// (8 token rows x 8 outputs). Per 16-wide K block: lanes 0..7 each decode one output row's block
+// into a per-simdgroup threadgroup tile (via the same DEC_* macros), then two 8x8x8 MMAs consume
+// it. The matrix pipeline reuses every loaded operand 8x, where the scalar GEMV/row-tiled kernels
+// pay one load per FMA — that ALU/load structure, not weight bandwidth, is what capped prefill.
+// The last (partial) row tile falls back to a scalar dot per element; host only routes here when
+// out_f % 8 == 0. Threadgroup = 128 threads (4 simdgroups), each with its own 8x16 f32 tile.
+#define GEMM_KERNEL(NAME, DEC)                                                                    \
+kernel void NAME(device const float*  x     [[buffer(0)]],                                       \
+                 device const uchar*  codes [[buffer(1)]],                                       \
+                 device const short2* scm   [[buffer(2)]],                                       \
+                 device const half2*  dd    [[buffer(3)]],                                       \
+                 device float*        dst   [[buffer(4)]],                                       \
+                 constant QLinParams& p     [[buffer(5)]],                                       \
+                 uint gid  [[thread_position_in_grid]],                                          \
+                 uint lane [[thread_index_in_simdgroup]],                                        \
+                 uint sgid [[simdgroup_index_in_threadgroup]]) {                                 \
+    uint sg = gid / 32u;                                                                          \
+    uint ntm = (p.m + 7u) / 8u;                                                                   \
+    uint nto = p.out_f / 16u;                                                                     \
+    if (sg >= ntm * nto) return;                                                                  \
+    uint tm = sg / nto;                                                                           \
+    uint to = sg % nto;                                                                           \
+    uint r0 = tm * 8u;                                                                            \
+    uint o0 = to * 16u;                                                                           \
+    uint nb = p.in_f >> 4;                                                                        \
+    threadgroup float wt[4][16 * 16];                                                             \
+    if (r0 + 8u <= p.m) {                                                                         \
+        simdgroup_float8x8 acc0 = simdgroup_float8x8(0.0f);                                       \
+        simdgroup_float8x8 acc1 = simdgroup_float8x8(0.0f);                                       \
+        for (uint kb = 0; kb < nb; kb++) {                                                        \
+            if (lane < 16u) {                                                                     \
+                ulong bi = (ulong)(o0 + lane) * nb + kb;                                          \
+                short2 s = scm[bi];                                                               \
+                half2 dv = dd[((ulong)(o0 + lane) * p.in_f + ((ulong)kb << 4)) >> p.dshift];      \
+                float scale = (float)dv.x * (float)s.x;                                           \
+                float mn = (float)dv.y * (float)s.y;                                              \
+                float wk[16];                                                                     \
+                DEC(wk, scale, mn)                                                                \
+                for (uint k2 = 0; k2 < 16u; k2++) wt[sgid][lane * 16u + k2] = wk[k2];             \
+            }                                                                                     \
+            simdgroup_barrier(mem_flags::mem_threadgroup);                                        \
+            device const float* xp = x + (ulong)r0 * p.in_f + ((ulong)kb << 4);                   \
+            simdgroup_float8x8 xa, wb;                                                            \
+            for (uint kh = 0; kh < 2u; kh++) {                                                    \
+                simdgroup_load(xa, xp + kh * 8u, p.in_f);                                         \
+                simdgroup_load(wb, &wt[sgid][kh * 8u], 16, ulong2(0, 0), true);                   \
+                simdgroup_multiply_accumulate(acc0, xa, wb, acc0);                                \
+                simdgroup_load(wb, &wt[sgid][128u + kh * 8u], 16, ulong2(0, 0), true);            \
+                simdgroup_multiply_accumulate(acc1, xa, wb, acc1);                                \
+            }                                                                                     \
+            simdgroup_barrier(mem_flags::mem_threadgroup);                                        \
+        }                                                                                         \
+        simdgroup_store(acc0, dst + (ulong)r0 * p.out_f + o0, p.out_f);                           \
+        simdgroup_store(acc1, dst + (ulong)r0 * p.out_f + o0 + 8u, p.out_f);                      \
+    } else {                                                                                      \
+        /* partial row tile: scalar dot per (row, output) element, 4 per lane */                  \
+        for (uint e = lane; e < 128u; e += 32u) {                                                 \
+            uint rr = r0 + e / 16u;                                                               \
+            uint o = o0 + (e % 16u);                                                              \
+            if (rr >= p.m) continue;                                                              \
+            float a2 = 0.0f;                                                                      \
+            for (uint kb = 0; kb < nb; kb++) {                                                    \
+                ulong bi = (ulong)o * nb + kb;                                                    \
+                short2 s = scm[bi];                                                               \
+                half2 dv = dd[((ulong)o * p.in_f + ((ulong)kb << 4)) >> p.dshift];                \
+                float scale = (float)dv.x * (float)s.x;                                           \
+                float mn = (float)dv.y * (float)s.y;                                              \
+                float wk[16];                                                                     \
+                DEC(wk, scale, mn)                                                                \
+                device const float* xb = x + (ulong)rr * p.in_f + ((ulong)kb << 4);               \
+                for (uint k2 = 0; k2 < 16u; k2++) a2 += xb[k2] * wk[k2];                          \
+            }                                                                                     \
+            dst[(ulong)rr * p.out_f + o] = a2;                                                    \
+        }                                                                                         \
+    }                                                                                             \
+}
+
+GEMM_KERNEL(linear_quik4_mm, DEC_K4)
+GEMM_KERNEL(linear_quik6_mm, DEC_K6)
+GEMM_KERNEL(linear_quik8_mm, DEC_K8)
+
 // ---- RoPE (NEOX): rotate the first rope_dim of each head; dims beyond pass through. One thread
 // per (row, head). `pos`/`ff` buffers are f32. `has_ff` selects the per-pair freq divisor.
 struct RopeParams { uint rows; uint n_head; uint head_dim; uint rope_dim; float theta; uint has_ff; };

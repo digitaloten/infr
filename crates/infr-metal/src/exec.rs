@@ -576,17 +576,40 @@ impl MetalBackend {
                 // 32 lanes (one simdgroup) per output element — see `linear_f32`/`linear_quik*`.
                 if infr_gguf::dequant::is_quant(g.desc(weight).dtype) {
                     // Native quant: decode the compact factored weight inline — no f32 blow-up.
-                    // Kernel matches the weight's code packing (4/6/8-bit).
+                    // Kernel matches the weight's code packing (4/6/8-bit). Multi-row (prefill)
+                    // takes the row-tiled variant: one simdgroup per (8-row tile, output), each
+                    // weight block decoded once for all 8 rows, instead of the GEMV kernel
+                    // re-streaming the whole weight matrix once per row.
                     let qw = self.weight_qui(weight, g, bindings);
-                    let pso = self.pipelines.get(qw.kern)?;
+                    // sgs = simdgroups to launch; tg = threadgroup width. GEMM tiles 8x8 per
+                    // simdgroup (4 simdgroups per threadgroup for the staging tile).
+                    let (kern, sgs, tg): (&'static str, usize, usize) =
+                        if m >= 16 && out_f % 16 == 0 {
+                            let mm = match qw.kern {
+                                "linear_quik4" => "linear_quik4_mm",
+                                "linear_quik6" => "linear_quik6_mm",
+                                _ => "linear_quik8_mm",
+                            };
+                            (mm, m.div_ceil(8) * (out_f / 16), 128)
+                        } else if m > 1 {
+                            let rt = match qw.kern {
+                                "linear_quik4" => "linear_quik4_rt",
+                                "linear_quik6" => "linear_quik6_rt",
+                                _ => "linear_quik8_rt",
+                            };
+                            (rt, m.div_ceil(8) * out_f, 32)
+                        } else {
+                            (qw.kern, out_f, 32)
+                        };
+                    let pso = self.pipelines.get(kern)?;
                     p.extend_from_slice(&qw.dshift.to_ne_bytes());
                     self.encode_tg(
                         r,
                         &pso,
                         &[bx.as_ref(), &qw.codes, &qw.scm, &qw.dd, bd.as_ref()],
                         &p,
-                        m * out_f * 32,
-                        32,
+                        sgs * 32,
+                        tg,
                     );
                 } else {
                     // f16/f32/bf16 weight: dequant-to-f32 device buffer, cached.
@@ -825,7 +848,7 @@ impl MetalBackend {
                 // the kernel is latency-bound on its ~kv_len/NSG serial online-softmax chain, so
                 // longer contexts take the 32-way split when head_dim fits its threadgroup
                 // accumulator (hd <= 128); NSG=8 covers the rest.
-                let split = rows * nh < 128;
+                let split = rows * nh < 128 || kv_len >= 128;
                 let split32 = split && kv_len >= 128 && hd <= 128;
                 let kern = match (g.desc(k_cache).dtype, split, split32) {
                     (DType::F16, false, _) => "attention_f16kv",
