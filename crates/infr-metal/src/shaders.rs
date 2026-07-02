@@ -1105,6 +1105,18 @@ inline float gated_act(uint act, float g) {
     return 0.5f * g * (1.0f + tanh(0.7978845608f * (g + 0.044715f * g * g * g)));
 }
 struct GatedParams { uint rows; uint nff; uint act; uint up_off; };
+// Fused-projection form (`combined_gu`): gate|up live in ONE [rows, 2*nff] buffer (gate half
+// first), produced by a single Linear over the concatenated weights.
+kernel void gatedactfused_f32(device const float* gu  [[buffer(0)]],
+                              device float*       dst [[buffer(1)]],
+                              constant GatedParams& p [[buffer(2)]],
+                              uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.rows * p.nff) return;
+    uint r = gid / p.nff;
+    uint i = gid % p.nff;
+    ulong gb = (ulong)r * 2u * p.nff;
+    dst[gid] = gated_act(p.act, gu[gb + i]) * gu[gb + p.nff + i];
+}
 kernel void gatedact_f32(device const float* gate [[buffer(0)]],
                          device const float* up   [[buffer(1)]],
                          device float*       dst  [[buffer(2)]],

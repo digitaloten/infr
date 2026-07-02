@@ -147,7 +147,9 @@ impl Backend for MetalBackend {
             decode_replay: true,
             // The reference backend keeps the separate gate/up FFN form (no GatedActFused
             // lowering); the runner's combined-gu upload stays Vulkan-only.
-            combined_gu: false,
+            // One fused [2*nff, ne] gate+up Linear + GatedActFused per FFN — one dispatch and
+            // one contiguous weight stream instead of two.
+            combined_gu: true,
         }
     }
 

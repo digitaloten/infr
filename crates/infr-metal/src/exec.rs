@@ -166,7 +166,11 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
     let mut has_attn = false;
     for op in &g.ops {
         match op {
-            Op::RmsNorm { .. } | Op::Linear { .. } | Op::GatedAct { .. } | Op::Add { .. } => {}
+            Op::RmsNorm { .. }
+            | Op::Linear { .. }
+            | Op::GatedAct { .. }
+            | Op::GatedActFused { .. }
+            | Op::Add { .. } => {}
             Op::QkNormRope { .. } => has_rope = true,
             Op::WriteKv { cache, .. } => {
                 if !matches!(g.desc(*cache).dtype, DType::F16 | DType::Q8_0) {
@@ -1240,10 +1244,28 @@ impl MetalBackend {
             }
             // Only produced when `Capabilities::combined_gu` is set — Metal leaves it false (the
             // reference backend keeps the separate gate/up form), so this arm is unreachable.
-            Op::GatedActFused { .. } => {
-                return Err(Error::Unsupported(
-                    "metal: GatedActFused unsupported (combined_gu is false)".into(),
-                ))
+            Op::GatedActFused {
+                gu,
+                dst,
+                rows,
+                nff,
+                act,
+            } => {
+                let (rows, nff) = (rows as usize, nff as usize);
+                let bg = self.ensure_device(r, gu);
+                let bd = self.dev_dst(r, dst, rows * nff);
+                let pso = self.pipelines.get("gatedactfused_f32")?;
+                let act_code: u32 = match act {
+                    infr_core::graph::Activation::Silu => 0,
+                    infr_core::graph::Activation::Gelu => 1,
+                    infr_core::graph::Activation::Sigmoid => 2,
+                };
+                let mut p = (rows as u32).to_ne_bytes().to_vec();
+                p.extend_from_slice(&(nff as u32).to_ne_bytes());
+                p.extend_from_slice(&act_code.to_ne_bytes());
+                p.extend_from_slice(&0u32.to_ne_bytes()); // pad to GatedParams
+                self.encode(r, &pso, &[bg.as_ref(), bd.as_ref()], &p, rows * nff);
+                r.loc[dst.0 as usize] = Loc::Device;
             }
             Op::WriteKv {
                 src,

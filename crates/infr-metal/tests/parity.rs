@@ -1265,6 +1265,24 @@ fn gatedact_upoff_parity() {
 
 #[test]
 #[ignore = "requires a Metal GPU"]
+fn gatedactfused_parity() {
+    let (rows, nff) = (3usize, 256usize);
+    let mut g = Graph::new();
+    let gu = g.input(TensorDesc::new(vec![rows, 2 * nff], DType::F32));
+    let dst = g.output(TensorDesc::new(vec![rows, nff], DType::F32));
+    g.push(Op::GatedActFused {
+        gu,
+        dst,
+        rows: rows as u32,
+        nff: nff as u32,
+        act: infr_core::graph::Activation::Silu,
+    });
+    let bound = vec![(gu, f32_bytes(&rand_f32(rows * 2 * nff, 270)))];
+    assert_parity(&g, &bound, dst, rows * nff, 1e-5);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
 fn moe_ffn_parity() {
     let (ne, n_expert, n_used, nff) = (64usize, 8usize, 2usize, 128usize);
     let mut g = Graph::new();
