@@ -1028,27 +1028,13 @@ impl MetalBackend {
                 );
                 self.ensure_host(r, g, x);
                 let xs = r.vals[x.0 as usize].clone();
+                // `x` may hold several rows (the seam's batched prefill) — route + run per row,
+                // mirroring the CPU reference's row loop.
+                let rows = xs.len() / ne;
                 // Router (host, mirroring the CPU reference). Structurally the same top-k selection,
                 // but the logits use a naive f32 sum here vs the CPU's 8-accumulator dot, so the
                 // summation order differs — top-k can pick differently on a near-tie logit.
                 let rw = self.weight_host(router, g, bindings);
-                let logits: Vec<f32> = (0..n_expert)
-                    .map(|e| (0..ne).map(|i| rw[e * ne + i] * xs[i]).sum::<f32>())
-                    .collect();
-                let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let mut probs: Vec<f32> = logits.iter().map(|&v| (v - maxl).exp()).collect();
-                let psum: f32 = probs.iter().sum();
-                for p in probs.iter_mut() {
-                    *p /= psum;
-                }
-                let mut idx: Vec<usize> = (0..n_expert).collect();
-                idx.sort_by(|&a, &b| {
-                    probs[b]
-                        .partial_cmp(&probs[a])
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                idx.truncate(n_used);
-                let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
                 // Per-expert stacked-weight byte-slice sizes (each expert = an equal slice).
                 let gbuf = metal_buf(bindings.get(gate_exps).expect("metal: unbound gate_exps"));
                 let ubuf = metal_buf(bindings.get(up_exps).expect("metal: unbound up_exps"));
@@ -1063,19 +1049,40 @@ impl MetalBackend {
                     g.desc(up_exps).dtype,
                     g.desc(down_exps).dtype,
                 );
-                let mut out = vec![0f32; ne];
-                for &e in &idx {
-                    // Dequant only this expert's slices, then matvec on the GPU.
-                    let gw = bytes_to_f32(&Self::read_bytes_range(gbuf, e * gst, gst), gdt);
-                    let uw = bytes_to_f32(&Self::read_bytes_range(ubuf, e * ust, ust), udt);
-                    let dw = bytes_to_f32(&Self::read_bytes_range(dbuf, e * dsz, dsz), ddt);
-                    let gate = self.gpu_matvec(&xs, &gw, ne, nffx)?;
-                    let up = self.gpu_matvec(&xs, &uw, ne, nffx)?;
-                    let actv: Vec<f32> = (0..nffx).map(|i| act_fn(act, gate[i]) * up[i]).collect();
-                    let y = self.gpu_matvec(&actv, &dw, nffx, ne)?;
-                    let w_e = probs[e] / wsum * scale;
-                    for i in 0..ne {
-                        out[i] += w_e * y[i];
+                let mut out = vec![0f32; rows * ne];
+                for (row, orow) in out.chunks_mut(ne).enumerate() {
+                    let xr = &xs[row * ne..row * ne + ne];
+                    let logits: Vec<f32> = (0..n_expert)
+                        .map(|e| (0..ne).map(|i| rw[e * ne + i] * xr[i]).sum::<f32>())
+                        .collect();
+                    let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let mut probs: Vec<f32> = logits.iter().map(|&v| (v - maxl).exp()).collect();
+                    let psum: f32 = probs.iter().sum();
+                    for p in probs.iter_mut() {
+                        *p /= psum;
+                    }
+                    let mut idx: Vec<usize> = (0..n_expert).collect();
+                    idx.sort_by(|&a, &b| {
+                        probs[b]
+                            .partial_cmp(&probs[a])
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    idx.truncate(n_used);
+                    let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
+                    for &e in &idx {
+                        // Dequant only this expert's slices, then matvec on the GPU.
+                        let gw = bytes_to_f32(&Self::read_bytes_range(gbuf, e * gst, gst), gdt);
+                        let uw = bytes_to_f32(&Self::read_bytes_range(ubuf, e * ust, ust), udt);
+                        let dw = bytes_to_f32(&Self::read_bytes_range(dbuf, e * dsz, dsz), ddt);
+                        let gate = self.gpu_matvec(xr, &gw, ne, nffx)?;
+                        let up = self.gpu_matvec(xr, &uw, ne, nffx)?;
+                        let actv: Vec<f32> =
+                            (0..nffx).map(|i| act_fn(act, gate[i]) * up[i]).collect();
+                        let y = self.gpu_matvec(&actv, &dw, nffx, ne)?;
+                        let w_e = probs[e] / wsum * scale;
+                        for i in 0..ne {
+                            orow[i] += w_e * y[i];
+                        }
                     }
                 }
                 r.vals[dst.0 as usize] = out;

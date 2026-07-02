@@ -2912,6 +2912,10 @@ impl Backend for CpuBackend {
                         n_ff_exp as usize,
                     );
                     let xs = vals[x.0 as usize].clone();
+                    // `x` may hold several rows (the seam's batched prefill): route + run the
+                    // expert FFN independently per row — the reference semantics for the GPU
+                    // adapter's GPU-routed batched form.
+                    let rows = xs.len() / ne;
                     // Stream a (row-major [out_f, in_f]) weight slice and matvec it against `v` —
                     // dequant per row, exactly like `Op::Linear`, parallel over rows.
                     let matvec = |bytes: &[u8], dt: DType, v: &[f32], in_f: usize, out_f: usize| {
@@ -2924,23 +2928,7 @@ impl Backend for CpuBackend {
                             })
                             .collect::<Vec<f32>>()
                     };
-                    // Router softmax over all experts.
                     let rbuf = bindings.get(router).expect("cpu backend: unbound router");
-                    let rbytes = cpu_buf(rbuf).read();
-                    let logits = matvec(&rbytes, g.desc(router).dtype, &xs, ne, n_expert);
-                    drop(rbytes);
-                    let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    let mut probs: Vec<f32> = logits.iter().map(|&v| (v - maxl).exp()).collect();
-                    let psum: f32 = probs.iter().sum();
-                    for p in probs.iter_mut() {
-                        *p /= psum;
-                    }
-                    // Top-`n_used` experts, renormalized weights.
-                    let mut idx: Vec<usize> = (0..n_expert).collect();
-                    idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
-                    idx.truncate(n_used);
-                    let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
-                    // Per-expert stacked-weight byte slices.
                     let gbuf = bindings
                         .get(gate_exps)
                         .expect("cpu backend: unbound gate_exps");
@@ -2948,6 +2936,7 @@ impl Backend for CpuBackend {
                     let dbuf = bindings
                         .get(down_exps)
                         .expect("cpu backend: unbound down_exps");
+                    let rbytes = cpu_buf(rbuf).read();
                     let gb = cpu_buf(gbuf).read();
                     let ub = cpu_buf(ubuf).read();
                     let db = cpu_buf(dbuf).read();
@@ -2961,16 +2950,33 @@ impl Backend for CpuBackend {
                         ub.len() / n_expert,
                         db.len() / n_expert,
                     );
-                    let mut out = vec![0f32; ne];
-                    for &e in &idx {
-                        let gate = matvec(&gb[e * gst..(e + 1) * gst], gdt, &xs, ne, nffx);
-                        let up = matvec(&ub[e * ust..(e + 1) * ust], udt, &xs, ne, nffx);
-                        let actv: Vec<f32> =
-                            (0..nffx).map(|i| act_fn(act, gate[i]) * up[i]).collect();
-                        let y = matvec(&db[e * dst_..(e + 1) * dst_], ddt, &actv, nffx, ne);
-                        let w_e = probs[e] / wsum * scale;
-                        for i in 0..ne {
-                            out[i] += w_e * y[i];
+                    let mut out = vec![0f32; rows * ne];
+                    for (r, orow) in out.chunks_mut(ne).enumerate() {
+                        let xr = &xs[r * ne..r * ne + ne];
+                        // Router softmax over all experts.
+                        let logits = matvec(&rbytes, g.desc(router).dtype, xr, ne, n_expert);
+                        let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        let mut probs: Vec<f32> =
+                            logits.iter().map(|&v| (v - maxl).exp()).collect();
+                        let psum: f32 = probs.iter().sum();
+                        for p in probs.iter_mut() {
+                            *p /= psum;
+                        }
+                        // Top-`n_used` experts, renormalized weights.
+                        let mut idx: Vec<usize> = (0..n_expert).collect();
+                        idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+                        idx.truncate(n_used);
+                        let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
+                        for &e in &idx {
+                            let gate = matvec(&gb[e * gst..(e + 1) * gst], gdt, xr, ne, nffx);
+                            let up = matvec(&ub[e * ust..(e + 1) * ust], udt, xr, ne, nffx);
+                            let actv: Vec<f32> =
+                                (0..nffx).map(|i| act_fn(act, gate[i]) * up[i]).collect();
+                            let y = matvec(&db[e * dst_..(e + 1) * dst_], ddt, &actv, nffx, ne);
+                            let w_e = probs[e] / wsum * scale;
+                            for i in 0..ne {
+                                orow[i] += w_e * y[i];
+                            }
                         }
                     }
                     vals[dst.0 as usize] = out;

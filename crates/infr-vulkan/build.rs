@@ -61,7 +61,9 @@ fn main() {
         ("scale", "scale", &[]),
         ("softcap", "softcap", &[]),
         ("gather_rows", "gather_rows", &[]),
+        ("gather_rows", "gather_rows_ind", &["-DMOE_IND"]),
         ("scatter_add_rows", "scatter_add_rows", &[]),
+        ("scatter_add_rows", "scatter_add_rows_ind", &["-DMOE_IND"]),
         ("silu_mul", "silu_mul", &[]),
         ("silu_mul", "gelu_mul", &["-DGELU"]),
         ("silu_mul_fused", "silu_mul_fused", &[]),
@@ -256,6 +258,7 @@ fn main() {
         ("moe_bucket_count", "moe_bucket_count", &[]),
         ("moe_bucket_scan", "moe_bucket_scan", &[]),
         ("moe_bucket_scatter", "moe_bucket_scatter", &[]),
+        ("moe_expert_args", "moe_expert_args", &[]),
         ("add_scaled_id", "add_scaled_id", &[]),
         // Native-block prefill GEMMs: one .spv per quant format (coopmat tiled, no residual).
         ("native_gemm_warp", "native_gemm_warp_q4k", &["-DFMT_Q4K"]),

@@ -505,6 +505,24 @@ pub(crate) fn softcap_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// SPIR-V for the GPU-routed (indirect) row gather — m/offset from the routing buffers.
+pub(crate) fn gather_rows_ind_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gather_rows_ind.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+/// SPIR-V for the GPU-routed (indirect) weighted scatter-add.
+pub(crate) fn scatter_add_rows_ind_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/scatter_add_rows_ind.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+/// SPIR-V for the batched-MoE FFN prologue (per-expert indirect dispatch args from GPU counts).
+pub(crate) fn moe_expert_args_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_expert_args.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for the row gather (`dst[j]=src[idx[j]]`).
 pub(crate) fn gather_rows_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gather_rows.spv"));

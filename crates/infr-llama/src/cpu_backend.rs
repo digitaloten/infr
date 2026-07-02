@@ -1146,7 +1146,20 @@ pub(crate) fn generate_dense_backend(
     // Guard: MoE uses Op::MoeFfn (per-token expert routing, no batched variant yet); E2B/gemma4
     // requires a per-(token,layer) host-side input vector that is computed in the per-step loop.
     // Both fall through to the original token-by-token loop below unchanged.
-    let decode_start = if prompt.len() - start > 2 && c.moe.is_none() {
+    // Batched MoE prefill needs the adapter's GPU-routed expert path (Q4_K gate/up + Q6_K down —
+    // what qwen3moe ships); other stacked formats keep the per-token loop.
+    let moe_batched_ok = c.moe.is_some() && {
+        let dt = |n: String| g.tensors().iter().find(|t| t.name == n).map(|t| t.dtype);
+        (0..c.n_layer).all(|l| {
+            dt(format!("blk.{l}.ffn_gate_exps.weight")) == Some(DType::Q4K)
+                && dt(format!("blk.{l}.ffn_up_exps.weight")) == Some(DType::Q4K)
+                && matches!(
+                    dt(format!("blk.{l}.ffn_down_exps.weight")),
+                    Some(DType::Q4K) | Some(DType::Q6K)
+                )
+        })
+    };
+    let decode_start = if prompt.len() - start > 2 && (c.moe.is_none() || moe_batched_ok) {
         // Batch-prefill the un-cached suffix, all but the last prompt token (positions
         // start..plen-1; rows 0..start are reused from the session cache).
         let pf_m = prompt.len() - 1 - start;

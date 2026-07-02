@@ -476,14 +476,33 @@ fn gpu_seam_matches_cpu_gemma4_e2b() {
     seam_vulkan_matches_cpu(&path, "What is 2+2? Answer briefly.", 12);
 }
 
-/// qwen3moe (routed-expert Op::MoeFfn) through the Vulkan seam (per-token prefill — MoE is
-/// excluded from the batched-prefill fast path).
+/// qwen3moe (routed-expert Op::MoeFfn) through the Vulkan seam, batched GPU-routed prefill. The
+/// batched FFN runs int8 dp4a expert GEMMs (each parity-tested at the inherent ~2e-2 activation-
+/// quant tolerance) — a numeric path the f32 CPU oracle can diverge from on a near-tie greedy
+/// pick, so per the repo convention this locks its OWN golden (deterministic + read for
+/// coherence; refresh with INFR_BLESS=1) instead of comparing token-for-token.
 #[test]
-fn gpu_seam_matches_cpu_qwen3moe() {
+fn gpu_seam_golden_qwen3moe() {
     let path = need_model!(qwen3moe_30b(), "Qwen3-30B-A3B");
     need_gpu!();
     let _tlk = test_serial_lock();
-    seam_vulkan_matches_cpu(&path, "What is 2+2? Answer briefly.", 8);
+    std::env::set_var("INFR_TEMP", "0");
+    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let rendered = model
+        .render_chat("What is 2+2? Answer briefly.")
+        .expect("render chat");
+    let out = model
+        .generate_dense_vulkan(&rendered, 8)
+        .expect("vulkan seam gen");
+    let h = fnv1a(&out);
+    if std::env::var("INFR_BLESS").is_ok() {
+        println!("qwen3moe seam golden: 0x{h:016x}  // {out:?}");
+    } else {
+        assert_eq!(
+            h, 0xfacca402bd6434e9,
+            "qwen3moe seam golden changed\n  out: {out:?}"
+        );
+    }
 }
 
 /// BF16 (float-weight) seam parity: a bf16 model runs on the seam with its projection weights

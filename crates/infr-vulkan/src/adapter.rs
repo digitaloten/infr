@@ -1086,6 +1086,222 @@ fn lower_op(
                     "vulkan adapter: MoeFfn expert banks need an id-native quant format",
                 ));
             }
+            // ── BATCHED MoE FFN (rows > 1, the seam's prefill chunks): GPU-resident expert
+            // routing (top-k → bucket count/scan/scatter, all on-GPU) + a prologue that writes
+            // per-expert INDIRECT dispatch args from the counts — so the whole expert loop
+            // records with NO host readback (the bespoke path downloads counts mid-graph to size
+            // its GEMMs; indirect dispatch replaces that). Q4_K gate/up + Q6_K down only (what
+            // qwen3moe ships) — the runner routes other formats through the per-token path.
+            let rows = graph.desc(*x).numel() / ne;
+            if rows > 1 {
+                use infr_core::DType::{Q4K, Q6K};
+                let down_q6 = matches!(ddt, Q6K);
+                if !(matches!(gdt, Q4K)
+                    && matches!(udt, Q4K)
+                    && (down_q6 || matches!(ddt, Q4K))
+                    && matches!(act, Activation::Silu))
+                {
+                    return Err(be(format!(
+                        "vulkan adapter: batched MoeFfn needs Q4_K gate/up + Q4_K/Q6_K down + \
+                         SiLU (got gate={gdt:?} up={udt:?} down={ddt:?} act={act:?})"
+                    )));
+                }
+                let al = |n: usize| be_.alloc((n * 4).max(4), BufferUsage::Activations);
+                let alu = |n: usize| be_.alloc_uninit(n.max(4), BufferUsage::Activations);
+                let n_pairs = rows * n_used;
+                let mpad = rows.div_ceil(64) * 64; // GEMMs write padded rows into the scratch
+                let logits = alu(rows * n_expert * 4)?;
+                let ids = alu(n_pairs * 4)?;
+                let wts = alu(n_pairs * 4)?;
+                let counts = al(n_expert)?; // zeroed below (bucket_count accumulates)
+                let offsets = alu(n_expert * 4)?;
+                let fill = alu(n_expert * 4)?;
+                let bucket_rows = alu(n_pairs * 4)?;
+                let bucket_wts = alu(n_pairs * 4)?;
+                let args = alu(n_expert * 7 * 16)?;
+                let xe = alu(mpad * ne * 4)?;
+                let gqa = alu(mpad * ne)?;
+                let gda = alu(mpad * (ne / 32) * 2)?;
+                let gsa = alu(mpad * (ne / 32) * 2)?;
+                let ge = alu(mpad * nff * 4)?;
+                let ue = alu(mpad * nff * 4)?;
+                let ae = alu(mpad * nff * 4)?;
+                let dqa = alu(mpad * nff)?;
+                let dda = alu(mpad * (nff / 32) * 2)?;
+                let dsa = alu(mpad * (nff / 32) * 2)?;
+                let ye = alu(mpad * ne * 4)?;
+                let xb = r(*x)?;
+                let yb = r(*dst)?;
+
+                // Router logits for all rows, then GPU routing.
+                let rdt = graph.desc(*router).dtype;
+                let rw = r(*router)?;
+                if native_dense_supported(rdt) {
+                    rec.linear_native(rdt, rw, xb, logits.as_ref(), rows, ne, n_expert);
+                } else if matches!(rdt, infr_core::DType::F32) {
+                    rec.linear_f32(rw, xb, logits.as_ref(), rows, ne, n_expert);
+                } else {
+                    rec.linear(rw, xb, logits.as_ref(), rows, ne, n_expert);
+                }
+                rec.moe_topk(
+                    logits.as_ref(),
+                    ids.as_ref(),
+                    wts.as_ref(),
+                    rows,
+                    n_expert,
+                    n_used,
+                    *scale,
+                );
+                rec.zero(counts.as_ref(), n_expert);
+                rec.moe_bucket_count(ids.as_ref(), counts.as_ref(), n_pairs);
+                rec.moe_bucket_scan(counts.as_ref(), offsets.as_ref(), fill.as_ref(), n_expert);
+                rec.moe_bucket_scatter(
+                    ids.as_ref(),
+                    wts.as_ref(),
+                    offsets.as_ref(),
+                    fill.as_ref(),
+                    bucket_rows.as_ref(),
+                    bucket_wts.as_ref(),
+                    n_pairs,
+                    n_used,
+                );
+                rec.moe_expert_args(counts.as_ref(), args.as_ref(), n_expert, ne, nff);
+
+                // dst accumulates weighted expert outputs — start from zero.
+                rec.zero(yb, rows * ne);
+                let (gw, uw, dw) = (r(*gate_exps)?, r(*up_exps)?, r(*down_exps)?);
+                for e in 0..n_expert {
+                    rec.gather_rows_ind(
+                        xb,
+                        bucket_rows.as_ref(),
+                        counts.as_ref(),
+                        offsets.as_ref(),
+                        xe.as_ref(),
+                        args.as_ref(),
+                        e,
+                        0,
+                        ne,
+                    );
+                    rec.quant_q8_ind(
+                        xe.as_ref(),
+                        gqa.as_ref(),
+                        gda.as_ref(),
+                        gsa.as_ref(),
+                        ne,
+                        args.as_ref(),
+                        e,
+                        1,
+                    );
+                    rec.matmul_mmq_q4k_ind(
+                        gqa.as_ref(),
+                        gda.as_ref(),
+                        gsa.as_ref(),
+                        gw,
+                        e * stride,
+                        ge.as_ref(),
+                        ne,
+                        nff,
+                        args.as_ref(),
+                        e,
+                        2,
+                    );
+                    rec.matmul_mmq_q4k_ind(
+                        gqa.as_ref(),
+                        gda.as_ref(),
+                        gsa.as_ref(),
+                        uw,
+                        e * stride,
+                        ue.as_ref(),
+                        ne,
+                        nff,
+                        args.as_ref(),
+                        e,
+                        2,
+                    );
+                    rec.silu_mul_ind(
+                        ge.as_ref(),
+                        ue.as_ref(),
+                        ae.as_ref(),
+                        mpad * nff,
+                        args.as_ref(),
+                        e,
+                        3,
+                    );
+                    rec.quant_q8_ind(
+                        ae.as_ref(),
+                        dqa.as_ref(),
+                        dda.as_ref(),
+                        dsa.as_ref(),
+                        nff,
+                        args.as_ref(),
+                        e,
+                        4,
+                    );
+                    if down_q6 {
+                        rec.matmul_mmq_q6k_ind(
+                            dqa.as_ref(),
+                            dda.as_ref(),
+                            dw,
+                            e * stride,
+                            ye.as_ref(),
+                            nff,
+                            ne,
+                            args.as_ref(),
+                            e,
+                            5,
+                        );
+                    } else {
+                        rec.matmul_mmq_q4k_ind(
+                            dqa.as_ref(),
+                            dda.as_ref(),
+                            dsa.as_ref(),
+                            dw,
+                            e * stride,
+                            ye.as_ref(),
+                            nff,
+                            ne,
+                            args.as_ref(),
+                            e,
+                            5,
+                        );
+                    }
+                    rec.scatter_add_rows_ind(
+                        ye.as_ref(),
+                        bucket_rows.as_ref(),
+                        bucket_wts.as_ref(),
+                        counts.as_ref(),
+                        offsets.as_ref(),
+                        yb,
+                        args.as_ref(),
+                        e,
+                        6,
+                        ne,
+                    );
+                }
+                transient.extend([
+                    logits,
+                    ids,
+                    wts,
+                    counts,
+                    offsets,
+                    fill,
+                    bucket_rows,
+                    bucket_wts,
+                    args,
+                    xe,
+                    gqa,
+                    gda,
+                    gsa,
+                    ge,
+                    ue,
+                    ae,
+                    dqa,
+                    dda,
+                    dsa,
+                    ye,
+                ]);
+                return Ok(());
+            }
             // Per-execute routing scratch. Local boxes used via `.as_ref()`, then moved into
             // `transient` at the end of the arm so they outlive `rec.finish()`.
             let al = |n: usize| be_.alloc((n * 4).max(4), BufferUsage::Activations);

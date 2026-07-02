@@ -33,7 +33,10 @@ fn mmv_epw(bits: u32) -> Option<usize> {
 pub struct Recorder<'a> {
     be: &'a VulkanBackend,
     cmd: vk::CommandBuffer,
-    pool: vk::DescriptorPool,
+    /// Descriptor pools, GROWN on exhaustion (a batched-MoE prefill chunk records ~50k dispatches
+    /// — far beyond any fixed max_sets). The last entry is the active pool; `alloc_set` appends a
+    /// fresh one on ERROR_OUT_OF_POOL_MEMORY.
+    pools: std::cell::RefCell<Vec<vk::DescriptorPool>>,
     /// Buffers written since the last barrier (for read-after-write / write-after-write detection).
     dirty_writes: RefCell<HashSet<vk::Buffer>>,
     /// Buffers read since the last barrier (for write-after-read detection).
@@ -101,19 +104,7 @@ impl<'a> Recorder<'a> {
         .map_err(|e| be(format!("begin cmd buffer: {e}")))?;
 
         // Big pool: one descriptor set per recorded op.
-        let pool_sizes = [vk::DescriptorPoolSize {
-            ty: vk::DescriptorType::STORAGE_BUFFER,
-            descriptor_count: 16384,
-        }];
-        let pool = unsafe {
-            device.create_descriptor_pool(
-                &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(4096)
-                    .pool_sizes(&pool_sizes),
-                None,
-            )
-        }
-        .map_err(|e| be(format!("create recorder pool: {e}")))?;
+        let pool = Self::new_desc_pool(device)?;
 
         const MAX_TS: u32 = 8192;
         // No per-op profiling on the persistent (replayed) path — the recorder is dropped after
@@ -138,7 +129,7 @@ impl<'a> Recorder<'a> {
         Ok(Self {
             be: backend,
             cmd,
-            pool,
+            pools: std::cell::RefCell::new(vec![pool]),
             dirty_writes: RefCell::new(HashSet::new()),
             dirty_reads: RefCell::new(HashSet::new()),
             dirty_transfer: std::cell::Cell::new(false),
@@ -159,6 +150,45 @@ impl<'a> Recorder<'a> {
     pub fn label_next(&self, label: &'static str) {
         if self.prof2 {
             self.next_label.set(Some(label));
+        }
+    }
+
+    /// Create one descriptor pool tranche (the chain grows by these on exhaustion).
+    fn new_desc_pool(device: &ash::Device) -> Result<vk::DescriptorPool> {
+        let pool_sizes = [vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_count: 16384,
+        }];
+        unsafe {
+            device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(4096)
+                    .pool_sizes(&pool_sizes),
+                None,
+            )
+        }
+        .map_err(|e| be(format!("create recorder pool: {e}")))
+    }
+
+    /// Allocate a descriptor set from the active pool, growing the chain when it runs dry.
+    fn alloc_set(&self, layout: vk::DescriptorSetLayout) -> vk::DescriptorSet {
+        let device = &self.be.shared.device;
+        let try_alloc = |pool: vk::DescriptorPool| unsafe {
+            device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(pool)
+                    .set_layouts(std::slice::from_ref(&layout)),
+            )
+        };
+        let cur = *self.pools.borrow().last().expect("≥1 descriptor pool");
+        match try_alloc(cur) {
+            Ok(sets) => sets[0],
+            Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY | vk::Result::ERROR_FRAGMENTED_POOL) => {
+                let fresh = Self::new_desc_pool(device).expect("grow descriptor pool");
+                self.pools.borrow_mut().push(fresh);
+                try_alloc(fresh).expect("alloc descriptor set (fresh pool)")[0]
+            }
+            Err(e) => panic!("alloc descriptor set: {e}"),
         }
     }
 
@@ -264,6 +294,7 @@ impl<'a> Recorder<'a> {
         n_out: usize,
         push: &[u8],
         args: vk::Buffer,
+        args_off: u64,
     ) {
         let split = buffers.len() - n_out;
         let (reads, writes) = buffers.split_at(split);
@@ -273,14 +304,7 @@ impl<'a> Recorder<'a> {
         self.sync(&all_reads, writes, false);
         self.indirect_pending.set(false);
         let device = &self.be.shared.device;
-        let set = unsafe {
-            device.allocate_descriptor_sets(
-                &vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(self.pool)
-                    .set_layouts(std::slice::from_ref(&k.ds_layout)),
-            )
-        }
-        .expect("alloc descriptor set")[0];
+        let set = self.alloc_set(k.ds_layout);
         let infos: Vec<vk::DescriptorBufferInfo> = buffers
             .iter()
             .map(|&buffer| vk::DescriptorBufferInfo {
@@ -318,7 +342,7 @@ impl<'a> Recorder<'a> {
                     push,
                 );
             }
-            device.cmd_dispatch_indirect(self.cmd, args, 0);
+            device.cmd_dispatch_indirect(self.cmd, args, args_off);
         }
     }
 
@@ -339,14 +363,7 @@ impl<'a> Recorder<'a> {
         let (reads, writes) = buffers.split_at(split);
         self.sync(reads, writes, false);
         let device = &self.be.shared.device;
-        let set = unsafe {
-            device.allocate_descriptor_sets(
-                &vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(self.pool)
-                    .set_layouts(std::slice::from_ref(&k.ds_layout)),
-            )
-        }
-        .expect("alloc descriptor set")[0];
+        let set = self.alloc_set(k.ds_layout);
 
         let infos: Vec<vk::DescriptorBufferInfo> = buffers
             .iter()
@@ -2067,6 +2084,7 @@ impl<'a> Recorder<'a> {
             3,
             &p1,
             Self::vkb(args),
+            0,
         );
 
         // pass 2: combine over the live chunks
@@ -3117,6 +3135,260 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Batched-MoE FFN prologue: per-expert INDIRECT dispatch args from the GPU-routed counts
+    /// (7 slots × 4 u32 per expert — see shaders/moe_expert_args.comp). One dispatch; the whole
+    /// expert loop then records with no host readback.
+    pub fn moe_expert_args(
+        &self,
+        counts: &dyn Buffer,
+        args: &dyn Buffer,
+        n_expert: usize,
+        ne: usize,
+        nff: usize,
+    ) {
+        self.stamp("moe_bucket");
+        let k = self
+            .be
+            .kernel("moe_expert_args", crate::gemm::moe_expert_args_spv(), 2, 12);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(n_expert as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(nff as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(counts), Self::vkb(args)],
+            1,
+            &push,
+            (n_expert as u32).div_ceil(64),
+        );
+    }
+
+    /// GPU-routed row gather for expert `e`: m/offset come from the routing buffers, the grid from
+    /// the prologue's indirect args (`slot` selects which of the 7 per-expert arg slots).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_rows_ind(
+        &self,
+        src: &dyn Buffer,
+        idx: &dyn Buffer,
+        counts: &dyn Buffer,
+        offsets: &dyn Buffer,
+        dst: &dyn Buffer,
+        args: &dyn Buffer,
+        e: usize,
+        slot: usize,
+        ne: usize,
+    ) {
+        self.stamp("moe_gather");
+        let k = self
+            .be
+            .kernel("gather_rows_ind", crate::gemm::gather_rows_ind_spv(), 5, 12);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(e as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
+        self.dispatch_indirect(
+            k,
+            &[
+                Self::vkb(src),
+                Self::vkb(idx),
+                Self::vkb(counts),
+                Self::vkb(offsets),
+                Self::vkb(dst),
+            ],
+            1,
+            &push,
+            Self::vkb(args),
+            ((e * 7 + slot) * 16) as u64,
+        );
+    }
+
+    /// GPU-routed weighted scatter-add for expert `e` (see [`Self::gather_rows_ind`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn scatter_add_rows_ind(
+        &self,
+        y: &dyn Buffer,
+        idx: &dyn Buffer,
+        w: &dyn Buffer,
+        counts: &dyn Buffer,
+        offsets: &dyn Buffer,
+        dst: &dyn Buffer,
+        args: &dyn Buffer,
+        e: usize,
+        slot: usize,
+        ne: usize,
+    ) {
+        self.stamp("moe_scatter");
+        let k = self.be.kernel(
+            "scatter_add_rows_ind",
+            crate::gemm::scatter_add_rows_ind_spv(),
+            6,
+            12,
+        );
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(e as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
+        self.dispatch_indirect(
+            k,
+            &[
+                Self::vkb(y),
+                Self::vkb(idx),
+                Self::vkb(w),
+                Self::vkb(counts),
+                Self::vkb(offsets),
+                Self::vkb(dst),
+            ],
+            1,
+            &push,
+            Self::vkb(args),
+            ((e * 7 + slot) * 16) as u64,
+        );
+    }
+
+    /// Indirect-grid quant_q8 (grid = m·nblk from the prologue args; the kernel derives its row
+    /// from the workgroup id, so no push-constant m is needed).
+    #[allow(clippy::too_many_arguments)]
+    pub fn quant_q8_ind(
+        &self,
+        a: &dyn Buffer,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: &dyn Buffer,
+        k_dim: usize,
+        args: &dyn Buffer,
+        e: usize,
+        slot: usize,
+    ) {
+        self.stamp("quant_q8");
+        let kq = self
+            .be
+            .kernel("quant_q8", crate::gemm::quant_q8_spv(), 4, 12);
+        let mut p = [0u8; 12];
+        // m unused in-shader (row = wg / nblk); keep 0.
+        p[4..8].copy_from_slice(&(k_dim as u32).to_ne_bytes());
+        p[8..12].copy_from_slice(&32u32.to_ne_bytes());
+        self.dispatch_indirect(
+            kq,
+            &[
+                Self::vkb(a),
+                Self::vkb(qa),
+                Self::vkb(dact),
+                Self::vkb(sact),
+            ],
+            3,
+            &p,
+            Self::vkb(args),
+            ((e * 7 + slot) * 16) as u64,
+        );
+    }
+
+    /// Indirect-grid Q4_K mmq expert GEMM (the kernel never reads its push-constant m — padded
+    /// rows read garbage and their outputs land in padded scratch, both already tolerated).
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_mmq_q4k_ind(
+        &self,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: &dyn Buffer,
+        w: &dyn Buffer,
+        w_base: usize,
+        c: &dyn Buffer,
+        k_dim: usize,
+        n: usize,
+        args: &dyn Buffer,
+        e: usize,
+        slot: usize,
+    ) {
+        self.stamp("expert_gateup");
+        let kern = self.be.kernel(
+            "native_gemm_mmq_q4k",
+            crate::gemm::native_gemm_mmq_q4k_spv(),
+            5,
+            16,
+        );
+        let mut push = [0u8; 16];
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k_dim as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        self.dispatch_indirect(
+            kern,
+            &[
+                Self::vkb(qa),
+                Self::vkb(dact),
+                Self::vkb(sact),
+                Self::vkb(w),
+                Self::vkb(c),
+            ],
+            1,
+            &push,
+            Self::vkb(args),
+            ((e * 7 + slot) * 16) as u64,
+        );
+    }
+
+    /// Indirect-grid Q6_K mmq expert GEMM (see [`Self::matmul_mmq_q4k_ind`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_mmq_q6k_ind(
+        &self,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        w: &dyn Buffer,
+        w_base: usize,
+        c: &dyn Buffer,
+        k_dim: usize,
+        n: usize,
+        args: &dyn Buffer,
+        e: usize,
+        slot: usize,
+    ) {
+        self.stamp("expert_down");
+        let kern = self.be.kernel(
+            "native_gemm_mmq_q6k",
+            crate::gemm::native_gemm_mmq_q6k_spv(),
+            4,
+            16,
+        );
+        let mut push = [0u8; 16];
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k_dim as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        self.dispatch_indirect(
+            kern,
+            &[Self::vkb(qa), Self::vkb(dact), Self::vkb(w), Self::vkb(c)],
+            1,
+            &push,
+            Self::vkb(args),
+            ((e * 7 + slot) * 16) as u64,
+        );
+    }
+
+    /// Indirect-grid SwiGLU (grid = ceil(m·nff/64) from the prologue; push n is the WORST-CASE
+    /// element count so the in-kernel guard passes for the whole dispatched range).
+    #[allow(clippy::too_many_arguments)]
+    pub fn silu_mul_ind(
+        &self,
+        gate: &dyn Buffer,
+        up: &dyn Buffer,
+        y: &dyn Buffer,
+        n_worst: usize,
+        args: &dyn Buffer,
+        e: usize,
+        slot: usize,
+    ) {
+        self.stamp("silu_mul");
+        let k = self
+            .be
+            .kernel("silu_mul", crate::gemm::silu_mul_spv(), 3, 8);
+        let mut push = [0u8; 8];
+        push[0..4].copy_from_slice(&(n_worst as u32).to_ne_bytes());
+        self.dispatch_indirect(
+            k,
+            &[Self::vkb(gate), Self::vkb(up), Self::vkb(y)],
+            1,
+            &push,
+            Self::vkb(args),
+            ((e * 7 + slot) * 16) as u64,
+        );
+    }
+
     /// Weighted scatter-add: `dst[idx[j],:] += w[j] * y[j,:]` for j in 0..m, each row `ne` wide.
     /// Accumulates an MoE expert's weighted token outputs back into the resident hidden state
     /// (chained across experts via WAW barriers on `dst`).
@@ -3201,7 +3473,9 @@ impl<'a> Recorder<'a> {
             }
             let cmd_pool = *self.be.shared.cmd_pool.lock().unwrap();
             device.free_command_buffers(cmd_pool, &[self.cmd]);
-            device.destroy_descriptor_pool(self.pool, None);
+            for p in self.pools.borrow().iter() {
+                device.destroy_descriptor_pool(*p, None);
+            }
         }
         Ok(())
     }
@@ -3219,7 +3493,7 @@ impl<'a> Recorder<'a> {
         Ok(RecordedCmd {
             shared: std::sync::Arc::clone(&self.be.shared),
             cmd: self.cmd,
-            pool: self.pool,
+            pools: self.pools.borrow().clone(),
         })
     }
 
@@ -3292,7 +3566,7 @@ impl VulkanBackend {
 pub struct RecordedCmd {
     shared: std::sync::Arc<crate::VulkanShared>,
     cmd: vk::CommandBuffer,
-    pool: vk::DescriptorPool,
+    pools: Vec<vk::DescriptorPool>,
 }
 
 impl RecordedCmd {
@@ -3322,7 +3596,9 @@ impl Drop for RecordedCmd {
             let _ = device.queue_wait_idle(self.shared.queue);
             let cmd_pool = *self.shared.cmd_pool.lock().unwrap();
             device.free_command_buffers(cmd_pool, &[self.cmd]);
-            device.destroy_descriptor_pool(self.pool, None);
+            for p in &self.pools {
+                device.destroy_descriptor_pool(*p, None);
+            }
         }
     }
 }
