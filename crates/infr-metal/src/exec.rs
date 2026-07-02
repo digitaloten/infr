@@ -52,6 +52,58 @@ struct Resident {
     enc: Option<ComputeCommandEncoder>,
     tape: Option<Vec<TapeEntry>>,
     posbuf: Option<MtlBuffer>,
+    /// Linear→Add residual fusion (see `linear_add_peephole`): Linear op index → (residual
+    /// tensor, final dst); the absorbed Adds are in `skip`.
+    fused: std::collections::HashMap<usize, (TensorId, TensorId)>,
+    skip: std::collections::HashSet<usize>,
+}
+
+/// Fuse `Linear (m==1, Q4_K/Q6_K weight, Internal dst) → Add(residual)` into the fused-residual
+/// GEMV (`linear_q4k_add`/`linear_q6k_add`) — one dispatch + one dependency stage instead of two,
+/// and no round-trip of the sublayer output (the decode o_proj/down_proj shape; mirrors the
+/// Vulkan adapter's peephole). Only the IMMEDIATELY following Add fuses: the seam builder emits
+/// the pair adjacent for non-gemma models, and gemma's sandwich norm sits between and correctly
+/// blocks it.
+fn linear_add_peephole(
+    g: &infr_core::graph::Graph,
+) -> (
+    std::collections::HashMap<usize, (TensorId, TensorId)>,
+    std::collections::HashSet<usize>,
+) {
+    let mut fused = std::collections::HashMap::new();
+    let mut skip = std::collections::HashSet::new();
+    for (i, op) in g.ops.iter().enumerate() {
+        let Op::Linear {
+            dst, m: 1, weight, ..
+        } = op
+        else {
+            continue;
+        };
+        if !matches!(g.tensors[dst.0 as usize].kind, TensorKind::Internal) {
+            continue;
+        }
+        if !matches!(g.desc(*weight).dtype, DType::Q4K | DType::Q6K) {
+            continue;
+        }
+        if let Some(Op::Add {
+            a,
+            b,
+            dst: add_dst,
+            ..
+        }) = g.ops.get(i + 1)
+        {
+            let residual = if a == dst {
+                *b
+            } else if b == dst {
+                *a
+            } else {
+                continue;
+            };
+            fused.insert(i, (residual, *add_dst));
+            skip.insert(i + 1);
+        }
+    }
+    (fused, skip)
 }
 
 /// One recorded dispatch: everything `encode_tg` needs to re-encode it verbatim. The buffer clones
@@ -477,7 +529,14 @@ impl MetalBackend {
             enc: None,
             tape: record.then(Vec::new),
             posbuf: None,
+            fused: std::collections::HashMap::new(),
+            skip: std::collections::HashSet::new(),
         };
+        {
+            let (fused, skip) = linear_add_peephole(g);
+            r.fused = fused;
+            r.skip = skip;
+        }
         if record {
             // Recording (`replay_shape` held): the tape must read/write the BOUND buffers, not
             // per-execute host-mirror copies — the engine mutates the bound hidden/positions
@@ -533,9 +592,12 @@ impl MetalBackend {
         }
 
         if self.profiling {
-            for op in &g.ops {
+            for (idx, op) in g.ops.iter().enumerate() {
+                if r.skip.contains(&idx) {
+                    continue;
+                }
                 let t0 = std::time::Instant::now();
-                self.run_op(op, g, bindings, &mut r)?;
+                self.run_op(op, idx, g, bindings, &mut r)?;
                 let enc = t0.elapsed();
                 // Per-op mode: flush now so this op's GPU wall is isolable (breaks batching).
                 let gpu = if self.prof_ops {
@@ -553,8 +615,11 @@ impl MetalBackend {
             }
             self.prof.lock().unwrap().add_forward();
         } else {
-            for op in &g.ops {
-                self.run_op(op, g, bindings, &mut r)?;
+            for (idx, op) in g.ops.iter().enumerate() {
+                if r.skip.contains(&idx) {
+                    continue;
+                }
+                self.run_op(op, idx, g, bindings, &mut r)?;
             }
         }
 
@@ -745,6 +810,7 @@ impl MetalBackend {
     fn run_op(
         &self,
         op: &Op,
+        idx: usize,
         g: &infr_core::graph::Graph,
         bindings: &Bindings,
         r: &mut Resident,
@@ -913,6 +979,34 @@ impl MetalBackend {
                             };
                             (qw.kern, sgs)
                         };
+                        // Residual peephole: this Linear absorbed the following Add — take the
+                        // fused-residual variant and write the Add's dst directly.
+                        if let Some(&(res, fdst)) = r.fused.get(&idx) {
+                            let fk = match kern {
+                                "linear_q4k" => "linear_q4k_add",
+                                _ => "linear_q6k_add",
+                            };
+                            let bres = self.ensure_device(r, res);
+                            let bfd = self.dev_dst(r, fdst, out_f);
+                            let pso = self.pipelines.get(fk)?;
+                            self.encode_tg(
+                                r,
+                                &pso,
+                                &[
+                                    bx.as_ref(),
+                                    &qw.codes,
+                                    &qw.scm,
+                                    &qw.dd,
+                                    bfd.as_ref(),
+                                    bres.as_ref(),
+                                ],
+                                &p,
+                                sgs * 32,
+                                32,
+                            );
+                            r.loc[fdst.0 as usize] = Loc::Device;
+                            return Ok(());
+                        }
                         let pso = self.pipelines.get(kern)?;
                         self.encode_tg(
                             r,

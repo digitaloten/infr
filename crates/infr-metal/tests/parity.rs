@@ -303,6 +303,64 @@ fn synth_q6k(n_elem: usize, seed: u32) -> Vec<u8> {
     out
 }
 
+// Linear (m=1, K-quant) immediately followed by a residual Add: the backend's peephole fuses the
+// pair into `linear_*_add` (one dispatch, Add's dst written directly). Compare against the CPU
+// reference running the UNFUSED pair — the fusion must be invisible.
+fn check_linear_add_fusion(dtype: DType, wbytes: Vec<u8>, in_f: usize, out_f: usize) {
+    let xs = rand_f32(in_f, 91);
+    let res = rand_f32(out_f, 92);
+    let mut g = Graph::new();
+    let x = g.input(TensorDesc::new(vec![1, in_f], DType::F32));
+    let w = g.weight(TensorDesc::new(vec![out_f, in_f], dtype));
+    let rt = g.input(TensorDesc::new(vec![out_f], DType::F32));
+    let mid = g.internal(TensorDesc::new(vec![1, out_f], DType::F32));
+    let dst = g.output(TensorDesc::new(vec![out_f], DType::F32));
+    g.push(Op::Linear {
+        x,
+        weight: w,
+        dst: mid,
+        m: 1,
+        in_f: in_f as u32,
+        out_f: out_f as u32,
+    });
+    g.push(Op::Add {
+        a: mid,
+        b: rt,
+        dst,
+        n: out_f as u32,
+    });
+    let bound = vec![(x, f32_bytes(&xs)), (w, wbytes.clone()), (rt, f32_bytes(&res))];
+    // Reference: dequant the SAME bytes + f32 matmul + add (the CPU backend Q8-quantizes the
+    // activation for quant Linear, so it is not the oracle here — same as the other quant tests).
+    let wref = infr_gguf::dequant::dequant_block(dtype, &wbytes).unwrap();
+    let mut reference = ref_linear(&xs, &wref, 1, in_f, out_f);
+    for (o, r) in reference.iter_mut().zip(res.iter()) {
+        *o += r;
+    }
+    let mtl = run(
+        &MetalBackend::new().expect("metal backend"),
+        &g,
+        &bound,
+        dst,
+        out_f,
+    );
+    assert_close(&reference, &mtl, 1e-3, "linear+add fusion");
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_add_fusion_q4k_parity() {
+    let (in_f, out_f) = (512usize, 384usize);
+    check_linear_add_fusion(DType::Q4K, synth_q4k(out_f * in_f, 93), in_f, out_f);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_add_fusion_q6k_parity() {
+    let (in_f, out_f) = (512usize, 384usize);
+    check_linear_add_fusion(DType::Q6K, synth_q6k(out_f * in_f, 94), in_f, out_f);
+}
+
 // Shared quant-Linear parity check: Metal dequants `wbytes` (via infr_gguf) and matmuls; compare to
 // a reference that dequants the SAME bytes and matmuls — isolates Metal's quant-weight path.
 fn check_quant_linear_parity(dtype: DType, wbytes: Vec<u8>, m: usize, in_f: usize, out_f: usize) {

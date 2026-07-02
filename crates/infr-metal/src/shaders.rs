@@ -443,14 +443,15 @@ kernel void NAME(device const half*   x     [[buffer(0)]],                      
 // reference dequant dot, floating-point reassociated. This access pattern (4 blocks in flight per
 // simdgroup for Q4_K, contiguous 8-element runs per lane) is what the sub-block-scatter DEC16
 // GEMV left on the table.
-kernel void linear_q4k(device const float*  x     [[buffer(0)]],
-                       device const uchar*  codes [[buffer(1)]],
-                       device const uchar*  scm   [[buffer(2)]],
-                       device const uchar*  dd    [[buffer(3)]],
-                       device float*        dst   [[buffer(4)]],
-                       constant QLinParams& p     [[buffer(5)]],
-                       uint gid  [[thread_position_in_grid]],
-                       uint lane [[thread_index_in_simdgroup]]) {
+// Body shared by the plain GEMV and the fused-residual variant (`FADD`: dst = W·x + res, the
+// decode o_proj/down_proj + Add peephole — one dispatch and no sublayer-output round-trip).
+template<bool FADD>
+inline void linear_q4k_body(device const float*  x,
+                            device const uchar*  codes,
+                            device float*        dst,
+                            device const float*  res,
+                            constant QLinParams& p,
+                            uint gid, uint lane) {
     uint first_row = (gid / 32u) * 2u;
     if (first_row >= p.out_f) return;
     uint nb = p.in_f >> 8;                 // 256-element blocks per row
@@ -515,11 +516,11 @@ kernel void linear_q4k(device const float*  x     [[buffer(0)]],
     }
     for (uint row = 0; row < 2u && first_row + row < p.out_f; row++) {
         float s = simd_sum(sumf[row]);
-        if (lane == 0u) dst[first_row + row] = s;
+        if (lane == 0u) dst[first_row + row] = FADD ? s + res[first_row + row] : s;
     }
 }
 
-kernel void linear_q6k(device const float*  x     [[buffer(0)]],
+kernel void linear_q4k(device const float*  x     [[buffer(0)]],
                        device const uchar*  codes [[buffer(1)]],
                        device const uchar*  scm   [[buffer(2)]],
                        device const uchar*  dd    [[buffer(3)]],
@@ -527,6 +528,27 @@ kernel void linear_q6k(device const float*  x     [[buffer(0)]],
                        constant QLinParams& p     [[buffer(5)]],
                        uint gid  [[thread_position_in_grid]],
                        uint lane [[thread_index_in_simdgroup]]) {
+    linear_q4k_body<false>(x, codes, dst, x, p, gid, lane);
+}
+kernel void linear_q4k_add(device const float*  x     [[buffer(0)]],
+                           device const uchar*  codes [[buffer(1)]],
+                           device const uchar*  scm   [[buffer(2)]],
+                           device const uchar*  dd    [[buffer(3)]],
+                           device float*        dst   [[buffer(4)]],
+                           device const float*  res   [[buffer(5)]],
+                           constant QLinParams& p     [[buffer(6)]],
+                           uint gid  [[thread_position_in_grid]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    linear_q4k_body<true>(x, codes, dst, res, p, gid, lane);
+}
+
+template<bool FADD>
+inline void linear_q6k_body(device const float*  x,
+                            device const uchar*  codes,
+                            device float*        dst,
+                            device const float*  res,
+                            constant QLinParams& p,
+                            uint gid, uint lane) {
     uint first_row = (gid / 32u) * 2u;
     if (first_row >= p.out_f) return;
     uint nb = p.in_f >> 8;
@@ -581,8 +603,30 @@ kernel void linear_q6k(device const float*  x     [[buffer(0)]],
     }
     for (uint row = 0; row < 2u && first_row + row < p.out_f; row++) {
         float s = simd_sum(sumf[row]);
-        if (lane == 0u) dst[first_row + row] = s;
+        if (lane == 0u) dst[first_row + row] = FADD ? s + res[first_row + row] : s;
     }
+}
+
+kernel void linear_q6k(device const float*  x     [[buffer(0)]],
+                       device const uchar*  codes [[buffer(1)]],
+                       device const uchar*  scm   [[buffer(2)]],
+                       device const uchar*  dd    [[buffer(3)]],
+                       device float*        dst   [[buffer(4)]],
+                       constant QLinParams& p     [[buffer(5)]],
+                       uint gid  [[thread_position_in_grid]],
+                       uint lane [[thread_index_in_simdgroup]]) {
+    linear_q6k_body<false>(x, codes, dst, x, p, gid, lane);
+}
+kernel void linear_q6k_add(device const float*  x     [[buffer(0)]],
+                           device const uchar*  codes [[buffer(1)]],
+                           device const uchar*  scm   [[buffer(2)]],
+                           device const uchar*  dd    [[buffer(3)]],
+                           device float*        dst   [[buffer(4)]],
+                           device const float*  res   [[buffer(5)]],
+                           constant QLinParams& p     [[buffer(6)]],
+                           uint gid  [[thread_position_in_grid]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    linear_q6k_body<true>(x, codes, dst, res, p, gid, lane);
 }
 
 GEMV_KERNEL(linear_quik4, DEC16_K4)

@@ -11,16 +11,20 @@ that emerged and the measured reasoning behind it.
 
 | model | metric | infr-metal | llama.cpp | gap |
 | --- | --- | --- | --- | --- |
-| 0.6B | tg128 | 147 tok/s | 191 | 1.30× |
+| 0.6B | tg128 | 159 tok/s | 191 | 1.20× |
 | 0.6B | tg128 @ d16384 | 48.3 tok/s | 42.9 | **infr ahead** |
 | 0.6B | pp2048 | 3346 tok/s | 3748 | 1.12× |
 | 0.6B | pp8192 | 2167 tok/s | 2336 | 1.08× |
-| 4B | tg128 | 39.9 tok/s | 46.7 | 1.17× |
+| 4B | tg128 | 40.9 tok/s | 46.7 | 1.14× |
 | 4B | tg128 @ d16384 | 21.4 tok/s | 24.5 | 1.14× |
 | 4B | pp8192 | 422 tok/s | 488 | 1.16× |
 
-The remaining decode gap at short/moderate depth is per-token host cost (graph
-rebuild + encode per token), not kernel time — the decode-replay lever.
+Decode is weight-stream bound: the GEMV kernels run ~107 GB/s of a measured
+~133 GB/s read roofline, and the per-token host cost is ~0.2 ms (the recorded
+decode-replay tape re-encodes the whole forward with no graph walk). The
+remaining gap vs llama.cpp is effective-bandwidth tail (dispatch ramp on
+36-66 MB matrices + the serial small-op chain), not kernel structure — the
+mul_mv port matches their N_R0/N_SG configuration exactly.
 
 From the naive reference implementation: decode ~44×, prefill ~250×+. Model
 load is ~10× faster than the repack era and resident weight memory is the raw
@@ -151,7 +155,7 @@ GPU wall per op — costs the batching (analysis mode, not the fast path).
 
 ## Tests
 
-`tests/parity.rs` — 37 GPU parity tests vs the CPU reference: every op, and
+`tests/parity.rs` — 39 GPU parity tests vs the CPU reference: every op, and
 for quantized Linear every (format × kernel shape) pair including partial
 tiles; attention covers unsplit/split8/split32/flash/flash2/vec, sliding
 windows at both tile and block granularity, partial query tiles, and the
@@ -162,7 +166,9 @@ kept so the floors above stay reproducible.
 ## Negative results (measured — don't re-try without new evidence)
 
 - Op fusion / dispatch-count reduction: per-kernel overhead is ~1.2 µs; a fused
-  Add+RmsNorm measured nothing.
+  Add+RmsNorm measured nothing at prefill. (The decode Linear→Add residual
+  peephole — mirroring the Vulkan adapter — is the exception: +2.5% on 4B
+  decode, from removing a dependency stage per sublayer, not dispatch count.)
 - Row-tiled GEMV for prefill weight reuse: zero change — the SLC already
   absorbed the re-reads; the scalar pipeline's ~1:1 load:FMA ratio was the
   limit (hence MMA).
