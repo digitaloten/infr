@@ -685,10 +685,18 @@ kernel void NAME(device const float*  x     [[buffer(0)]],                      
                                                                                                   \
     uint nb = p.in_f >> 4;                                                                        \
     for (uint k0 = 0; k0 < p.in_f; k0 += 32u) {                                                   \
+        /* device reads + dequant FIRST, into registers — issued while the previous       */     \
+        /* iteration's MMA phase (other simdgroups) is still draining; the barrier below  */     \
+        /* orders only the threadgroup-memory stores (mul_mm does exactly this)           */     \
+        ulong bi = (ulong)(ro + lr0) * nb + (ulong)(k0 >> 4) + il0;                               \
+        float wk[16];                                                                             \
+        DEC(wk)                                                                                   \
+        device const float4* yy =                                                                 \
+            (device const float4*)(x + (ulong)(rt + lr1c) * p.in_f + k0 + iyk);                   \
+        float4 yv0 = yy[0];                                                                       \
+        float4 yv1 = yy[1];                                                                       \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                                          \
         {   /* stage A: one 16-block per thread, into pre-transposed 8x8 tiles */                 \
-            ulong bi = (ulong)(ro + lr0) * nb + (ulong)(k0 >> 4) + il0;                           \
-            float wk[16];                                                                         \
-            DEC(wk)                                                                               \
             uint sy = lr0 >> 3;                                                                   \
             uint lx = lr0 & 7u;                                                                   \
             for (uint i = 0; i < 16u; i++) {                                                      \
@@ -696,25 +704,29 @@ kernel void NAME(device const float*  x     [[buffer(0)]],                      
                 sa[64u * (8u * sx + sy) + 8u * (i & 7u) + lx] = (half)wk[i];                      \
             }                                                                                     \
         }                                                                                         \
-        {   /* stage B: 8 activations per thread, f32 -> f16 inline */                            \
-            device const float* yy = x + (ulong)(rt + lr1c) * p.in_f + k0 + iyk;                  \
+        {   /* stage B: 8 activations per thread, two vectorized f32->f16 half4 stores */         \
             uint ib = 4u * (tid & 3u) + (lr1 >> 3);                                               \
             uint ly = lr1 & 7u;                                                                   \
-            for (uint i = 0; i < 8u; i++) sb[64u * ib + 8u * ly + i] = (half)yy[i];               \
+            threadgroup half4* sb4 = (threadgroup half4*)(sb + 64u * ib + 8u * ly);               \
+            sb4[0] = half4(yv0);                                                                  \
+            sb4[1] = half4(yv1);                                                                  \
         }                                                                                         \
         threadgroup_barrier(mem_flags::mem_threadgroup);                                          \
         threadgroup const half* lsma = sa + 4u * 64u * (sgid & 1u);                               \
         threadgroup const half* lsmb = sb + 2u * 64u * (sgid >> 1);                               \
         for (uint ik = 0; ik < 4u; ik++) {                                                        \
+            simdgroup_barrier(mem_flags::mem_none);                                               \
             for (uint i = 0; i < 4u; i++) simdgroup_load(ma[i], lsma + 64u * i, 8);               \
+            simdgroup_barrier(mem_flags::mem_none);                                               \
             for (uint i = 0; i < 2u; i++) simdgroup_load(mb[i], lsmb + 64u * i, 8);               \
+            simdgroup_barrier(mem_flags::mem_none);                                               \
             for (uint i = 0; i < 8u; i++)                                                         \
                 simdgroup_multiply_accumulate(mc[i], mb[i >> 2], ma[i & 3u], mc[i]);              \
             lsma += 8u * 64u;                                                                     \
             lsmb += 4u * 64u;                                                                     \
         }                                                                                         \
-        threadgroup_barrier(mem_flags::mem_threadgroup);                                          \
     }                                                                                             \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                                              \
                                                                                                   \
     if (rt + 32u <= p.m) {                                                                        \
         device float* C = dst + (ro + 32u * (sgid & 1u)) +                                        \
