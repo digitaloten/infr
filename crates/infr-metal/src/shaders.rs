@@ -778,8 +778,10 @@ HGEMM_KERNEL(linear_q4k_hmm, DEC16_Q4K)
 HGEMM_KERNEL(linear_q6k_hmm, DEC16_Q6K)
 
 
-// ---- RoPE (NEOX): rotate the first rope_dim of each head; dims beyond pass through. One thread
-// per (row, head). `pos`/`ff` buffers are f32. `has_ff` selects the per-pair freq divisor.
+// ---- RoPE (Op::Rope = the no-qk-norm llama-family rotation): INTERLEAVED pairs (2p, 2p+1) —
+// llama.cpp's ROPE_TYPE_NORM, matching infr-cpu and the Vulkan `rope` kernel. (QkNormRope below
+// is the NEOX split-half used by qwen/gemma; the styles are NOT interchangeable.) Rotates the
+// first rope_dim of each head; dims beyond pass through. One thread per (row, head).
 struct RopeParams { uint rows; uint n_head; uint head_dim; uint rope_dim; float theta; uint has_ff; };
 kernel void rope_f32(device const float* x   [[buffer(0)]],
                      device const float* pos [[buffer(1)]],
@@ -794,7 +796,7 @@ kernel void rope_f32(device const float* x   [[buffer(0)]],
     uint hf = p.rope_dim / 2;
     float p0 = pos[r];
     for (uint pp = 0; pp < hf; pp++) {
-        uint i0 = pp, i1 = pp + hf;
+        uint i0 = 2 * pp, i1 = 2 * pp + 1;
         float ang = p0 * pow(p.theta, -2.0f * (float)pp / (float)p.rope_dim);
         if (p.has_ff != 0) ang /= ff[pp];
         float c = cos(ang), s = sin(ang);

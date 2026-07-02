@@ -2597,13 +2597,17 @@ impl Backend for CpuBackend {
                     let pos = vals[positions.0 as usize].clone();
                     let ff = freq_factors.map(|f| vals[f.0 as usize].clone());
                     let mut out = xs.clone(); // dims beyond rope_dim pass through unchanged
+                                              // Op::Rope is the no-qk-norm (llama-family) rotation: INTERLEAVED pairs
+                                              // (2p, 2p+1) — llama.cpp's ROPE_TYPE_NORM, matching the Vulkan `rope` kernel
+                                              // and the bespoke fused attn_in. (QkNormRope is the NEOX split-half rotation
+                                              // used by qwen/gemma; the two styles are NOT interchangeable.)
                     let hf = rd / 2;
                     for r in 0..rows {
                         let p0 = pos[r];
                         for h in 0..nh {
                             let b = (r * nh + h) * hd;
                             for p in 0..hf {
-                                let (i0, i1) = (p, p + hf);
+                                let (i0, i1) = (2 * p, 2 * p + 1);
                                 let mut ang = p0 * theta.powf(-2.0 * p as f32 / rd as f32);
                                 if let Some(ff) = &ff {
                                     ang /= ff[p];

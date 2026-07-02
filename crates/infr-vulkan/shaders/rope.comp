@@ -1,19 +1,45 @@
 #version 460
 // RoPE (ggml NORM, interleaved pairs) over x laid out [t, n_heads, hd]. One thread per (t, head).
+// Variants: -DOUT_F16 writes f16 (the llama q/KV-cache write: `out_base` shifts the output row —
+// 0 for the Q scratch, `pos` for the fused K cache write); -DUSE_PARAMS additionally reads the
+// per-token pos from the params SSBO so the record-once decode can replay (`pc.pos_offset` is
+// then the 0/1 out_base multiplier, like qk_norm_rope_dyn's `out_base`).
+#ifdef OUT_F16
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC {
-    uint t; uint nheads; uint hd; uint rope_dim; float theta; uint pos_offset;
+    uint t; uint nheads; uint hd; uint rope_dim; float theta; uint pos_offset; uint out_base;
 } pc;
 layout(binding = 0) readonly buffer XB { float x[]; };
+#ifdef USE_PARAMS
+layout(binding = 1) readonly buffer PB { uint p_pos; uint p_kvlen; };
+layout(binding = 2) buffer YB { float16_t y[]; };
+#elif defined(OUT_F16)
+layout(binding = 1) buffer YB { float16_t y[]; };
+#else
 layout(binding = 1) buffer YB { float y[]; };
+#endif
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= pc.t * pc.nheads) { return; }
+#ifdef USE_PARAMS
+    uint pos = p_pos + idx / pc.nheads;
+    uint out_base = pc.out_base * p_pos; // pc.out_base is the 0/1 multiplier in dyn mode
+#else
     uint pos = pc.pos_offset + idx / pc.nheads;
+    uint out_base = pc.out_base;
+#endif
     uint base = idx * pc.hd;
-    for (uint i = 0u; i < pc.hd; i++) { y[base + i] = x[base + i]; }
+    uint obase = out_base * pc.nheads * pc.hd + base;
+#ifdef OUT_F16
+    for (uint i = 0u; i < pc.hd; i++) { y[obase + i] = float16_t(x[base + i]); }
+#else
+    for (uint i = 0u; i < pc.hd; i++) { y[obase + i] = x[base + i]; }
+#endif
     uint hf = pc.rope_dim / 2u;
     for (uint i = 0u; i < hf; i++) {
         float freq = pow(pc.theta, -2.0 * float(i) / float(pc.rope_dim));
@@ -22,7 +48,12 @@ void main() {
         float co = cos(ang);
         float a = x[base + 2u * i];
         float b = x[base + 2u * i + 1u];
-        y[base + 2u * i] = a * co - b * s;
-        y[base + 2u * i + 1u] = a * s + b * co;
+#ifdef OUT_F16
+        y[obase + 2u * i] = float16_t(a * co - b * s);
+        y[obase + 2u * i + 1u] = float16_t(a * s + b * co);
+#else
+        y[obase + 2u * i] = a * co - b * s;
+        y[obase + 2u * i + 1u] = a * s + b * co;
+#endif
     }
 }

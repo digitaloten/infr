@@ -71,6 +71,8 @@ fn main() {
         ("store_f16", "store_f16", &[]),
         ("store_f16", "store_f16_dyn", &["-DUSE_PARAMS"]),
         ("rope", "rope", &[]),
+        ("rope", "rope_f16", &["-DOUT_F16"]),
+        ("rope", "rope_f16_dyn", &["-DOUT_F16", "-DUSE_PARAMS"]),
         ("linear_f16", "linear_f16", &[]),
         ("linear_bf16", "linear_bf16", &[]),
         ("linear_f32", "linear_f32", &[]),

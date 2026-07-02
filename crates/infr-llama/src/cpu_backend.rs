@@ -958,10 +958,13 @@ pub(crate) fn generate_dense_backend(
                         k16
                     }
                     None => {
+                        // llama (no k-norm): interleaved RoPE straight to the f16 scratch — the
+                        // same fused shape as the qk-norm path, so the Vulkan peephole redirects
+                        // the write into the KV cache and the decode replays via rope_f16_dyn.
                         g.push(Op::Rope {
                             x: k,
                             positions,
-                            dst: k,
+                            dst: k16,
                             rows: batch as u32,
                             n_head: nkv as u32,
                             head_dim: hd as u32,
@@ -969,7 +972,7 @@ pub(crate) fn generate_dense_backend(
                             theta,
                             freq_factors: layer_ff,
                         });
-                        k
+                        k16
                     }
                 };
                 g.push(Op::WriteKv {
@@ -1006,10 +1009,11 @@ pub(crate) fn generate_dense_backend(
                     q16
                 }
                 None => {
+                    // llama: Q roped to the f16 scratch (the attention kernels read f16 q).
                     g.push(Op::Rope {
                         x: q,
                         positions,
-                        dst: q,
+                        dst: q16,
                         rows: batch as u32,
                         n_head: nh as u32,
                         head_dim: hd as u32,
@@ -1017,7 +1021,7 @@ pub(crate) fn generate_dense_backend(
                         theta,
                         freq_factors: layer_ff,
                     });
-                    q
+                    q16
                 }
             };
             g.push(Op::Attention {
@@ -1438,9 +1442,9 @@ pub(crate) fn generate_dense_backend(
     // adapter records the graph once and replays it per token, reading `pos` from the bound
     // positions buffer + a params SSBO — so the baked pos=0 here is irrelevant, and the per-token
     // host cost drops to just the emb/pos (+ E2B ipl) uploads. The gate mirrors the adapter's
-    // graph eligibility: qk-norm models only (llama's plain-Rope decode has no dyn kernel) — the
-    // whole gemma family replays too (SWA windows + scale via push constants, freq_factors via
-    // qk_norm_rope_dyn_ff, V-norm/Softcap/Scale are pos-independent), as does MoE. Backends
+    // graph eligibility: every dense arch replays — qk-norm (qwen3), the gemma family (SWA
+    // windows + scale via push constants, freq_factors via qk_norm_rope_dyn_ff, V-norm/Softcap/
+    // Scale are pos-independent), llama (f16-out interleaved Rope via rope_f16_dyn), MoE. Backends
     // without `decode_replay` (CPU interpreter, which reads the baked `pos`) and every ineligible
     // model keep rebuilding + recompiling per token below.
     // INFR_SEAM_NO_REPLAY=1 forces per-token rebuild (the adapter's static path) — slower, but
@@ -1449,9 +1453,11 @@ pub(crate) fn generate_dense_backend(
     // bakes pos=0/kv_len=1, which is only correct when the adapter replays it (dyn kernels read
     // the live pos/kv_len); an ineligible graph would silently run the static path with the baked
     // values. Hence the per-layer head-dim mirror of the adapter's Attention check.
+    // llama (no qk-norm) replays too — its f16-out Rope has a dyn kernel — but only without
+    // freq_factors (the standalone Rope kernel has no ff binding; gemma4's ff rides QkNormRope).
     let dyn_replay = be.capabilities().decode_replay
         && std::env::var("INFR_SEAM_NO_REPLAY").is_err()
-        && qk_norm
+        && (qk_norm || rope_freqs.is_none())
         && (0..c.n_layer)
             .all(|l| c.layer_head_dim(l).is_multiple_of(4) && c.layer_head_dim(l) <= 512);
     let ro = if dyn_replay {

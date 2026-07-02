@@ -1292,17 +1292,91 @@ impl<'a> Recorder<'a> {
         pos_offset: usize,
     ) {
         self.stamp("rope");
-        let k = self.be.kernel("rope", crate::gemm::rope_spv(), 2, 24);
-        let mut push = [0u8; 24];
+        let k = self.be.kernel("rope", crate::gemm::rope_spv(), 2, 28);
+        let mut push = [0u8; 28];
         push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n_heads as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(hd as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(rope_dim as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&theta.to_ne_bytes());
         push[20..24].copy_from_slice(&(pos_offset as u32).to_ne_bytes());
+        // [24..28] out_base: 0 (in-place f32 rope has no output shift)
         self.dispatch(
             k,
             &[Self::vkb(x), Self::vkb(y)],
+            1,
+            &push,
+            (t * n_heads) as u32,
+        );
+    }
+
+    /// Interleaved (llama NORM) RoPE writing f16 — the llama q/k analogue of `qk_norm_rope`'s
+    /// f16 output: `out_base` shifts the output row (0 for the Q scratch; `pos` for the fused
+    /// K cache write via the kv_write peephole).
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_f16(
+        &self,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        t: usize,
+        n_heads: usize,
+        hd: usize,
+        rope_dim: usize,
+        theta: f32,
+        pos_offset: usize,
+        out_base: usize,
+    ) {
+        self.stamp("rope");
+        let k = self
+            .be
+            .kernel("rope_f16", crate::gemm::rope_f16_spv(), 2, 28);
+        let mut push = [0u8; 28];
+        push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n_heads as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(hd as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(rope_dim as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&theta.to_ne_bytes());
+        push[20..24].copy_from_slice(&(pos_offset as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&(out_base as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(y)],
+            1,
+            &push,
+            (t * n_heads) as u32,
+        );
+    }
+
+    /// Record-once variant of [`Self::rope_f16`]: pos from `params`; `out_base_mul` is the 0/1
+    /// multiplier the shader scales by pos (1 -> write cache row pos, 0 -> row 0 of the Q scratch).
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_f16_dyn(
+        &self,
+        x: &dyn Buffer,
+        params: &dyn Buffer,
+        y: &dyn Buffer,
+        t: usize,
+        n_heads: usize,
+        hd: usize,
+        rope_dim: usize,
+        theta: f32,
+        out_base_mul: usize,
+    ) {
+        self.stamp("rope");
+        let k = self
+            .be
+            .kernel("rope_f16_dyn", crate::gemm::rope_f16_dyn_spv(), 3, 28);
+        let mut push = [0u8; 28];
+        push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n_heads as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(hd as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(rope_dim as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&theta.to_ne_bytes());
+        // [20..24] pos_offset: unused (from params)
+        push[24..28].copy_from_slice(&(out_base_mul as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(params), Self::vkb(y)],
             1,
             &push,
             (t * n_heads) as u32,

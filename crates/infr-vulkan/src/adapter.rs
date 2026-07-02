@@ -81,7 +81,7 @@ fn decode_eligible(graph: &Graph) -> bool {
     if std::env::var("INFR_SEAM_NO_REPLAY").is_ok() {
         return false;
     }
-    let mut has_qknr = false;
+    let mut has_rope = false;
     let mut has_attn = false;
     for op in &graph.ops {
         match op {
@@ -96,18 +96,29 @@ fn decode_eligible(graph: &Graph) -> bool {
                 }
             }
             // freq_factors (gemma4 proportional RoPE) binds via qk_norm_rope_dyn_ff.
-            Op::QkNormRope { .. } => has_qknr = true,
+            Op::QkNormRope { .. } => has_rope = true,
+            // Standalone llama Rope replays via rope_f16_dyn — needs the f16-out builder shape
+            // (the f32 in-place form has no dyn kernel) and no freq_factors.
+            Op::Rope {
+                dst, freq_factors, ..
+            } => {
+                if freq_factors.is_some()
+                    || !matches!(graph.desc(*dst).dtype, infr_core::DType::F16)
+                {
+                    return false;
+                }
+                has_rope = true;
+            }
             // MoeFfn is REPLAY-SAFE: router GEMV + GPU-side top-k + id-indexed expert GEMVs are
             // all push-constant/pos-independent, and its scratch is plan-held. QkNorm (gemma4
             // V-norm) and Softcap are pos-independent elementwise — replay-safe as recorded.
-            // Still rejected: Rope (llama plain-rope decode has no dyn kernel) and
-            // Conv1dSilu/DeltaNet (recurrent state the replay contract doesn't cover).
+            // Still rejected: Conv1dSilu/DeltaNet (recurrent state the contract doesn't cover).
             Op::MoeFfn { .. } | Op::QkNorm { .. } | Op::Softcap { .. } => {}
-            Op::Rope { .. } | Op::Conv1dSilu { .. } | Op::DeltaNet { .. } => return false,
+            Op::Conv1dSilu { .. } | Op::DeltaNet { .. } => return false,
             _ => {}
         }
     }
-    has_qknr && has_attn
+    has_rope && has_attn
 }
 
 /// Read `positions[0]` for the record-once decode. The runner writes the position into a host-visible
@@ -275,23 +286,27 @@ fn kv_write_peephole(graph: &Graph) -> (HashMap<usize, (TensorId, usize)>, HashS
     let mut fused: HashMap<usize, (TensorId, usize)> = HashMap::new();
     let mut skip: HashSet<usize> = HashSet::new();
     for (i, op) in graph.ops.iter().enumerate() {
-        if let Op::QkNormRope { dst: kxx, .. } = op {
-            // Only fuse an Internal (scratch) dst (we redirect the write into the KV cache). The
-            // output is always f16 (the shader casts f32→f16); WriteKv of an f16 src is a plain copy.
-            if !matches!(graph.tensors[kxx.0 as usize].kind, TensorKind::Internal) {
-                continue;
-            }
-            if !matches!(graph.desc(*kxx).dtype, infr_core::DType::F16) {
-                continue;
-            }
-            if let Some(Op::WriteKv {
-                src, cache, pos, ..
-            }) = graph.ops.get(i + 1)
-            {
-                if src == kxx {
-                    fused.insert(i, (*cache, *pos as usize));
-                    skip.insert(i + 1);
-                }
+        // QkNormRope (qwen/gemma) or f16-out Rope (llama) — both write the f16 K row the peephole
+        // can redirect straight into the KV cache.
+        let kxx = match op {
+            Op::QkNormRope { dst, .. } | Op::Rope { dst, .. } => dst,
+            _ => continue,
+        };
+        // Only fuse an Internal (scratch) dst (we redirect the write into the KV cache). The
+        // output must be f16 (the shader casts f32→f16); WriteKv of an f16 src is a plain copy.
+        if !matches!(graph.tensors[kxx.0 as usize].kind, TensorKind::Internal) {
+            continue;
+        }
+        if !matches!(graph.desc(*kxx).dtype, infr_core::DType::F16) {
+            continue;
+        }
+        if let Some(Op::WriteKv {
+            src, cache, pos, ..
+        }) = graph.ops.get(i + 1)
+        {
+            if src == kxx {
+                fused.insert(i, (*cache, *pos as usize));
+                skip.insert(i + 1);
             }
         }
     }
@@ -688,8 +703,10 @@ fn lower_op(
                 }
             }
         }
-        // Standalone RoPE (llama: no q/k-norm). Static only — `decode_eligible` rejects `Rope`, so it
-        // never reaches the record-once path. The basic kernel has no freq_factors.
+        // Standalone RoPE (llama: no q/k-norm; INTERLEAVED pairs — llama.cpp's ROPE_TYPE_NORM).
+        // An f16 dst takes the same fused shapes as QkNormRope: the kv_write peephole redirects
+        // the K write into the cache, and Dynamic mode replays via `rope_f16_dyn` (pos from
+        // `params`). The legacy f32 in-place form stays static-only. No freq_factors kernel.
         Op::Rope {
             x,
             positions,
@@ -701,26 +718,63 @@ fn lower_op(
             theta,
             freq_factors,
         } => {
-            let RopeMode::Static(rope_pos) = mode else {
-                return Err(be(
-                    "vulkan adapter: dynamic decode standalone Rope unsupported",
-                ));
-            };
             if freq_factors.is_some() {
                 return Err(be(
                     "vulkan adapter: standalone Rope with freq_factors unsupported",
                 ));
             }
-            rec.rope(
-                r(*x)?,
-                r(*dst)?,
-                *rows as usize,
-                *n_head as usize,
-                *head_dim as usize,
-                *rope_dim as usize,
-                *theta,
-                rope_pos[&positions.0],
-            );
+            let f16_out = matches!(graph.desc(*dst).dtype, infr_core::DType::F16);
+            let (out_buf, fused) = if let Some(&(cache, pos)) = fused_kv_write.get(&op_idx) {
+                (r(cache)?, Some(pos))
+            } else {
+                (r(*dst)?, None)
+            };
+            match mode {
+                RopeMode::Static(rope_pos) => {
+                    if f16_out {
+                        rec.rope_f16(
+                            r(*x)?,
+                            out_buf,
+                            *rows as usize,
+                            *n_head as usize,
+                            *head_dim as usize,
+                            *rope_dim as usize,
+                            *theta,
+                            rope_pos[&positions.0],
+                            fused.unwrap_or(0),
+                        );
+                    } else {
+                        rec.rope(
+                            r(*x)?,
+                            r(*dst)?,
+                            *rows as usize,
+                            *n_head as usize,
+                            *head_dim as usize,
+                            *rope_dim as usize,
+                            *theta,
+                            rope_pos[&positions.0],
+                        );
+                    }
+                }
+                RopeMode::Dynamic(params) => {
+                    if !f16_out {
+                        return Err(be(
+                            "vulkan adapter: dynamic decode f32 in-place Rope unsupported",
+                        ));
+                    }
+                    rec.rope_f16_dyn(
+                        r(*x)?,
+                        *params,
+                        out_buf,
+                        *rows as usize,
+                        *n_head as usize,
+                        *head_dim as usize,
+                        *rope_dim as usize,
+                        *theta,
+                        usize::from(fused.is_some()),
+                    );
+                }
+            }
         }
         // GQA scaled-dot-product attention over the f16 KV cache. Dynamic mode (decode, rows==1,
         // causal, 1/√hd) uses `attention_kv_dyn` (pos_offset + kv_len from `params`). Static mode

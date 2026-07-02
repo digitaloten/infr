@@ -457,6 +457,16 @@ fn gpu_seam_matches_cpu_gemma3() {
     seam_vulkan_matches_cpu(&path, "What is the capital of France? Answer briefly.", 16);
 }
 
+/// llama (no qk-norm: standalone INTERLEAVED RoPE — llama.cpp's ROPE_TYPE_NORM — through the
+/// f16-out Rope shape, fused KV write, and the rope_f16_dyn record-once replay).
+#[test]
+fn gpu_seam_matches_cpu_llama() {
+    let path = need_model!(llama32_1b(), "Llama-3.2-1B");
+    need_gpu!();
+    let _tlk = test_serial_lock();
+    seam_vulkan_matches_cpu(&path, "Count from one to five, digits only.", 16);
+}
+
 /// gemma4 (heterogeneous head dims 256/512, V-norm, freq_factors, softcap) through the Vulkan seam.
 #[test]
 fn gpu_seam_matches_cpu_gemma4() {
@@ -622,6 +632,15 @@ fn gpu_golden_qwen3_quants() {
 
 fn gemma3_1b() -> Option<PathBuf> {
     find_gguf("unsloth--gemma-3-1b-it-GGUF", "gemma-3-1b-it-Q4_K_M.gguf")
+}
+
+// ─── Llama (plain interleaved RoPE, no qk-norm) ────────────────────────────────
+
+fn llama32_1b() -> Option<PathBuf> {
+    find_gguf(
+        "unsloth--Llama-3.2-1B-Instruct-GGUF",
+        "Llama-3.2-1B-Instruct-Q8_0.gguf",
+    )
 }
 
 // Captured + verified coherent: "Paris! 🇫🇷", a brave-knight short story (mournful Obsidian Peaks).
