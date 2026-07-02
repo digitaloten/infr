@@ -590,6 +590,17 @@ fn lower_op(
                     && hd == 128
                     && matches!(mask, AttnMask::Causal)
                     && (*scale - 1.0 / (hd as f32).sqrt()).abs() < 1e-6;
+                // Decode (rows==1), causal, default scale: flash-decoding split-K — each head's KV
+                // range splits across ~32 chunks of workgroups instead of the scalar attention_kv's
+                // rows*nh (= nh at decode, ~16 workgroups on a 96-CU GPU — the decode bottleneck).
+                // attn_partial handles any hd%4==0 ≤ 512 (hd=128 fast path, general path above).
+                let chunk = (kv_len / 32).clamp(64, 512);
+                let split_ok = rows == 1
+                    && kv_len > chunk
+                    && matches!(mask, AttnMask::Causal)
+                    && hd % 4 == 0
+                    && hd <= 512
+                    && (*scale - 1.0 / (hd as f32).sqrt()).abs() < 1e-6;
                 if flash_ok {
                     let mpad = rows.div_ceil(64) * 64;
                     let po = be_.alloc(8 * mpad * nh * hd * 4, BufferUsage::Activations)?;
@@ -611,6 +622,27 @@ fn lower_op(
                         pos,
                     );
                     transient.extend([po, pm, pl]);
+                } else if split_ok {
+                    let n_chunks = kv_len.div_ceil(chunk);
+                    let pm = be_.alloc(nh * n_chunks * 4, BufferUsage::Activations)?;
+                    let pl = be_.alloc(nh * n_chunks * 4, BufferUsage::Activations)?;
+                    let pacc = be_.alloc(nh * n_chunks * hd * 4, BufferUsage::Activations)?;
+                    rec.attention_kv_split(
+                        r(*q)?,
+                        r(*k_cache)?,
+                        r(*v_cache)?,
+                        r(*dst)?,
+                        pm.as_ref(),
+                        pl.as_ref(),
+                        pacc.as_ref(),
+                        kv_len,
+                        nh,
+                        nkv,
+                        hd,
+                        chunk,
+                        n_chunks,
+                    );
+                    transient.extend([pm, pl, pacc]);
                 } else {
                     let window = match mask {
                         AttnMask::Causal => 0,

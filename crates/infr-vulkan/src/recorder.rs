@@ -2997,6 +2997,8 @@ mod tests {
         run_attn_kv_split(600, 9, 3, 64); // 2 chunks
         run_attn_kv_split(2050, 9, 3, 64); // 5 chunks, partial last
         run_attn_kv_split(8000, 4, 2, 32); // 16 chunks
+        run_attn_kv_split(830, 16, 2, 256); // qwen35 full-attn decode (hd=256 general path)
+        run_attn_kv_split(2050, 16, 8, 256); // gemma SWA-shape decode (hd=256, GQA 16:8)
     }
 
     #[test]
