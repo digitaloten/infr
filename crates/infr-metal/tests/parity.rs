@@ -329,7 +329,11 @@ fn check_linear_add_fusion(dtype: DType, wbytes: Vec<u8>, in_f: usize, out_f: us
         dst,
         n: out_f as u32,
     });
-    let bound = vec![(x, f32_bytes(&xs)), (w, wbytes.clone()), (rt, f32_bytes(&res))];
+    let bound = vec![
+        (x, f32_bytes(&xs)),
+        (w, wbytes.clone()),
+        (rt, f32_bytes(&res)),
+    ];
     // Reference: dequant the SAME bytes + f32 matmul + add (the CPU backend Q8-quantizes the
     // activation for quant Linear, so it is not the oracle here — same as the other quant tests).
     let wref = infr_gguf::dequant::dequant_block(dtype, &wbytes).unwrap();
@@ -1053,8 +1057,9 @@ fn attention_long_context_split32_hd96_parity() {
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn attention_vec_sliding_window_parity() {
-    let (rows, kv_len, nh, nkv, hd, pos, win) =
-        (1usize, 300usize, 8usize, 2usize, 64usize, 299usize, 100usize);
+    let (rows, kv_len, nh, nkv, hd, pos, win) = (
+        1usize, 300usize, 8usize, 2usize, 64usize, 299usize, 100usize,
+    );
     let mut g = Graph::new();
     let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
     let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));

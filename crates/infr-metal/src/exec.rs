@@ -86,10 +86,7 @@ fn linear_add_peephole(
             continue;
         }
         if let Some(Op::Add {
-            a,
-            b,
-            dst: add_dst,
-            ..
+            a, b, dst: add_dst, ..
         }) = g.ops.get(i + 1)
         {
             let residual = if a == dst {
@@ -400,10 +397,7 @@ impl MetalBackend {
                 }
                 let cap = e.pso.max_total_threads_per_threadgroup() as usize;
                 let tg = if e.tg == 0 { cap } else { e.tg.min(cap) }.min(e.threads.max(1)) as u64;
-                enc.dispatch_threads(
-                    MTLSize::new(e.threads as u64, 1, 1),
-                    MTLSize::new(tg, 1, 1),
-                );
+                enc.dispatch_threads(MTLSize::new(e.threads as u64, 1, 1), MTLSize::new(tg, 1, 1));
             }
             enc.end_encoding();
             let t0 = self.profiling.then(std::time::Instant::now);
