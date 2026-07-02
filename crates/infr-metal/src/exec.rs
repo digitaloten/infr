@@ -947,15 +947,22 @@ impl MetalBackend {
                 let flash = f16 && rows * nh >= 128 && kv_len >= 64 && hd <= 128 && hd % 8 == 0;
                 let split = !flash && (rows * nh < 128 || kv_len >= 128);
                 // The cooperative flash kernel (4 simdgroups per query tile, llama.cpp
-                // flash_attn_ext structure) needs hd % 32 == 0 for its per-simdgroup O
-                // fragment split and a 128-thread threadgroup (pipeline-cap gated like the
-                // split kernels); otherwise the single-simdgroup flash still applies.
-                let flash2 = flash && hd % 32 == 0 && {
-                    self.pipelines
-                        .get("attnflash2_f16kv")?
-                        .max_total_threads_per_threadgroup()
-                        >= 128
+                // flash_attn_ext structure) is instantiated per compile-time head size
+                // (fully unrolled QK/PV loops) and needs a 128-thread threadgroup
+                // (pipeline-cap gated like the split kernels); other head sizes keep the
+                // single-simdgroup flash.
+                let flash2_kern = match hd {
+                    64 => Some("attnflash2_f16kv_hd64"),
+                    128 => Some("attnflash2_f16kv_hd128"),
+                    _ => None,
                 };
+                let flash2 = flash
+                    && flash2_kern.is_some_and(|kn| {
+                        self.pipelines
+                            .get(kn)
+                            .map(|pl| pl.max_total_threads_per_threadgroup() >= 128)
+                            .unwrap_or(false)
+                    });
                 // The split kernels REQUIRE their full NSG*32-thread threadgroup: every simdgroup
                 // owns a strided KV slice, so a smaller launch would silently skip positions and
                 // merge uninitialized partials. maxTotalThreadsPerThreadgroup is per-PIPELINE
@@ -991,7 +998,7 @@ impl MetalBackend {
                             256,
                         )?);
                 let kern = match (flash, f16, split, split32) {
-                    (true, ..) if flash2 => "attnflash2_f16kv",
+                    (true, ..) if flash2 => flash2_kern.unwrap(),
                     (true, ..) => "attnflash_f16kv",
                     (_, true, false, _) => "attention_f16kv",
                     (_, true, _, true) => "attnsplit32_f16kv",
