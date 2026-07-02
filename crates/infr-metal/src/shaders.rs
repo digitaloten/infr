@@ -185,6 +185,44 @@ kernel void linear_qui(device const float*  x     [[buffer(0)]],
     if (lane == 0u) dst[sg] = acc;
 }
 
+// ---- linear_qui with NIBBLE-PACKED codes (two 4-bit codes per byte, low nibble first): the Q4
+// family's codes all fit 4 bits, so the host halves the code stream — decode GEMV is bound on
+// exactly that stream, making this a direct ~2x traffic cut on Q4 weights (~6 bpw incl. sm vs
+// linear_qui's ~10). One uchar4 now covers 8 elements; i is a multiple of 8, so all 8 still share
+// one 16-block's (scale, min). Reconstruction stays bit-for-bit `infr_gguf::dequant`.
+kernel void linear_qui4(device const float*  x     [[buffer(0)]],
+                        device const uchar4* codes [[buffer(1)]],
+                        device const float2* sm    [[buffer(2)]],
+                        device float*        dst   [[buffer(3)]],
+                        constant LinearParams& p   [[buffer(4)]],
+                        uint gid  [[thread_position_in_grid]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+    uint sg = gid / 32u;
+    if (sg >= p.m * p.out_f) return;
+    uint r = sg / p.out_f;
+    uint o = sg % p.out_f;
+    ulong xbase = (ulong)r * p.in_f;
+    uint n8 = p.in_f / 8u;                            // uchar4s per weight row (in_f % 256 == 0)
+    ulong wbase8 = (ulong)o * n8;
+    float acc = 0.0f;
+    for (uint b = lane; b < n8; b += 32u) {
+        uchar4 c = codes[wbase8 + b];
+        uint i = b * 8u;
+        float2 s = sm[((ulong)o * p.in_f + i) >> 4];  // one (scale, min) for all 8 elements
+        device const float* xr = x + xbase + i;
+        acc += xr[0] * (s.x * (float)(c.x & 15u) + s.y)
+             + xr[1] * (s.x * (float)(c.x >> 4u) + s.y)
+             + xr[2] * (s.x * (float)(c.y & 15u) + s.y)
+             + xr[3] * (s.x * (float)(c.y >> 4u) + s.y)
+             + xr[4] * (s.x * (float)(c.z & 15u) + s.y)
+             + xr[5] * (s.x * (float)(c.z >> 4u) + s.y)
+             + xr[6] * (s.x * (float)(c.w & 15u) + s.y)
+             + xr[7] * (s.x * (float)(c.w >> 4u) + s.y);
+    }
+    acc = simd_sum(acc);
+    if (lane == 0u) dst[sg] = acc;
+}
+
 // ---- RoPE (NEOX): rotate the first rope_dim of each head; dims beyond pass through. One thread
 // per (row, head). `pos`/`ff` buffers are f32. `has_ff` selects the per-pair freq divisor.
 struct RopeParams { uint rows; uint n_head; uint head_dim; uint rope_dim; float theta; uint has_ff; };

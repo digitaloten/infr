@@ -21,6 +21,10 @@ use std::sync::Arc;
 pub(crate) struct QuiWeight {
     codes: MtlBuffer,
     sm: MtlBuffer,
+    /// Codes are nibble-packed (two per byte, low nibble first). True whenever every code of the
+    /// source quant fits in 4 bits (the Q4 family) — halves the dominant weight stream, which is
+    /// what decode GEMV is bound on. Read by `linear_qui4`; unpacked u8 codes by `linear_qui`.
+    packed4: bool,
 }
 
 /// Where a tensor's current value lives. GPU ops keep their results on the device and only pay a
@@ -401,14 +405,24 @@ impl MetalBackend {
             sm[2 * b] = sc[b * 16];
             sm[2 * b + 1] = mn[b * 16];
         }
+        // 4-bit-code quants (the Q4 family) pack two codes per byte — the weight stream is what
+        // decode GEMV is bandwidth-bound on, so halving it is a direct win. Checked against the
+        // data, not the dtype, so it is exact for any format whose codes happen to fit.
+        let packed4 = qv.iter().all(|&c| c < 16);
+        let codes_bytes: Vec<u8> = if packed4 {
+            qv.chunks_exact(2).map(|p| p[0] | (p[1] << 4)).collect()
+        } else {
+            qv
+        };
         let codes = self.device.new_buffer_with_data(
-            qv.as_ptr() as *const c_void,
-            qv.len().max(1) as u64,
+            codes_bytes.as_ptr() as *const c_void,
+            codes_bytes.len().max(1) as u64,
             MTLResourceOptions::StorageModeShared,
         );
         let w = Arc::new(QuiWeight {
             codes,
             sm: self.f32_buf(&sm),
+            packed4,
         });
         self.qui_cache.lock().unwrap().insert(key, w.clone());
         w
@@ -540,8 +554,12 @@ impl MetalBackend {
                 // 32 lanes (one simdgroup) per output element — see `linear_f32`/`linear_qui`.
                 if infr_gguf::dequant::is_quant(g.desc(weight).dtype) {
                     // Native quant: decode the compact unified weight inline — no f32 blow-up.
+                    // Nibble-packed (4-bit-code) weights take the qui4 kernel: half the bytes on
+                    // the bandwidth-bound weight stream.
                     let qw = self.weight_qui(weight, g, bindings);
-                    let pso = self.pipelines.get("linear_qui")?;
+                    let pso = self
+                        .pipelines
+                        .get(if qw.packed4 { "linear_qui4" } else { "linear_qui" })?;
                     self.encode_tg(
                         r,
                         &pso,
