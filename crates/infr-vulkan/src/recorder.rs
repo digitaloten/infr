@@ -421,6 +421,37 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// f32-weight GEMV `y = x·Wᵀ` — full-precision projection weights (gemma4 E2B's per-layer
+    /// inp_gate/proj and qwen3moe's router ship as F32; reading them through the f16 kernel
+    /// produced garbage). Reuses the eager path's thread-per-output `linear_f32` kernel
+    /// (dispatch = ceil(rows·out_f/64) groups of 64 threads) — these weights are small, so the
+    /// simple kernel is fine.
+    pub fn linear_f32(
+        &self,
+        w: &dyn Buffer,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.stamp("lm_head");
+        let k = self
+            .be
+            .kernel("linear_f32", crate::gemm::linear_f32_spv(), 3, 12);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(w), Self::vkb(x), Self::vkb(y)],
+            1,
+            &push,
+            ((rows * out_f) as u32).div_ceil(64),
+        );
+    }
+
     /// Prefill projection GEMM: `c[m,n] = a[m,k] · Wᵀ` on the matrix cores (coopmat). `a` is f32;
     /// `wq` is the weight (f16 packed 2/u32 with bits=16, or quant idx with bits=4|8 + scales/mins).
     /// `c` MUST be allocated `ceil(m/64)*64` rows (the kernel writes padded rows as 0). `n%64==0`,

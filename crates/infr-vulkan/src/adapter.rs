@@ -201,6 +201,9 @@ struct DynAttnCtx {
 fn linear_add_peephole(graph: &Graph) -> (HashMap<usize, (TensorId, TensorId)>, HashSet<usize>) {
     let mut fused: HashMap<usize, (TensorId, TensorId)> = HashMap::new();
     let mut skip: HashSet<usize> = HashSet::new();
+    if std::env::var("INFR_NO_FUSE_ADD").is_ok() {
+        return (fused, skip);
+    }
     for (i, op) in graph.ops.iter().enumerate() {
         let Op::Linear {
             dst,
@@ -417,6 +420,10 @@ fn lower_op(
                 }
             } else if native_dense_supported(dt) {
                 rec.linear_native(dt, w, xb, y, m, in_f, out_f);
+            } else if matches!(dt, infr_core::DType::F32) {
+                // Full-precision projection weight (gemma4 E2B per-layer inp_gate/proj): the seam
+                // uploads native dtype, and the f16 GEMV would read the f32 bytes as f16 garbage.
+                rec.linear_f32(w, xb, y, m, in_f, out_f);
             } else {
                 rec.linear(w, xb, y, m, in_f, out_f);
             }
@@ -1087,6 +1094,10 @@ fn lower_op(
             let rw = r(*router)?;
             if native_dense_supported(rdt) {
                 rec.linear_native(rdt, rw, xb, logits.as_ref(), 1, ne, n_expert);
+            } else if matches!(rdt, infr_core::DType::F32) {
+                // qwen3moe ships the router (ffn_gate_inp) as F32 — the f16 GEMV would read its
+                // bytes as f16 garbage and route to arbitrary experts.
+                rec.linear_f32(rw, xb, logits.as_ref(), 1, ne, n_expert);
             } else {
                 rec.linear(rw, xb, logits.as_ref(), 1, ne, n_expert);
             }

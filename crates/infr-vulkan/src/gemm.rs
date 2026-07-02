@@ -332,6 +332,7 @@ const GELU_MUL_FUSED_SPV_BYTES: &[u8] =
 const STORE_F16_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/store_f16.spv"));
 const ROPE_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope.spv"));
 const LINEAR_F16_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f16.spv"));
+const LINEAR_F32_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f32.spv"));
 const LINEAR_BF16_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_bf16.spv"));
 const LINEAR_Q_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_q.spv"));
 const LINEAR_RES_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_res.spv"));
@@ -600,6 +601,11 @@ pub(crate) fn rope_spv() -> &'static [u32] {
 pub(crate) fn linear_f16_spv() -> &'static [u32] {
     static LINEAR_F16_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     LINEAR_F16_SPV.get_or_init(|| spv_words(LINEAR_F16_SPV_BYTES))
+}
+/// SPIR-V for the f32-weight GEMV (full-precision projection weights, e.g. gemma4 E2B per-layer).
+pub(crate) fn linear_f32_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(LINEAR_F32_SPV_BYTES))
 }
 /// SPIR-V for the bf16-weight GEMV (`y=x·Wᵀ`).
 pub(crate) fn linear_bf16_spv() -> &'static [u32] {

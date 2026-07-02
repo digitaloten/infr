@@ -383,6 +383,67 @@ fn gpu_seam_flash_matches_cpu() {
     );
 }
 
+/// Vulkan-seam vs CPU-oracle parity for one model: greedy `n`-token continuation of `prompt`
+/// (rendered through the model's chat template) must match token-for-token. Proves the arch's ops
+/// lower correctly through the Vulkan adapter — the CPU seam runs the IDENTICAL Graph. A near-tie
+/// argmax split (f16 GPU kernels vs f32 CPU) would show here as an early divergence; none of the
+/// covered models exhibit one on these prompts today, so keep the strict compare until it flakes.
+fn seam_vulkan_matches_cpu(path: &std::path::Path, prompt: &str, n: usize) {
+    std::env::set_var("INFR_TEMP", "0");
+    let model = infr_llama::CpuModel::load(path, None).expect("cpu load");
+    let rendered = model.render_chat(prompt).expect("render chat");
+    let mut cpu_txt = String::new();
+    model
+        .generate_cpu(&rendered, n, |p| cpu_txt.push_str(p))
+        .expect("cpu gen");
+    let gpu_txt = model
+        .generate_dense_vulkan(&rendered, n)
+        .expect("vulkan seam gen");
+    assert_eq!(
+        cpu_txt.trim(),
+        gpu_txt.trim(),
+        "Vulkan seam diverged from the CPU oracle for {path:?}"
+    );
+}
+
+/// gemma3 (SWA + dual-rope + GeGLU + sandwich norms, hd=256) through the Vulkan seam.
+#[test]
+fn gpu_seam_matches_cpu_gemma3() {
+    let path = need_model!(gemma3_1b(), "gemma-3-1b");
+    need_gpu!();
+    let _tlk = test_serial_lock();
+    seam_vulkan_matches_cpu(&path, "What is the capital of France? Answer briefly.", 16);
+}
+
+/// gemma4 (heterogeneous head dims 256/512, V-norm, freq_factors, softcap) through the Vulkan seam.
+#[test]
+fn gpu_seam_matches_cpu_gemma4() {
+    let path = need_model!(gemma4_12b(), "gemma-4-12b");
+    need_gpu!();
+    let _tlk = test_serial_lock();
+    seam_vulkan_matches_cpu(&path, "What is 2+2? Answer briefly.", 12);
+}
+
+/// gemma4 E2B (per-layer embeddings, KV/FFN sharing) through the Vulkan seam (per-token prefill —
+/// E2B is excluded from the batched-prefill fast path).
+#[test]
+fn gpu_seam_matches_cpu_gemma4_e2b() {
+    let path = need_model!(gemma4_e2b(), "gemma-4-E2B");
+    need_gpu!();
+    let _tlk = test_serial_lock();
+    seam_vulkan_matches_cpu(&path, "What is 2+2? Answer briefly.", 12);
+}
+
+/// qwen3moe (routed-expert Op::MoeFfn) through the Vulkan seam (per-token prefill — MoE is
+/// excluded from the batched-prefill fast path).
+#[test]
+fn gpu_seam_matches_cpu_qwen3moe() {
+    let path = need_model!(qwen3moe_30b(), "Qwen3-30B-A3B");
+    need_gpu!();
+    let _tlk = test_serial_lock();
+    seam_vulkan_matches_cpu(&path, "What is 2+2? Answer briefly.", 8);
+}
+
 /// BF16 (float-weight) seam parity: a bf16 model runs on the seam with its projection weights
 /// converted to f16 (the matmul_proj / f16-GEMM prefill path) while the norm weights stay f32 (the
 /// rmsnorm/qk_norm kernels read f32). Must match the CPU reference oracle token-for-token — proving

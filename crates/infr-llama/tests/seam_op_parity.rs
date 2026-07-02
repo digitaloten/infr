@@ -205,6 +205,37 @@ fn gated_sigmoid_parity() {
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
+fn gated_gelu_offset_parity() {
+    // gemma4 E2B's per-layer input mix: `gelu(gate) * up[up_off..]` — the only GatedAct with a
+    // nonzero up_off (the layer's slice of the per-layer input vector).
+    let Some(vk) = gpu() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, nff, up_off) = (1usize, 16usize, 32usize);
+    let mut g = Graph::new();
+    let gate = g.input(f32d(rows * nff));
+    let up = g.input(f32d(up_off + rows * nff + 8));
+    let dst = g.output(f32d(rows * nff));
+    g.push(Op::GatedAct {
+        gate,
+        up,
+        dst,
+        rows: rows as u32,
+        nff: nff as u32,
+        act: Activation::Gelu,
+        up_off: up_off as u32,
+    });
+    let gi = gen(rows * nff, 2);
+    let ui = gen(up_off + rows * nff + 8, 3);
+    let c = run(&cpu, &g, &[(gate, &gi), (up, &ui)], &[], dst, rows * nff);
+    let v = run(&vk, &g, &[(gate, &gi), (up, &ui)], &[], dst, rows * nff);
+    println!("GatedAct(gelu,up_off) max_err={:e}", maxerr(&c, &v));
+    assert!(maxerr(&c, &v) < 1e-3, "GatedAct gelu+offset diverges");
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
 fn qknorm_parity() {
     let Some(vk) = gpu() else {
         return;
