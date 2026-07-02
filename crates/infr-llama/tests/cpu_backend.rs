@@ -173,6 +173,21 @@ const QWEN3_GOLDEN: &[(&str, usize, u64)] = &[
 ];
 
 /// CPU-only: the deterministic Qwen3 output (short + long) must match its golden hash.
+
+/// Serialize the GPU tests: the default parallel test harness runs several models on the one GPU at
+/// once, and the 30B MoE golden (18.4 GB weights + 4 GB KV) plus a concurrent test's model
+/// OVERSUBSCRIBES VRAM — driver migration / auto-fit divergence then flips the MoE golden
+/// intermittently (fails in a full parallel run, passes alone). Every gpu_* test takes this lock so
+/// GPU tests run one at a time while the CPU tests keep full parallelism. NOTE: this serializes
+/// within THIS test binary only — GPU tests in other test binaries can still overlap if cargo runs
+/// the binaries concurrently.
+static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
+    // A previous test panicking while holding the lock poisons it; the GPU itself is fine.
+    GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[test]
 fn cpu_golden_qwen3() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
@@ -195,6 +210,7 @@ const QWEN3_GPU_GOLDEN: &[(&str, usize, u64)] = &[
 /// GPU dense Qwen3-0.6B golden-hash lock.
 #[test]
 fn gpu_golden_qwen3() {
+    let _gpu = gpu_lock();
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
     need_gpu!();
     let _tlk = test_serial_lock();
@@ -225,6 +241,7 @@ fn is_degenerate(s: &str) -> bool {
 /// test produces garbage; with it, coherent.
 #[test]
 fn gpu_no_garbage_on_repeated_forward() {
+    let _gpu = gpu_lock();
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
     need_gpu!();
     let _tlk = test_serial_lock();
@@ -338,6 +355,7 @@ const QWEN3_SEAM_GOLDEN: &[(&str, usize, u64)] = &[
 /// the GPU and reproduces the production GPU path (`gpu_golden_qwen3`).
 #[test]
 fn gpu_seam_golden_qwen3() {
+    let _gpu = gpu_lock();
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
     need_gpu!();
     let _tlk = test_serial_lock();
@@ -359,6 +377,7 @@ fn gpu_seam_golden_qwen3() {
 /// per-token attention). Guards the m>1 prefill kernels the short-prompt goldens never exercise.
 #[test]
 fn gpu_seam_flash_matches_cpu() {
+    let _gpu = gpu_lock();
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
     need_gpu!();
     let _tlk = test_serial_lock();
@@ -389,6 +408,7 @@ fn gpu_seam_flash_matches_cpu() {
 /// the float-weight GPU path is correct, not just fast.
 #[test]
 fn gpu_seam_bf16_matches_cpu() {
+    let _gpu = gpu_lock();
     let snap = match qwen3_06b() {
         Some(p) => p.parent().unwrap().to_path_buf(),
         None => return,
@@ -475,6 +495,7 @@ const QWEN3_QUANT_GPU_GOLDEN: &[(&str, usize, u64)] = &[
 /// alongside the affine k-quants. Refresh with `INFR_BLESS=1`.
 #[test]
 fn gpu_golden_qwen3_quants() {
+    let _gpu = gpu_lock();
     need_gpu!();
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
@@ -535,6 +556,7 @@ const GEMMA3_GPU_GOLDEN: &[(&str, usize, u64)] = &[
 /// GPU dense Gemma 3 golden-hash lock (sandwich norms, GeGLU, dual-RoPE, SWA, √n_embd embed scale).
 #[test]
 fn gpu_golden_gemma3() {
+    let _gpu = gpu_lock();
     let path = need_model!(gemma3_1b(), "gemma-3-1b");
     need_gpu!();
     let _tlk = test_serial_lock();
@@ -620,6 +642,7 @@ const QWEN3MOE_GPU_GOLDEN: &[(&str, usize, u64)] =
 /// SwiGLU sum). Only `n_used` of 128 experts run per token; uses the dedicated MoE GPU forward.
 #[test]
 fn gpu_golden_qwen3moe() {
+    let _gpu = gpu_lock();
     let path = need_model!(qwen3moe_30b(), "Qwen3-30B-A3B");
     need_gpu!();
     let _tlk = test_serial_lock();
@@ -663,6 +686,7 @@ const GEMMA4_E2B_GPU_GOLDEN: &[(&str, usize, u64)] =
 /// of the gemma4 dense path.
 #[test]
 fn gpu_golden_gemma4_e2b() {
+    let _gpu = gpu_lock();
     let path = need_model!(gemma4_e2b(), "gemma-4-E2B");
     need_gpu!();
     let _tlk = test_serial_lock();
@@ -687,6 +711,7 @@ const GEMMA4_12B_GPU_GOLDEN: &[(&str, usize, u64)] =
 /// final softcap.
 #[test]
 fn gpu_golden_gemma4() {
+    let _gpu = gpu_lock();
     let path = need_model!(gemma4_12b(), "gemma-4-12b");
     need_gpu!();
     let _tlk = test_serial_lock();
