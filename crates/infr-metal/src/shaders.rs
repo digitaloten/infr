@@ -739,7 +739,7 @@ kernel void rope_f32(device const float* x   [[buffer(0)]],
 struct QkRopeParams { uint rows; uint n_head; uint head_dim; uint rope_dim; float theta; float eps; uint has_ff; };
 kernel void qknormrope_f32(device const float* x   [[buffer(0)]],
                            device const float* w   [[buffer(1)]],
-                           device const float* pos [[buffer(2)]],
+                           device const int*   pos [[buffer(2)]],
                            device const float* ff  [[buffer(3)]],
                            device float*       dst [[buffer(4)]],
                            constant QkRopeParams& p [[buffer(5)]],
@@ -754,7 +754,7 @@ kernel void qknormrope_f32(device const float* x   [[buffer(0)]],
     ss = simd_sum(ss) / (float)p.head_dim;
     float s = 1.0f / sqrt(ss + p.eps);
     uint hf = p.rope_dim / 2;
-    float p0 = pos[r];
+    float p0 = (float)pos[r];  // bound i32 read directly; exact widening
     for (uint pp = lane; pp < hf; pp += 32u) {
         uint i0 = pp, i1 = pp + hf;
         float ang = p0 * pow(p.theta, -2.0f * (float)pp / (float)p.rope_dim);
@@ -1290,27 +1290,30 @@ template [[host_name("attnflash2_f16kv_hd128")]] kernel attnflash2_t attnflash2_
 // as attnsplit32, only reassociated). Tail positions clamp their row pointer to kv_len-1 and are
 // masked in the softmax, so reads never leave the cache. O accumulates in shared per simdgroup
 // (ty==0 lanes own hd/32 float4 columns each after the fold).
+// The body is a plain inline function so the static kernel (baked pos/kv_len from AttnParams)
+// and the DYNAMIC-POS kernel (pos read from the bound positions buffer — the decode-replay
+// contract, where one recorded dispatch is replayed every token) share it exactly.
 template<uint hd, uint NSG>
-kernel void attnvec_f16kv_t(device const float* q   [[buffer(0)]],
-                            device const half*  k   [[buffer(1)]],
-                            device const half*  v   [[buffer(2)]],
-                            device float*       dst [[buffer(3)]],
-                            constant AttnParams& p  [[buffer(4)]],
-                            uint3  tgpig [[threadgroup_position_in_grid]],
-                            ushort sgitg [[simdgroup_index_in_threadgroup]],
-                            ushort tiisg [[thread_index_in_simdgroup]]) {
+inline void attnvec_body(device const float* q,
+                         device const half*  k,
+                         device const half*  v,
+                         device float*       dst,
+                         constant AttnParams& p,
+                         uint abs, uint kvl,
+                         threadgroup float* sq,
+                         threadgroup float* ssc,
+                         threadgroup float* so,
+                         uint3  tgpig,
+                         ushort sgitg,
+                         ushort tiisg) {
     constexpr uint C = 32, NE = 4, NL = 32u / NE;  // 4 KV rows x 8-lane dots per simdgroup pass
     constexpr uint hd4 = hd / 4u;
     constexpr uint NI = hd4 / NL;                  // float4s per lane per row (2 or 4)
-    threadgroup float sq[hd];
-    threadgroup float ssc[NSG * C];                // per-simdgroup scores, then P; (S, M) at merge
-    threadgroup float so[NSG * hd];                // per-simdgroup O partials
 
     uint tg = tgpig.x;
     uint ti = tg / p.n_head;
     uint h  = tg % p.n_head;
     uint kvh = h / (p.n_head / p.n_kv);
-    uint abs = p.pos + ti;
     uint lo = (p.window > 0u && abs + 1u > p.window) ? (abs + 1u - p.window) : 0u;
     uint tx = tiisg % NL, ty = tiisg / NL;
 
@@ -1339,7 +1342,7 @@ kernel void attnvec_f16kv_t(device const float* q   [[buffer(0)]],
             float mqk[C / NE];
             for (uint cc = 0; cc < C / NE; cc++) {
                 // clamp tail rows into the cache; their scores are masked below
-                uint rc = min(ic + NE * cc + ty, p.kv_len - 1u);
+                uint rc = min(ic + NE * cc + ty, kvl - 1u);
                 device const half4* pk = k4 + ((ulong)rc * p.n_kv + kvh) * hd4;
                 float acc = 0.0f;
                 for (uint ii = 0; ii < NI; ii++)
@@ -1376,7 +1379,7 @@ kernel void attnvec_f16kv_t(device const float* q   [[buffer(0)]],
             float4 lov[NI];
             for (uint ii = 0; ii < NI; ii++) lov[ii] = float4(0.0f);
             for (uint cc = 0; cc < C / NE; cc++) {
-                uint rc = min(ic + NE * cc + ty, p.kv_len - 1u);
+                uint rc = min(ic + NE * cc + ty, kvl - 1u);
                 device const half4* pv = v4 + ((ulong)rc * p.n_kv + kvh) * hd4;
                 float pw = ss[NE * cc + ty];
                 for (uint ii = 0; ii < NI; ii++)
@@ -1417,9 +1420,48 @@ kernel void attnvec_f16kv_t(device const float* q   [[buffer(0)]],
     }
 }
 
+template<uint hd, uint NSG>
+kernel void attnvec_f16kv_t(device const float* q   [[buffer(0)]],
+                            device const half*  k   [[buffer(1)]],
+                            device const half*  v   [[buffer(2)]],
+                            device float*       dst [[buffer(3)]],
+                            constant AttnParams& p  [[buffer(4)]],
+                            uint3  tgpig [[threadgroup_position_in_grid]],
+                            ushort sgitg [[simdgroup_index_in_threadgroup]],
+                            ushort tiisg [[thread_index_in_simdgroup]]) {
+    threadgroup float sq[hd];
+    threadgroup float ssc[NSG * 32];               // per-simdgroup scores, then P; (S, M) at merge
+    threadgroup float so[NSG * hd];                // per-simdgroup O partials
+    uint abs = p.pos + tgpig.x / p.n_head;
+    attnvec_body<hd, NSG>(q, k, v, dst, p, abs, p.kv_len, sq, ssc, so, tgpig, sgitg, tiisg);
+}
+
+// Dynamic-pos variant for decode replay: `pos` comes from the bound positions buffer (updated by
+// the host every token) instead of the recorded AttnParams, whose baked pos/kv_len are stale by
+// the second replay. rows is 1 on this path, so kv_len is exactly pos + 1.
+template<uint hd, uint NSG>
+kernel void attnvec_dyn_f16kv_t(device const float* q    [[buffer(0)]],
+                                device const half*  k    [[buffer(1)]],
+                                device const half*  v    [[buffer(2)]],
+                                device float*       dst  [[buffer(3)]],
+                                device const int*   posb [[buffer(4)]],
+                                constant AttnParams& p   [[buffer(5)]],
+                                uint3  tgpig [[threadgroup_position_in_grid]],
+                                ushort sgitg [[simdgroup_index_in_threadgroup]],
+                                ushort tiisg [[thread_index_in_simdgroup]]) {
+    threadgroup float sq[hd];
+    threadgroup float ssc[NSG * 32];
+    threadgroup float so[NSG * hd];
+    uint abs = (uint)posb[0];
+    attnvec_body<hd, NSG>(q, k, v, dst, p, abs, abs + 1u, sq, ssc, so, tgpig, sgitg, tiisg);
+}
+
 typedef decltype(attnvec_f16kv_t<64, 32>) attnvec_t;
 template [[host_name("attnvec_f16kv_hd64")]]  kernel attnvec_t attnvec_f16kv_t<64, 32>;
 template [[host_name("attnvec_f16kv_hd128")]] kernel attnvec_t attnvec_f16kv_t<128, 32>;
+typedef decltype(attnvec_dyn_f16kv_t<64, 32>) attnvec_dyn_t;
+template [[host_name("attnvec_dyn_f16kv_hd64")]]  kernel attnvec_dyn_t attnvec_dyn_f16kv_t<64, 32>;
+template [[host_name("attnvec_dyn_f16kv_hd128")]] kernel attnvec_dyn_t attnvec_dyn_f16kv_t<128, 32>;
 
 // ---- WriteKv: cast-copy `n` f32 source elems into the bound KV cache at row offset `base`, on the
 // GPU so it stays in the batch (no host round-trip that would force a per-layer flush). The (half)
@@ -1438,5 +1480,17 @@ kernel void writekv_f32(device const float* src   [[buffer(0)]],
                         uint gid [[thread_position_in_grid]]) {
     if (gid >= p.n) return;
     cache[p.base + gid] = src[gid];
+}
+// Dynamic-pos WriteKv for decode replay: the row offset is pos*row_stride with pos read from the
+// bound positions buffer per token (`base` in a recorded params blob would be stale). f16 cache
+// only (the replay gate requires it).
+struct WriteKvDynParams { uint n; uint row_stride; };
+kernel void writekv_dyn_f16(device const float* src   [[buffer(0)]],
+                            device half*        cache [[buffer(1)]],
+                            device const int*   posb  [[buffer(2)]],
+                            constant WriteKvDynParams& p [[buffer(3)]],
+                            uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.n) return;
+    cache[(uint)posb[0] * p.row_stride + gid] = (half)src[gid];
 }
 "#;

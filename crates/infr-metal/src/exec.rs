@@ -41,13 +41,108 @@ enum Loc {
 
 /// Per-forward execution state: the host mirror (`vals`), a device buffer per tensor (`dev`), where
 /// each tensor currently lives (`loc`), and the open command buffer that batches consecutive GPU ops
-/// so they share a single commit + wait instead of one per op.
+/// so they share a single commit + wait instead of one per op. When `tape` is armed, every encoded
+/// dispatch is also recorded for decode replay (see [`Tape`]), and `posbuf` carries the bound
+/// positions buffer the dynamic-pos kernels read.
 struct Resident {
     vals: Vec<Vec<f32>>,
     dev: Vec<Option<Arc<MtlBuffer>>>,
     loc: Vec<Loc>,
     cb: Option<CommandBuffer>,
     enc: Option<ComputeCommandEncoder>,
+    tape: Option<Vec<TapeEntry>>,
+    posbuf: Option<MtlBuffer>,
+}
+
+/// One recorded dispatch: everything `encode_tg` needs to re-encode it verbatim. The buffer clones
+/// are retains, so the tape keeps every transient (intermediate activations, cached weights) alive
+/// across replays — replaying reuses the exact buffers the recording ran on.
+pub(crate) struct TapeEntry {
+    pso: ComputePipelineState,
+    bufs: Vec<MtlBuffer>,
+    params: Vec<u8>,
+    threads: usize,
+    tg: usize,
+}
+
+/// A recorded decode forward for the seam's record-once replay (`Capabilities::decode_replay`):
+/// the engine compiles the decode graph once (baked pos=0), binds everything once, and re-executes
+/// the same plan per token after uploading the new embedding + position. Metal command buffers are
+/// single-use, so "replay" here is re-encoding this flat dispatch list — no graph walk, no host
+/// mirror, no transient allocation, no routing. Ops whose behavior depends on the position use
+/// DYNAMIC-POS kernels that read the bound positions buffer (`attnvec_dyn_*`, `writekv_dyn_f16`;
+/// RoPE already reads it), so the recorded params stay valid for every token.
+pub(crate) struct Tape {
+    /// Fingerprint of (op discriminants, tensor count, bound buffer addresses): a tape is replayed
+    /// only for a graph with the identical op sequence over the identical bindings. Baked pos /
+    /// kv_len MAY differ across tokens — the dynamic-pos kernels ignore them by construction.
+    fp: u64,
+    entries: Vec<TapeEntry>,
+}
+
+/// Fingerprint the (graph shape, bindings) pair for tape matching. Op kind + tensor count pins the
+/// graph structure; the bound buffer addresses pin the weights/caches/IO. Two graphs that agree on
+/// all of that and pass [`replay_shape`] differ at most in baked positions, which replay reads
+/// dynamically.
+fn replay_fp(g: &infr_core::graph::Graph, bindings: &Bindings) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mut mix = |v: u64| {
+        h ^= v;
+        h = h.wrapping_mul(0x100000001b3);
+    };
+    mix(g.tensors.len() as u64);
+    for op in &g.ops {
+        mix(op_name(op).as_ptr() as u64);
+    }
+    for i in 0..g.tensors.len() {
+        if let Some(b) = bindings.get(TensorId(i as u32)) {
+            mix(metal_buf(b) as *const _ as u64);
+        }
+    }
+    h
+}
+
+/// Is this graph the decode shape the replay tape supports? Every op must be one the recorder
+/// handles fully on-device, attention must be the rows=1 f16 shape with a dynamic-pos kernel
+/// instantiation (hd 64/128), and a QkNormRope must exist to name the positions buffer.
+fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
+    use infr_core::graph::TensorKind;
+    let mut has_rope = false;
+    let mut has_attn = false;
+    for op in &g.ops {
+        match op {
+            Op::RmsNorm { .. } | Op::Linear { .. } | Op::GatedAct { .. } | Op::Add { .. } => {}
+            Op::QkNormRope { .. } => has_rope = true,
+            Op::WriteKv { cache, .. } => {
+                if g.desc(*cache).dtype != DType::F16 {
+                    return false;
+                }
+            }
+            Op::Attention {
+                rows,
+                head_dim,
+                k_cache,
+                ..
+            } => {
+                has_attn = true;
+                if *rows != 1
+                    || !matches!(*head_dim, 64 | 128)
+                    || g.desc(*k_cache).dtype != DType::F16
+                {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    // Every non-in-place tensor the recording direct-binds must actually be bound.
+    for (i, decl) in g.tensors.iter().enumerate() {
+        let needs_binding = matches!(decl.kind, TensorKind::Input | TensorKind::Output);
+        if needs_binding && bindings.get(TensorId(i as u32)).is_none() {
+            return false;
+        }
+    }
+    has_rope && has_attn
 }
 
 /// Reinterpret raw buffer bytes as `f32` per `dtype` (dequantizing quant/f16/bf16, widening integer
@@ -219,8 +314,55 @@ impl MetalBackend {
             );
         }
         let cap = pso.max_total_threads_per_threadgroup() as usize;
-        let tg = if tg == 0 { cap } else { tg.min(cap) }.min(threads.max(1)) as u64;
-        enc.dispatch_threads(MTLSize::new(threads as u64, 1, 1), MTLSize::new(tg, 1, 1));
+        let tgw = if tg == 0 { cap } else { tg.min(cap) }.min(threads.max(1)) as u64;
+        enc.dispatch_threads(MTLSize::new(threads as u64, 1, 1), MTLSize::new(tgw, 1, 1));
+        if let Some(tape) = r.tape.as_mut() {
+            tape.push(TapeEntry {
+                pso: pso.clone(),
+                bufs: bufs.iter().map(|b| (*b).clone()).collect(),
+                params: params.to_vec(),
+                threads,
+                tg,
+            });
+        }
+    }
+
+    /// Re-encode a recorded tape: one command buffer, the flat dispatch list, commit + wait.
+    /// This IS the per-token decode cost on the replay path — no graph walk, no host mirror,
+    /// no allocation.
+    fn replay_tape(&self, tape: &Tape) {
+        objc::rc::autoreleasepool(|| {
+            let cb = self.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            for e in &tape.entries {
+                enc.set_compute_pipeline_state(&e.pso);
+                for (i, b) in e.bufs.iter().enumerate() {
+                    enc.set_buffer(i as u64, Some(b), 0);
+                }
+                if !e.params.is_empty() {
+                    enc.set_bytes(
+                        e.bufs.len() as u64,
+                        e.params.len() as u64,
+                        e.params.as_ptr() as *const c_void,
+                    );
+                }
+                let cap = e.pso.max_total_threads_per_threadgroup() as usize;
+                let tg = if e.tg == 0 { cap } else { e.tg.min(cap) }.min(e.threads.max(1)) as u64;
+                enc.dispatch_threads(
+                    MTLSize::new(e.threads as u64, 1, 1),
+                    MTLSize::new(tg, 1, 1),
+                );
+            }
+            enc.end_encoding();
+            let t0 = self.profiling.then(std::time::Instant::now);
+            cb.commit();
+            cb.wait_until_completed();
+            if let Some(t0) = t0 {
+                let mut pr = self.prof.lock().unwrap();
+                pr.add_dispatch(t0.elapsed());
+                pr.add_forward();
+            }
+        });
     }
 
     /// Close the open batch: end encoding, commit, and wait. A no-op if nothing is buffered.
@@ -277,12 +419,51 @@ impl MetalBackend {
             .expect("metal backend: plan is not a GraphPlan")
             .graph;
 
+        // Decode replay: if this exact (graph shape, bindings) pair was recorded, re-encode the
+        // tape and skip the graph walk entirely (see `Tape`). The engine's replay loop re-executes
+        // one compiled plan with stable bindings, so after the first recorded token every
+        // subsequent token takes this path. The dynamic-pos vector kernel REQUIRES its full
+        // 1024-thread threadgroup (same silent-clamp hazard as the split kernels), so recording is
+        // gated on its pipeline cap — a capped device (CI paravirtual) keeps the per-token path.
+        let dyn_cap_ok = || -> bool {
+            let kern = g.ops.iter().find_map(|op| match op {
+                Op::Attention { head_dim: 64, .. } => Some("attnvec_dyn_f16kv_hd64"),
+                Op::Attention { head_dim: 128, .. } => Some("attnvec_dyn_f16kv_hd128"),
+                _ => None,
+            });
+            kern.is_some_and(|kn| {
+                self.pipelines
+                    .get(kn)
+                    .map(|pl| pl.max_total_threads_per_threadgroup() >= 1024)
+                    .unwrap_or(false)
+            })
+        };
+        if replay_shape(g, bindings) && dyn_cap_ok() {
+            let fp = replay_fp(g, bindings);
+            if let Some(tape) = self.replay.lock().unwrap().as_ref() {
+                if tape.fp == fp {
+                    self.replay_tape(tape);
+                    return Ok(());
+                }
+            }
+            let entries = objc::rc::autoreleasepool(|| self.run_graph(g, bindings, true))?;
+            if let Some(entries) = entries {
+                *self.replay.lock().unwrap() = Some(Tape { fp, entries });
+            }
+            return Ok(());
+        }
+
         // Wrap the whole forward in one autorelease pool: the batched command buffers/encoders are
         // retained owned handles, so we drain the pool once per forward instead of once per op.
-        objc::rc::autoreleasepool(|| self.run_graph(g, bindings))
+        objc::rc::autoreleasepool(|| self.run_graph(g, bindings, false).map(|_| ()))
     }
 
-    fn run_graph(&self, g: &infr_core::graph::Graph, bindings: &Bindings) -> Result<()> {
+    fn run_graph(
+        &self,
+        g: &infr_core::graph::Graph,
+        bindings: &Bindings,
+        record: bool,
+    ) -> Result<Option<Vec<TapeEntry>>> {
         // f32 host mirror for every Input/Internal/Output handle (mirrors the CPU interpreter); GPU
         // results stay on-device until a host op or the write-back needs them (see `Loc`/`Resident`).
         // KV caches are written/read in place from their bound buffers (see `direct`).
@@ -294,13 +475,50 @@ impl MetalBackend {
             loc: vec![Loc::Host; n],
             cb: None,
             enc: None,
+            tape: record.then(Vec::new),
+            posbuf: None,
         };
+        if record {
+            // Recording (`replay_shape` held): the tape must read/write the BOUND buffers, not
+            // per-execute host-mirror copies — the engine mutates the bound hidden/positions
+            // buffers between replays and reads logits from its bound buffer. So f32 Inputs and
+            // Outputs are direct-bound as the tensor's device buffer, and the positions buffer
+            // (i32, named by the graph's QkNormRope) is stashed for the dynamic-pos kernels.
+            for (i, decl) in g.tensors.iter().enumerate() {
+                let id = TensorId(i as u32);
+                if direct.contains(&id) {
+                    continue;
+                }
+                let bound = match decl.kind {
+                    TensorKind::Input if decl.desc.dtype == DType::F32 => true,
+                    TensorKind::Output => true,
+                    _ => false,
+                };
+                if bound {
+                    let buf = metal_buf(bindings.get(id).expect("replay_shape checked bindings"));
+                    r.dev[i] = Some(Arc::new(buf.raw.clone()));
+                    if decl.kind == TensorKind::Input {
+                        r.loc[i] = Loc::Device;
+                    }
+                }
+            }
+            let positions = g
+                .ops
+                .iter()
+                .find_map(|op| match op {
+                    Op::QkNormRope { positions, .. } => Some(*positions),
+                    _ => None,
+                })
+                .expect("replay_shape checked QkNormRope");
+            r.posbuf = Some(metal_buf(bindings.get(positions).unwrap()).raw.clone());
+        }
         for (i, decl) in g.tensors.iter().enumerate() {
             match decl.kind {
                 TensorKind::Internal | TensorKind::Output => {
                     r.vals[i] = vec![0f32; decl.desc.numel()]
                 }
                 TensorKind::Input if direct.contains(&TensorId(i as u32)) => {}
+                TensorKind::Input if record && decl.desc.dtype == DType::F32 => {}
                 TensorKind::Input => {
                     let buf = metal_buf(
                         bindings
@@ -350,9 +568,14 @@ impl MetalBackend {
                 continue;
             }
             if bindings.get(TensorId(i as u32)).is_some() {
+                let b = metal_buf(bindings.get(TensorId(i as u32)).unwrap());
+                // Direct-bound (recording): the GPU already wrote the bound buffer — nothing to
+                // copy, the trailing flush below makes it visible.
+                if matches!(&r.dev[i], Some(d) if d.contents() == b.raw.contents()) {
+                    continue;
+                }
                 // Pull the value back to the host mirror (flushes the batch if it's still on-device).
                 self.ensure_host(&mut r, g, TensorId(i as u32));
-                let b = metal_buf(bindings.get(TensorId(i as u32)).unwrap());
                 let src: &[u8] = bytemuck::cast_slice(&r.vals[i]);
                 unsafe {
                     std::ptr::copy_nonoverlapping(
@@ -365,7 +588,7 @@ impl MetalBackend {
         }
         // Close any trailing batch (an Internal-only tail never pulled to host).
         self.flush(&mut r);
-        Ok(())
+        Ok(r.tape.take())
     }
 
     /// Fetch a dequantized weight as a device f32 buffer, cached by bound-buffer address.
@@ -766,7 +989,18 @@ impl MetalBackend {
                 let (rows, nh, hd) = (rows as usize, n_head as usize, head_dim as usize);
                 let bx = self.ensure_device(r, x);
                 let bw = self.weight_buf(weight, g, bindings);
-                let bpos = self.ensure_device(r, positions);
+                // The kernel reads the bound i32 positions buffer directly (exact widening in
+                // the shader) — no host round-trip, and the decode-replay tape stays valid when
+                // the engine rewrites the position between replays.
+                let bpos = Arc::new(
+                    metal_buf(
+                        bindings
+                            .get(positions)
+                            .expect("metal backend: unbound positions"),
+                    )
+                    .raw
+                    .clone(),
+                );
                 let bff = match freq_factors {
                     Some(f) => self.ensure_device(r, f),
                     None => Arc::new(self.zeros_buf(1)),
@@ -883,14 +1117,23 @@ impl MetalBackend {
                 );
                 let base = pos * rs;
                 let n = rows * rs;
-                let kern = match g.desc(cache).dtype {
-                    DType::F16 => "writekv_f16",
-                    _ => "writekv_f32",
-                };
-                let pso = self.pipelines.get(kern)?;
-                let mut p = (n as u32).to_ne_bytes().to_vec();
-                p.extend_from_slice(&(base as u32).to_ne_bytes());
-                self.encode(r, &pso, &[bsrc.as_ref(), &cbuf.raw], &p, n);
+                if let Some(posbuf) = r.posbuf.clone() {
+                    // Recording a replay tape: the row offset must come from the positions buffer
+                    // (the baked `pos` is this token's only) — f16 cache guaranteed by the gate.
+                    let pso = self.pipelines.get("writekv_dyn_f16")?;
+                    let mut p = (n as u32).to_ne_bytes().to_vec();
+                    p.extend_from_slice(&(rs as u32).to_ne_bytes());
+                    self.encode(r, &pso, &[bsrc.as_ref(), &cbuf.raw, &posbuf], &p, n);
+                } else {
+                    let kern = match g.desc(cache).dtype {
+                        DType::F16 => "writekv_f16",
+                        _ => "writekv_f32",
+                    };
+                    let pso = self.pipelines.get(kern)?;
+                    let mut p = (n as u32).to_ne_bytes().to_vec();
+                    p.extend_from_slice(&(base as u32).to_ne_bytes());
+                    self.encode(r, &pso, &[bsrc.as_ref(), &cbuf.raw], &p, n);
+                }
             }
             Op::Attention {
                 q,
@@ -929,6 +1172,37 @@ impl MetalBackend {
                     infr_core::graph::AttnMask::Causal => 0,
                     infr_core::graph::AttnMask::SlidingWindow(w) => w as u32,
                 };
+                if let Some(posbuf) = r.posbuf.clone() {
+                    // Recording a replay tape (rows==1, f16 cache, hd 64/128 — checked by the
+                    // gate): route straight to the dynamic-pos vector flash kernel, which reads
+                    // pos from the positions buffer and covers every kv_len from 1 up. The usual
+                    // shape routing below would bake this token's kv_len into the kernel CHOICE,
+                    // which is exactly what a replayed tape can't have.
+                    let kern = if hd == 64 {
+                        "attnvec_dyn_f16kv_hd64"
+                    } else {
+                        "attnvec_dyn_f16kv_hd128"
+                    };
+                    let pso = self.pipelines.get(kern)?;
+                    let mut p = (rows as u32).to_ne_bytes().to_vec();
+                    p.extend_from_slice(&(kv_len as u32).to_ne_bytes());
+                    p.extend_from_slice(&(nh as u32).to_ne_bytes());
+                    p.extend_from_slice(&(nkv as u32).to_ne_bytes());
+                    p.extend_from_slice(&(hd as u32).to_ne_bytes());
+                    p.extend_from_slice(&scale.to_ne_bytes());
+                    p.extend_from_slice(&window.to_ne_bytes());
+                    p.extend_from_slice(&pos.to_ne_bytes());
+                    self.encode_tg(
+                        r,
+                        &pso,
+                        &[bq.as_ref(), &kbuf.raw, &vbuf.raw, bd.as_ref(), &posbuf],
+                        &p,
+                        rows * nh * 32 * 32,
+                        32 * 32,
+                    );
+                    r.loc[dst.0 as usize] = Loc::Device;
+                    return Ok(());
+                }
                 // Route by kernel-latency shape. The one-simdgroup-per-(query, head) kernels are
                 // latency-bound on their serial O(kv_len) online-softmax chain, so any long
                 // context takes a split-KV kernel — NSG simdgroups per (query, head) merged in
