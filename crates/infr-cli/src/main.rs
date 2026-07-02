@@ -850,9 +850,6 @@ fn cmd_bench(
     Ok(())
 }
 
-/// CPU-backend bench (`infr bench -ngl 0`): the GPU bench's pp/tg/pg metrics on the agnostic CPU
-/// reference path, using `CpuModel`'s token-level timing — directly comparable to `llama-bench -ngl 0`.
-#[allow(clippy::too_many_arguments)]
 /// Shared bench-result reporter: average the per-rep t/s samples and print either the JSON shape
 /// (`[{"avg_ts": ..}]`, llama-bench-comparable) or `label[ @ dN][tag]: X t/s (N reps)`. One
 /// implementation for the dense-CPU / qwen35 bench tails (they previously each had a copy).
@@ -870,6 +867,9 @@ fn print_bench_avg(samples: &[f64], label: &str, depth: usize, tag: &str, reps: 
     }
 }
 
+/// CPU-backend bench (`infr bench -ngl 0`): the GPU bench's pp/tg/pg metrics on the agnostic CPU
+/// reference path, using `CpuModel`'s token-level timing — directly comparable to `llama-bench -ngl 0`.
+#[allow(clippy::too_many_arguments)]
 fn cmd_bench_cpu(
     gguf: &Path,
     tok: Option<&Path>,
