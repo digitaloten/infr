@@ -608,18 +608,51 @@ fn lower_op(
                 *pos as usize,
             );
             if let RopeMode::Dynamic(params) = mode {
-                // Eligibility guarantees rows==1, causal, scale==1/√hd → the gemma-disabled dyn kernel.
-                rec.attention_kv_dyn(
-                    r(*q)?,
-                    r(*k_cache)?,
-                    r(*v_cache)?,
-                    *params,
-                    r(*dst)?,
-                    1,
-                    nh,
-                    nkv,
-                    hd,
-                );
+                // Eligibility guarantees rows==1, causal, scale==1/√hd (gemma-disabled).
+                // Flash-decoding split-K: the scalar attention_kv_dyn launches only nh workgroups
+                // and rescans the whole cache per token — decode slowed ~4x from kv 100→600 on the
+                // seam replay path. `chunk`/`n_chunks` are push constants (dispatch structure), so
+                // bake the WORST CASE from the bound cache's capacity: chunks past the live kv_len
+                // (read from `params` at replay) produce zero-weight partials (m=-3e38, l=0) the
+                // combine ignores. attn_combine's shared array caps n_chunks at 512 → scale chunk
+                // with capacity. Scratch is plan-held (`transient`), so replay reuses it.
+                let cap = graph.desc(*k_cache).numel() / (nkv * hd);
+                let chunk = cap.div_ceil(512).max(64);
+                let n_chunks = cap.div_ceil(chunk);
+                if hd % 4 == 0 && hd <= 512 && n_chunks > 1 {
+                    let pm = be_.alloc_uninit(nh * n_chunks * 4, BufferUsage::Activations)?;
+                    let pl = be_.alloc_uninit(nh * n_chunks * 4, BufferUsage::Activations)?;
+                    let pacc =
+                        be_.alloc_uninit(nh * n_chunks * hd * 4, BufferUsage::Activations)?;
+                    rec.attention_kv_split_dyn(
+                        r(*q)?,
+                        r(*k_cache)?,
+                        r(*v_cache)?,
+                        r(*dst)?,
+                        pm.as_ref(),
+                        pl.as_ref(),
+                        pacc.as_ref(),
+                        *params,
+                        nh,
+                        nkv,
+                        hd,
+                        chunk,
+                        n_chunks,
+                    );
+                    transient.extend([pm, pl, pacc]);
+                } else {
+                    rec.attention_kv_dyn(
+                        r(*q)?,
+                        r(*k_cache)?,
+                        r(*v_cache)?,
+                        *params,
+                        r(*dst)?,
+                        1,
+                        nh,
+                        nkv,
+                        hd,
+                    );
+                }
             } else {
                 // Prefill (rows≥64), causal, hd==128, standard 1/√hd scale: FlashAttention-2 (split-K
                 // online softmax, no materialized [m,kv] scores). The flash kernel hardcodes 1/√hd and
