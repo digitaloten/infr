@@ -34,6 +34,11 @@ pub struct Capabilities {
     /// When set, the runner may compile the decode graph once (pos=0) and reuse it across the whole
     /// decode loop. Backends that read the baked `pos`/`kv_len` (CPU interpreter) leave this false.
     pub decode_replay: bool,
+    /// The backend prefers the dense FFN's gate+up weights CONCATENATED into one `[2*nff, ne]`
+    /// tensor (one GEMV/GEMM + `Op::GatedActFused` instead of two Linears + `Op::GatedAct`).
+    /// Costs an owned copy of both weights at load, so zero-copy mmap backends (CPU) leave this
+    /// false and keep the separate-tensor form.
+    pub combined_gu: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

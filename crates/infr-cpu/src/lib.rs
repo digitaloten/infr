@@ -2253,6 +2253,7 @@ impl Backend for CpuBackend {
             // The interpreter reads the baked `pos`/`kv_len` from the graph ops, so the decode graph
             // must be rebuilt per token — no record-once replay.
             decode_replay: false,
+            combined_gu: false,
         }
     }
 
@@ -2824,6 +2825,25 @@ impl Backend for CpuBackend {
                         let ub = r * nff + up_off;
                         for i in 0..nff {
                             out[gb + i] = act_fn(act, gs[gb + i]) * us[ub + i];
+                        }
+                    }
+                    vals[dst.0 as usize] = out;
+                }
+                Op::GatedActFused {
+                    gu,
+                    dst,
+                    rows,
+                    nff,
+                    act,
+                } => {
+                    // Combined [rows, 2*nff] gate|up buffer: gate half first, up half second.
+                    let (rows, nff) = (rows as usize, nff as usize);
+                    let gus = &vals[gu.0 as usize];
+                    let mut out = vec![0f32; rows * nff];
+                    for r in 0..rows {
+                        let gb = r * 2 * nff;
+                        for i in 0..nff {
+                            out[r * nff + i] = act_fn(act, gus[gb + i]) * gus[gb + nff + i];
                         }
                     }
                     vals[dst.0 as usize] = out;

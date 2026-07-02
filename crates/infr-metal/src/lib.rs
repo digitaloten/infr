@@ -132,6 +132,7 @@ impl Backend for MetalBackend {
             // Like the CPU interpreter, this backend reads the baked `pos`/`kv_len` from the graph
             // ops each execute, so the decode graph is rebuilt per token (no record-once replay).
             decode_replay: false,
+            combined_gu: false,
         }
     }
 

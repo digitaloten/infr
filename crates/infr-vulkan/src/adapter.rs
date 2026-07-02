@@ -176,6 +176,30 @@ fn alloc_scratch(be_: &VulkanBackend, graph: &Graph) -> Result<Vec<Option<Box<dy
 /// The intermediate tensor (k16) has ONE TensorId reused across ALL layers' QkNormRope ops, so the
 /// map is keyed by OP INDEX (not TensorId): each layer's pair maps to its own KV-cache buffer.
 /// Returns (fused: op index of the QkNormRope → (cache, row offset `pos`); skip: absorbed WriteKv ops).
+/// Per-execute transient-scratch pool: the SAME (tag, bytes) key across ops returns the SAME
+/// buffer. Layers are serialized by dataflow and the recorder's hazard tracking turns each
+/// rewrite into an ordinary WAR/WAW barrier (the bespoke path shares its split scratch across
+/// layers the same way), so per-tag reuse is safe — and it cuts the held transient VRAM from
+/// O(n_layer) to O(1) buffers per tag. Without it, an 8B p8000 prefill held 36 layers × ~1GB of
+/// flash-attention partials (≈38 GB) and took the device down.
+type ScratchPool = HashMap<(&'static str, usize), Box<dyn Buffer>>;
+
+/// Get-or-alloc the pool buffer for (tag, bytes); returns the map key so callers can hold several
+/// pool buffers at once via immutable indexing (`pool[&k].as_ref()`).
+fn pooled(
+    pool: &mut ScratchPool,
+    be_: &VulkanBackend,
+    tag: &'static str,
+    bytes: usize,
+) -> Result<(&'static str, usize)> {
+    let key = (tag, bytes.max(4));
+    if let std::collections::hash_map::Entry::Vacant(e) = pool.entry(key) {
+        // alloc_uninit: every pooled buffer is fully written before read within each op.
+        e.insert(be_.alloc_uninit(key.1, BufferUsage::Activations)?);
+    }
+    Ok(key)
+}
+
 /// Per-execute Dynamic-attention shared state: ONE attn_live prologue + ONE pm/pl/pacc split
 /// scratch set per distinct (nh, hd, chunk, n_chunks, window) attention shape (see `lower_op`'s
 /// `dyn_args`). Uniform models (qwen3) have exactly one; gemma alternates SWA/global layers (and
@@ -305,6 +329,7 @@ fn lower_op(
     // sets cost 28x the VRAM and added run-to-run placement variance). A uniform model (qwen3)
     // holds one entry; gemma's SWA/global alternation (and gemma4-12b's hd 256/512) holds a few.
     dyn_args: &mut Vec<DynAttnCtx>,
+    pool: &mut ScratchPool,
     dummy: &dyn Buffer,
 ) -> Result<()> {
     let r = |id: TensorId| resolve(scratch, bindings, id);
@@ -392,16 +417,23 @@ fn lower_op(
                     && std::env::var("INFR_NO_MMQ").is_err()
                 {
                     // mmq (dp4a int8): quantize activations once, integer matmul on raw blocks.
+                    // Scratch is pooled — every same-shape Linear in the graph reuses one set.
                     let nblk = in_f / 32;
-                    // alloc_uninit: quant_q8 fills all m rows before the GEMM reads them.
-                    let qa = be_.alloc_uninit((m * in_f).max(4), BufferUsage::Activations)?;
-                    let dact = be_.alloc_uninit((m * nblk * 2).max(4), BufferUsage::Activations)?;
-                    let sact = be_.alloc_uninit((m * nblk * 2).max(4), BufferUsage::Activations)?;
-                    rec.quant_q8(xb, qa.as_ref(), dact.as_ref(), sact.as_ref(), m, in_f);
+                    let qa = pooled(pool, be_, "mmq_qa", m * in_f)?;
+                    let dact = pooled(pool, be_, "mmq_dact", m * nblk * 2)?;
+                    let sact = pooled(pool, be_, "mmq_sact", m * nblk * 2)?;
+                    rec.quant_q8(
+                        xb,
+                        pool[&qa].as_ref(),
+                        pool[&dact].as_ref(),
+                        pool[&sact].as_ref(),
+                        m,
+                        in_f,
+                    );
                     rec.matmul_mmq_q4k(
-                        qa.as_ref(),
-                        dact.as_ref(),
-                        sact.as_ref(),
+                        pool[&qa].as_ref(),
+                        pool[&dact].as_ref(),
+                        pool[&sact].as_ref(),
                         w,
                         0,
                         out,
@@ -409,7 +441,6 @@ fn lower_op(
                         in_f,
                         out_f,
                     );
-                    transient.extend([qa, dact, sact]);
                 } else if native_dense_supported(dt) {
                     rec.matmul_native(dt, xb, w, out, m, in_f, out_f);
                 } else {
@@ -537,6 +568,25 @@ fn lower_op(
                 Activation::Gelu => {
                     let eb = graph.desc(*up).dtype.dense_bytes(1).unwrap_or(4);
                     rec.gelu_mul_off(g_, u_, *up_off as usize * eb, y, n);
+                }
+            }
+        }
+        // Combined [rows, 2*nff] gate|up buffer — the bespoke path's silu/gelu_mul_fused shape
+        // (one GEMV/GEMM produced the whole gu, this reads both halves per row).
+        Op::GatedActFused {
+            gu,
+            dst,
+            rows,
+            nff,
+            act,
+        } => {
+            let (rows, nff) = (*rows as usize, *nff as usize);
+            let (gu_, y) = (r(*gu)?, r(*dst)?);
+            match act {
+                Activation::Silu => rec.silu_mul_fused(gu_, y, rows, nff),
+                Activation::Gelu => rec.gelu_mul_fused(gu_, y, rows, nff),
+                Activation::Sigmoid => {
+                    return Err(be("vulkan adapter: GatedActFused Sigmoid unsupported"))
                 }
             }
         }
@@ -812,19 +862,19 @@ fn lower_op(
                 let split_ok = rows == 1 && kv_len > chunk && hd % 4 == 0 && hd <= 512;
                 if flash_ok {
                     let mpad = rows.div_ceil(64) * 64;
-                    // alloc_uninit: split partials are fully written before the combine reads them
-                    // (zero-fill would be a ~70MB host memset per op on ReBAR).
-                    let po = be_.alloc_uninit(8 * mpad * nh * hd * 4, BufferUsage::Activations)?;
-                    let pm = be_.alloc_uninit(8 * mpad * nh * 4, BufferUsage::Activations)?;
-                    let pl = be_.alloc_uninit(8 * mpad * nh * 4, BufferUsage::Activations)?;
+                    // Pooled split partials (fully written before the combine reads them) — one
+                    // set serves every layer instead of n_layer live copies (~1GB each at 8B p8k).
+                    let po = pooled(pool, be_, "flash_po", 8 * mpad * nh * hd * 4)?;
+                    let pm = pooled(pool, be_, "flash_pm", 8 * mpad * nh * 4)?;
+                    let pl = pooled(pool, be_, "flash_pl", 8 * mpad * nh * 4)?;
                     rec.attention_prefill_flash(
                         r(*q)?,
                         r(*k_cache)?,
                         r(*v_cache)?,
                         r(*dst)?,
-                        po.as_ref(),
-                        pm.as_ref(),
-                        pl.as_ref(),
+                        pool[&po].as_ref(),
+                        pool[&pm].as_ref(),
+                        pool[&pl].as_ref(),
                         rows,
                         kv_len,
                         nh,
@@ -832,7 +882,6 @@ fn lower_op(
                         hd,
                         pos,
                     );
-                    transient.extend([po, pm, pl]);
                 } else if nonfa_ok {
                     let window = match mask {
                         AttnMask::Causal => 0,
@@ -840,20 +889,19 @@ fn lower_op(
                     };
                     let mpad = rows.div_ceil(64) * 64;
                     let kv_pad = kv_len.div_ceil(256) * 256;
-                    // scores scratch [nh, mpad, kv_pad] f16 + split-K PV partials (≤8 splits) f32.
-                    // alloc_uninit: these are ~80MB per attention op and fully written before read
-                    // (attn_qk fills every [mpad, kv_pad] row; PV partials are written per split
-                    // before the reduce) — the calloc-style alloc's zero-fill is a host memset of
-                    // the whole thing on ReBAR, ~500MB/chunk of pure overhead across 6 attn layers.
-                    let s = be_.alloc_uninit(nh * mpad * kv_pad * 2, BufferUsage::Activations)?;
-                    let pv = be_.alloc_uninit(8 * mpad * nh * hd * 4, BufferUsage::Activations)?;
+                    // Pooled scores scratch [nh, mpad, kv_pad] f16 + split-K PV partials (≤8
+                    // splits) f32 — ~80MB per attention op, fully written before read (attn_qk
+                    // fills every [mpad, kv_pad] row; PV partials are written per split before
+                    // the reduce), and one set serves every same-shape layer.
+                    let s = pooled(pool, be_, "nonfa_s", nh * mpad * kv_pad * 2)?;
+                    let pv = pooled(pool, be_, "nonfa_pv", 8 * mpad * nh * hd * 4)?;
                     rec.attention_prefill_nonfa(
                         r(*q)?,
                         r(*k_cache)?,
                         r(*v_cache)?,
                         r(*dst)?,
-                        s.as_ref(),
-                        pv.as_ref(),
+                        pool[&s].as_ref(),
+                        pool[&pv].as_ref(),
                         rows,
                         kv_len,
                         nh,
@@ -863,25 +911,23 @@ fn lower_op(
                         window,
                         *scale,
                     );
-                    transient.extend([s, pv]);
                 } else if split_ok {
                     let window = match mask {
                         AttnMask::Causal => 0,
                         AttnMask::SlidingWindow(w) => *w,
                     };
                     let n_chunks = kv_len.div_ceil(chunk);
-                    let pm = be_.alloc_uninit(nh * n_chunks * 4, BufferUsage::Activations)?;
-                    let pl = be_.alloc_uninit(nh * n_chunks * 4, BufferUsage::Activations)?;
-                    let pacc =
-                        be_.alloc_uninit(nh * n_chunks * hd * 4, BufferUsage::Activations)?;
+                    let pm = pooled(pool, be_, "split_pm", nh * n_chunks * 4)?;
+                    let pl = pooled(pool, be_, "split_pl", nh * n_chunks * 4)?;
+                    let pacc = pooled(pool, be_, "split_pacc", nh * n_chunks * hd * 4)?;
                     rec.attention_kv_split(
                         r(*q)?,
                         r(*k_cache)?,
                         r(*v_cache)?,
                         r(*dst)?,
-                        pm.as_ref(),
-                        pl.as_ref(),
-                        pacc.as_ref(),
+                        pool[&pm].as_ref(),
+                        pool[&pl].as_ref(),
+                        pool[&pacc].as_ref(),
                         kv_len,
                         nh,
                         nkv,
@@ -891,7 +937,6 @@ fn lower_op(
                         *scale,
                         window,
                     );
-                    transient.extend([pm, pl, pacc]);
                 } else {
                     let window = match mask {
                         AttnMask::Causal => 0,
@@ -1466,6 +1511,7 @@ fn record_decode_replay(
 
     let mut transient: Vec<Box<dyn Buffer>> = Vec::new();
     let mut dyn_args: Vec<DynAttnCtx> = Vec::new();
+    let mut pool: ScratchPool = HashMap::new();
     let dummy = be_.alloc(16, BufferUsage::Activations)?;
     let rec = be_.recorder_persistent()?;
     let mode = RopeMode::Dynamic(params.as_ref());
@@ -1486,12 +1532,14 @@ fn record_decode_replay(
             &mode,
             &mut transient,
             &mut dyn_args,
+            &mut pool,
             dummy.as_ref(),
         )?;
     }
     for c in dyn_args.drain(..) {
         transient.extend([c.args, c.pm, c.pl, c.pacc]);
     }
+    transient.extend(pool.into_values());
     let recorded = rec.finish_record().map_err(|e| be(e.to_string()))?;
     // dummy is unused in an eligible decode (m=1 GEMV path), but hold it (and any transient) so the
     // recording can't reference a freed buffer.
@@ -1542,6 +1590,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     let rec = be_.recorder()?;
     let mode = RopeMode::Static(&rope_pos);
     let mut dyn_args: Vec<DynAttnCtx> = Vec::new();
+    let mut pool: ScratchPool = HashMap::new();
     for (op_idx, op) in graph.ops.iter().enumerate() {
         if skip_op.contains(&op_idx) {
             continue;
@@ -1559,12 +1608,14 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
             &mode,
             &mut transient,
             &mut dyn_args,
+            &mut pool,
             dummy.as_ref(),
         )?;
     }
     for c in dyn_args.drain(..) {
         transient.extend([c.args, c.pm, c.pl, c.pacc]);
     }
+    transient.extend(pool.into_values());
     rec.finish().map_err(|e| be(e.to_string()))?;
     Ok(())
 }

@@ -26,6 +26,8 @@ enum FfnW {
         wup: TensorId,
         wdown: TensorId,
     },
+    /// Combined gate+up weight `[2*nff, ne]` (one GEMV/GEMM + `GatedActFused`); see `fuse_gu`.
+    DenseFused { wgu: TensorId, wdown: TensorId },
     Moe {
         router: TensorId,
         gate_exps: TensorId,
@@ -86,7 +88,20 @@ pub(crate) fn generate_dense_cpu(
     let cpu_be = CpuBackend::new();
     generate_dense_backend(
         &cpu_be,
-        &|tb, dt, _n| Ok((cpu_be.map_weight(tb), dt)),
+        &|tb, dt, _n| match tb {
+            WBytes::Mmap(tb) => Ok((cpu_be.map_weight(tb), dt)),
+            // Owned bytes (combined gate+up) never reach the CPU binder — combined_gu is false —
+            // but stay correct if they ever do.
+            WBytes::Owned(v) => {
+                let buf = cpu_be
+                    .alloc(v.len().max(1), BufferUsage::Weights)
+                    .map_err(|e| anyhow!("{e}"))?;
+                cpu_be
+                    .upload(buf.as_ref(), &v)
+                    .map_err(|e| anyhow!("{e}"))?;
+                Ok((buf, dt))
+            }
+        },
         g,
         cfg,
         token_embd,
@@ -235,9 +250,26 @@ pub(crate) fn generate_dense_metal(
 /// backend buffer: the CPU maps it zero-copy from the mmap; the GPU pads + uploads it to VRAM. This
 /// is the single forward both backends share — running it on Vulkan and diffing the CPU oracle is
 /// the end-to-end dense parity check.
+/// Weight bytes handed to a binder: a zero-copy mmap slice (the normal case), or an owned
+/// concatenation (the combined gate+up upload — only produced when `Capabilities::combined_gu`).
+pub(crate) enum WBytes {
+    Mmap(TensorBytes),
+    Owned(Vec<u8>),
+}
+
+impl std::ops::Deref for WBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            WBytes::Mmap(tb) => tb,
+            WBytes::Owned(v) => v,
+        }
+    }
+}
+
 /// Turns a native-dtype GGUF tensor into a backend buffer + the EFFECTIVE dtype it now holds (the
 /// GPU binder may convert float weights to f16), so the graph declares the handle to match.
-type BindWeight<'a> = dyn Fn(TensorBytes, DType, usize) -> AResult<(Box<dyn Buffer>, DType)> + 'a;
+type BindWeight<'a> = dyn Fn(WBytes, DType, usize) -> AResult<(Box<dyn Buffer>, DType)> + 'a;
 
 /// Persistent per-session seam state: the uploaded weights, the KV cache (sized to `max_ctx`
 /// once), the per-step IO buffers, and the token ids currently MATERIALIZED in the cache. A caller
@@ -396,6 +428,20 @@ pub(crate) fn generate_dense_backend(
         } else {
             None
         };
+    // Combined gate+up FFN weights (one GEMV/GEMM + GatedActFused instead of two Linears +
+    // GatedAct — the bespoke path's fused-gu shape, ~1 dispatch/layer off the decode hot loop).
+    // Requires the backend to opt in (Vulkan; the CPU keeps zero-copy separate tensors) AND every
+    // dense layer's gate/up to share a dtype (the concat is one [2*nff, ne] tensor). The decision
+    // is global so the upload order and `build`'s handle declarations always agree.
+    let fuse_gu = be.capabilities().combined_gu
+        && c.moe.is_none()
+        && (0..c.n_layer).all(|l| {
+            let dt = |s: &str| {
+                let name = format!("blk.{l}.{s}");
+                g.tensors().iter().find(|t| t.name == name).map(|t| t.dtype)
+            };
+            dt("ffn_gate.weight").is_some() && dt("ffn_gate.weight") == dt("ffn_up.weight")
+        });
 
     // ── one-time session init: weights, KV cache, per-step IO (skipped when `state` is warm) ──
     if state.is_none() {
@@ -405,70 +451,92 @@ pub(crate) fn generate_dense_backend(
         //    order MUST equal the `g.weight()` order in `build` below. ──────────────────────────────────
         let mut wbufs: Vec<Box<dyn Buffer>> = Vec::new();
         let mut wspecs: Vec<(DType, usize)> = Vec::new();
-        // Map a weight tensor zero-copy from the GGUF mmap (no alloc, no memcpy); record its native dtype
-        // + element count so `build` declares the handle to match.
-        let mut wraw = |name: &str| -> AResult<()> {
-            let info = g
-                .tensors()
-                .iter()
-                .find(|t| t.name == name)
-                .ok_or_else(|| anyhow!("tensor not found: {name}"))?
-                .clone();
-            let numel: usize = info.shape.iter().product();
-            let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
+        // Load one weight (zero-copy mmap slice — no alloc, no memcpy) or CONCATENATE several into
+        // one owned buffer (the combined gate+up upload; same dtype, row-major concat of [nff, ne]
+        // tensors = a valid [k*nff, ne] tensor). Records the native dtype + element count so
+        // `build` declares the handle to match.
+        let mut wload = |names: &[&str]| -> AResult<()> {
+            let info = |name: &str| {
+                g.tensors()
+                    .iter()
+                    .find(|t| t.name == name)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("tensor not found: {name}"))
+            };
+            let (bytes, dt, numel) = if let [name] = names {
+                let i = info(name)?;
+                let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
+                (WBytes::Mmap(tb), i.dtype, i.shape.iter().product())
+            } else {
+                let mut cat = Vec::new();
+                let mut numel = 0usize;
+                let dt = info(names[0])?.dtype;
+                for name in names {
+                    let i = info(name)?;
+                    if i.dtype != dt {
+                        return Err(anyhow!("wload concat dtype mismatch: {names:?}"));
+                    }
+                    numel += i.shape.iter().product::<usize>();
+                    cat.extend_from_slice(&g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?);
+                }
+                (WBytes::Owned(cat), dt, numel)
+            };
             // bind_weight returns the EFFECTIVE dtype the buffer holds (the GPU binder may convert float
             // weights to f16), so the graph declares the handle to match what the backend will read.
-            let (buf, eff_dt) = bind_weight(tb, info.dtype, numel)?;
+            let (buf, eff_dt) = bind_weight(bytes, dt, numel)?;
             wbufs.push(buf);
             wspecs.push((eff_dt, numel));
             Ok(())
         };
         for l in 0..c.n_layer {
             let p = |s: &str| format!("blk.{l}.{s}");
-            wraw(&p("attn_norm.weight"))?;
-            wraw(&p("attn_q.weight"))?;
-            wraw(&p("attn_k.weight"))?;
+            wload(&[&p("attn_norm.weight")])?;
+            wload(&[&p("attn_q.weight")])?;
+            wload(&[&p("attn_k.weight")])?;
             if has_wv[l] {
-                wraw(&p("attn_v.weight"))?;
+                wload(&[&p("attn_v.weight")])?;
             }
             if qk_norm {
-                wraw(&p("attn_q_norm.weight"))?;
-                wraw(&p("attn_k_norm.weight"))?;
+                wload(&[&p("attn_q_norm.weight")])?;
+                wload(&[&p("attn_k_norm.weight")])?;
             }
-            wraw(&p("attn_output.weight"))?;
+            wload(&[&p("attn_output.weight")])?;
             if gemma {
-                wraw(&p("post_attention_norm.weight"))?;
+                wload(&[&p("post_attention_norm.weight")])?;
             }
-            wraw(&p("ffn_norm.weight"))?;
+            wload(&[&p("ffn_norm.weight")])?;
             if c.moe.is_some() {
                 // qwen3moe: router + stacked per-expert gate/up/down banks.
-                wraw(&p("ffn_gate_inp.weight"))?;
-                wraw(&p("ffn_gate_exps.weight"))?;
-                wraw(&p("ffn_up_exps.weight"))?;
-                wraw(&p("ffn_down_exps.weight"))?;
+                wload(&[&p("ffn_gate_inp.weight")])?;
+                wload(&[&p("ffn_gate_exps.weight")])?;
+                wload(&[&p("ffn_up_exps.weight")])?;
+                wload(&[&p("ffn_down_exps.weight")])?;
+            } else if fuse_gu {
+                wload(&[&p("ffn_gate.weight"), &p("ffn_up.weight")])?;
+                wload(&[&p("ffn_down.weight")])?;
             } else {
-                wraw(&p("ffn_gate.weight"))?;
-                wraw(&p("ffn_up.weight"))?;
-                wraw(&p("ffn_down.weight"))?;
+                wload(&[&p("ffn_gate.weight")])?;
+                wload(&[&p("ffn_up.weight")])?;
+                wload(&[&p("ffn_down.weight")])?;
             }
             if gemma {
-                wraw(&p("post_ffw_norm.weight"))?;
+                wload(&[&p("post_ffw_norm.weight")])?;
             }
             if e2b {
                 // gemma4 E2B per-layer input-embedding application weights.
-                wraw(&p("inp_gate.weight"))?;
-                wraw(&p("proj.weight"))?;
-                wraw(&p("post_norm.weight"))?;
+                wload(&[&p("inp_gate.weight")])?;
+                wload(&[&p("proj.weight")])?;
+                wload(&[&p("post_norm.weight")])?;
             }
         }
         // Globals: output_norm, lm_head. lm_head = `output.weight`, or (tied) the quantized
         // `token_embd.weight` mapped from the mmap and dequantized per-row by `Op::Linear` — same f32
         // values as the host `token_embd`, but zero-copy.
-        wraw("output_norm.weight")?;
+        wload(&["output_norm.weight"])?;
         if g.tensors().iter().any(|t| t.name == "output.weight") {
-            wraw("output.weight")?;
+            wload(&["output.weight"])?;
         } else {
-            wraw("token_embd.weight")?;
+            wload(&["token_embd.weight"])?;
         }
         // gemma4 weightless per-head V-norm = `QkNorm` with a unit weight (out = x/rms). One ones-vector
         // of the max head dim serves every layer (a narrower layer reads its leading prefix).
@@ -640,6 +708,11 @@ pub(crate) fn generate_dense_backend(
                     up_exps: wpush(&mut g, &mut weights),
                     down_exps: wpush(&mut g, &mut weights),
                 }
+            } else if fuse_gu {
+                FfnW::DenseFused {
+                    wgu: wpush(&mut g, &mut weights),
+                    wdown: wpush(&mut g, &mut weights),
+                }
             } else {
                 FfnW::Dense {
                     wgate: wpush(&mut g, &mut weights),
@@ -698,8 +771,16 @@ pub(crate) fn generate_dense_backend(
         let q16 = g.internal(f16d(batch * max_qrow));
         let k16 = g.internal(f16d(batch * max_kvrow));
         let attn = g.internal(f32d(batch * max_qrow));
-        let gbuf = g.internal(f32d(batch * nff));
-        let ubuf = g.internal(f32d(batch * nff));
+        // Separate gate/up scratch, or one combined [batch, 2*nff] gu buffer when fused — declare
+        // only the shape in use (Internal buffers are allocated by the backend even if never read).
+        let (gbuf, ubuf, gubuf) = if fuse_gu {
+            let gu = g.internal(f32d(batch * 2 * nff));
+            (gu, gu, gu)
+        } else {
+            let gb = g.internal(f32d(batch * nff));
+            let ub = g.internal(f32d(batch * nff));
+            (gb, ub, gb)
+        };
         let actbuf = g.internal(f32d(batch * nff));
         let sub = g.internal(f32d(batch * ne));
         // E2B per-layer embed scratch: gate `[npl]` and projected `[ne]`.
@@ -925,6 +1006,31 @@ pub(crate) fn generate_dense_backend(
                 eps,
             });
             match lw.ffn {
+                FfnW::DenseFused { wgu, wdown } => {
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: wgu,
+                        dst: gubuf,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: (2 * nff_l) as u32,
+                    });
+                    g.push(Op::GatedActFused {
+                        gu: gubuf,
+                        dst: actbuf,
+                        rows: batch as u32,
+                        nff: nff_l as u32,
+                        act,
+                    });
+                    g.push(Op::Linear {
+                        x: actbuf,
+                        weight: wdown,
+                        dst: sub,
+                        m: batch as u32,
+                        in_f: nff_l as u32,
+                        out_f: ne as u32,
+                    });
+                }
                 FfnW::Dense { wgate, wup, wdown } => {
                     g.push(Op::Linear {
                         x: hn,
@@ -1170,76 +1276,83 @@ pub(crate) fn generate_dense_backend(
     };
     let decode_start = if prompt.len() - start > 2 && (c.moe.is_none() || moe_batched_ok) {
         // Batch-prefill the un-cached suffix, all but the last prompt token (positions
-        // start..plen-1; rows 0..start are reused from the session cache).
-        let pf_m = prompt.len() - 1 - start;
-        let mut pf_hidden: Vec<f32> = Vec::with_capacity(pf_m * ne);
-        for &tok in &prompt[start..prompt.len() - 1] {
-            let base = tok as usize * ne;
-            pf_hidden.extend(token_embd[base..base + ne].iter().map(|&x| x * embed_scale));
-        }
-        // Absolute positions [start, ..., plen-2].
-        let pf_positions: Vec<i32> = (start as i32..(prompt.len() - 1) as i32).collect();
-        // Allocate staging buffers sized for the prefill batch.
-        let pf_hidden_buf = be
-            .alloc(pf_m * ne * 4, BufferUsage::Staging)
-            .map_err(|e| anyhow!("{e}"))?;
-        let pf_pos_buf = be
-            .alloc(pf_m * 4, BufferUsage::Staging)
-            .map_err(|e| anyhow!("{e}"))?;
-        be.upload(pf_hidden_buf.as_ref(), bytemuck::cast_slice(&pf_hidden))
-            .map_err(|e| anyhow!("{e}"))?;
-        be.upload(pf_pos_buf.as_ref(), bytemuck::cast_slice(&pf_positions))
-            .map_err(|e| anyhow!("{e}"))?;
+        // start..plen-1; rows 0..start are reused from the session cache) — in UBATCH CHUNKS.
+        // One giant graph would scale the internal activation/attention scratch with the whole
+        // prompt (an 8B p8000 prefill built a multi-second single submission whose tail work
+        // tripped the amdgpu ring watchdog → device lost) and bakes a multi-second unpreemptible
+        // submit; fixed-size chunks bound both, exactly like the bespoke path's ubatches.
+        let ubatch: usize = std::env::var("INFR_UBATCH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(1024);
+        let pf_end = prompt.len() - 1;
+        let mut cstart = start;
+        while cstart < pf_end {
+            let cend = (cstart + ubatch).min(pf_end);
+            let pf_m = cend - cstart;
+            let mut pf_hidden: Vec<f32> = Vec::with_capacity(pf_m * ne);
+            for &tok in &prompt[cstart..cend] {
+                let base = tok as usize * ne;
+                pf_hidden.extend(token_embd[base..base + ne].iter().map(|&x| x * embed_scale));
+            }
+            // Absolute positions [cstart, ..., cend-1].
+            let pf_positions: Vec<i32> = (cstart as i32..cend as i32).collect();
+            let pf_hidden_buf = be
+                .alloc(pf_m * ne * 4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?;
+            let pf_pos_buf = be
+                .alloc(pf_m * 4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?;
+            be.upload(pf_hidden_buf.as_ref(), bytemuck::cast_slice(&pf_hidden))
+                .map_err(|e| anyhow!("{e}"))?;
+            be.upload(pf_pos_buf.as_ref(), bytemuck::cast_slice(&pf_positions))
+                .map_err(|e| anyhow!("{e}"))?;
 
-        // gemma4 E2B: the chunk's per-(token,layer) input vectors, host-computed in parallel.
-        let pf_ipl_buf = if let Some(ple) = ple {
-            let ipl = e2b_ipl_rows(
-                g,
-                c,
-                ple,
-                token_embd,
-                &prompt[start..prompt.len() - 1],
-                embed_scale,
-            )?;
-            let b = be
-                .alloc(ipl.len() * 4, BufferUsage::Staging)
+            // gemma4 E2B: the chunk's per-(token,layer) input vectors, host-computed in parallel.
+            let pf_ipl_buf = if let Some(ple) = ple {
+                let ipl = e2b_ipl_rows(g, c, ple, token_embd, &prompt[cstart..cend], embed_scale)?;
+                let b = be
+                    .alloc(ipl.len() * 4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?;
+                be.upload(b.as_ref(), bytemuck::cast_slice(&ipl))
+                    .map_err(|e| anyhow!("{e}"))?;
+                Some(b)
+            } else {
+                None
+            };
+            let pf_t0 = std::time::Instant::now();
+            let (pf_g, pf_h) = build(pf_m, cstart);
+            let pf_plan = be.compile(&pf_g).map_err(|e| anyhow!("{e}"))?;
+            let mut pf_b = Bindings::new();
+            pf_b.bind(pf_h.hidden, pf_hidden_buf.as_ref());
+            pf_b.bind(pf_h.positions, pf_pos_buf.as_ref());
+            // gemma4's proportional-RoPE divisors are a graph input too — bind them (the per-token
+            // decode loop below does the same). Without this the batched graph has an unbound
+            // `rope_freqs` Input and panics.
+            if let (Some(rid), Some((rb, _))) = (pf_h.rope_freqs, &rf_buf) {
+                pf_b.bind(rid, rb.as_ref());
+            }
+            if let (Some(pid), Some(ib)) = (pf_h.per_layer_inp, &pf_ipl_buf) {
+                pf_b.bind(pid, ib.as_ref());
+            }
+            for l in 0..c.n_layer {
+                pf_b.bind(pf_h.k_cache[l], kbufs[l].as_ref());
+                pf_b.bind(pf_h.v_cache[l], vbufs[l].as_ref());
+            }
+            for (i, wid) in pf_h.weights.iter().enumerate() {
+                pf_b.bind(*wid, wbufs[i].as_ref());
+            }
+            pf_b.bind(pf_h.logits, logits_buf.as_ref());
+            be.execute(pf_plan.as_ref(), &pf_b)
                 .map_err(|e| anyhow!("{e}"))?;
-            be.upload(b.as_ref(), bytemuck::cast_slice(&ipl))
-                .map_err(|e| anyhow!("{e}"))?;
-            Some(b)
-        } else {
-            None
-        };
-        let pf_t0 = std::time::Instant::now();
-        let (pf_g, pf_h) = build(pf_m, start);
-        let pf_plan = be.compile(&pf_g).map_err(|e| anyhow!("{e}"))?;
-        let mut pf_b = Bindings::new();
-        pf_b.bind(pf_h.hidden, pf_hidden_buf.as_ref());
-        pf_b.bind(pf_h.positions, pf_pos_buf.as_ref());
-        // gemma4's proportional-RoPE divisors are a graph input too — bind them (the per-token decode
-        // loop below does the same). Without this the batched graph has an unbound `rope_freqs` Input
-        // and panics. (E2B's per-layer input is excluded by the `!e2b` guard above.)
-        if let (Some(rid), Some((rb, _))) = (pf_h.rope_freqs, &rf_buf) {
-            pf_b.bind(rid, rb.as_ref());
+            prompt_t += pf_t0.elapsed();
+            cstart = cend;
         }
-        if let (Some(pid), Some(ib)) = (pf_h.per_layer_inp, &pf_ipl_buf) {
-            pf_b.bind(pid, ib.as_ref());
-        }
-        for l in 0..c.n_layer {
-            pf_b.bind(pf_h.k_cache[l], kbufs[l].as_ref());
-            pf_b.bind(pf_h.v_cache[l], vbufs[l].as_ref());
-        }
-        for (i, wid) in pf_h.weights.iter().enumerate() {
-            pf_b.bind(*wid, wbufs[i].as_ref());
-        }
-        pf_b.bind(pf_h.logits, logits_buf.as_ref());
-        be.execute(pf_plan.as_ref(), &pf_b)
-            .map_err(|e| anyhow!("{e}"))?;
-        prompt_t += pf_t0.elapsed();
 
         // KV rows are now filled through position plen-2; the last prompt token is handled by
         // the decode loop below (writes its KV, produces the logits the first sample uses).
-        prompt.len() - 1
+        pf_end
     } else {
         start // fall through to per-token loop for MoE / E2B / short suffixes
     };

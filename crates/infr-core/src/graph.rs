@@ -173,6 +173,17 @@ pub enum Op {
         act: Activation,
         up_off: u32,
     },
+    /// Gated FFN activation over a COMBINED `gu` buffer `[rows, 2*nff]` (gate half first, up half
+    /// second per row): `dst[r,i] = act(gu[r,i]) * gu[r, nff+i]`. Produced when the runner
+    /// concatenates the gate+up weights into one `[2*nff, ne]` tensor so the FFN input projection
+    /// is a single GEMV/GEMM instead of two (see `Capabilities::combined_gu`).
+    GatedActFused {
+        gu: TensorId,
+        dst: TensorId,
+        rows: u32,
+        nff: u32,
+        act: Activation,
+    },
     /// `dst[i] = a[i] + b[i]` (residual add). In place when `dst == a`.
     Add {
         a: TensorId,
@@ -294,6 +305,7 @@ impl Op {
             Op::WriteKv { .. } => "WriteKv",
             Op::Attention { .. } => "Attention",
             Op::GatedAct { .. } => "GatedAct",
+            Op::GatedActFused { .. } => "GatedActFused",
             Op::Add { .. } => "Add",
             Op::Scale { .. } => "Scale",
             Op::Softcap { .. } => "Softcap",

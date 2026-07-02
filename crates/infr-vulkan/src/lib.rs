@@ -455,6 +455,7 @@ impl VulkanBackend {
             // The seam adapter records the decode graph once and replays it (params-driven `_dyn`
             // kernels); the runner compiles the eligible qwen3 decode graph once.
             decode_replay: true,
+            combined_gu: true,
         };
 
         // ── gpu-allocator ──────────────────────────────────────────────────────

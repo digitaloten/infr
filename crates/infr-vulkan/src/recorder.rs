@@ -2293,12 +2293,13 @@ impl<'a> Recorder<'a> {
         let mut push = [0u8; 8];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(nff as u32).to_ne_bytes());
+        // Thread-per-element kernel (local_size 64) — dispatch element-count/64 workgroups.
         self.dispatch(
             k,
             &[Self::vkb(gu), Self::vkb(y)],
             1,
             &push,
-            (rows * nff) as u32,
+            ((rows * nff) as u32).div_ceil(64),
         );
     }
 
@@ -2312,12 +2313,13 @@ impl<'a> Recorder<'a> {
         let mut push = [0u8; 8];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(nff as u32).to_ne_bytes());
+        // Thread-per-element kernel (local_size 64) — dispatch element-count/64 workgroups.
         self.dispatch(
             k,
             &[Self::vkb(gu), Self::vkb(y)],
             1,
             &push,
-            (rows * nff) as u32,
+            ((rows * nff) as u32).div_ceil(64),
         );
     }
 

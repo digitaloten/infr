@@ -78,6 +78,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::WriteKv { .. } => "WriteKv",
         Op::Attention { .. } => "Attention",
         Op::GatedAct { .. } => "GatedAct",
+        Op::GatedActFused { .. } => "GatedActFused",
         Op::Add { .. } => "Add",
         Op::Scale { .. } => "Scale",
         Op::Softcap { .. } => "Softcap",
@@ -831,6 +832,13 @@ impl MetalBackend {
                     rows * nff,
                 );
                 r.loc[dst.0 as usize] = Loc::Device;
+            }
+            // Only produced when `Capabilities::combined_gu` is set — Metal leaves it false (the
+            // reference backend keeps the separate gate/up form), so this arm is unreachable.
+            Op::GatedActFused { .. } => {
+                return Err(be(
+                    "metal: GatedActFused unsupported (combined_gu is false)",
+                ))
             }
             Op::WriteKv {
                 src,
