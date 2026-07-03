@@ -216,46 +216,29 @@ pub(crate) fn generate_dense_gpu_session(
     generate_dense_backend(
         vk,
         &|name, tb, dt, _n| {
-            // Raw upload for EVERYTHING except bf16 — the file's bytes go straight to VRAM (u32-padded)
-            // and the kernel reads/dequants the native dtype in-shader. F16 needs no conversion (the
-            // f16 coopmat GEMM / f16 GEMV read it directly), F32 is left native (rmsnorm/qk_norm_rope
-            // read f32; the norms would be corrupted by narrowing), and quant weights are raw blocks.
-            // bf16 is the one exception: this GPU has no hardware bf16 coopmat, so bf16 weights are
-            // narrowed to f16 on load until a raw-bf16 GEMM lands (tracked; slightly lossy).
-            match dt {
-                DType::Bf16 => {
-                    let f32v = crate::dequant_block(dt, &tb).map_err(|e| anyhow!("{e}"))?;
-                    let mut f16b = Vec::with_capacity(f32v.len() * 2);
-                    for &v in &f32v {
-                        f16b.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
-                    }
-                    let buf = vk
-                        .alloc(f16b.len(), BufferUsage::Weights)
-                        .map_err(|e| anyhow!("{e}"))?;
-                    vk.upload(buf.as_ref(), &f16b).map_err(|e| anyhow!("{e}"))?;
-                    Ok((buf, DType::F16))
-                }
-                _ => {
-                    let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
-                    // Auto-fit-offloaded expert banks land in HOST memory (HostWeights =
-                    // system-RAM GTT the GPU reads over the bus; it binds as an SSBO like any
-                    // weight). alloc_uninit: the upload covers the whole extent.
-                    let usage = if host_bank(name) {
-                        BufferUsage::HostWeights
-                    } else {
-                        BufferUsage::Weights
-                    };
-                    let buf = if matches!(usage, BufferUsage::HostWeights) {
-                        vk.alloc_uninit(padded.len(), usage)
-                    } else {
-                        vk.alloc(padded.len(), usage)
-                    }
-                    .map_err(|e| anyhow!("{e}"))?;
-                    vk.upload(buf.as_ref(), &padded)
-                        .map_err(|e| anyhow!("{e}"))?;
-                    Ok((buf, dt))
-                }
+            // Raw upload for EVERY dtype — the file's bytes go straight to VRAM (u32-padded) and the
+            // kernel reads/dequants the native dtype in-shader. F16 → f16 coopmat GEMM / f16 GEMV;
+            // F32 stays native (rmsnorm/qk_norm_rope read f32); bf16 → in-shader expand (bf16 is the
+            // top 16 bits of an f32, EXACT; the warp GEMM narrows to f16 for the matrix cores like
+            // every other format); quant weights → raw blocks. No host dtype conversion on any path.
+            let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
+            // Auto-fit-offloaded expert banks land in HOST memory (HostWeights = system-RAM GTT the
+            // GPU reads over the bus; it binds as an SSBO like any weight). alloc_uninit: the upload
+            // covers the whole extent.
+            let usage = if host_bank(name) {
+                BufferUsage::HostWeights
+            } else {
+                BufferUsage::Weights
+            };
+            let buf = if matches!(usage, BufferUsage::HostWeights) {
+                vk.alloc_uninit(padded.len(), usage)
+            } else {
+                vk.alloc(padded.len(), usage)
             }
+            .map_err(|e| anyhow!("{e}"))?;
+            vk.upload(buf.as_ref(), &padded)
+                .map_err(|e| anyhow!("{e}"))?;
+            Ok((buf, dt))
         },
         g,
         cfg,

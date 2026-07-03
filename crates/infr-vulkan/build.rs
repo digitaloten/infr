@@ -94,6 +94,12 @@ fn main() {
         ),
         // Native-block dequant GEMVs: one .spv per (quant format, residual) from one source.
         ("native_gemv", "native_q8_0", &["-DFMT_Q8_0"]),
+        ("native_gemv", "native_bf16", &["-DFMT_BF16"]),
+        (
+            "native_gemv",
+            "native_bf16_res",
+            &["-DFMT_BF16", "-DUSE_RES"],
+        ),
         (
             "native_gemv",
             "native_iq2xxs",
@@ -349,6 +355,12 @@ fn main() {
             "native_gemm_warp_q8_0_sk_ag",
             &["-DFMT_Q8_0", "-DNARROW_N", "-DSPLIT_K", "-DA_GLOBAL"],
         ),
+        ("native_gemm_warp", "native_gemm_warp_bf16", &["-DFMT_BF16"]),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_bf16_n128",
+            &["-DFMT_BF16", "-DNARROW_N"],
+        ),
         (
             "native_gemm_warp",
             "native_gemm_warp_iq4xs",
@@ -459,6 +471,7 @@ fn main() {
         ),
         ("splitk_reduce", "splitk_reduce", &[]),
         ("native_gemm", "native_gemm_q8_0", &["-DFMT_Q8_0"]),
+        ("native_gemm", "native_gemm_bf16", &["-DFMT_BF16"]),
         ("native_gemm", "native_gemm_q4_0", &["-DFMT_Q4_0"]),
         ("native_gemm", "native_gemm_q4_1", &["-DFMT_Q4_1"]),
         ("native_gemm", "native_gemm_q5_0", &["-DFMT_Q5_0"]),

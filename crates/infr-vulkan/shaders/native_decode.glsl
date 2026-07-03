@@ -37,6 +37,19 @@ void dqblk(uint gstart, out float v[32]) {
 }
 #endif
 
+#if defined(FMT_BF16)
+// BF16: contiguous 16-bit truncated-f32 (no blocks/scale). y = bitcast(bits << 16) — EXACT (bf16 is
+// the top 16 bits of an f32). Element e lives at byte e*2 (packed 2-per-u32).
+float dq(uint g) {
+    return uintBitsToFloat(ru16(g * 2u) << 16u);
+}
+#define HAVE_DQBLK
+void dqblk(uint gstart, out float v[32]) {
+    uint bo = gstart * 2u;
+    for (uint w = 0u; w < 32u; w++) { v[w] = uintBitsToFloat(ru16(bo + w * 2u) << 16u); }
+}
+#endif
+
 #if defined(FMT_Q4_0)
 // Q4_0: [f16 d][u8 qs[16]] = 18 bytes, 32 elements. y = d * (nibble - 8).
 float dq(uint g) {

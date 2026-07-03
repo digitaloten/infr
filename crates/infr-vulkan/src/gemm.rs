@@ -34,6 +34,8 @@ pub(crate) fn native_build_spv(dtype: infr_core::DType, res: bool) -> Option<&'s
     Some(match (dtype, res) {
         (Q8_0, false) => v!("native_q8_0"),
         (Q8_0, true) => v!("native_q8_0_res"),
+        (Bf16, false) => v!("native_bf16"),
+        (Bf16, true) => v!("native_bf16_res"),
         (Q4_0, false) => v!("native_q4_0"),
         (Q4_0, true) => v!("native_q4_0_res"),
         (Q4_1, false) => v!("native_q4_1"),
@@ -217,6 +219,7 @@ pub(crate) fn native_gemm_warp_build_spv(dtype: infr_core::DType) -> Option<&'st
         }};
     }
     Some(match dtype {
+        Bf16 => v!("native_gemm_warp_bf16"),
         Iq4Xs => v!("native_gemm_warp_iq4xs"),
         Q2K => v!("native_gemm_warp_q2k"),
         Q4_0 => v!("native_gemm_warp_q4_0"),
@@ -242,6 +245,7 @@ pub(crate) fn native_gemm_warp_n128_build_spv(dtype: infr_core::DType) -> Option
         }};
     }
     Some(match dtype {
+        Bf16 => v!("native_gemm_warp_bf16_n128"),
         Iq4Xs => v!("native_gemm_warp_iq4xs_n128"),
         Q2K => v!("native_gemm_warp_q2k_n128"),
         Q4_0 => v!("native_gemm_warp_q4_0_n128"),
@@ -426,6 +430,7 @@ pub(crate) fn native_gemm_build_spv(dtype: infr_core::DType) -> Option<&'static 
     }
     Some(match dtype {
         Q8_0 => v!("native_gemm_q8_0"),
+        Bf16 => v!("native_gemm_bf16"),
         Q4_0 => v!("native_gemm_q4_0"),
         Q4_1 => v!("native_gemm_q4_1"),
         Q5_0 => v!("native_gemm_q5_0"),

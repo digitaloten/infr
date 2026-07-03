@@ -69,6 +69,8 @@ pub fn native_kernel_name(dtype: infr_core::DType, residual: bool) -> &'static s
     match (dtype, residual) {
         (Q8_0, false) => "native_q8_0",
         (Q8_0, true) => "native_q8_0_res",
+        (Bf16, false) => "native_bf16",
+        (Bf16, true) => "native_bf16_res",
         (Q4_0, false) => "native_q4_0",
         (Q4_0, true) => "native_q4_0_res",
         (Q4_1, false) => "native_q4_1",
@@ -122,6 +124,7 @@ pub fn native_gemm_kernel_name(dtype: infr_core::DType) -> &'static str {
     use infr_core::DType::*;
     match dtype {
         Q8_0 => "native_gemm_q8_0",
+        Bf16 => "native_gemm_bf16",
         Q4_0 => "native_gemm_q4_0",
         Q4_1 => "native_gemm_q4_1",
         Q5_0 => "native_gemm_q5_0",
@@ -161,7 +164,8 @@ pub fn native_dense_supported(dtype: infr_core::DType) -> bool {
     use infr_core::DType::*;
     matches!(
         dtype,
-        Q8_0 | Q4_0
+        Bf16 | Q8_0
+            | Q4_0
             | Q4_1
             | Q5_0
             | Q5_1
