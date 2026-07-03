@@ -419,12 +419,24 @@ impl CpuModel {
     /// [`bench`](Self::bench)): prefill `n_prompt` dummy tokens, decode `n_gen`, return the timing.
     /// Lets `infr bench` (with `INFR_METAL=1`) measure pp/tg directly comparable to `llama-bench`
     /// on the Metal build.
+    /// Runs through a persistent [`DenseMetalSession`] so backend, uploaded weights, compiled
+    /// pipelines, and the dequant/repack weight caches all survive across reps — a fresh backend
+    /// per rep re-paid every one-time cost inside the measurement (a factored-format checkpoint
+    /// re-repacked hundreds of MB per rep). The materialized tokens reset each call, so every
+    /// rep still measures a FULL prefill (llama-bench keeps one context across reps the same way).
     #[cfg(target_os = "macos")]
-    pub fn bench_metal(&self, n_prompt: usize, n_gen: usize) -> Result<crate::GenStats> {
+    pub fn bench_metal(
+        &self,
+        session: &mut DenseMetalSession,
+        n_prompt: usize,
+        n_gen: usize,
+    ) -> Result<crate::GenStats> {
         let prompt: Vec<u32> = (0..n_prompt.max(1)).map(|i| (i % 100) as u32).collect();
-        let mtl = infr_metal::MetalBackend::new().map_err(|e| anyhow!("metal init: {e}"))?;
-        let (_, stats) = crate::cpu_backend::generate_dense_metal(
-            &mtl,
+        if let Some(s) = session.state.as_mut() {
+            s.reset_tokens();
+        }
+        let (_, stats) = crate::cpu_backend::generate_dense_metal_session(
+            &session.mtl,
             &self.gguf,
             &self.cfg,
             &self.token_embd,
@@ -432,6 +444,9 @@ impl CpuModel {
             &prompt,
             n_gen,
             |_| {},
+            &mut session.state,
+            session.max_ctx,
+            None,
         )?;
         Ok(stats)
     }

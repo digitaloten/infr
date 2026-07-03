@@ -361,6 +361,14 @@ fn linear_add_fusion_q4k_parity() {
 
 #[test]
 #[ignore = "requires a Metal GPU"]
+fn linear_add_fusion_q8_0_parity() {
+    let (in_f, out_f) = (512usize, 384usize);
+    let wf = rand_f32(out_f * in_f, 95);
+    check_linear_add_fusion(DType::Q8_0, quantize_q8_0(&wf), in_f, out_f);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
 fn linear_add_fusion_q6k_parity() {
     let (in_f, out_f) = (512usize, 384usize);
     check_linear_add_fusion(DType::Q6K, synth_q6k(out_f * in_f, 94), in_f, out_f);
@@ -650,6 +658,25 @@ fn linear_q8_0_matches_dequant_reference() {
         let err = (r - mm).abs() / r.abs().max(1.0);
         assert!(err <= 1e-3, "elem {i}: ref={r} metal={mm} err={err}");
     }
+}
+
+// Native Q8_0 half-fragment GEMM (m=18 → the hmm route; out_f % 64 != 0 keeps cmm out).
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_q8_0_gemm_matches_dequant_reference() {
+    let (m, in_f, out_f) = (18usize, 256usize, 96usize);
+    let wf = rand_f32(out_f * in_f, 96);
+    check_quant_linear_parity_impl(DType::Q8_0, quantize_q8_0(&wf), m, in_f, out_f, 1e-3, true);
+}
+
+// Native Q8_0 GEMV (m=1, the mul_mv_q8_0 shape: FOUR rows per simdgroup; out_f=94 exercises the
+// clamped tail rows of a partial 4-row group).
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_q8_0_gemv_matches_dequant_reference() {
+    let (m, in_f, out_f) = (1usize, 256usize, 94usize);
+    let wf = rand_f32(out_f * in_f, 97);
+    check_quant_linear_parity(DType::Q8_0, quantize_q8_0(&wf), m, in_f, out_f);
 }
 
 // K-quants are the formats real checkpoints actually ship. Exercise the Metal dequant path
@@ -1022,6 +1049,13 @@ fn attention_q8_flash_parity() {
     q8_attention_test(17, 136, 128, 119, 5e-3, 260);
 }
 
+// hd=256 q8 decode (gemma + INFR_KV_Q8): the NSG=16 q8 vector instantiation.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_q8_vec_hd256_parity() {
+    q8_attention_test(1, 200, 256, 199, 1e-4, 270);
+}
+
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn attention_gqa_causal_parity() {
@@ -1187,6 +1221,71 @@ fn attention_flash2_hd128_matches_reference() {
         (vc, f16_bytes(&rand_f32(kv_len * nkv * hd, 183))),
     ];
     assert_parity(&g, &bound, dst, rows * nh * hd, 5e-3);
+}
+
+// hd=256 (gemma): the cooperative flash instantiation with 8 O fragments per simdgroup.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_flash2_hd256_matches_reference() {
+    let (rows, kv_len, nh, nkv, hd, pos) = (17usize, 136usize, 8usize, 2usize, 256usize, 119usize);
+    let mut g = Graph::new();
+    let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    g.push(Op::Attention {
+        q,
+        k_cache: kc,
+        v_cache: vc,
+        dst,
+        rows: rows as u32,
+        kv_len: kv_len as u32,
+        n_head: nh as u32,
+        n_kv: nkv as u32,
+        head_dim: hd as u32,
+        scale: 1.0 / (hd as f32).sqrt(),
+        mask: infr_core::graph::AttnMask::SlidingWindow(64),
+        pos: pos as u32,
+    });
+    let bound = vec![
+        (q, f32_bytes(&rand_f32(rows * nh * hd, 401))),
+        (kc, f16_bytes(&rand_f32(kv_len * nkv * hd, 402))),
+        (vc, f16_bytes(&rand_f32(kv_len * nkv * hd, 403))),
+    ];
+    assert_parity(&g, &bound, dst, rows * nh * hd, 5e-3);
+}
+
+// hd=256 decode (gemma): the NSG=16 vector flash instantiation, sliding window active (gemma's
+// local layers decode with window clipping — the shape the sweep found on the split fallback).
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_vec_hd256_sliding_window_parity() {
+    let (rows, kv_len, nh, nkv, hd, pos) = (1usize, 200usize, 4usize, 1usize, 256usize, 199usize);
+    let mut g = Graph::new();
+    let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    g.push(Op::Attention {
+        q,
+        k_cache: kc,
+        v_cache: vc,
+        dst,
+        rows: rows as u32,
+        kv_len: kv_len as u32,
+        n_head: nh as u32,
+        n_kv: nkv as u32,
+        head_dim: hd as u32,
+        scale: 1.0 / (hd as f32).sqrt(),
+        mask: infr_core::graph::AttnMask::SlidingWindow(96),
+        pos: pos as u32,
+    });
+    let bound = vec![
+        (q, f32_bytes(&rand_f32(rows * nh * hd, 404))),
+        (kc, f16_bytes(&rand_f32(kv_len * nkv * hd, 405))),
+        (vc, f16_bytes(&rand_f32(kv_len * nkv * hd, 406))),
+    ];
+    assert_parity(&g, &bound, dst, rows * nh * hd, 1e-4);
 }
 
 // Sliding-window masking through the cooperative flash kernel: the analytic per-row window

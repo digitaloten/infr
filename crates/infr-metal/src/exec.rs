@@ -88,7 +88,7 @@ fn linear_add_peephole(
         if !matches!(g.tensors[dst.0 as usize].kind, TensorKind::Internal) {
             continue;
         }
-        if !matches!(g.desc(*weight).dtype, DType::Q4K | DType::Q6K) {
+        if !matches!(g.desc(*weight).dtype, DType::Q4K | DType::Q6K | DType::Q8_0) {
             continue;
         }
         if let Some(Op::Add {
@@ -188,7 +188,7 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
             } => {
                 has_attn = true;
                 if *rows != 1
-                    || !matches!(*head_dim, 64 | 128)
+                    || !matches!(*head_dim, 64 | 128 | 256)
                     || !matches!(g.desc(*k_cache).dtype, DType::F16 | DType::Q8_0)
                 {
                     return false;
@@ -515,21 +515,27 @@ impl MetalBackend {
         let dyn_cap_ok = || -> bool {
             let kern = g.ops.iter().find_map(|op| match op {
                 Op::Attention {
-                    head_dim: hd @ (64 | 128),
+                    head_dim: hd @ (64 | 128 | 256),
                     k_cache,
                     ..
-                } => Some(match (g.desc(*k_cache).dtype == DType::Q8_0, hd) {
-                    (false, 64) => "attnvec_dyn_f16kv_hd64",
-                    (false, _) => "attnvec_dyn_f16kv_hd128",
-                    (true, 64) => "attnvec_dyn_q8kv_hd64",
-                    (true, _) => "attnvec_dyn_q8kv_hd128",
-                }),
+                } => Some((
+                    match (g.desc(*k_cache).dtype == DType::Q8_0, hd) {
+                        (false, 64) => "attnvec_dyn_f16kv_hd64",
+                        (false, 256) => "attnvec_dyn_f16kv_hd256",
+                        (false, _) => "attnvec_dyn_f16kv_hd128",
+                        (true, 64) => "attnvec_dyn_q8kv_hd64",
+                        (true, 256) => "attnvec_dyn_q8kv_hd256",
+                        (true, _) => "attnvec_dyn_q8kv_hd128",
+                    },
+                    // hd=256 instantiates at NSG=16 (threadgroup budget) — 512 threads.
+                    if *hd == 256 { 512 } else { 1024 },
+                )),
                 _ => None,
             });
-            kern.is_some_and(|kn| {
+            kern.is_some_and(|(kn, need)| {
                 self.pipelines
                     .get(kn)
-                    .map(|pl| pl.max_total_threads_per_threadgroup() >= 1024)
+                    .map(|pl| pl.max_total_threads_per_threadgroup() >= need)
                     .unwrap_or(false)
             })
         };
@@ -733,7 +739,12 @@ impl MetalBackend {
         bindings: &Bindings,
     ) -> Arc<MtlBuffer> {
         let buf = metal_buf(bindings.get(id).expect("metal backend: unbound Weight"));
-        let key = buf as *const _ as usize;
+        // Key on the UNDERLYING MTLBuffer (unified-memory contents pointer), not the wrapper
+        // address: the runner rebuilds its bindings map per prefill graph, so wrapper addresses
+        // change every forward and a wrapper-keyed cache re-repacks each one — hundreds of ms
+        // per forward on a factored-format checkpoint. The MTLBuffer lives as long as the
+        // uploaded weight, so its contents pointer is stable and unique.
+        let key = buf.raw.contents() as usize;
         if let Some(w) = self.weight_cache.lock().unwrap().get(&key) {
             return w.clone();
         }
@@ -767,13 +778,15 @@ impl MetalBackend {
         bindings: &Bindings,
     ) -> Arc<QuiWeight> {
         let buf = metal_buf(bindings.get(id).expect("metal backend: unbound Weight"));
-        let key = buf as *const _ as usize;
+        // Stable underlying-buffer key — see `weight_buf` for why the wrapper address is not.
+        let key = buf.raw.contents() as usize;
         if let Some(w) = self.qui_cache.lock().unwrap().get(&key) {
             return w.clone();
         }
         let native_kern = match g.desc(id).dtype {
             DType::Q4K => Some("linear_q4k"),
             DType::Q6K => Some("linear_q6k"),
+            DType::Q8_0 => Some("linear_q8_0"),
             _ => None,
         };
         if let Some(kern) = native_kern {
@@ -978,6 +991,7 @@ impl MetalBackend {
                         // Native kernels read raw GGUF blocks; scm/dd are dummy buffers.
                         "linear_q4k" => (e / 256 * 144, 0, 0),
                         "linear_q6k" => (e / 256 * 210, 0, 0),
+                        "linear_q8_0" => (e / 32 * 34, 0, 0),
                         "linear_quik4" => (e / 2, e / 4, dd_off),
                         "linear_quik6" => (e / 4 * 3, e / 4, dd_off),
                         _ => (e, e / 4, dd_off),
@@ -1001,6 +1015,7 @@ impl MetalBackend {
                         "linear_quik6" => "linear_quik6_hmm",
                         "linear_q4k" => "linear_q4k_hmm",
                         "linear_q6k" => "linear_q6k_hmm",
+                        "linear_q8_0" => "linear_q8_0_hmm",
                         _ => "linear_quik8_hmm",
                     };
                     let cmm_kern = match qw.kern {
@@ -1008,6 +1023,7 @@ impl MetalBackend {
                         "linear_quik6" => "linear_quik6_cmm",
                         "linear_q4k" => "linear_q4k_cmm",
                         "linear_q6k" => "linear_q6k_cmm",
+                        "linear_q8_0" => "linear_q8_0_cmm",
                         _ => "linear_quik8_cmm",
                     };
                     // Prefer the cooperative 32x64 threadgroup tile; per-simdgroup HGEMM covers
@@ -1076,13 +1092,16 @@ impl MetalBackend {
                                 "linear_quik6" => "linear_quik6_rt",
                                 "linear_q4k" => "linear_q4k_rt",
                                 "linear_q6k" => "linear_q6k_rt",
+                                "linear_q8_0" => "linear_q8_0_rt",
                                 _ => "linear_quik8_rt",
                             };
                             (rt, m.div_ceil(8) * out_f)
                         } else {
-                            // The native mul_mv-shape GEMVs cover TWO output rows per simdgroup.
+                            // The native mul_mv-shape GEMVs cover TWO output rows per simdgroup
+                            // (FOUR for Q8_0 — llama.cpp's N_R0_Q8_0).
                             let sgs = match qw.kern {
                                 "linear_q4k" | "linear_q6k" => out_f.div_ceil(2),
+                                "linear_q8_0" => out_f.div_ceil(4),
                                 _ => out_f,
                             };
                             (qw.kern, sgs)
@@ -1092,6 +1111,7 @@ impl MetalBackend {
                         if let Some(&(res, fdst)) = r.fused.get(&idx) {
                             let fk = match kern {
                                 "linear_q4k" => "linear_q4k_add",
+                                "linear_q8_0" => "linear_q8_0_add",
                                 _ => "linear_q6k_add",
                             };
                             let bres = self.ensure_device(r, res);
@@ -1434,10 +1454,14 @@ impl MetalBackend {
                     // which is exactly what a replayed tape can't have.
                     let kern = match (g.desc(k_cache).dtype == DType::Q8_0, hd) {
                         (false, 64) => "attnvec_dyn_f16kv_hd64",
+                        (false, 256) => "attnvec_dyn_f16kv_hd256",
                         (false, _) => "attnvec_dyn_f16kv_hd128",
                         (true, 64) => "attnvec_dyn_q8kv_hd64",
+                        (true, 256) => "attnvec_dyn_q8kv_hd256",
                         (true, _) => "attnvec_dyn_q8kv_hd128",
                     };
+                    // hd=256 instantiates at NSG=16 (see the shader) — half the threadgroup.
+                    let nsg = if hd == 256 { 16 } else { 32 };
                     let pso = self.pipelines.get(kern)?;
                     let mut p = (rows as u32).to_ne_bytes().to_vec();
                     p.extend_from_slice(&(kv_len as u32).to_ne_bytes());
@@ -1452,8 +1476,8 @@ impl MetalBackend {
                         &pso,
                         &[bq.as_ref(), &kbuf.raw, &vbuf.raw, bd.as_ref(), &posbuf],
                         &p,
-                        rows * nh * 32 * 32,
-                        32 * 32,
+                        rows * nh * nsg * 32,
+                        nsg * 32,
                     );
                     r.loc[dst.0 as usize] = Loc::Device;
                     return Ok(());
@@ -1510,23 +1534,25 @@ impl MetalBackend {
                     }
                     // The vector kernel runs one threadgroup per (row, head), covering decode
                     // and any prefill shape the flash gate declined.
-                    let vq8 = matches!(hd, 64 | 128) && kv_len >= 128 && {
-                        let kn = if hd == 64 {
-                            "attnvec_q8kv_hd64"
-                        } else {
-                            "attnvec_q8kv_hd128"
-                        };
-                        self.pipelines
-                            .get(kn)
-                            .map(|pl| pl.max_total_threads_per_threadgroup() >= 1024)
-                            .unwrap_or(false)
+                    let vq8_kern = match hd {
+                        64 => Some("attnvec_q8kv_hd64"),
+                        128 => Some("attnvec_q8kv_hd128"),
+                        256 => Some("attnvec_q8kv_hd256"),
+                        _ => None,
                     };
+                    // hd=256 instantiates at NSG=16 (threadgroup budget) — 512 threads.
+                    let vnsg = if hd == 256 { 16 } else { 32 };
+                    let vq8 = kv_len >= 128
+                        && vq8_kern.is_some_and(|kn| {
+                            self.pipelines
+                                .get(kn)
+                                .map(|pl| {
+                                    pl.max_total_threads_per_threadgroup() >= vnsg as u64 * 32
+                                })
+                                .unwrap_or(false)
+                        });
                     let kern = if vq8 {
-                        if hd == 64 {
-                            "attnvec_q8kv_hd64"
-                        } else {
-                            "attnvec_q8kv_hd128"
-                        }
+                        vq8_kern.unwrap()
                     } else {
                         "attention_q8kv"
                     };
@@ -1539,7 +1565,7 @@ impl MetalBackend {
                     p.extend_from_slice(&scale.to_ne_bytes());
                     p.extend_from_slice(&window.to_ne_bytes());
                     p.extend_from_slice(&pos.to_ne_bytes());
-                    let nsg = if vq8 { 32 } else { 1 };
+                    let nsg = if vq8 { vnsg } else { 1 };
                     self.encode_tg(
                         r,
                         &pso,
@@ -1566,8 +1592,6 @@ impl MetalBackend {
                 // fragments load straight from the cache, Q is cast once to f16 below. Small
                 // kv_len stays scalar (also keeps the short-kv wide parity test on the exact
                 // path). See `attnflash_f16kv` for why the f32 flash attempt lost and this wins.
-                let flash = f16 && rows * nh >= 128 && kv_len >= 64 && hd <= 128 && hd % 8 == 0;
-                let split = !flash && (rows * nh < 128 || kv_len >= 128);
                 // The cooperative flash kernel (4 simdgroups per query tile, llama.cpp
                 // flash_attn_ext structure) is instantiated per compile-time head size
                 // (fully unrolled QK/PV loops) and needs a 128-thread threadgroup
@@ -1576,15 +1600,24 @@ impl MetalBackend {
                 let flash2_kern = match hd {
                     64 => Some("attnflash2_f16kv_hd64"),
                     128 => Some("attnflash2_f16kv_hd128"),
+                    256 => Some("attnflash2_f16kv_hd256"),
                     _ => None,
                 };
-                let flash2 = flash
-                    && flash2_kern.is_some_and(|kn| {
-                        self.pipelines
-                            .get(kn)
-                            .map(|pl| pl.max_total_threads_per_threadgroup() >= 128)
-                            .unwrap_or(false)
-                    });
+                let flash2_ok = flash2_kern.is_some_and(|kn| {
+                    self.pipelines
+                        .get(kn)
+                        .map(|pl| pl.max_total_threads_per_threadgroup() >= 128)
+                        .unwrap_or(false)
+                });
+                // hd > 128 has no single-simdgroup flash fallback (its register accumulator
+                // tops out at 128), so the wide gate only opens there when flash2 itself can run.
+                let flash = f16
+                    && rows * nh >= 128
+                    && kv_len >= 64
+                    && hd % 8 == 0
+                    && (hd <= 128 || flash2_ok);
+                let split = !flash && (rows * nh < 128 || kv_len >= 128);
+                let flash2 = flash && flash2_ok;
                 // The split kernels REQUIRE their full NSG*32-thread threadgroup: every simdgroup
                 // owns a strided KV slice, so a smaller launch would silently skip positions and
                 // merge uninitialized partials. maxTotalThreadsPerThreadgroup is per-PIPELINE
@@ -1604,8 +1637,11 @@ impl MetalBackend {
                 let vec_kern = match hd {
                     64 => Some("attnvec_f16kv_hd64"),
                     128 => Some("attnvec_f16kv_hd128"),
+                    256 => Some("attnvec_f16kv_hd256"),
                     _ => None,
                 };
+                // hd=256 instantiates at NSG=16 (threadgroup budget) — 512 threads.
+                let vec_nsg: usize = if hd == 256 { 16 } else { 32 };
                 let vec = !flash
                     && f16
                     && split
@@ -1613,7 +1649,7 @@ impl MetalBackend {
                     && vec_kern.is_some_and(|kn| {
                         self.pipelines
                             .get(kn)
-                            .map(|pl| pl.max_total_threads_per_threadgroup() >= 1024)
+                            .map(|pl| pl.max_total_threads_per_threadgroup() >= vec_nsg as u64 * 32)
                             .unwrap_or(false)
                     });
                 let split32 = split
@@ -1683,7 +1719,9 @@ impl MetalBackend {
                 } else {
                     // One simdgroup per (query, head); split/vec kernels use NSG simdgroups
                     // per pair, grid still exactly rows*n_head threadgroups.
-                    let nsg = if vec || split32 {
+                    let nsg = if vec {
+                        vec_nsg
+                    } else if split32 {
                         32
                     } else if split {
                         8

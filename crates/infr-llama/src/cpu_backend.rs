@@ -387,6 +387,15 @@ impl SeamKv {
         common_prefix_len(&self.cached, prompt)
     }
 
+    /// Forget the materialized tokens WITHOUT dropping weights or buffers: the next call
+    /// re-prefills from position 0 into the same session. Bench reps use this so each rep
+    /// measures a full prefill while weights/pipelines/repack caches stay warm.
+    /// (cfg-gated with its only caller, the Metal bench session — dead code on other targets.)
+    #[cfg(target_os = "macos")]
+    pub(crate) fn reset_tokens(&mut self) {
+        self.cached.clear();
+    }
+
     /// Number of token ids materialized in this slot's KV cache.
     pub(crate) fn cached_len(&self) -> usize {
         self.cached.len()
