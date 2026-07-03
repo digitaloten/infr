@@ -658,7 +658,7 @@ pub(crate) fn generate_dense_backend(
     // and the env is stable for the process, so a warm session and its rebuilt graphs always agree.
     let kv_align_ok =
         (0..c.n_layer).all(|l| (c.layer_n_kv(l) * c.layer_head_dim(l)).is_multiple_of(32));
-    let kv_q8_backend = matches!(be.name(), "metal" | "cpu");
+    let kv_q8_backend = matches!(be.name(), "metal" | "cpu" | "vulkan");
     let parse_kv_fmt = |var: &str| -> DType {
         let side = std::env::var(var).ok();
         let want_q8 = match side.as_deref() {
@@ -672,8 +672,15 @@ pub(crate) fn generate_dense_backend(
             DType::F16
         }
     };
-    let k_fmt = parse_kv_fmt("INFR_KV_TYPE_K");
-    let v_fmt = parse_kv_fmt("INFR_KV_TYPE_V");
+    let mut k_fmt = parse_kv_fmt("INFR_KV_TYPE_K");
+    let mut v_fmt = parse_kv_fmt("INFR_KV_TYPE_V");
+    // Vulkan currently supports only COUPLED Q8 (K==V==q8): its dequant-on-read attention is a single
+    // coupled-Q8 kernel. A mixed request (one side q8, one f16) falls back to f16 on both (CPU/Metal
+    // handle mixed natively). Drop this once the Vulkan mixed-K/V kernels land.
+    if be.name() == "vulkan" && k_fmt != v_fmt {
+        k_fmt = DType::F16;
+        v_fmt = DType::F16;
+    }
 
     // ── one-time session init: weights, KV cache, per-step IO (skipped when `state` is warm) ──
     if state.is_none() {

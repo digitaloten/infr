@@ -304,7 +304,9 @@ fn kv_write_peephole(graph: &Graph) -> (HashMap<usize, (TensorId, usize)>, HashS
             src, cache, pos, ..
         }) = graph.ops.get(i + 1)
         {
-            if src == kxx {
+            // A Q8_0 cache needs a real quantizing WriteKv (store_q8), so DON'T fuse the f16 rope
+            // write into it — leave the standalone WriteKv to run.
+            if src == kxx && matches!(graph.desc(*cache).dtype, infr_core::DType::F16) {
                 fused.insert(i, (*cache, *pos as usize));
                 skip.insert(i + 1);
             }
@@ -696,7 +698,15 @@ fn lower_op(
             let (rows, rs, pos) = (*rows as usize, *row_stride as usize, *pos as usize);
             let n = rows * rs;
             let (s, c) = (r(*src)?, r(*cache)?);
+            // Q8_0 cache: quantize the row(s) into 34 B/32-elem blocks. For a Q8 cache the K-rope
+            // peephole is disabled, so the K WriteKv (f16 staging) reaches here alongside the f32 V.
+            let cache_q8 = matches!(graph.desc(*cache).dtype, infr_core::DType::Q8_0);
+            let src_f16 = matches!(graph.desc(*src).dtype, infr_core::DType::F16);
             match mode {
+                RopeMode::Static(_) if cache_q8 => rec.store_q8(s, c, n, pos * rs, src_f16),
+                RopeMode::Dynamic(params) if cache_q8 => {
+                    rec.store_q8_dyn(s, *params, c, n, src_f16)
+                }
                 RopeMode::Static(_) => match graph.desc(*src).dtype {
                     infr_core::DType::F16 => rec.copy(s, 0, c, pos * rs * 2, n * 2),
                     _ => rec.store_f16(s, c, n, pos * rs),
@@ -879,6 +889,10 @@ fn lower_op(
                 *head_dim as usize,
                 *pos as usize,
             );
+            // Coupled Q8_0 KV cache (K==V==q8): the coalesced f16 flash/split kernels can't read Q8
+            // blocks, so route through the scalar dequant-on-read attention_kv (static) /
+            // attention_kv_dyn (decode) instead. (Native-Q8 coalesced kernels are a follow-up.)
+            let kv_q8 = matches!(graph.desc(*k_cache).dtype, infr_core::DType::Q8_0);
             if let RopeMode::Dynamic(params) = mode {
                 // Eligibility guarantees rows==1. Scale rides a push constant (gemma4 uses 1.0;
                 // 0.0 → kernel default 1/√hd) and SWA windows ride the window-aware prologue +
@@ -902,7 +916,7 @@ fn lower_op(
                 // live kv_len each token, so one recorded plan serves every depth.
                 let chunk = cap.div_ceil(1024).max(64);
                 let n_chunks = cap.div_ceil(chunk);
-                if hd % 4 == 0 && hd <= 512 && n_chunks > 1 {
+                if hd % 4 == 0 && hd <= 512 && n_chunks > 1 && !kv_q8 {
                     // ONE prologue + ONE scratch set per (nh, hd, chunk, n_chunks, window) key:
                     // the first Dynamic attention op of a shape records/allocates; every later
                     // same-shape layer reuses (kv_len is per-token, and the layers' attention ops
@@ -964,6 +978,7 @@ fn lower_op(
                         hd,
                         pscale,
                         window,
+                        kv_q8,
                     );
                 }
             } else {
@@ -973,7 +988,8 @@ fn lower_op(
                 let flash_ok = rows >= 64
                     && hd == 128
                     && matches!(mask, AttnMask::Causal)
-                    && (*scale - 1.0 / (hd as f32).sqrt()).abs() < 1e-6;
+                    && (*scale - 1.0 / (hd as f32).sqrt()).abs() < 1e-6
+                    && !kv_q8;
                 // Prefill at hd≠128 (qwen35/gemma hd=256): the non-FA coopmat pipeline
                 // (attn_qk → softmax → attn_pv) is hd-general and ~an order faster than the scalar
                 // attention_kv. Needs 64-row-padded q/dst (Internal buffers are row-padded), so
@@ -982,6 +998,7 @@ fn lower_op(
                     && rows >= 64
                     && hd % 64 == 0
                     && hd <= 512
+                    && !kv_q8
                     && matches!(graph.tensors[q.0 as usize].kind, TensorKind::Internal)
                     && matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal);
                 // Decode (rows==1): flash-decoding split-K — each head's KV range splits across
@@ -991,7 +1008,7 @@ fn lower_op(
                 // (push constant; gemma4 uses 1.0), and SWA windows (chunks below the window
                 // clamp to empty → zero-weight partials the combine skips).
                 let chunk = (kv_len / 32).clamp(64, 512);
-                let split_ok = rows == 1 && kv_len > chunk && hd % 4 == 0 && hd <= 512;
+                let split_ok = rows == 1 && kv_len > chunk && hd % 4 == 0 && hd <= 512 && !kv_q8;
                 if flash_ok {
                     let mpad = rows.div_ceil(64) * 64;
                     // Pooled split partials (fully written before the combine reads them) — one
@@ -1087,6 +1104,7 @@ fn lower_op(
                         pos,
                         window,
                         *scale,
+                        kv_q8,
                     );
                 }
             }

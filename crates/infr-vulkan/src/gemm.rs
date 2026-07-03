@@ -894,6 +894,14 @@ dyn_spv!(rope_f16_dyn_spv, "rope_f16_dyn");
 dyn_spv!(store_f16_dyn_spv, "store_f16_dyn");
 dyn_spv!(attention_kv_dyn_spv, "attention_kv_dyn");
 dyn_spv!(attn_partial_dyn_spv, "attn_partial_dyn");
+// Coupled Q8_0 KV cache: scalar dequant-on-read attention (static + record-once) and the row
+// quantize-store kernels (f32 V + f16 K sources, each with a params/decode variant).
+dyn_spv!(attention_kv_q8_spv, "attention_kv_q8");
+dyn_spv!(attention_kv_dyn_q8_spv, "attention_kv_dyn_q8");
+dyn_spv!(store_q8_spv, "store_q8");
+dyn_spv!(store_q8_dyn_spv, "store_q8_dyn");
+dyn_spv!(store_q8_f16_spv, "store_q8_f16");
+dyn_spv!(store_q8_f16_dyn_spv, "store_q8_f16_dyn");
 /// SPIR-V for the SELF-CHUNKING record-once split-K decode partial (adaptive chunk from the live
 /// kv_len; workgroups past the live range early-exit with a zero-weight header).
 pub(crate) fn attn_partial_dynac_spv() -> &'static [u32] {

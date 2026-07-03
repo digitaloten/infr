@@ -3,12 +3,46 @@
 // q/k/v f16, o f32. hd <= 512 (thread t owns output dims t, t+64, …, t+7*64 that fall < hd).
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#ifdef KVQ8
+// KV cache stored as GGUF Q8_0 blocks: [f16 d][i8 qs[32]] = 34 bytes / 32 elems. K and V are read
+// as raw bytes and dequantized per element (y = d * qs[j]). Coupled K==V==Q8 (mixed K/V dtype is a
+// CPU-only feature for now). Keeps the scalar path correct; the coalesced flash/split kernels stay
+// f16-only and are gated off for a Q8 cache.
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+#endif
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC { uint q_len; uint kv_len; uint nh; uint nkv; uint hd; uint pos_offset; uint window; float scale; } pc;
 layout(binding = 0) readonly buffer QB { float16_t q[]; };
+#ifdef KVQ8
+layout(binding = 1) readonly buffer KB { uint8_t kbuf[]; };
+layout(binding = 2) readonly buffer VB { uint8_t vbuf[]; };
+// Dequant element `idx` from a Q8_0 byte buffer: block = idx/32 (byte base block*34), the block's
+// f16 scale sits at the base, the int8 code at base+2+idx%32.
+float dq8k(uint idx) {
+    uint b = (idx / 32u) * 34u;
+    uint16_t s = uint16_t(kbuf[b]) | (uint16_t(kbuf[b + 1u]) << 8);
+    int c = int(kbuf[b + 2u + idx % 32u]);
+    c -= (c >= 128) ? 256 : 0;
+    return float(uint16BitsToFloat16(s)) * float(c);
+}
+float dq8v(uint idx) {
+    uint b = (idx / 32u) * 34u;
+    uint16_t s = uint16_t(vbuf[b]) | (uint16_t(vbuf[b + 1u]) << 8);
+    int c = int(vbuf[b + 2u + idx % 32u]);
+    c -= (c >= 128) ? 256 : 0;
+    return float(uint16BitsToFloat16(s)) * float(c);
+}
+#define KREAD(i) dq8k(i)
+#define VREAD(i) dq8v(i)
+#else
 layout(binding = 1) readonly buffer KB { float16_t k[]; };
 layout(binding = 2) readonly buffer VB { float16_t v[]; };
+#define KREAD(i) float(k[i])
+#define VREAD(i) float(v[i])
+#endif
 #ifdef USE_PARAMS
 // Record-once decode: pos_offset comes from a host-updated params SSBO so the buffer can be replayed.
 // `o` moves to binding 4 (params takes binding 3) so the recorder's reads|writes split is output-last.
@@ -66,7 +100,7 @@ void main() {
             } else {
                 uint kbase = (j * pc.nkv + kvh) * hd;
                 float dotv = 0.0;
-                for (uint d = 0u; d < hd; d++) { dotv += q_sh[d] * float(k[kbase + d]); }
+                for (uint d = 0u; d < hd; d++) { dotv += q_sh[d] * KREAD(kbase + d); }
                 s = dotv * scale;
             }
             sc[j - ts] = s;
@@ -102,7 +136,7 @@ void main() {
             uint d = t + c * 64u;
             if (d < hd) {
                 float a = 0.0;
-                for (uint j = ts; j < te; j++) { a += sc[j - ts] * float(v[(j * pc.nkv + kvh) * hd + d]); }
+                for (uint j = ts; j < te; j++) { a += sc[j - ts] * VREAD((j * pc.nkv + kvh) * hd + d); }
                 acc[c] = acc[c] * corr + a;
             }
         }

@@ -66,6 +66,16 @@ fn main() {
         ("silu_mul_fused", "gelu_mul_fused", &["-DGELU"]),
         ("store_f16", "store_f16", &[]),
         ("store_f16", "store_f16_dyn", &["-DUSE_PARAMS"]),
+        // Quantize a KV row into the Q8_0 cache. f32 source (V) + f16 source (un-fused roped K),
+        // each with a record-once (pos from params) variant.
+        ("store_q8", "store_q8", &[]),
+        ("store_q8", "store_q8_dyn", &["-DUSE_PARAMS"]),
+        ("store_q8", "store_q8_f16", &["-DSRC_F16"]),
+        (
+            "store_q8",
+            "store_q8_f16_dyn",
+            &["-DSRC_F16", "-DUSE_PARAMS"],
+        ),
         ("rope", "rope", &[]),
         ("rope", "rope_f16", &["-DOUT_F16"]),
         ("rope", "rope_f16_dyn", &["-DOUT_F16", "-DUSE_PARAMS"]),
@@ -84,6 +94,13 @@ fn main() {
         ("attn_live", "attn_live", &[]),
         ("attention_kv", "attention_kv", &[]),
         ("attention_kv", "attention_kv_dyn", &["-DUSE_PARAMS"]),
+        // Coupled Q8_0 KV cache (K==V==q8): scalar dequant-on-read variants (static + record-once).
+        ("attention_kv", "attention_kv_q8", &["-DKVQ8"]),
+        (
+            "attention_kv",
+            "attention_kv_dyn_q8",
+            &["-DKVQ8", "-DUSE_PARAMS"],
+        ),
         ("qk_norm_rope", "qk_norm_rope", &[]),
         ("qk_norm_rope", "qk_norm_rope_dyn", &["-DUSE_PARAMS"]),
         ("qk_norm_rope", "qk_norm_rope_ff", &["-DFREQ_FACTORS"]),

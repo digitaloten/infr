@@ -1,0 +1,52 @@
+#version 460
+// Quantize a contiguous source row (`n` elements) into the GGUF Q8_0 KV cache at element offset
+// `off`: block = [f16 d][i8 qs[32]] = 34 bytes / 32 elems, d = amax/127, q = round(x/d). One
+// workgroup = one subgroup (32 lanes) = one 32-element block, so `n` and `off` must be multiples of
+// 32 (guaranteed: the KV row width n_kv*head_dim is block-aligned and off = pos*row_width).
+//   SRC_F16 : source is f16 (the un-fused roped K staging); default source is f32 (V projection).
+//   USE_PARAMS : record-once decode — off = p_pos*n from a host-updated params SSBO (one KV row).
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint n; uint off; } pc;
+#ifdef SRC_F16
+layout(binding = 0) readonly buffer SB { float16_t src[]; };
+#else
+layout(binding = 0) readonly buffer SB { float src[]; };
+#endif
+#ifdef USE_PARAMS
+layout(binding = 1) readonly buffer PB { uint p_pos; uint p_kvlen; };
+layout(binding = 2) writeonly buffer CB { uint8_t cbuf[]; };
+#else
+layout(binding = 1) writeonly buffer CB { uint8_t cbuf[]; };
+#endif
+
+void main() {
+    uint blk = gl_WorkGroupID.x;         // 0 .. n/32-1  (source block)
+    uint t = gl_LocalInvocationID.x;     // 0 .. 31      (element within block)
+#ifdef USE_PARAMS
+    uint off = p_pos * pc.n;
+#else
+    uint off = pc.off;
+#endif
+    float v = float(src[blk * 32u + t]);
+    float amax = subgroupMax(abs(v));
+    float d = amax / 127.0;
+    float inv = (amax > 0.0) ? 1.0 / d : 0.0;
+    int q = clamp(int(round(v * inv)), -127, 127);
+    // Destination block: (off + blk*32)/32 = off/32 + blk. byte base = block*34.
+    uint b = (off / 32u + blk) * 34u;
+    if (t == 0u) {
+        uint16_t s = float16BitsToUint16(float16_t(d));
+        cbuf[b] = uint8_t(s & uint16_t(0xFFu));
+        cbuf[b + 1u] = uint8_t(s >> 8);
+    }
+    cbuf[b + 2u + t] = uint8_t(q);   // two's-complement byte; reader sign-extends
+}

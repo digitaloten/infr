@@ -1316,11 +1316,16 @@ impl<'a> Recorder<'a> {
         window: usize,
         // QK scale: `> 0` overrides the default 1/√hd (gemma4 passes 1.0). `0.0` = default.
         scale: f32,
+        // Q8_0 KV cache (K==V==q8): dequant-on-read variant. `false` = f16 cache.
+        q8: bool,
     ) {
         self.stamp("attention_kv");
-        let kern = self
-            .be
-            .kernel("attention_kv", crate::gemm::attention_kv_spv(), 4, 32);
+        let (name, spv) = if q8 {
+            ("attention_kv_q8", crate::gemm::attention_kv_q8_spv())
+        } else {
+            ("attention_kv", crate::gemm::attention_kv_spv())
+        };
+        let kern = self.be.kernel(name, spv, 4, 32);
         let mut push = [0u8; 32];
         push[0..4].copy_from_slice(&(q_len as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());
@@ -1761,6 +1766,66 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Quantize `src[0..n]` → the GGUF Q8_0 KV cache at element offset `off` (34 B / 32-elem block).
+    /// `src_f16` selects the f16-source variant (the un-fused roped K staging); f32 source otherwise
+    /// (the V projection). `n` and `off` must be block-aligned (KV row width is a multiple of 32).
+    pub fn store_q8(
+        &self,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        n: usize,
+        off: usize,
+        src_f16: bool,
+    ) {
+        self.stamp("store_q8");
+        let (name, spv) = if src_f16 {
+            ("store_q8_f16", crate::gemm::store_q8_f16_spv())
+        } else {
+            ("store_q8", crate::gemm::store_q8_spv())
+        };
+        let k = self.be.kernel(name, spv, 2, 8);
+        let mut push = [0u8; 8];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
+        // One workgroup (32 lanes) per 32-element block.
+        self.dispatch(
+            k,
+            &[Self::vkb(src), Self::vkb(dst)],
+            1,
+            &push,
+            (n as u32) / 32,
+        );
+    }
+
+    /// Record-once decode variant of [`Recorder::store_q8`]: the write offset is `p_pos*n` (one KV
+    /// row at the token's position), `p_pos` read from the `params` SSBO so the buffer replays.
+    pub fn store_q8_dyn(
+        &self,
+        src: &dyn Buffer,
+        params: &dyn Buffer,
+        dst: &dyn Buffer,
+        n: usize,
+        src_f16: bool,
+    ) {
+        self.stamp("store_q8");
+        let (name, spv) = if src_f16 {
+            ("store_q8_f16_dyn", crate::gemm::store_q8_f16_dyn_spv())
+        } else {
+            ("store_q8_dyn", crate::gemm::store_q8_dyn_spv())
+        };
+        let k = self.be.kernel(name, spv, 3, 8);
+        let mut push = [0u8; 8];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        // [4..8] off: unused (from params)
+        self.dispatch(
+            k,
+            &[Self::vkb(src), Self::vkb(params), Self::vkb(dst)],
+            1,
+            &push,
+            (n as u32) / 32,
+        );
+    }
+
     /// Qwen3 QK-norm + RoPE over `x[rows, nheads, hd]` → `y` at rows `out_base..`. `nw` is the
     /// per-head [hd] norm weight. (q: out_base=0; k: out_base=pos so it lands in the cache.)
     #[allow(clippy::too_many_arguments)]
@@ -1998,14 +2063,19 @@ impl<'a> Recorder<'a> {
         hd: usize,
         scale: f32,
         window: usize,
+        // Q8_0 KV cache (K==V==q8): dequant-on-read variant. `false` = f16 cache.
+        q8: bool,
     ) {
         self.stamp("attention_kv");
-        let kern = self.be.kernel(
-            "attention_kv_dyn",
-            crate::gemm::attention_kv_dyn_spv(),
-            5,
-            32,
-        );
+        let (name, spv) = if q8 {
+            (
+                "attention_kv_dyn_q8",
+                crate::gemm::attention_kv_dyn_q8_spv(),
+            )
+        } else {
+            ("attention_kv_dyn", crate::gemm::attention_kv_dyn_spv())
+        };
+        let kern = self.be.kernel(name, spv, 5, 32);
         let mut push = [0u8; 32];
         push[0..4].copy_from_slice(&(q_len as u32).to_ne_bytes());
         // [4..8] kv_len: unused
@@ -3630,8 +3700,9 @@ mod tests {
             nkv,
             hd,
             pos_offset,
-            0,   // full causal (no sliding window)
-            0.0, // default 1/√hd scale
+            0,     // full causal (no sliding window)
+            0.0,   // default 1/√hd scale
+            false, // f16 KV cache
         );
         rec.finish().unwrap();
         let mut bytes = vec![0u8; q_len * nh * hd * 4];

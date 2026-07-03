@@ -362,6 +362,47 @@ fn gpu_seam_kv_reuse_matches_fresh() {
     );
 }
 
+/// Q8_0 KV cache on the Vulkan seam (coupled K==V==q8 via INFR_KV_Q8): both the one-shot static
+/// path (store_q8 write + attention_kv_q8 scalar read) and the record-once session path (store_q8_dyn
+/// + attention_kv_dyn_q8) must produce coherent (non-degenerate) greedy output. Q8 KV shifts the
+/// numerics (no exact match with the f16 golden), but the near-lossless quant must stay sensible; a
+/// broken quantize/dequant or a mis-gated flash/split kernel would collapse or garble the output.
+#[test]
+fn gpu_seam_kv_q8_coherent() {
+    let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
+    need_gpu!();
+    let _tlk = test_serial_lock();
+    std::env::set_var("INFR_TEMP", "0");
+    std::env::set_var("INFR_KV_Q8", "1");
+    let head = |s: &str| s.chars().take(64).collect::<String>();
+    // A prompt long enough (>64 tokens) to take the prefill path, then a deep-cache decode.
+    let long =
+        "Explain how a CPU instruction pipeline works and list its common hazards. ".repeat(6);
+
+    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    // (a) one-shot static path.
+    let g_static = model
+        .generate_dense_vulkan(&long, 24)
+        .expect("q8 static gen");
+    assert!(
+        !is_degenerate(&g_static),
+        "Q8 static Vulkan output degenerate: {:?}",
+        head(&g_static)
+    );
+    // (b) record-once session path (Dynamic store_q8_dyn + attention_kv_dyn_q8).
+    let mut sess = model.vulkan_session(512).expect("q8 session");
+    let mut g_sess = String::new();
+    model
+        .generate_vulkan_session(&mut sess, &long, 24, |p| g_sess.push_str(p))
+        .expect("q8 session gen");
+    assert!(
+        !is_degenerate(&g_sess),
+        "Q8 session Vulkan output degenerate: {:?}",
+        head(&g_sess)
+    );
+    std::env::remove_var("INFR_KV_Q8");
+}
+
 /// Multi-slot KV prefix sharing: two INTERLEAVED conversations with a common long prefix (a
 /// "system prompt"). Conversation B must (a) generate exactly what a fresh full prefill does,
 /// (b) prefill only past the shared prefix (its slot was SEEDED by a device-side KV copy from
