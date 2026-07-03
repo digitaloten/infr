@@ -639,7 +639,7 @@ pub(crate) fn generate_dense_backend(
     // backends keep f16. The graph decl carries the dtype either way, and the env is stable for
     // the process, so a warm session and its rebuilt graphs always agree.
     let kv_q8 = std::env::var("INFR_KV_Q8").is_ok()
-        && matches!(be.name(), "metal" | "cpu-reference")
+        && matches!(be.name(), "metal" | "cpu")
         && (0..c.n_layer).all(|l| (c.layer_n_kv(l) * c.layer_head_dim(l)).is_multiple_of(32));
 
     // ── one-time session init: weights, KV cache, per-step IO (skipped when `state` is warm) ──
@@ -862,9 +862,12 @@ pub(crate) fn generate_dense_backend(
         let mut g = Graph::new();
         let f32d = |n: usize| TensorDesc::new(vec![n], DType::F32);
         // KV cache dtype: f16 by default (halves memory vs f32, tightens CPU↔GPU parity);
-        // Q8_0 when the runner enabled it (see `kv_q8` at the cache alloc).
+        // Q8_0 when the runner enabled it (see `kv_q8` at the cache alloc). ONLY the persistent
+        // caches take this dtype — the roped q16/k16 staging stays f16 (`qk_norm_rope`/`rope_f16`
+        // write f16; a Q8_0 decl there would lie to any backend that trusts it, and the Vulkan
+        // kv-write peephole fuses on the f16 decl).
         let kvd = |n: usize| TensorDesc::new(vec![n], if kv_q8 { DType::Q8_0 } else { DType::F16 });
-        let f16d = kvd;
+        let f16d = |n: usize| TensorDesc::new(vec![n], DType::F16);
         let hidden = g.input(f32d(batch * ne));
         let positions = g.input(TensorDesc::new(vec![batch], DType::I32));
         let rope_freqs = rf_buf.as_ref().map(|(_, n)| g.input(f32d(*n)));
@@ -878,8 +881,8 @@ pub(crate) fn generate_dense_backend(
         let mut v_cache = Vec::new();
         for l in 0..c.n_layer {
             let kvrow_l = c.layer_n_kv(l) * c.layer_head_dim(l);
-            k_cache.push(g.input(f16d(max_ctx * kvrow_l)));
-            v_cache.push(g.input(f16d(max_ctx * kvrow_l)));
+            k_cache.push(g.input(kvd(max_ctx * kvrow_l)));
+            v_cache.push(g.input(kvd(max_ctx * kvrow_l)));
         }
 
         // Weights — declared in the SAME order as the upload loop, pulling (dtype, numel) from
