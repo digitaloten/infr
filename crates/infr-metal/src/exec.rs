@@ -1046,6 +1046,8 @@ impl MetalBackend {
             DType::Q8_0 => Some("linear_q8_0"),
             DType::Q5_0 => Some("linear_q5_0"),
             DType::Q4_0 => Some("linear_q4_0"),
+            DType::Iq4Xs => Some("linear_iq4xs"),
+            DType::Iq4Nl => Some("linear_iq4nl"),
             _ => None,
         };
         if let Some(kern) = native_kern {
@@ -1268,7 +1270,8 @@ impl MetalBackend {
                 p.extend_from_slice(&(in_f as u32).to_ne_bytes());
                 p.extend_from_slice(&(out_f as u32).to_ne_bytes());
                 // 32 lanes (one simdgroup) per output element — see `linear_f32`/`linear_quik*`.
-                if infr_gguf::dequant::is_quant(g.desc(weight).dtype) {
+                let wdt = g.desc(weight).dtype;
+                if infr_gguf::dequant::is_quant(wdt) || matches!(wdt, DType::Iq4Xs | DType::Iq4Nl) {
                     // Native quant: decode the compact factored weight inline — no f32 blow-up.
                     // Kernel matches the weight's code packing (4/6/8-bit). Multi-row (prefill)
                     // takes the row-tiled variant: one simdgroup per (8-row tile, output), each
@@ -1292,6 +1295,8 @@ impl MetalBackend {
                         "linear_q8_0" => (e / 32 * 34, 0, 0),
                         "linear_q5_0" => (e / 32 * 22, 0, 0),
                         "linear_q4_0" => (e / 32 * 18, 0, 0),
+                        "linear_iq4xs" => (e / 256 * 136, 0, 0),
+                        "linear_iq4nl" => (e / 32 * 18, 0, 0),
                         "linear_quik4" => (e / 2, e / 4, dd_off),
                         "linear_quik6" => (e / 4 * 3, e / 4, dd_off),
                         _ => (e, e / 4, dd_off),
@@ -1318,6 +1323,8 @@ impl MetalBackend {
                         "linear_q8_0" => "linear_q8_0_hmm",
                         "linear_q5_0" => "linear_q5_0_hmm",
                         "linear_q4_0" => "linear_q4_0_hmm",
+                        "linear_iq4xs" => "linear_iq4xs_hmm",
+                        "linear_iq4nl" => "linear_iq4nl_hmm",
                         _ => "linear_quik8_hmm",
                     };
                     let cmm_kern = match qw.kern {
@@ -1328,6 +1335,8 @@ impl MetalBackend {
                         "linear_q8_0" => "linear_q8_0_cmm",
                         "linear_q5_0" => "linear_q5_0_cmm",
                         "linear_q4_0" => "linear_q4_0_cmm",
+                        "linear_iq4xs" => "linear_iq4xs_cmm",
+                        "linear_iq4nl" => "linear_iq4nl_cmm",
                         _ => "linear_quik8_cmm",
                     };
                     // Prefer the cooperative 32x64 threadgroup tile; per-simdgroup HGEMM covers
@@ -1509,6 +1518,8 @@ impl MetalBackend {
                                 "linear_q8_0" => "linear_q8_0_rt",
                                 "linear_q5_0" => "linear_q5_0_rt",
                                 "linear_q4_0" => "linear_q4_0_rt",
+                                "linear_iq4xs" => "linear_iq4xs_rt",
+                                "linear_iq4nl" => "linear_iq4nl_rt",
                                 _ => "linear_quik8_rt",
                             };
                             (rt, m.div_ceil(8) * out_f * 32, 32)
