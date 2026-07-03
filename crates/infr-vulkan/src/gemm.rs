@@ -344,10 +344,6 @@ const ATTENTION_KV_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/
 const QK_NORM_ROPE_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/qk_norm_rope.spv"));
 const QK_NORM_ROPE_FF_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/qk_norm_rope_ff.spv"));
-const ATTN_IN_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_in.spv"));
-const FFN_IN_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ffn_in.spv"));
-const FFN_IN_Q_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ffn_in_q.spv"));
-const ATTN_IN_Q_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_in_q.spv"));
 const MMV_Q4_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q4.spv"));
 const MMV_Q8_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q8.spv"));
 const MMV_Q4_RES_SPV_BYTES: &[u8] =
