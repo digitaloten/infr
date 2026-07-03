@@ -790,6 +790,73 @@ fn linear_q8_0_gemv_matches_dequant_reference() {
     check_quant_linear_parity(DType::Q8_0, quantize_q8_0(&wf), m, in_f, out_f);
 }
 
+// Q5_K (176-byte / 256-elem blocks) rides the FACTORED path — first exercised by bartowski
+// IQ4_XS mixes, which ship attn_v as Q5_K.
+fn synth_q5k(n_elem: usize, seed: u32) -> Vec<u8> {
+    assert_eq!(n_elem % 256, 0);
+    let mut out = Vec::new();
+    for blk_i in 0..(n_elem / 256) {
+        let mut blk = vec![0u8; 176];
+        blk[0..2].copy_from_slice(&half::f16::from_f32(0.05).to_le_bytes());
+        blk[2..4].copy_from_slice(&half::f16::from_f32(0.10).to_le_bytes());
+        blk[4..176].copy_from_slice(&lcg_bytes(seed ^ blk_i as u32, 172));
+        out.extend_from_slice(&blk);
+    }
+    out
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_q5k_matches_dequant_reference() {
+    let (m, in_f, out_f) = (2usize, 256usize, 96usize);
+    check_quant_linear_parity(DType::Q5K, synth_q5k(out_f * in_f, 120), m, in_f, out_f);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_q5k_gemv_matches_dequant_reference() {
+    let (m, in_f, out_f) = (1usize, 256usize, 96usize);
+    check_quant_linear_parity(DType::Q5K, synth_q5k(out_f * in_f, 121), m, in_f, out_f);
+}
+
+// IQ4_XS is codebook (host-dequant to a cached f32 device weight on Metal); the fused-QKV
+// runner slices it with w_off, so both the plain and offset routes need coverage. Valid blocks:
+// 136 B / 256 elems = [f16 d][u16 scales_h][u32 scales_l... layout per gguf]; LCG payload works
+// because the parity compares against dequant of the SAME bytes.
+fn synth_iq4xs(n_elem: usize, seed: u32) -> Vec<u8> {
+    assert_eq!(n_elem % 256, 0);
+    let mut out = Vec::new();
+    for blk_i in 0..(n_elem / 256) {
+        let mut blk = vec![0u8; 136];
+        blk[0..2].copy_from_slice(&half::f16::from_f32(0.06).to_le_bytes());
+        blk[2..136].copy_from_slice(&lcg_bytes(seed ^ blk_i as u32, 134));
+        out.extend_from_slice(&blk);
+    }
+    out
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_iq4xs_matches_dequant_reference() {
+    let (m, in_f, out_f) = (2usize, 256usize, 96usize);
+    check_quant_linear_parity(DType::Iq4Xs, synth_iq4xs(out_f * in_f, 122), m, in_f, out_f);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_woff_iq4xs_gemv() {
+    let (in_f, slices) = (256usize, [128usize, 64, 64]);
+    check_linear_woff(
+        DType::Iq4Xs,
+        synth_iq4xs(256 * in_f, 123),
+        1,
+        in_f,
+        &slices,
+        false,
+        1e-3,
+    );
+}
+
 // K-quants are the formats real checkpoints actually ship. Exercise the Metal dequant path
 // (`weight_buf` → `dequant_block`) for Q4_K and Q6_K, same dequant-reference comparison as Q8_0.
 #[test]

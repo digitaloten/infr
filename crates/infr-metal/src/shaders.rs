@@ -345,6 +345,39 @@ struct QLinParams { uint m; uint in_f; uint out_f; uint dshift; };
         wk[2u * k + 1u] = d * ((float)b1 - 8.0f);                                                 \
     }
 
+// IQ4_NL / IQ4_XS shared 16-entry signed codebook (llama.cpp kvalues_iq4nl).
+constant float kvalues_iq4nl_f[16] = {
+    -127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f, -22.0f, -10.0f,
+    1.0f, 13.0f, 25.0f, 38.0f, 53.0f, 69.0f, 89.0f, 113.0f,
+};
+
+// NATIVE IQ4_XS block (136 B / 256 elems): [f16 d][u16 scales_h][4 B scales_l][128 B nibbles],
+// 8 sub-blocks of 32; value = (d * (ls - 32)) * kvalues[q4] — every factor exact in f32, so it
+// matches dequant_codebook bit-for-bit. The dominant mac format (bartowski IQ4_XS mixes);
+// without a native kernel it dequanted to a cached f32 weight, which OOM-corrupted any >2B
+// model on a 18 GB machine.
+#define DEC16_IQ4XS(wk)                                                                           \
+    device const uchar* blk = codes + (ulong)(bi >> 4) * 136ul;                                   \
+    device const ushort* b16 = (device const ushort*)blk;                                         \
+    float d = (float)as_type<half>(b16[0]);                                                      \
+    uint sub = bi & 15u;                                                                          \
+    uint ib4 = sub >> 1;                                                                          \
+    uint lo = ((uint)blk[4u + (ib4 >> 1)] >> (4u * (ib4 & 1u))) & 0xFu;                           \
+    uint hi2 = ((uint)b16[1] >> (2u * ib4)) & 3u;                                                 \
+    float dl = d * ((float)(lo | (hi2 << 4)) - 32.0f);                                            \
+    device const uchar* qs = blk + 8u + ib4 * 16u;                                                \
+    uint h4 = (sub & 1u) * 4u;                                                                    \
+    for (uint k = 0; k < 16u; k++) wk[k] = dl * kvalues_iq4nl_f[(qs[k] >> h4) & 0xFu];
+
+// NATIVE IQ4_NL block (18 B / 32 elems): [f16 d][16 B nibbles]; value = d * kvalues[q4].
+#define DEC16_IQ4NL(wk)                                                                           \
+    device const uchar* blk = codes + (ulong)(bi >> 1) * 18ul;                                    \
+    device const ushort* b16 = (device const ushort*)blk;                                         \
+    float d = (float)as_type<half>(b16[0]);                                                      \
+    device const uchar* qs = blk + 2u;                                                            \
+    uint h4 = (bi & 1u) * 4u;                                                                     \
+    for (uint k = 0; k < 16u; k++) wk[k] = d * kvalues_iq4nl_f[(qs[k] >> h4) & 0xFu];
+
 // NATIVE Q8_0 block (34 B / 32 elems): [f16 d][32 x i8]. 8.5 bpw streamed vs the factored
 // form's ~10.2 (codes + scm + dd) — the decode GEMV is bound on exactly this stream. 34 % 4 != 0,
 // so d assembles from bytes and the quants are char loads (same convention as Q6_K's byte loads).
@@ -1654,6 +1687,8 @@ kernel void moe_topk(device const float* logits_all [[buffer(0)]],
 GEMV_KERNEL(linear_quik4, DEC16_K4)
 GEMV_KERNEL(linear_quik6, DEC16_K6)
 GEMV_KERNEL(linear_quik8, DEC16_K8)
+GEMV_KERNEL(linear_iq4xs, DEC16_IQ4XS)
+GEMV_KERNEL(linear_iq4nl, DEC16_IQ4NL)
 RT_KERNEL(linear_quik4_rt, DEC16_K4)
 RT_KERNEL(linear_quik6_rt, DEC16_K6)
 RT_KERNEL(linear_quik8_rt, DEC16_K8)
@@ -1662,6 +1697,8 @@ RT_KERNEL(linear_q6k_rt, DEC16_Q6K)
 RT_KERNEL(linear_q8_0_rt, DEC16_Q8_0)
 RT_KERNEL(linear_q5_0_rt, DEC16_Q5_0)
 RT_KERNEL(linear_q4_0_rt, DEC16_Q4_0)
+RT_KERNEL(linear_iq4xs_rt, DEC16_IQ4XS)
+RT_KERNEL(linear_iq4nl_rt, DEC16_IQ4NL)
 // Cooperative-tile half-fragment GEMM, mul_mm-shape: one 64-output x 32-token tile per 128-thread
 // threadgroup, NK=32 K-steps. What the simpler cooperative tile above lacked (each of its shapes
 // measured and replaced): weights AND activations are staged into threadgroup memory as
@@ -1908,6 +1945,8 @@ CMMKS_KERNEL(linear_q6k_cmm_ks, DEC16_Q6K)
 CMMKS_KERNEL(linear_q8_0_cmm_ks, DEC16_Q8_0)
 CMMKS_KERNEL(linear_q5_0_cmm_ks, DEC16_Q5_0)
 CMMKS_KERNEL(linear_q4_0_cmm_ks, DEC16_Q4_0)
+CMMKS_KERNEL(linear_iq4xs_cmm_ks, DEC16_IQ4XS)
+CMMKS_KERNEL(linear_iq4nl_cmm_ks, DEC16_IQ4NL)
 
 CMM_KERNEL(linear_quik4_cmm, DEC16_K4)
 CMM_KERNEL(linear_quik6_cmm, DEC16_K6)
@@ -1916,6 +1955,8 @@ CMM_KERNEL(linear_q4k_cmm, DEC16_Q4K)
 CMM_KERNEL(linear_q8_0_cmm, DEC16_Q8_0)
 CMM_KERNEL(linear_q5_0_cmm, DEC16_Q5_0)
 CMM_KERNEL(linear_q4_0_cmm, DEC16_Q4_0)
+CMM_KERNEL(linear_iq4xs_cmm, DEC16_IQ4XS)
+CMM_KERNEL(linear_iq4nl_cmm, DEC16_IQ4NL)
 CMM_KERNEL(linear_q6k_cmm, DEC16_Q6K)
 
 HGEMM_KERNEL(linear_quik4_hmm, DEC16_K4)
@@ -1926,6 +1967,8 @@ HGEMM_KERNEL(linear_q6k_hmm, DEC16_Q6K)
 HGEMM_KERNEL(linear_q8_0_hmm, DEC16_Q8_0)
 HGEMM_KERNEL(linear_q5_0_hmm, DEC16_Q5_0)
 HGEMM_KERNEL(linear_q4_0_hmm, DEC16_Q4_0)
+HGEMM_KERNEL(linear_iq4xs_hmm, DEC16_IQ4XS)
+HGEMM_KERNEL(linear_iq4nl_hmm, DEC16_IQ4NL)
 
 
 // ---- RoPE (Op::Rope = the no-qk-norm llama-family rotation): INTERLEAVED pairs (2p, 2p+1) —
