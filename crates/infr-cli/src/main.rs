@@ -10,9 +10,49 @@ use clap::{Parser, Subcommand};
     version,
     about = "Pure-Rust, Vulkan-first LLM inference engine"
 )]
+#[command(arg_required_else_help = true)]
 struct Cli {
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
+
+    /// Print shell completions to stdout and exit (packaging helper).
+    #[arg(long, value_enum, value_name = "SHELL", hide = true)]
+    completions: Option<CompletionShell>,
+
+    /// Print the man page (troff) to stdout and exit (packaging helper).
+    #[arg(long, hide = true)]
+    man: bool,
+}
+
+/// Shells `--completions` can generate for: clap_complete's five core shells plus nushell
+/// (separate generator crate). Mirrors gpur's packaging-helper flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
+    Powershell,
+    Elvish,
+    Nushell,
+}
+
+impl CompletionShell {
+    fn generate(self, cmd: &mut clap::Command) {
+        use clap_complete::Shell;
+        let out = &mut std::io::stdout();
+        match self {
+            CompletionShell::Bash => clap_complete::generate(Shell::Bash, cmd, "infr", out),
+            CompletionShell::Zsh => clap_complete::generate(Shell::Zsh, cmd, "infr", out),
+            CompletionShell::Fish => clap_complete::generate(Shell::Fish, cmd, "infr", out),
+            CompletionShell::Powershell => {
+                clap_complete::generate(Shell::PowerShell, cmd, "infr", out)
+            }
+            CompletionShell::Elvish => clap_complete::generate(Shell::Elvish, cmd, "infr", out),
+            CompletionShell::Nushell => {
+                clap_complete::generate(clap_complete_nushell::Nushell, cmd, "infr", out)
+            }
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -117,7 +157,27 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    match cli.cmd {
+
+    // Packaging helpers (hidden): emit completions / man page and exit. The man page includes
+    // every subcommand and flag straight from the clap definitions, so it can't drift.
+    if let Some(shell) = cli.completions {
+        use clap::CommandFactory;
+        shell.generate(&mut Cli::command());
+        return Ok(());
+    }
+    if cli.man {
+        use clap::CommandFactory;
+        clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
+        return Ok(());
+    }
+
+    let Some(cmd) = cli.cmd else {
+        // arg_required_else_help covers the bare invocation; a flag-only call lands here.
+        use clap::CommandFactory;
+        Cli::command().print_help()?;
+        return Ok(());
+    };
+    match cmd {
         Cmd::Pull { model } => cmd_pull(&model),
         Cmd::Run { model, message } => cmd_run(&model, message.as_deref()),
         Cmd::Serve { model, addr } => cmd_serve(&model, &addr),
