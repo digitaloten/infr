@@ -73,7 +73,10 @@ impl ChatStream {
         // head could still be a forming marker, hold everything back.
         const CT: [&str; 2] = ["<|channel|>thought", "<|channel>thought"];
         const FINAL: &str = "<channel|>";
-        if let Some(hm) = CT.iter().find_map(|m| raw.starts_with(m).then_some(m.len())) {
+        if let Some(hm) = CT
+            .iter()
+            .find_map(|m| raw.starts_with(m).then_some(m.len()))
+        {
             let (r_end, hold, c_start) = match raw.find(FINAL) {
                 Some(f) => (f, false, Some(f + FINAL.len())),
                 None => (raw.len(), !final_flush, None),
