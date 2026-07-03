@@ -361,6 +361,14 @@ fn linear_add_fusion_q4k_parity() {
 
 #[test]
 #[ignore = "requires a Metal GPU"]
+fn linear_add_fusion_q8_0_parity() {
+    let (in_f, out_f) = (512usize, 384usize);
+    let wf = rand_f32(out_f * in_f, 95);
+    check_linear_add_fusion(DType::Q8_0, quantize_q8_0(&wf), in_f, out_f);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
 fn linear_add_fusion_q6k_parity() {
     let (in_f, out_f) = (512usize, 384usize);
     check_linear_add_fusion(DType::Q6K, synth_q6k(out_f * in_f, 94), in_f, out_f);
@@ -650,6 +658,25 @@ fn linear_q8_0_matches_dequant_reference() {
         let err = (r - mm).abs() / r.abs().max(1.0);
         assert!(err <= 1e-3, "elem {i}: ref={r} metal={mm} err={err}");
     }
+}
+
+// Native Q8_0 half-fragment GEMM (m=18 → the hmm route; out_f % 64 != 0 keeps cmm out).
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_q8_0_gemm_matches_dequant_reference() {
+    let (m, in_f, out_f) = (18usize, 256usize, 96usize);
+    let wf = rand_f32(out_f * in_f, 96);
+    check_quant_linear_parity_impl(DType::Q8_0, quantize_q8_0(&wf), m, in_f, out_f, 1e-3, true);
+}
+
+// Native Q8_0 GEMV (m=1, the mul_mv_q8_0 shape: FOUR rows per simdgroup; out_f=94 exercises the
+// clamped tail rows of a partial 4-row group).
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_q8_0_gemv_matches_dequant_reference() {
+    let (m, in_f, out_f) = (1usize, 256usize, 94usize);
+    let wf = rand_f32(out_f * in_f, 97);
+    check_quant_linear_parity(DType::Q8_0, quantize_q8_0(&wf), m, in_f, out_f);
 }
 
 // K-quants are the formats real checkpoints actually ship. Exercise the Metal dequant path

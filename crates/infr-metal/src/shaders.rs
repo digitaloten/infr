@@ -299,6 +299,16 @@ struct QLinParams { uint m; uint in_f; uint out_f; uint dshift; };
         wk[4u * i + 3u] = dl3 * (float)(q & 0xFF000000u) + mn;                                    \
     }
 
+// NATIVE Q8_0 block (34 B / 32 elems): [f16 d][32 x i8]. 8.5 bpw streamed vs the factored
+// form's ~10.2 (codes + scm + dd) — the decode GEMV is bound on exactly this stream. 34 % 4 != 0,
+// so d assembles from bytes and the quants are char loads (same convention as Q6_K's byte loads).
+// wk = d * q, the exact dequantize_q8_0 product.
+#define DEC16_Q8_0(wk)                                                                            \
+    device const uchar* blk = codes + (ulong)(bi >> 1) * 34ul;                                    \
+    float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));                     \
+    device const char* qs = (device const char*)(blk + 2u + (bi & 1u) * 16u);                     \
+    for (uint k = 0; k < 16u; k++) wk[k] = d * (float)qs[k];
+
 // GEMV: one simdgroup (32 lanes) per output element; each lane decodes one 16-element block per
 // step, coalesced across lanes, `simd_sum` reduction. m=1 decode is bound on the weight stream.
 #define GEMV_KERNEL(NAME, DEC)                                                                    \
@@ -677,6 +687,80 @@ kernel void linear_q6k_add(device const float*  x     [[buffer(0)]],
     linear_q6k_body<1>(x, codes, dst, res, p, 0.0f, false, gid, lane);
 }
 
+// Decode GEMV for NATIVE Q8_0 (34 B / 32-elem blocks), mul_mv shape (ported from llama.cpp's
+// kernel_mul_mv_q8_0_f32): each simdgroup computes FOUR output rows (N_R0_Q8_0); lanes fold as
+// 8 blocks in flight x 4 threads per block (8 quants each), activations load once into registers
+// and are reused across all four rows, and the inner product is d * sum(q*y) — the exact
+// dequantize_q8_0 product, reassociated. The stream is the raw 8.5 bpw weight — the factored
+// quik8 form paid ~10.2 bpw for the same values, and decode GEMV is bound on exactly this stream.
+// Same EPI epilogue contract as `linear_q4k_body`. Tail rows clamp their pointer into the weight
+// (their sums are discarded at the write).
+template<int EPI, typename PT>
+inline void linear_q8_0_body(device const float*  x,
+                             device const uchar*  codes,
+                             device float*        dst,
+                             device const float*  res,
+                             constant PT& p,
+                             float wgt, bool zeroacc,
+                             uint gid, uint lane) {
+    uint first_row = (gid / 32u) * 4u;
+    if (first_row >= p.out_f) return;
+    uint nb = p.in_f >> 5;                 // 32-element blocks per row
+    ulong row_b = (ulong)nb * 34ul;        // row stride in bytes
+    uint nrows = min(4u, p.out_f - first_row);
+
+    uint ix = lane >> 2;                   // 0..7: which of 8 blocks in flight
+    uint il = (lane & 3u) * 8u;            // this thread's 8 quants within the block
+
+    float yl[8];
+    float sumf[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    device const float* yb = x + ix * 32u + il;
+
+    for (uint ib = ix; ib < nb; ib += 8u) {
+        for (uint i = 0; i < 8u; i++) yl[i] = yb[i];
+        for (uint row = 0; row < 4u; row++) {
+            device const uchar* blk =
+                codes + (ulong)(first_row + min(row, nrows - 1u)) * row_b + (ulong)ib * 34ul;
+            device const char* qs = (device const char*)(blk + 2u) + il;
+            float sumq = 0.0f;
+            for (uint i = 0; i < 8u; i++) sumq += (float)qs[i] * yl[i];
+            sumf[row] += sumq * (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+        }
+        yb += 8u * 32u;
+    }
+    for (uint row = 0; row < nrows; row++) {
+        float s = simd_sum(sumf[row]);
+        if (lane == 0u) {
+            uint o = first_row + row;
+            if (EPI == 2)      dst[o] = (zeroacc ? 0.0f : dst[o]) + wgt * s;
+            else if (EPI == 1) dst[o] = s + res[o];
+            else               dst[o] = s;
+        }
+    }
+}
+
+kernel void linear_q8_0(device const float*  x     [[buffer(0)]],
+                        device const uchar*  codes [[buffer(1)]],
+                        device const uchar*  scm   [[buffer(2)]],
+                        device const uchar*  dd    [[buffer(3)]],
+                        device float*        dst   [[buffer(4)]],
+                        constant QLinParams& p     [[buffer(5)]],
+                        uint gid  [[thread_position_in_grid]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+    linear_q8_0_body<0>(x, codes, dst, x, p, 0.0f, false, gid, lane);
+}
+kernel void linear_q8_0_add(device const float*  x     [[buffer(0)]],
+                            device const uchar*  codes [[buffer(1)]],
+                            device const uchar*  scm   [[buffer(2)]],
+                            device const uchar*  dd    [[buffer(3)]],
+                            device float*        dst   [[buffer(4)]],
+                            device const float*  res   [[buffer(5)]],
+                            constant QLinParams& p     [[buffer(6)]],
+                            uint gid  [[thread_position_in_grid]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+    linear_q8_0_body<1>(x, codes, dst, res, p, 0.0f, false, gid, lane);
+}
+
 // ---- MoE expert GEMVs: the shared GEMV bodies, batched over the SELECTED experts — one
 // dispatch covers all n_used experts (slot = high grid bits), each picking its weight slice
 // from the device expert table (`moe_topk` below), so a whole MoE FFN is 7 dispatches with no
@@ -930,6 +1014,7 @@ RT_KERNEL(linear_quik6_rt, DEC16_K6)
 RT_KERNEL(linear_quik8_rt, DEC16_K8)
 RT_KERNEL(linear_q4k_rt, DEC16_Q4K)
 RT_KERNEL(linear_q6k_rt, DEC16_Q6K)
+RT_KERNEL(linear_q8_0_rt, DEC16_Q8_0)
 // Cooperative-tile half-fragment GEMM, mul_mm-shape: one 64-output x 32-token tile per 128-thread
 // threadgroup, NK=32 K-steps. What the simpler cooperative tile above lacked (each of its shapes
 // measured and replaced): weights AND activations are staged into threadgroup memory as
@@ -1046,6 +1131,7 @@ CMM_KERNEL(linear_quik4_cmm, DEC16_K4)
 CMM_KERNEL(linear_quik6_cmm, DEC16_K6)
 CMM_KERNEL(linear_quik8_cmm, DEC16_K8)
 CMM_KERNEL(linear_q4k_cmm, DEC16_Q4K)
+CMM_KERNEL(linear_q8_0_cmm, DEC16_Q8_0)
 CMM_KERNEL(linear_q6k_cmm, DEC16_Q6K)
 
 HGEMM_KERNEL(linear_quik4_hmm, DEC16_K4)
@@ -1053,6 +1139,7 @@ HGEMM_KERNEL(linear_quik6_hmm, DEC16_K6)
 HGEMM_KERNEL(linear_quik8_hmm, DEC16_K8)
 HGEMM_KERNEL(linear_q4k_hmm, DEC16_Q4K)
 HGEMM_KERNEL(linear_q6k_hmm, DEC16_Q6K)
+HGEMM_KERNEL(linear_q8_0_hmm, DEC16_Q8_0)
 
 
 // ---- RoPE (Op::Rope = the no-qk-norm llama-family rotation): INTERLEAVED pairs (2p, 2p+1) —

@@ -88,7 +88,7 @@ fn linear_add_peephole(
         if !matches!(g.tensors[dst.0 as usize].kind, TensorKind::Internal) {
             continue;
         }
-        if !matches!(g.desc(*weight).dtype, DType::Q4K | DType::Q6K) {
+        if !matches!(g.desc(*weight).dtype, DType::Q4K | DType::Q6K | DType::Q8_0) {
             continue;
         }
         if let Some(Op::Add {
@@ -786,6 +786,7 @@ impl MetalBackend {
         let native_kern = match g.desc(id).dtype {
             DType::Q4K => Some("linear_q4k"),
             DType::Q6K => Some("linear_q6k"),
+            DType::Q8_0 => Some("linear_q8_0"),
             _ => None,
         };
         if let Some(kern) = native_kern {
@@ -990,6 +991,7 @@ impl MetalBackend {
                         // Native kernels read raw GGUF blocks; scm/dd are dummy buffers.
                         "linear_q4k" => (e / 256 * 144, 0, 0),
                         "linear_q6k" => (e / 256 * 210, 0, 0),
+                        "linear_q8_0" => (e / 32 * 34, 0, 0),
                         "linear_quik4" => (e / 2, e / 4, dd_off),
                         "linear_quik6" => (e / 4 * 3, e / 4, dd_off),
                         _ => (e, e / 4, dd_off),
@@ -1013,6 +1015,7 @@ impl MetalBackend {
                         "linear_quik6" => "linear_quik6_hmm",
                         "linear_q4k" => "linear_q4k_hmm",
                         "linear_q6k" => "linear_q6k_hmm",
+                        "linear_q8_0" => "linear_q8_0_hmm",
                         _ => "linear_quik8_hmm",
                     };
                     let cmm_kern = match qw.kern {
@@ -1020,6 +1023,7 @@ impl MetalBackend {
                         "linear_quik6" => "linear_quik6_cmm",
                         "linear_q4k" => "linear_q4k_cmm",
                         "linear_q6k" => "linear_q6k_cmm",
+                        "linear_q8_0" => "linear_q8_0_cmm",
                         _ => "linear_quik8_cmm",
                     };
                     // Prefer the cooperative 32x64 threadgroup tile; per-simdgroup HGEMM covers
@@ -1088,13 +1092,16 @@ impl MetalBackend {
                                 "linear_quik6" => "linear_quik6_rt",
                                 "linear_q4k" => "linear_q4k_rt",
                                 "linear_q6k" => "linear_q6k_rt",
+                                "linear_q8_0" => "linear_q8_0_rt",
                                 _ => "linear_quik8_rt",
                             };
                             (rt, m.div_ceil(8) * out_f)
                         } else {
-                            // The native mul_mv-shape GEMVs cover TWO output rows per simdgroup.
+                            // The native mul_mv-shape GEMVs cover TWO output rows per simdgroup
+                            // (FOUR for Q8_0 — llama.cpp's N_R0_Q8_0).
                             let sgs = match qw.kern {
                                 "linear_q4k" | "linear_q6k" => out_f.div_ceil(2),
+                                "linear_q8_0" => out_f.div_ceil(4),
                                 _ => out_f,
                             };
                             (qw.kern, sgs)
@@ -1104,6 +1111,7 @@ impl MetalBackend {
                         if let Some(&(res, fdst)) = r.fused.get(&idx) {
                             let fk = match kern {
                                 "linear_q4k" => "linear_q4k_add",
+                                "linear_q8_0" => "linear_q8_0_add",
                                 _ => "linear_q6k_add",
                             };
                             let bres = self.ensure_device(r, res);
