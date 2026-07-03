@@ -375,6 +375,25 @@ float dq(uint g) {
     uint idx = (within < 16u) ? (rb(qoff + within) & 0xFu) : (rb(qoff + within - 16u) >> 4u);
     return dl * float(KV_IQ4NL[idx]);
 }
+#define HAVE_DQBLK
+// One 32-elem sub-block = exactly one of the 8 IQ4_XS sub-blocks (gstart is 32-aligned).
+// Decode d and the 6-bit sub-block scale ONCE, read each of the 16 qs bytes once (both nibbles).
+void dqblk(uint gstart, out float v[32]) {
+    uint p = gstart % 256u;
+    uint bd = (gstart / 256u) * 136u;
+    float d = f16tof32(ru16(bd));
+    uint scales_h = ru16(bd + 2u);
+    uint ib = p / 32u;
+    uint lo = (rb(bd + 4u + (ib / 2u)) >> (4u * (ib & 1u))) & 0xFu;
+    uint hi = (scales_h >> (2u * ib)) & 3u;
+    float dl = d * float(int(lo | (hi << 4u)) - 32);
+    uint qoff = bd + 8u + 16u * ib;
+    for (uint j = 0u; j < 16u; j++) {
+        uint b = rb(qoff + j);
+        v[j] = dl * float(KV_IQ4NL[b & 0xFu]);
+        v[j + 16u] = dl * float(KV_IQ4NL[b >> 4u]);
+    }
+}
 #endif
 
 #if defined(FMT_MXFP4)
