@@ -217,7 +217,10 @@ pub(crate) fn native_gemm_warp_build_spv(dtype: infr_core::DType) -> Option<&'st
         }};
     }
     Some(match dtype {
+        Q2K => v!("native_gemm_warp_q2k"),
+        Q4_0 => v!("native_gemm_warp_q4_0"),
         Q4K => v!("native_gemm_warp_q4k"),
+        Q5K => v!("native_gemm_warp_q5k"),
         Q6K => v!("native_gemm_warp_q6k"),
         Q8_0 => v!("native_gemm_warp_q8_0"),
         _ => return None,
@@ -238,7 +241,10 @@ pub(crate) fn native_gemm_warp_n128_build_spv(dtype: infr_core::DType) -> Option
         }};
     }
     Some(match dtype {
+        Q2K => v!("native_gemm_warp_q2k_n128"),
+        Q4_0 => v!("native_gemm_warp_q4_0_n128"),
         Q4K => v!("native_gemm_warp_q4k_n128"),
+        Q5K => v!("native_gemm_warp_q5k_n128"),
         Q6K => v!("native_gemm_warp_q6k_n128"),
         Q8_0 => v!("native_gemm_warp_q8_0_n128"),
         _ => return None,
@@ -263,7 +269,10 @@ pub(crate) fn native_gemm_warp_ag_build_spv(
         }};
     }
     Some(match dtype {
+        Q2K => ("native_gemm_warp_q2k_ag", v!("native_gemm_warp_q2k_ag")),
+        Q4_0 => ("native_gemm_warp_q4_0_ag", v!("native_gemm_warp_q4_0_ag")),
         Q4K => ("native_gemm_warp_q4k_ag", v!("native_gemm_warp_q4k_ag")),
+        Q5K => ("native_gemm_warp_q5k_ag", v!("native_gemm_warp_q5k_ag")),
         Q6K => ("native_gemm_warp_q6k_ag", v!("native_gemm_warp_q6k_ag")),
         Q8_0 => ("native_gemm_warp_q8_0_ag", v!("native_gemm_warp_q8_0_ag")),
         _ => return None,
@@ -285,9 +294,21 @@ pub(crate) fn native_gemm_warp_n128_ag_build_spv(
         }};
     }
     Some(match dtype {
+        Q2K => (
+            "native_gemm_warp_q2k_n128_ag",
+            v!("native_gemm_warp_q2k_n128_ag"),
+        ),
+        Q4_0 => (
+            "native_gemm_warp_q4_0_n128_ag",
+            v!("native_gemm_warp_q4_0_n128_ag"),
+        ),
         Q4K => (
             "native_gemm_warp_q4k_n128_ag",
             v!("native_gemm_warp_q4k_n128_ag"),
+        ),
+        Q5K => (
+            "native_gemm_warp_q5k_n128_ag",
+            v!("native_gemm_warp_q5k_n128_ag"),
         ),
         Q6K => (
             "native_gemm_warp_q6k_n128_ag",
@@ -316,9 +337,21 @@ pub(crate) fn native_gemm_warp_sk_ag_build_spv(
         }};
     }
     Some(match dtype {
+        Q2K => (
+            "native_gemm_warp_q2k_sk_ag",
+            v!("native_gemm_warp_q2k_sk_ag"),
+        ),
+        Q4_0 => (
+            "native_gemm_warp_q4_0_sk_ag",
+            v!("native_gemm_warp_q4_0_sk_ag"),
+        ),
         Q4K => (
             "native_gemm_warp_q4k_sk_ag",
             v!("native_gemm_warp_q4k_sk_ag"),
+        ),
+        Q5K => (
+            "native_gemm_warp_q5k_sk_ag",
+            v!("native_gemm_warp_q5k_sk_ag"),
         ),
         Q6K => (
             "native_gemm_warp_q6k_sk_ag",
@@ -345,7 +378,10 @@ pub(crate) fn native_gemm_warp_sk_build_spv(dtype: infr_core::DType) -> Option<&
         }};
     }
     Some(match dtype {
+        Q2K => v!("native_gemm_warp_q2k_sk"),
+        Q4_0 => v!("native_gemm_warp_q4_0_sk"),
         Q4K => v!("native_gemm_warp_q4k_sk"),
+        Q5K => v!("native_gemm_warp_q5k_sk"),
         Q6K => v!("native_gemm_warp_q6k_sk"),
         Q8_0 => v!("native_gemm_warp_q8_0_sk"),
         _ => return None,
