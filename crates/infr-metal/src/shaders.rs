@@ -1592,7 +1592,7 @@ kernel void attnflash2_f16kv_t(device const half*  q   [[buffer(0)]],
         // load directly from the f16 cache; fully-causal-masked 8-row KV blocks skipped (their
         // P is all zero, and skipping keeps reads within 7 rows of the limit)
         {
-            simdgroup_float8x8 lo[4];
+            simdgroup_float8x8 lo[no];
             threadgroup float* sot = so + 8u * sgitg;
             for (uint ii = 0; ii < no; ii++) simdgroup_load(lo[ii], sot + 8u * NSG * ii, hd);
             device const half* pv = v + ((ulong)ic * p.n_kv + kvh) * hd + 8u * sgitg;
@@ -1640,6 +1640,8 @@ kernel void attnflash2_f16kv_t(device const half*  q   [[buffer(0)]],
 typedef decltype(attnflash2_f16kv_t<64, 4>) attnflash2_t;
 template [[host_name("attnflash2_f16kv_hd64")]]  kernel attnflash2_t attnflash2_f16kv_t<64, 4>;
 template [[host_name("attnflash2_f16kv_hd128")]] kernel attnflash2_t attnflash2_f16kv_t<128, 4>;
+// hd=256 (gemma): sq 4KB + so 8KB + ss 2KB = 14KB shared, 8 O fragments per simdgroup.
+template [[host_name("attnflash2_f16kv_hd256")]] kernel attnflash2_t attnflash2_f16kv_t<256, 4>;
 
 // ---- Vector flash attention for decode (f16 KV cache, hd 64 or 128, one query row per
 // threadgroup): the llama.cpp `kernel_flash_attn_ext_vec` structure. NSG simdgroups each own
@@ -1825,6 +1827,11 @@ template [[host_name("attnvec_f16kv_hd128")]] kernel attnvec_t attnvec_f16kv_t<1
 typedef decltype(attnvec_dyn_f16kv_t<64, 32>) attnvec_dyn_t;
 template [[host_name("attnvec_dyn_f16kv_hd64")]]  kernel attnvec_dyn_t attnvec_dyn_f16kv_t<64, 32>;
 template [[host_name("attnvec_dyn_f16kv_hd128")]] kernel attnvec_dyn_t attnvec_dyn_f16kv_t<128, 32>;
+// hd=256 (gemma) drops to NSG=16: the per-simdgroup O partials are NSG*hd*4 bytes — 32 KB at
+// NSG=32/hd=256, over the whole threadgroup budget before sq/ssc. 16 simdgroups still cut the
+// serial chain 16x vs the plain split kernel; the merge tree just starts one level lower.
+template [[host_name("attnvec_f16kv_hd256")]]     kernel attnvec_t     attnvec_f16kv_t<256, 16>;
+template [[host_name("attnvec_dyn_f16kv_hd256")]] kernel attnvec_dyn_t attnvec_dyn_f16kv_t<256, 16>;
 
 // ---- Gated DeltaNet (Qwen3-Next linear attention) + its depthwise conv, ON DEVICE. Both are
 // sequential-over-rows recurrences; the parallelism is across CHANNELS (conv: each thread owns a
@@ -2340,7 +2347,7 @@ kernel void attnflash2_q8kv_t(device const half*  q   [[buffer(0)]],
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         {
-            simdgroup_float8x8 lo[4];
+            simdgroup_float8x8 lo[no];
             threadgroup float* sot = so + 8u * sgitg;
             for (uint ii = 0; ii < no; ii++) simdgroup_load(lo[ii], sot + 8u * NSG * ii, hd);
             threadgroup const half* pv = kvt + 8u * sgitg;
@@ -2380,4 +2387,8 @@ template [[host_name("attnvec_q8kv_hd128")]] kernel attnvec_q8_t attnvec_q8kv_t<
 typedef decltype(attnvec_dyn_q8kv_t<64, 32>) attnvec_dyn_q8_t;
 template [[host_name("attnvec_dyn_q8kv_hd64")]]  kernel attnvec_dyn_q8_t attnvec_dyn_q8kv_t<64, 32>;
 template [[host_name("attnvec_dyn_q8kv_hd128")]] kernel attnvec_dyn_q8_t attnvec_dyn_q8kv_t<128, 32>;
+// hd=256 at NSG=16 — same threadgroup-budget math as the f16 vec kernel. (No q8 flash hd256:
+// its dequant-staging tile alone is C*hd = 32 KB half — needs a C=32 variant first.)
+template [[host_name("attnvec_q8kv_hd256")]]     kernel attnvec_q8_t     attnvec_q8kv_t<256, 16>;
+template [[host_name("attnvec_dyn_q8kv_hd256")]] kernel attnvec_dyn_q8_t attnvec_dyn_q8kv_t<256, 16>;
 "#;

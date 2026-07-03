@@ -752,18 +752,32 @@ fn cmd_bench_metal(
     {
         let model = infr_llama::CpuModel::load(gguf, tok)?;
         let measure_tg = pg.is_none() && n_gen > 0;
+        // ONE session for warmup + every rep: backend, uploaded weights, compiled pipelines and
+        // the dequant/repack weight caches persist (each rep still measures a full prefill —
+        // `bench_metal` resets the materialized tokens). A fresh backend per rep re-paid those
+        // one-time costs inside the measurement.
+        let ctx = pg.map(|(p, g)| p + g).unwrap_or(if measure_tg {
+            depth.max(1) + n_gen
+        } else {
+            n_prompt
+        }) + 2;
+        let mut sess = model.metal_session(ctx)?;
         // One untimed warmup: page-cache the mmap + build the weight caches + compile pipelines.
-        let _ = model.bench_metal(depth.max(1), if measure_tg || pg.is_some() { 1 } else { 0 });
+        let _ = model.bench_metal(
+            &mut sess,
+            depth.max(1),
+            if measure_tg || pg.is_some() { 1 } else { 0 },
+        );
         let mut samples = Vec::with_capacity(reps);
         for _ in 0..reps {
             let ts = if let Some((p, g)) = pg {
-                let s = model.bench_metal(p, g)?;
+                let s = model.bench_metal(&mut sess, p, g)?;
                 (p + g) as f64 / (s.prompt_secs + s.decode_secs)
             } else if measure_tg {
-                let s = model.bench_metal(depth.max(1), n_gen)?;
+                let s = model.bench_metal(&mut sess, depth.max(1), n_gen)?;
                 n_gen as f64 / s.decode_secs
             } else {
-                let s = model.bench_metal(n_prompt, 0)?;
+                let s = model.bench_metal(&mut sess, n_prompt, 0)?;
                 n_prompt as f64 / s.prompt_secs
             };
             samples.push(ts);
