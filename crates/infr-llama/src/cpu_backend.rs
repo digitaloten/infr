@@ -216,13 +216,14 @@ pub(crate) fn generate_dense_gpu_session(
     generate_dense_backend(
         vk,
         &|name, tb, dt, _n| {
-            // Convert ONLY f16/bf16 weights → f16 in VRAM (mirrors the production loader): the
-            // adapter's Linear then runs the f16 coopmat GEMM for prefill instead of the slow per-row
-            // GEMV, and the declared dtype becomes F16 so the graph handle matches. F32 is left native
-            // — the norm weights are F32 and rmsnorm/qk_norm_rope read f32, so converting them would
-            // corrupt the norms. Quant weights → raw native blocks (u32-padded, in-shader dequant).
+            // Raw upload for EVERYTHING except bf16 — the file's bytes go straight to VRAM (u32-padded)
+            // and the kernel reads/dequants the native dtype in-shader. F16 needs no conversion (the
+            // f16 coopmat GEMM / f16 GEMV read it directly), F32 is left native (rmsnorm/qk_norm_rope
+            // read f32; the norms would be corrupted by narrowing), and quant weights are raw blocks.
+            // bf16 is the one exception: this GPU has no hardware bf16 coopmat, so bf16 weights are
+            // narrowed to f16 on load until a raw-bf16 GEMM lands (tracked; slightly lossy).
             match dt {
-                DType::F16 | DType::Bf16 => {
+                DType::Bf16 => {
                     let f32v = crate::dequant_block(dt, &tb).map_err(|e| anyhow!("{e}"))?;
                     let mut f16b = Vec::with_capacity(f32v.len() * 2);
                     for &v in &f32v {
