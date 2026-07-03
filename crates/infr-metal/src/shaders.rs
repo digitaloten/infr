@@ -807,27 +807,50 @@ inline void linear_q5_0_body(device const float*  x,
     uint il = (lane & 3u) * 8u;            // this thread's 8 quants within the block
     bool hi = il >= 16u;
     uint jq = hi ? il - 16u : il;          // nibble byte offset within qs
-    uint jh = hi ? il - 4u : il;           // qh shift base: hi bit e sits at (e-16)+12
 
     float yl[8];
     float sumf[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     device const float* yb = x + ix * 32u + il;
 
     for (uint ib = ix; ib < nb; ib += 8u) {
-        for (uint i = 0; i < 8u; i++) yl[i] = yb[i];
+        float sumy = 0.0f;
+        for (uint i = 0; i < 8u; i++) {
+            yl[i] = yb[i];
+            sumy += yb[i];
+        }
         for (uint row = 0; row < 4u; row++) {
             device const uchar* blk =
                 codes + (ulong)(first_row + min(row, nrows - 1u)) * row_b + (ulong)ib * 22ul;
-            uint qh = (uint)blk[2] | ((uint)blk[3] << 8) | ((uint)blk[4] << 16)
-                | ((uint)blk[5] << 24);
-            device const uchar* qs = blk + 6u + jq;
-            float sumq = 0.0f;
-            for (uint i = 0; i < 8u; i++) {
-                uint q = hi ? ((uint)(qs[i] >> 4) | ((qh >> (jh + i)) & 0x10u))
-                            : ((uint)(qs[i] & 0x0Fu) | (((qh >> (jh + i)) << 4) & 0x10u));
-                sumq += ((float)q - 16.0f) * yl[i];
-            }
-            sumf[row] += sumq * (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+            // 22-byte blocks keep every field on an even address: d and qh load as ushorts,
+            // the thread's 8 nibble-source bytes as two 4-byte words — 5 loads per (row, block)
+            // instead of 14 byte loads. Extraction stays in registers, q4k-body style: 4
+            // elements live as the bytes of one uint (nibbles OR'd with the spread qh bits),
+            // the dot runs on byte-masked floats with exact 1/256-power scale folding, and the
+            // -16 offset factors out through sumy — no per-element subtract or shift chain.
+            // (The qh bit for element e is bit e for BOTH nibble halves — the reference's two
+            // expressions land on the same bit.)
+            device const ushort* b16 = (device const ushort*)blk;
+            uint qh = (uint)b16[1] | ((uint)b16[2] << 16);
+            device const ushort* qsp = (device const ushort*)(blk + 6u + jq);
+            uint w0 = (uint)qsp[0] | ((uint)qsp[1] << 16);
+            uint w1 = (uint)qsp[2] | ((uint)qsp[3] << 16);
+            uint n0 = hi ? (w0 >> 4) & 0x0F0F0F0Fu : w0 & 0x0F0F0F0Fu;
+            uint n1 = hi ? (w1 >> 4) & 0x0F0F0F0Fu : w1 & 0x0F0F0F0Fu;
+            uint hb = (qh >> il) & 0xFFu;   // this thread's 8 high bits (element i at bit i)
+            uint q40 = n0 | ((hb & 1u) << 4) | ((hb & 2u) << 11) | ((hb & 4u) << 18)
+                | ((hb & 8u) << 25);
+            uint hb1 = hb >> 4;
+            uint q41 = n1 | ((hb1 & 1u) << 4) | ((hb1 & 2u) << 11) | ((hb1 & 4u) << 18)
+                | ((hb1 & 8u) << 25);
+            float4 acc;
+            acc.x = (float)(q40 & 0x000000FFu) * yl[0] + (float)(q41 & 0x000000FFu) * yl[4];
+            acc.y = (float)(q40 & 0x0000FF00u) * yl[1] + (float)(q41 & 0x0000FF00u) * yl[5];
+            acc.z = (float)(q40 & 0x00FF0000u) * yl[2] + (float)(q41 & 0x00FF0000u) * yl[6];
+            acc.w = (float)(q40 & 0xFF000000u) * yl[3] + (float)(q41 & 0xFF000000u) * yl[7];
+            float d = (float)as_type<half>(b16[0]);
+            sumf[row] += d
+                * (acc.x + acc.y * (1.0f / 256.0f) + acc.z * (1.0f / 65536.0f)
+                    + acc.w * (1.0f / 16777216.0f) - 16.0f * sumy);
         }
         yb += 8u * 32u;
     }
