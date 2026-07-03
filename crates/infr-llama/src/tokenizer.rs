@@ -238,7 +238,7 @@ pub(crate) fn build_spm_tokenizer(g: &Gguf) -> Result<Tokenizer> {
 #[cfg(test)]
 mod tokenizer_tests {
     use super::*;
-    use crate::*;
+    use crate::sampling::{sample_logits, Sampler};
 
     // Validate the GGUF-derived tokenizer against the HF tokenizer.json sidecar (same model).
     // Skips if the test model isn't present.
@@ -284,17 +284,6 @@ mod tokenizer_tests {
             sidecar.decode(ids.get_ids(), true).unwrap(),
             "decode differs from sidecar"
         );
-    }
-
-    // Streaming must hold a multi-byte char (emoji) split across tokens instead of emitting `�`.
-    #[test]
-    fn stream_decoder_holds_partial_utf8() {
-        let mut s = StreamDecoder::default();
-        // Simulate the per-step FULL decode of "Hi😄" where the emoji's bytes arrive across 2 tokens.
-        assert_eq!(s.step("Hi"), "Hi");
-        assert_eq!(s.step("Hi\u{FFFD}"), ""); // emoji half-decoded → hold, no `�` emitted
-        assert_eq!(s.step("Hi😄"), "😄"); // completes → emit the whole char
-        assert_eq!(s.step("Hi😄!"), "!");
     }
 
     // Sampling: temp<=0 and top_k==1 are greedy; otherwise picks only within the top-k/top-p set.

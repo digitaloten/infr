@@ -55,65 +55,6 @@ pub(crate) fn seed_rng() -> u64 {
         | 1
 }
 
-/// A forward step's output: the sampled token (chosen on the GPU — only 4 bytes cross the bus) or
-/// the full vocab logits (host samples them, when GPU sampling can't handle the config).
-pub(crate) enum GenOut {
-    Token(u32),
-    Logits(Vec<f32>),
-}
-
-/// Per-step sampling config for on-GPU token selection. `u` is the host-drawn uniform in [0,1).
-#[derive(Clone, Copy)]
-pub(crate) struct SampleParams {
-    pub(crate) temp: f32,
-    pub(crate) top_k: usize,
-    pub(crate) top_p: f32,
-    pub(crate) u: f32,
-}
-impl SampleParams {
-    /// Greedy (argmax) when temperature is off or only one candidate is kept.
-    pub(crate) fn greedy(&self) -> bool {
-        self.temp <= 0.0 || self.top_k == 1
-    }
-    /// The GPU sampler handles temp/top-k/top-p only for a bounded top_k; else host samples logits.
-    pub(crate) fn gpu_capable(&self) -> bool {
-        !self.greedy() && self.top_k >= 2 && self.top_k <= infr_vulkan::Recorder::SAMPLE_KMAX
-    }
-}
-
-/// Advance an xorshift64 RNG and return a uniform in [0,1) — the per-step random draw for sampling.
-pub(crate) fn draw_u(rng: &mut u64) -> f32 {
-    let mut x = *rng;
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    *rng = x;
-    (x >> 40) as f32 / (1u64 << 24) as f32
-}
-
-/// Incremental UTF-8-safe detokenizer: fed the FULL decoded text each step, returns the newly
-/// completed suffix. Byte-level BPE splits a multi-byte char (e.g. an emoji) across tokens, so a
-/// step's decode can end mid-character as U+FFFD (`�`); we hold output until it completes (decode no
-/// longer ends in `�`), emitting whole characters only.
-#[derive(Default)]
-pub(crate) struct StreamDecoder {
-    printed: usize,
-}
-impl StreamDecoder {
-    pub(crate) fn step(&mut self, full: &str) -> String {
-        if !full.ends_with('\u{FFFD}')
-            && full.len() > self.printed
-            && full.is_char_boundary(self.printed)
-        {
-            let delta = full[self.printed..].to_string();
-            self.printed = full.len();
-            delta
-        } else {
-            String::new()
-        }
-    }
-}
-
 pub(crate) fn argmax(v: &[f32]) -> usize {
     let mut bi = 0;
     let mut bv = f32::NEG_INFINITY;

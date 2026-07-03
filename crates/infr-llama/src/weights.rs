@@ -1,7 +1,7 @@
 //! GPU weight-storage types: a projection weight (f16 / native-quant blocks), MoE expert
 //! weights (GPU-resident or host-backed), and a layer FFN (dense gate||up + down, or a MoE
 //! bank). Mechanically split out of `lib.rs` (no logic change).
-use crate::{dequant_block, f16_bytes, f32_to_f16_sat};
+use crate::{dequant_block, f32_to_f16_sat};
 use anyhow::{anyhow, Result};
 use infr_core::backend::Buffer;
 use infr_core::WeightSource;
@@ -24,75 +24,7 @@ pub(crate) enum Wt {
         dtype: infr_core::DType,
     },
 }
-impl Wt {
-    /// The f16 buffer (panics if quantized — used by the llama fused path, which is f16-only).
-    pub(crate) fn f16(&self) -> &dyn Buffer {
-        match self {
-            Wt::F16(b) => b.as_ref(),
-            Wt::Native { .. } => {
-                panic!("expected f16 weight, got native quant (llama fused path needs f16)")
-            }
-        }
-    }
-}
-
-/// One expert weight: resident on the GPU (`Gpu`) or host-backed (`Cpu`) — for host-backed experts
-/// the bytes are read on demand from the kept-alive GGUF mmap (no host-RAM copy), then computed on
-/// the CPU or streamed to a VRAM pool (`INFR_NCMOE` / `INFR_MOE_STREAM`, cf. `--n-cpu-moe`).
-pub(crate) enum ExpertW {
-    Gpu(Wt),
-    Cpu { dtype: infr_core::DType },
-}
-impl ExpertW {
-    pub(crate) fn is_cpu(&self) -> bool {
-        matches!(self, ExpertW::Cpu { .. })
-    }
-    /// The GPU weight (panics for host experts — callers branch on [`is_cpu`] first).
-    pub(crate) fn gpu(&self) -> &Wt {
-        match self {
-            ExpertW::Gpu(w) => w,
-            ExpertW::Cpu { .. } => panic!("expected GPU expert"),
-        }
-    }
-}
-
-/// One routed expert's SwiGLU weights (gate/up [n_embd→n_ff_exp], down [n_ff_exp→n_embd]).
-pub(crate) struct ExpertWt {
-    pub(crate) gate: ExpertW,
-    pub(crate) up: ExpertW,
-    pub(crate) down: ExpertW,
-}
-
-/// Stacked GPU expert bank: one Native buffer per role holding all experts contiguously, addressed
-/// by element offset (`expert_id * stride`). Lets the GPU-resident decode/prefill dispatch every
-/// expert from a single buffer (so an on-GPU router id can pick the expert — no host round-trip).
-/// Built only for fully-GPU, native-quant, non-offloaded models; offloaded models keep `experts`.
-pub(crate) struct MoeStacked {
-    pub(crate) gate: Wt,
-    pub(crate) up: Wt,
-    pub(crate) down: Wt,
-    pub(crate) stride: usize, // elements per expert (n_ff_exp * n_embd), identical for gate/up/down
-}
-
-/// A layer's FFN: dense fused gate‖up + down, or a routed MoE bank (router + per-expert weights).
-pub(crate) enum FfnWt {
-    Dense {
-        wgateup: Wt,
-        wdown: Wt,
-    },
-    Moe {
-        gate_inp: Wt,
-        experts: Vec<ExpertWt>, // empty when `stacked` is Some (per-expert buffers dropped)
-        stacked: Option<MoeStacked>,
-    },
-}
-pub(crate) fn is_native_default(d: infr_core::DType) -> bool {
-    use infr_core::DType::*;
-    matches!(
-        d,
-        Q8_0 | Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q2K | Q3K | Q4K | Q5K | Q6K
-    )
-}
+impl Wt {}
 
 /// Upload a projection weight, keeping quantized weights quantized in-VRAM (else convert to f16).
 ///
@@ -137,117 +69,6 @@ pub(crate) fn upload_wt_bytes(
         .flat_map(|&v| f32_to_f16_sat(v).to_bits().to_le_bytes())
         .collect();
     Ok(Wt::F16(be.upload_weight_bytes(&f16_bytes)?))
-}
-
-/// Build a dense layer's fused gate‖up weight (`[2*n_ff, n_embd]`, gate rows then up rows). Quant
-/// stays quantized (raw native blocks); float → f16. `prefix` is e.g. `"blk.3."`.
-pub(crate) fn build_wgateup(be: &VulkanBackend, g: &Gguf, prefix: &str) -> Result<Wt> {
-    let gate_name = format!("{prefix}ffn_gate.weight");
-    let up_name = format!("{prefix}ffn_up.weight");
-    let gate_dtype = g
-        .tensors()
-        .iter()
-        .find(|t| t.name == gate_name)
-        .map(|t| t.dtype);
-    let gb = g.tensor_bytes(&gate_name).map_err(|e| anyhow!("{e}"))?;
-    let ub = g.tensor_bytes(&up_name).map_err(|e| anyhow!("{e}"))?;
-    // Native path (every quant format): the fused `[2*n_ff, n_embd]` weight is just gate's rows
-    // followed by up's rows, and each tensor's bytes are already row-contiguous native blocks — so
-    // concatenating the raw bytes IS the fused weight (up's first block lands exactly at `gb.len()`,
-    // no inter-tensor padding). Raw upload, in-shader dequant — no host dequant/repack.
-    if let Some(dt) = gate_dtype {
-        if infr_vulkan::linear::native_dense_supported(dt) {
-            let mut fused = gb.to_vec();
-            fused.extend_from_slice(ub);
-            let padded = infr_vulkan::linear::pad_to_u32_align(&fused);
-            return Ok(Wt::Native {
-                buf: be
-                    .upload_weight_bytes(&padded)
-                    .map_err(|e| anyhow!("native gateup upload: {e}"))?,
-                dtype: dt,
-            });
-        }
-    }
-    // Float gate/up → f16.
-    let mut gateup = f16_bytes(g, &gate_name)?;
-    gateup.extend_from_slice(&f16_bytes(g, &up_name)?);
-    Ok(Wt::F16(be.upload_weight_bytes(&gateup)?))
-}
-/// Dispatch a [`Wt`] linear (`y = x·Wᵀ`) into a recorder, picking the f16 / quant / native op.
-/// The (dtype, buffer) of a Native weight — for the stacked MoE expert dispatch (native-only).
-pub(crate) fn native_parts(w: &Wt) -> (infr_core::DType, &dyn Buffer) {
-    match w {
-        Wt::Native { buf, dtype } => (*dtype, buf.as_ref()),
-        _ => unreachable!("stacked MoE experts are native-only"),
-    }
-}
-
-/// Prefill projection (`y = X·Wᵀ`, X = [m,in_f], m≥64): tiled coopmat GEMM for native-quant weights
-/// (decode-once, reused across the 64-row tile) instead of the per-row GEMV that re-reads the weight
-/// m times. `y` is allocated `ceil(m/64)*64` rows. Non-native weights (the small f16 router) fall
-/// back to the GEMV.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn rec_proj(
-    rec: &infr_vulkan::Recorder,
-    w: &Wt,
-    x: &dyn Buffer,
-    y: &dyn Buffer,
-    m: usize,
-    in_f: usize,
-    out_f: usize,
-) {
-    match w {
-        Wt::Native { buf, dtype } => rec.matmul_native(*dtype, x, buf.as_ref(), y, m, in_f, out_f),
-        _ => rec_linear(rec, w, x, y, m, in_f, out_f),
-    }
-}
-
-/// Dispatch a stacked MoE expert as a tiled coopmat GEMM (`y = X·W_eᵀ`, X = [m,in_f]): the weight is
-/// `expert*stride` elements into the stacked Native buffer, decoded ONCE and reused across the 64-row
-/// tile (vs the per-row GEMV re-read). `y` is allocated `ceil(m/64)*64` rows. Native-only.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn rec_gemm_expert(
-    rec: &infr_vulkan::Recorder,
-    w: &Wt,
-    expert: usize,
-    stride: usize,
-    x: &dyn Buffer,
-    y: &dyn Buffer,
-    m: usize,
-    in_f: usize,
-    out_f: usize,
-) {
-    let (dtype, buf) = native_parts(w);
-    rec.matmul_native_off(dtype, x, buf, expert * stride, y, m, in_f, out_f);
-}
-
-/// Dispatch a stacked MoE expert's linear (`y = x·W_eᵀ`): the weight is `expert * stride` elements
-/// into the role's stacked Native buffer. Stacked experts are native-only (see [`load_moe`]).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn rec_linear_expert(
-    rec: &infr_vulkan::Recorder,
-    w: &Wt,
-    expert: usize,
-    stride: usize,
-    x: &dyn Buffer,
-    y: &dyn Buffer,
-    rows: usize,
-    in_f: usize,
-    out_f: usize,
-) {
-    match w {
-        Wt::Native { buf, dtype } => rec.linear_native_off(
-            *dtype,
-            buf.as_ref(),
-            expert * stride,
-            x,
-            y,
-            rows,
-            in_f,
-            out_f,
-        ),
-        _ => unreachable!("stacked MoE experts are native-only"),
-    }
 }
 
 pub(crate) fn rec_linear(
@@ -303,7 +124,7 @@ impl WeightFootprint {
     }
 
     /// Footprint if experts are STREAMED through an `n_slots`-slot pool of `stride`-byte slots
-    /// (`infr_vulkan::ExpertPool`) instead of all kept resident: `dense + n_slots·stride`, bounded
+    /// (a VRAM slot pool) instead of all kept resident: `dense + n_slots·stride`, bounded
     /// regardless of the model's expert count. The MoE loader picks all-resident ([`total`]) when it
     /// fits VRAM, else reserves this and streams. (`stride` = one expert's max packed weight bytes.)
     pub fn streaming_total(&self, n_slots: usize, stride: usize) -> u64 {
@@ -346,79 +167,4 @@ pub fn weight_footprint(g: &Gguf) -> WeightFootprint {
         }
     }
     WeightFootprint { dense, expert }
-}
-
-/// Load a layer's MoE expert bank: the router `ffn_gate_inp` + the `n_expert` per-expert SwiGLU
-/// weights sliced from the stacked `ffn_{gate,up,down}_exps` tensors (each expert is one contiguous
-/// `1/n_expert` block of the stacked tensor — quant blocks never cross expert boundaries).
-pub(crate) fn load_moe(
-    be: &VulkanBackend,
-    g: &Gguf,
-    prefix: &str,
-    n_expert: usize,
-    on_cpu: bool,
-    build_stacked: bool,
-    stride_elems: usize,
-) -> Result<FfnWt> {
-    let gate_inp = upload_wt(be, g, &format!("{prefix}ffn_gate_inp.weight"))?;
-    let stacked = |role: &str| -> Result<(infr_core::DType, &[u8])> {
-        let name = format!("{prefix}ffn_{role}_exps.weight");
-        let dt = g
-            .tensors()
-            .iter()
-            .find(|t| t.name == name)
-            .ok_or_else(|| anyhow!("tensor not found: {name}"))?
-            .dtype;
-        let bytes = g.tensor_bytes(&name).map_err(|e| anyhow!("{e}"))?;
-        Ok((dt, bytes))
-    };
-    let (gdt, gbytes) = stacked("gate")?;
-    let (udt, ubytes) = stacked("up")?;
-    let (ddt, dbytes) = stacked("down")?;
-
-    // Fully-GPU native model: upload each role's whole `*_exps` tensor as ONE Native buffer and
-    // address experts by element offset. Per-expert buffers are dropped (same VRAM, one allocation),
-    // and the on-GPU router can index experts without a host round-trip.
-    let native_ok = [gdt, udt, ddt].iter().all(|&d| is_native_default(d));
-    if build_stacked && !on_cpu && native_ok {
-        let mk = |dt, b| upload_wt_bytes(be, dt, b);
-        return Ok(FfnWt::Moe {
-            gate_inp,
-            experts: Vec::new(),
-            stacked: Some(MoeStacked {
-                gate: mk(gdt, gbytes)?,
-                up: mk(udt, ubytes)?,
-                down: mk(ddt, dbytes)?,
-                stride: stride_elems,
-            }),
-        });
-    }
-
-    let (gstride, ustride, dstride) = (
-        gbytes.len() / n_expert,
-        ubytes.len() / n_expert,
-        dbytes.len() / n_expert,
-    );
-    // GPU experts upload to VRAM; host experts store only the dtype — their bytes are read on demand
-    // from the kept-alive GGUF mmap at forward time (no host-RAM copy).
-    let place = |dt: infr_core::DType, b: &[u8]| -> Result<ExpertW> {
-        if on_cpu {
-            Ok(ExpertW::Cpu { dtype: dt })
-        } else {
-            Ok(ExpertW::Gpu(upload_wt_bytes(be, dt, b)?))
-        }
-    };
-    let mut experts = Vec::with_capacity(n_expert);
-    for e in 0..n_expert {
-        experts.push(ExpertWt {
-            gate: place(gdt, &gbytes[e * gstride..(e + 1) * gstride])?,
-            up: place(udt, &ubytes[e * ustride..(e + 1) * ustride])?,
-            down: place(ddt, &dbytes[e * dstride..(e + 1) * dstride])?,
-        });
-    }
-    Ok(FfnWt::Moe {
-        gate_inp,
-        experts,
-        stacked: None,
-    })
 }

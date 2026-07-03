@@ -710,27 +710,6 @@ pub(crate) fn attn_live_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(ATTN_LIVE_SPV_BYTES))
 }
-dyn_spv!(attn_in_dyn_spv, "attn_in_dyn");
-/// SPIR-V for fused attention input (RMSNorm + QKV proj + RoPE).
-pub(crate) fn attn_in_spv() -> &'static [u32] {
-    static ATTN_IN_SPV: OnceLock<Vec<u32>> = OnceLock::new();
-    ATTN_IN_SPV.get_or_init(|| spv_words(ATTN_IN_SPV_BYTES))
-}
-/// SPIR-V for fused FFN input (RMSNorm + gate/up proj + SwiGLU).
-pub(crate) fn ffn_in_spv() -> &'static [u32] {
-    static FFN_IN_SPV: OnceLock<Vec<u32>> = OnceLock::new();
-    FFN_IN_SPV.get_or_init(|| spv_words(FFN_IN_SPV_BYTES))
-}
-/// SPIR-V for the quant variant of fused FFN input.
-pub(crate) fn ffn_in_q_spv() -> &'static [u32] {
-    static FFN_IN_Q_SPV: OnceLock<Vec<u32>> = OnceLock::new();
-    FFN_IN_Q_SPV.get_or_init(|| spv_words(FFN_IN_Q_SPV_BYTES))
-}
-/// SPIR-V for the quant variant of fused attention input (RMSNorm + QKV proj).
-pub(crate) fn attn_in_q_spv() -> &'static [u32] {
-    static ATTN_IN_Q_SPV: OnceLock<Vec<u32>> = OnceLock::new();
-    ATTN_IN_Q_SPV.get_or_init(|| spv_words(ATTN_IN_Q_SPV_BYTES))
-}
 /// SPIR-V for the subgroup decode GEMV (`y=x·Wᵀ`). `bits`=4/8 picks the quant variant; `res` adds
 /// a fused residual. Used by the recorder's `linear_q` / `linear_add_q`.
 pub(crate) fn mul_mat_vec_q_spv(bits: u32, res: bool) -> &'static [u32] {

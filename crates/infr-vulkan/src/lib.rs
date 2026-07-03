@@ -10,14 +10,12 @@
 #![allow(clippy::too_many_arguments)]
 
 mod adapter;
-mod expert_pool;
 mod gemm;
 pub mod linear;
 mod matmul;
 mod ops;
 mod recorder;
 
-pub use expert_pool::ExpertPool;
 pub use recorder::{RecordedCmd, Recorder};
 
 /// Shared-memory bytes consumed per query row of a flash-attention prefill tile

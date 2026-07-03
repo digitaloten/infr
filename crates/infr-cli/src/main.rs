@@ -331,7 +331,6 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     let is_q35 = infr_llama::qwen35::is_qwen35(&gguf);
     // Chat-default sampling for every backend (the bespoke branch reads the same envs below).
     set_default_sampling_env();
-    let llama; // declared here so a borrowing ChatSession / MoeChat outlives `chat`
     let model: Box<dyn infr_llama::model::ChatModel + '_> = if std::env::var("INFR_METAL").is_ok() {
         if is_q35 {
             eprintln!(
@@ -366,38 +365,13 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         };
         eprintln!("[qwen35 Qwen3-Next — {mode}]");
         Box::new(infr_llama::model::Qwen35Chat::new(gguf.clone()))
-    } else if std::env::var("INFR_SEAM").is_ok() {
-        // Opt-in: dense/MoE on the VULKAN agnostic seam with a persistent KV session (per-turn
-        // suffix-only prefill). Becomes the default once it beats the bespoke path everywhere.
+    } else {
+        // The default: dense/MoE on the VULKAN agnostic seam — persistent multi-slot KV sessions
+        // (per-turn suffix-only prefill), record-once decode replay, MoE expert auto-fit.
         eprintln!("[vulkan seam — dense/MoE on the agnostic compute graph, persistent KV session]");
         Box::new(infr_llama::model::DenseSeamChat::new(
             infr_llama::CpuModel::load(&gguf, tok.as_deref())?,
         ))
-    } else {
-        llama = infr_llama::Llama::load_opt(&gguf, tok.as_deref())?;
-        // Qwen3's recommended sampling — pure greedy makes thinking models degenerate
-        // (unterminated <think>, no answer). Tune via INFR_TEMP / INFR_TOP_K / INFR_TOP_P.
-        llama.set_sampling(
-            envf("INFR_TEMP", 0.6),
-            envu("INFR_TOP_K", 20),
-            envf("INFR_TOP_P", 0.95),
-        );
-        if llama.is_moe() {
-            eprintln!("[qwen3moe — eager MoE forward: GPU matmuls + GPU KV cache + CPU router/top-k + auto-fit]");
-            Box::new(infr_llama::model::MoeChat::new(&llama))
-        } else {
-            // Honor the model's default context length; INFR_MAX_CTX overrides it.
-            let max_ctx = ctx_override.unwrap_or_else(|| llama.config().n_ctx_train);
-            eprintln!(
-                "[ctx {max_ctx}{}]",
-                if ctx_override.is_some() {
-                    " (override)"
-                } else {
-                    " (model default)"
-                }
-            );
-            Box::new(llama.chat_session(max_ctx)?)
-        }
     };
     let mut chat = infr_llama::model::Chat::new(model);
 
@@ -453,129 +427,14 @@ fn run_chat_turn(
     Ok(())
 }
 
-/// Adapter: drive `infr-llama` through the server's `ChatGenerator` seam.
-struct LlamaGenerator {
-    llama: infr_llama::Llama,
-    /// Multi-slot prefix cache: each request prefills only the suffix that differs from the slot it
-    /// continues, so a coding agent's stable system prompt + history isn't re-prefilled every turn
-    /// (cutting time-to-first-token). Multiple slots keep concurrent/interleaved conversations from
-    /// thrashing one cache. Server generation is serialized by a Mutex, so the cache needs no lock.
-    cache: infr_llama::ServeCache,
-}
-
-impl infr_server::ChatGenerator for LlamaGenerator {
-    fn chat(
-        &mut self,
-        messages: &[infr_engine::ChatMessage],
-        tools_json: Option<&str>,
-        tool_choice: Option<&str>,
-        on_delta: &mut dyn FnMut(infr_engine::Delta),
-    ) -> anyhow::Result<()> {
-        // Render the FULL conversation (system/user/assistant-with-tool_calls/tool results) + the
-        // request's tool spec through the model's own chat template — the template emits each model's
-        // native tool syntax, so infr never hardcodes a format.
-        let tools: Option<serde_json::Value> = tools_json
-            .map(serde_json::from_str)
-            .transpose()
-            .context("parsing request `tools`")?;
-        let prompt = self.llama.render_chat_oai(messages, tools.as_ref())?;
-        // INFR_DUMP_REQ=<file>: append the exact rendered prompt for each request (debugging the
-        // serve-only garbage). Replay it verbatim to reproduce/root-cause outside the server.
-        if let Ok(path) = std::env::var("INFR_DUMP_REQ") {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-            {
-                let _ = write!(
-                    f,
-                    "===REQ n_msgs={} has_tools={} chars={}===\n{prompt}\n===END===\n",
-                    messages.len(),
-                    tools.is_some(),
-                    prompt.len(),
-                );
-            }
-        }
-        let max_new = std::env::var("INFR_MAX_NEW")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2048usize);
-
-        // For tool_choice "required"/named, build a grammar constraint that FORCES a valid,
-        // schema-conforming tool call (llama.cpp-parity reliability). "auto"/"none"/absent → None.
-        if let Some(mut constraint) = self.llama.tool_constraint(tools.as_ref(), tool_choice)? {
-            // Forced path: prime the assistant turn with the `<tool_call>` opener and grammar-constrain
-            // the JSON body. On any grammar/parser error, OR if the constrained body is empty/unparseable
-            // (e.g. the toktrie bridge masked out the whole call), fall through to unconstrained
-            // generation rather than failing the request or returning an empty `stop`.
-            let primed = format!("{prompt}<tool_call>\n");
-            let emitted = match self.cache.generate(
-                &self.llama,
-                &primed,
-                max_new,
-                Some(&mut constraint),
-                |_| {},
-            ) {
-                Ok(ids) => {
-                    let body = self.llama.decode_ids(&ids, false)?;
-                    // The constrained output IS the JSON call object — parse it straight; strip any
-                    // trailing `</tool_call>` past the grammar.
-                    let body = body.trim().trim_end_matches("</tool_call>").trim();
-                    match serde_json::from_str::<serde_json::Value>(body) {
-                        Ok(val) => val.get("name").and_then(|v| v.as_str()).map(|name| {
-                            let arguments = val
-                                .get("arguments")
-                                .cloned()
-                                .unwrap_or(serde_json::json!({}));
-                            on_delta(infr_engine::Delta::ToolCall {
-                                name: name.to_string(),
-                                arguments: serde_json::to_string(&arguments)
-                                    .unwrap_or_else(|_| "{}".to_string()),
-                            });
-                        }),
-                        Err(_) => None,
-                    }
-                    .is_some()
-                }
-                Err(e) => {
-                    eprintln!("[tools] grammar-constrained generation failed ({e})");
-                    false
-                }
-            };
-            if emitted {
-                return Ok(());
-            }
-            eprintln!("[tools] forced tool call produced no parseable call; falling back to unconstrained");
-            // fall through to the unconstrained path below
-        }
-
-        // Auto path: unconstrained, STREAMED. Each decoded piece is routed live — `<think>…</think>`
-        // → Reasoning deltas, the rest → Content deltas — via `ChatStream`, which holds back a
-        // marker-length tail so a partial `<think>`/`</think>`/`<tool_call>` never streams. `tool_choice
-        // "none"` forbids tool calls (all output is content); otherwise, once a `<tool_call>` opener
-        // appears the tail is buffered and parsed into ToolCall deltas at finish().
-        let mut stream = ChatStream::new(tool_choice != Some("none"));
-        {
-            let od = &mut *on_delta;
-            self.cache
-                .generate(&self.llama, &prompt, max_new, None, |piece: &str| {
-                    stream.push(piece, &mut *od)
-                })?;
-        }
-        stream.finish(on_delta);
-        Ok(())
-    }
-}
-
 /// Serve adapter for the seam-backed [`ChatModel`]s (qwen35 on any backend, dense/MoE on the
 /// Vulkan seam or the CPU/Metal reference): renders the FULL OpenAI conversation — including tool
 /// specs and prior tool calls/results — through the model's own chat template
 /// (`infr_chat::render_chat_oai`, model-independent), generates through the SAME `ChatModel`
 /// primitive `infr run`/`bench` drive (persistent session ⇒ per-request suffix-only prefill), and
 /// streams through the same [`ChatStream`] splitter (reasoning/content/auto-parsed tool calls).
-/// Grammar-FORCED tool_choice isn't wired on the seam yet — it degrades to auto with a warning
-/// (the streamed parser still extracts any tool call the model emits). Decode is greedy.
+/// Grammar-FORCED tool_choice builds an llguidance constraint and generates through
+/// `generate_constrained` (llama.cpp-parity reliability); auto/none stream through the parser.
 struct SeamGenerator {
     model: Box<dyn infr_llama::model::ChatModel + Send>,
     renderer: infr_llama::model::OaiRenderer,
@@ -817,34 +676,6 @@ fn cmd_bench(
     if infr_llama::qwen35::is_qwen35(&gguf) {
         return cmd_bench_qwen35(&gguf, n_prompt, n_gen, depth, pg, reps, ngl == 0, json);
     }
-    // INFR_GPU_SEAM=1: bench the dense forward on the Vulkan backend THROUGH THE AGNOSTIC SEAM
-    // instead of the production Recorder path. An eligible qwen3-style dense decode now records the
-    // graph ONCE and replays it per token (params-driven `_dyn` kernels), matching the production
-    // Recorder's record-once behavior. Reuses -p/-n/-r; reports pp/tg like the others.
-    if std::env::var("INFR_GPU_SEAM").is_ok() {
-        let model = infr_llama::CpuModel::load(&gguf, tok.as_deref())?;
-        let mut pps = Vec::new();
-        let mut tgs = Vec::new();
-        for _ in 0..reps.max(1) {
-            let s = model.bench_vulkan(n_prompt, n_gen)?;
-            if s.prompt_secs > 0.0 {
-                pps.push(s.n_prompt as f64 / s.prompt_secs);
-            }
-            if s.decode_secs > 0.0 {
-                tgs.push(s.n_gen as f64 / s.decode_secs);
-            }
-        }
-        let med = |mut v: Vec<f64>| {
-            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            v.get(v.len() / 2).copied().unwrap_or(0.0)
-        };
-        println!(
-            "seam (record-once replay): pp={:.1} tok/s  tg={:.1} tok/s  (p={n_prompt} n={n_gen} r={reps})",
-            med(pps),
-            med(tgs),
-        );
-        return Ok(());
-    }
     // -ngl 0: run on the CPU reference backend (no GPU), comparable to `llama-bench -ngl 0`.
     if ngl == 0 {
         return cmd_bench_cpu(
@@ -874,95 +705,15 @@ fn cmd_bench(
         );
     }
     let _ = dev; // GPU device selection: VulkanBackend uses the default adapter (--dev reserved for parity).
-    let llama = infr_llama::Llama::load_opt(&gguf, tok.as_deref())?;
-    let measure_tg = pg.is_none() && n_gen > 0;
-    let dummy =
-        |pos: usize, c: usize| -> Vec<u32> { (0..c).map(|i| ((pos + i) % 100) as u32).collect() };
-    // ubatch>0 pins the prefill chunk (= llama-bench -ub); 0 = the engine's adaptive policy.
-    let chunk = |pos: usize| {
-        if ubatch > 0 {
-            ubatch
-        } else {
-            llama.prefill_chunk(pos)
-        }
-    };
-    let cap = depth + pg.map_or(n_prompt + n_gen, |(p, g)| p + g) + 64;
-    let mut samples = Vec::with_capacity(reps);
-    // MoE models use the eager forward + GPU MoE KV cache; dense models the resident GPU forward.
-    // Same prefill→measure shape, different forward/cache types, so the rep body is branched.
-    if llama.is_moe() {
-        let prefill = |llama: &infr_llama::Llama,
-                       kv: &mut infr_llama::MoeKv,
-                       count: usize|
-         -> anyhow::Result<()> {
-            let mut done = 0usize;
-            while done < count {
-                let pos = kv.len();
-                let c = chunk(pos).min(count - done);
-                llama.forward_moe_chunk(&dummy(pos, c), kv)?;
-                done += c;
-            }
-            Ok(())
-        };
-        // Pipelines are compiled at load (Llama::warmup); the timed reps measure compute only.
-        for _ in 0..reps {
-            let mut kv = llama.new_moe_kv(cap)?;
-            prefill(&llama, &mut kv, depth)?; // warm to `depth` (untimed)
-            let t = std::time::Instant::now();
-            if let Some((p, g)) = pg {
-                prefill(&llama, &mut kv, p)?;
-                for _ in 0..g {
-                    llama.forward_moe_chunk(&[7u32], &mut kv)?;
-                }
-                samples.push((p + g) as f64 / t.elapsed().as_secs_f64());
-            } else if measure_tg {
-                for _ in 0..n_gen {
-                    llama.forward_moe_chunk(&[7u32], &mut kv)?;
-                }
-                samples.push(n_gen as f64 / t.elapsed().as_secs_f64());
-            } else {
-                prefill(&llama, &mut kv, n_prompt)?;
-                samples.push(n_prompt as f64 / t.elapsed().as_secs_f64());
-            }
-        }
-    } else {
-        // prefill `count` tokens at the cache head, chunked.
-        let prefill = |kv: &mut infr_llama::KvCache, count: usize| -> anyhow::Result<()> {
-            let mut done = 0usize;
-            while done < count {
-                let pos = kv.len();
-                let c = chunk(pos).min(count - done);
-                llama.forward_resident_kv(&dummy(pos, c), kv)?;
-                done += c;
-            }
-            Ok(())
-        };
-        // Pipelines are compiled at load (Llama::warmup); the timed reps measure compute only.
-        for _ in 0..reps {
-            let mut kv = llama.new_kv(cap)?;
-            prefill(&mut kv, depth)?; // warm to `depth` (untimed)
-            let t = std::time::Instant::now();
-            if let Some((p, g)) = pg {
-                // coding-agent turn: time prompt ingest + reply generation together.
-                prefill(&mut kv, p)?;
-                for _ in 0..g {
-                    llama.forward_resident_kv(&[7u32], &mut kv)?;
-                }
-                samples.push((p + g) as f64 / t.elapsed().as_secs_f64());
-            } else if measure_tg {
-                for _ in 0..n_gen {
-                    llama.forward_resident_kv(&[7u32], &mut kv)?;
-                }
-                samples.push(n_gen as f64 / t.elapsed().as_secs_f64());
-            } else {
-                prefill(&mut kv, n_prompt)?;
-                samples.push(n_prompt as f64 / t.elapsed().as_secs_f64());
-            }
-        }
+                 // ubatch>0 pins the seam's prefill chunk (= llama-bench -ub); 0 = the default (1024).
+    if ubatch > 0 {
+        std::env::set_var("INFR_UBATCH", ubatch.to_string());
     }
+    let model = infr_llama::CpuModel::load(&gguf, tok.as_deref())?;
+    let samples = model.bench_vulkan(n_prompt, n_gen, depth, pg, reps)?;
     let label = if let Some((p, g)) = pg {
         format!("pg{p}+{g}")
-    } else if measure_tg {
+    } else if n_gen > 0 {
         format!("tg{n_gen}")
     } else {
         format!("pp{n_prompt}")
@@ -1403,36 +1154,32 @@ fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
         .to_string();
     let sockaddr: std::net::SocketAddr = addr.parse().context("invalid --addr")?;
 
-    // Seam-backed serve: qwen35 (which the bespoke Llama engine can't load at all) always, and
-    // dense/MoE when opted in (INFR_SEAM / INFR_CPU / INFR_METAL) — the SAME ChatModel + session
-    // `infr run` uses, so serve gets per-request suffix-only prefill for free. Greedy decode;
-    // forced tool_choice degrades to auto (see SeamGenerator).
+    // Seam-backed serve — the ONE engine: the SAME ChatModel + multi-slot session `infr run`
+    // uses, so serve gets per-request suffix-only prefill and cross-conversation prefix seeding
+    // for free. INFR_CPU / INFR_METAL select the reference backends; Vulkan is the default.
     let is_q35 = infr_llama::qwen35::is_qwen35(&gguf);
-    let seam_model: Option<Box<dyn infr_llama::model::ChatModel + Send>> = if is_q35 {
-        let m = if std::env::var("INFR_METAL").is_ok() {
+    let mut m: Box<dyn infr_llama::model::ChatModel + Send> = if is_q35 {
+        Box::new(if std::env::var("INFR_METAL").is_ok() {
             infr_llama::model::Qwen35Chat::new_metal(gguf.clone())
         } else if std::env::var("INFR_CPU").is_ok() {
             infr_llama::model::Qwen35Chat::new_cpu(gguf.clone())
         } else {
             infr_llama::model::Qwen35Chat::new(gguf.clone())
-        };
-        Some(Box::new(m))
+        })
     } else if std::env::var("INFR_METAL").is_ok() {
-        Some(Box::new(infr_llama::model::CpuDenseChat::new_metal(
+        Box::new(infr_llama::model::CpuDenseChat::new_metal(
             infr_llama::CpuModel::load(&gguf, tok.as_deref())?,
-        )))
+        ))
     } else if std::env::var("INFR_CPU").is_ok() {
-        Some(Box::new(infr_llama::model::CpuDenseChat::new(
+        Box::new(infr_llama::model::CpuDenseChat::new(
             infr_llama::CpuModel::load(&gguf, tok.as_deref())?,
-        )))
-    } else if std::env::var("INFR_SEAM").is_ok() {
-        Some(Box::new(infr_llama::model::DenseSeamChat::new(
-            infr_llama::CpuModel::load(&gguf, tok.as_deref())?,
-        )))
+        ))
     } else {
-        None
+        Box::new(infr_llama::model::DenseSeamChat::new(
+            infr_llama::CpuModel::load(&gguf, tok.as_deref())?,
+        ))
     };
-    if let Some(mut m) = seam_model {
+    {
         set_default_sampling_env();
         // Compile every lazily-built pipeline NOW (a tiny throwaway generation) so the first
         // request doesn't pay seconds of pipeline builds on top of its own prefill.
@@ -1446,37 +1193,8 @@ fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
             Box::new(SeamGenerator::new(&gguf, m)?);
         let rt = tokio::runtime::Runtime::new()?;
         println!("infr serve: {model_id} on http://{sockaddr}  (OpenAI /v1, agnostic seam)");
-        return rt.block_on(infr_server::serve(generator, model_id, sockaddr));
+        rt.block_on(infr_server::serve(generator, model_id, sockaddr))
     }
-
-    let llama = infr_llama::Llama::load_opt(&gguf, tok.as_deref())?;
-    // Qwen3's recommended sampling — pure greedy makes thinking models degenerate (unterminated
-    // `<think>`, repeated tokens). Mirrors `cmd_run`; tune via INFR_TEMP / INFR_TOP_K / INFR_TOP_P.
-    let envf = |k: &str, d: f32| {
-        std::env::var(k)
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(d)
-    };
-    let envu = |k: &str, d: usize| {
-        std::env::var(k)
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(d)
-    };
-    llama.set_sampling(
-        envf("INFR_TEMP", 0.6),
-        envu("INFR_TOP_K", 20),
-        envf("INFR_TOP_P", 0.95),
-    );
-    let generator: Box<dyn infr_server::ChatGenerator> = Box::new(LlamaGenerator {
-        cache: infr_llama::ServeCache::from_env(),
-        llama,
-    });
-
-    let rt = tokio::runtime::Runtime::new()?;
-    println!("infr serve: {model_id} on http://{sockaddr}  (OpenAI /v1)");
-    rt.block_on(infr_server::serve(generator, model_id, sockaddr))
 }
 
 #[cfg(test)]

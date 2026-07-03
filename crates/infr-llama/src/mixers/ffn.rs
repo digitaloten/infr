@@ -12,6 +12,7 @@ use infr_vulkan::Recorder;
 /// gate‖up weight layout for the SwiGLU block.
 pub(crate) enum GateUp<'a> {
     /// Fused `[2*n_ff, n_embd]` (gate rows then up rows): one GEMV + `silu_mul_fused`.
+    #[allow(dead_code)] // the fused-gu shape (see combined_gu); qwen35 adopts it next
     Fused(&'a Wt),
     /// Separate gate/up `[n_ff, n_embd]`: two GEMVs + `silu_mul`.
     Split { gate: &'a Wt, up: &'a Wt },

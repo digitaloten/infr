@@ -248,24 +248,67 @@ impl CpuModel {
             .map_err(|e| anyhow!("decode: {e}"))
     }
 
-    /// Token-level bench on the **Vulkan** backend through the agnostic seam (the GPU twin of
-    /// [`bench`](Self::bench)): prefill `n_prompt` dummy tokens, decode `n_gen`, return the timing.
-    /// The decode tok/s here (per-token graph recompile) is the baseline the record-once replay
-    /// optimization must close toward the production Recorder path.
-    pub fn bench_vulkan(&self, n_prompt: usize, n_gen: usize) -> Result<crate::GenStats> {
-        let prompt: Vec<u32> = (0..n_prompt.max(1)).map(|i| (i % 100) as u32).collect();
+    /// Token-level bench on the Vulkan seam, llama-bench-comparable: ONE weight upload (a
+    /// persistent session) + an untimed pipeline warmup, then per rep — reset the KV, warm it to
+    /// `depth` (untimed), and time ONE metric: `pg` = a whole (P prefill + G decode) turn,
+    /// `n_gen > 0` = decode at depth, else prefill of `n_prompt` at depth. Returns the per-rep
+    /// tokens/sec samples.
+    pub fn bench_vulkan(
+        &self,
+        n_prompt: usize,
+        n_gen: usize,
+        depth: usize,
+        pg: Option<(usize, usize)>,
+        reps: usize,
+    ) -> Result<Vec<f64>> {
         let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
-        let (_, stats) = crate::cpu_backend::generate_dense_gpu(
-            &vk,
-            &self.gguf,
-            &self.cfg,
-            &self.token_embd,
-            self.per_layer_embd.as_ref(),
-            &prompt,
-            n_gen,
-            |_| {},
-        )?;
-        Ok(stats)
+        let (p_eff, g_eff) = pg.unwrap_or((n_prompt, n_gen));
+        let want = depth + p_eff.max(1) + g_eff + 8;
+        let dummy = |n: usize| -> Vec<u32> { (0..n.max(1)).map(|i| (i % 100) as u32).collect() };
+        let mut state: Option<crate::cpu_backend::SeamKv> = None;
+        let run = |prompt_len: usize,
+                   gen: usize,
+                   state: &mut Option<crate::cpu_backend::SeamKv>|
+         -> Result<crate::GenStats> {
+            let (_, stats) = crate::cpu_backend::generate_dense_gpu_session(
+                &vk,
+                &self.gguf,
+                &self.cfg,
+                &self.token_embd,
+                self.per_layer_embd.as_ref(),
+                &dummy(prompt_len),
+                gen,
+                |_| {},
+                state,
+                want,
+                None,
+            )?;
+            Ok(stats)
+        };
+        // Untimed warmup: uploads the weights and compiles every pipeline the timed reps hit.
+        run(8, 2, &mut state)?;
+        let mut samples = Vec::with_capacity(reps);
+        for _ in 0..reps.max(1) {
+            if let Some(st) = state.as_mut() {
+                st.reset();
+            }
+            if depth > 0 {
+                run(depth, 0, &mut state)?; // warm the cache to `depth` (untimed)
+            }
+            if let Some((p, g)) = pg {
+                // coding-agent turn: prompt ingest + reply generation timed together.
+                let s = run(depth + p, g, &mut state)?;
+                samples.push((p + g) as f64 / (s.prompt_secs + s.decode_secs).max(1e-9));
+            } else if n_gen > 0 {
+                // decode at depth: 1-token suffix feeds the loop, the timed part is the decode.
+                let s = run(depth + 1, n_gen, &mut state)?;
+                samples.push(n_gen as f64 / s.decode_secs.max(1e-9));
+            } else {
+                let s = run(depth + n_prompt, 0, &mut state)?;
+                samples.push(n_prompt as f64 / s.prompt_secs.max(1e-9));
+            }
+        }
+        Ok(samples)
     }
 
     /// Greedy generation on the reference **Metal** backend through the agnostic seam (the

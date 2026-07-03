@@ -107,21 +107,6 @@ fn check_golden(model: &infr_llama::CpuModel, cases: &[(&str, usize, u64)]) {
     }
 }
 
-/// Greedy GPU generation: render the plain-text prompt with the model's chat template, generate on
-/// the GPU dense path, return the text. The production GPU path; mirrors [`cpu_gen`].
-fn gpu_gen(llama: &infr_llama::Llama, prompt: &str, n: usize) -> String {
-    llama
-        .generate(&llama.render_chat(prompt).expect("render chat"), n, |_| {})
-        .expect("gpu generate")
-}
-
-/// As [`gpu_gen`] but via the routed-expert MoE forward ([`Llama::generate_moe`]).
-fn gpu_gen_moe(llama: &infr_llama::Llama, prompt: &str, n: usize) -> String {
-    llama
-        .generate_moe(&llama.render_chat(prompt).expect("render chat"), n, |_| {})
-        .expect("gpu moe generate")
-}
-
 /// Assert (or, with `INFR_BLESS=1`, print) the GPU golden hash for each `(prompt, n, fnv1a)` case.
 fn check_gpu_golden(gen: impl Fn(&str, usize) -> String, cases: &[(&str, usize, u64)]) {
     let bless = std::env::var("INFR_BLESS").is_ok();
@@ -182,27 +167,6 @@ fn cpu_golden_qwen3() {
     check_golden(&model, QWEN3_GOLDEN);
 }
 
-// Captured + verified coherent on the GPU (chat-templated Qwen3-0.6B Q4_K_M).
-const QWEN3_GPU_GOLDEN: &[(&str, usize, u64)] = &[
-    ("The capital of France is", 32, 0xfd63781ea3bfa785),
-    (
-        "Explain how a computer works in simple terms.",
-        48,
-        0xcf56ba8c4bb5c455,
-    ),
-];
-
-/// GPU dense Qwen3-0.6B golden-hash lock.
-#[test]
-fn gpu_golden_qwen3() {
-    let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    need_gpu!();
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
-    let llama = infr_llama::Llama::load_opt(&path, None).expect("load");
-    check_gpu_golden(|p, n| gpu_gen(&llama, p, n), QWEN3_GPU_GOLDEN);
-}
-
 /// A BIG prompt (~1000+ tokens): large enough that the dense prefill's padded-KV attention reads the
 /// padding rows beyond the real tokens. Short prompts don't reproduce the KV-cache bug.
 fn repeat_prompt() -> String {
@@ -214,40 +178,6 @@ fn repeat_prompt() -> String {
 fn is_degenerate(s: &str) -> bool {
     let t = s.trim();
     t.chars().count() >= 8 && t.chars().collect::<std::collections::HashSet<char>>().len() <= 2
-}
-
-/// REGRESSION (Vulkan backend): repeated forwards on the same model must NOT degenerate. The GPU KV
-/// cache is allocated from RECYCLED VRAM; before the fix (`new_kv` zeroes the cache), the prefill
-/// attention read STALE K/V in the padding rows beyond the prompt → repeated-token garbage. This hit
-/// the `infr serve` path (a session's 2nd request reused the 1st's freed KV buffers → "5555…"). Two
-/// greedy generations of the same big prompt must be non-degenerate AND identical (greedy is
-/// deterministic; a stale-KV corruption makes the 2nd differ / collapse). With the fix removed this
-/// test produces garbage; with it, coherent.
-#[test]
-fn gpu_no_garbage_on_repeated_forward() {
-    let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    need_gpu!();
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
-    let llama = infr_llama::Llama::load_opt(&path, None).expect("load");
-    let p = repeat_prompt();
-    let g1 = gpu_gen(&llama, &p, 20);
-    let g2 = gpu_gen(&llama, &p, 20); // 2nd fresh KV reuses the 1st's freed (recycled) VRAM
-    let head = |s: &str| s.chars().take(48).collect::<String>();
-    assert!(
-        !is_degenerate(&g1),
-        "1st GPU forward degenerate: {:?}",
-        head(&g1)
-    );
-    assert!(
-        !is_degenerate(&g2),
-        "2nd GPU forward degenerate (stale-KV regression): {:?}",
-        head(&g2)
-    );
-    assert_eq!(
-        g1, g2,
-        "repeated GPU forward diverged (greedy must be deterministic)"
-    );
 }
 
 /// REGRESSION (CPU reference backend): the same repeated-forward invariant on the no-GPU
@@ -274,49 +204,6 @@ fn cpu_no_garbage_on_repeated_forward() {
         head(&g2)
     );
     assert_eq!(g1, g2, "repeated CPU forward diverged");
-}
-
-/// Dense multi-turn through the shared `Chat` MUST reuse the KV cache: turn 2 re-renders the whole
-/// conversation but prefills only the NEW suffix (incremental prefill), not the whole thing. So the
-/// tokens prefilled on turn 2 (`GenStats.n_prompt`) must be FAR fewer than turn 1's long prompt —
-/// if the refactor had broken KV reuse, turn 2 would re-prefill turn 1 + its reply + turn 2 and be
-/// LARGER. `INFR_THINK=0` keeps the reply think-free so the cached tokens match the re-rendered
-/// history cleanly (no `<think>` divergence), making the suffix just the turn-2 wrapper.
-#[test]
-fn dense_chat_reuses_kv() {
-    let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    need_gpu!();
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
-    std::env::set_var("INFR_THINK", "0");
-    let llama = infr_llama::Llama::load_opt(&path, None).expect("load");
-    let session = llama.chat_session(4096).expect("session");
-    let mut chat = infr_llama::model::Chat::new(Box::new(session));
-    // A deliberately long turn-1 prompt so its prefill dwarfs the short turn-2 suffix.
-    let s1 = chat
-        .turn(
-            "Hello there. Please remember this fact for later: my favorite color is teal. \
-             Acknowledge in one short sentence.",
-            24,
-            &mut |_| {},
-        )
-        .expect("turn 1");
-    let s2 = chat
-        .turn("What is my favorite color?", 24, &mut |_| {})
-        .expect("turn 2");
-    // Restore BEFORE the asserts so a failure can't leak INFR_THINK=0 to another test (the lock is
-    // still held until this fn returns, so no concurrent test observes the interim mutation anyway).
-    std::env::remove_var("INFR_THINK");
-    assert!(
-        s1.n_prompt > 0 && s2.n_prompt > 0,
-        "prompts must be non-empty"
-    );
-    assert!(
-        s2.n_prompt < s1.n_prompt,
-        "KV reuse broken: turn 2 prefilled {} tok (should be just the new suffix), turn 1 was {}",
-        s2.n_prompt,
-        s1.n_prompt,
-    );
 }
 
 // Captured + verified coherent on the Vulkan backend via the agnostic compute seam (the SAME dense
@@ -540,6 +427,21 @@ fn gpu_seam_matches_cpu_gemma4() {
 }
 
 /// gemma4 E2B (per-layer embeddings, KV/FFN sharing) through the Vulkan seam (per-token prefill —
+fn gemma4_e2b() -> Option<PathBuf> {
+    find_gguf("unsloth--gemma-4-E2B-it-GGUF", "gemma-4-E2B-it-Q4_K_M.gguf")
+}
+
+// Captured + verified coherent (gemma4 E2B: per-layer input embeds + KV sharing): "The capital of
+// France is **Paris**.", a brave-knight story ("Sir Kaelan … kingdom of Eldoria …").
+const GEMMA4_E2B_GOLDEN: &[(&str, usize, u64)] = &[
+    ("The capital of France is", 32, 0xfd644a0cebde4e73),
+    (
+        "Tell me a short story about a brave knight.",
+        48,
+        0xd1281a5e24ad58b9,
+    ),
+];
+
 /// E2B is excluded from the batched-prefill fast path).
 #[test]
 fn gpu_seam_matches_cpu_gemma4_e2b() {
@@ -651,46 +553,6 @@ fn cpu_golden_qwen3_quants() {
     }
 }
 
-// GPU quant coverage: the SAME prompt through every downloaded Qwen3-0.6B quant, all via the raw
-// native-block upload — affine (Q4_0, Q2_K/Q4_K/Q5_K/Q6_K, Q8_0) AND the IQ4_XS codebook i-quant,
-// which now decodes natively in-shader (no host→f16). BF16 is float → the plain f16 GEMV. Hashes are
-// GPU-specific; captured INFR_BLESS=1 and read coherent ("…Paris"). Missing quants are skipped.
-const QWEN3_QUANT_GPU_GOLDEN: &[(&str, usize, u64)] = &[
-    ("IQ4_XS", 32, 0xd028ff03b524cb28),
-    ("Q2_K", 32, 0x6442c2818c12ca56),
-    ("Q4_0", 32, 0x88221dcfca820246),
-    ("Q4_K_M", 32, 0xfd63781ea3bfa785),
-    ("Q5_K_M", 32, 0x4e510646d603bc03),
-    ("Q6_K", 32, 0xb68f96c3aa8d22fe),
-    ("Q8_0", 32, 0xb68f96c3aa8d22fe),
-    ("BF16", 32, 0xb68f96c3aa8d22fe),
-];
-
-/// GPU native-upload coverage across quant formats — proves the codebook IQ4_XS path runs natively
-/// alongside the affine k-quants. Refresh with `INFR_BLESS=1`.
-#[test]
-fn gpu_golden_qwen3_quants() {
-    need_gpu!();
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
-    let bless = std::env::var("INFR_BLESS").is_ok();
-    let prompt = "The capital of France is";
-    for (quant, n, want) in QWEN3_QUANT_GPU_GOLDEN {
-        let Some(path) = qwen3_quant(quant) else {
-            eprintln!("skip {quant}: not downloaded");
-            continue;
-        };
-        let llama = infr_llama::Llama::load_opt(&path, None).expect("load");
-        let out = gpu_gen(&llama, prompt, *n);
-        let h = fnv1a(&out);
-        if bless {
-            println!("    ({quant:?}, {n}, 0x{h:016x}),  // {out:?}");
-        } else {
-            assert_eq!(h, *want, "GPU quant {quant} golden changed\n  out: {out:?}");
-        }
-    }
-}
-
 // ─── Gemma 3 (dense) ────────────────────────────────────────────────────────────
 
 fn gemma3_1b() -> Option<PathBuf> {
@@ -724,27 +586,6 @@ fn cpu_golden_gemma3() {
     std::env::set_var("INFR_TEMP", "0");
     let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
     check_golden(&model, GEMMA3_GOLDEN);
-}
-
-// Captured + verified coherent on the GPU (gemma-3-1b Q4_K_M: sandwich norms, GeGLU, dual-RoPE, SWA).
-const GEMMA3_GPU_GOLDEN: &[(&str, usize, u64)] = &[
-    ("The capital of France is", 32, 0xe5a37ab078db3a2c),
-    (
-        "Tell me a short story about a brave knight.",
-        48,
-        0x5147de9a0ddfae50,
-    ),
-];
-
-/// GPU dense Gemma 3 golden-hash lock (sandwich norms, GeGLU, dual-RoPE, SWA, √n_embd embed scale).
-#[test]
-fn gpu_golden_gemma3() {
-    let path = need_model!(gemma3_1b(), "gemma-3-1b");
-    need_gpu!();
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
-    let llama = infr_llama::Llama::load_opt(&path, None).expect("load");
-    check_gpu_golden(|p, n| gpu_gen(&llama, p, n), GEMMA3_GPU_GOLDEN);
 }
 
 // ─── Qwen3.5 / Qwen3-Next (gated DeltaNet) ──────────────────────────────────────
@@ -810,45 +651,6 @@ fn cpu_golden_qwen3moe() {
     check_golden(&model, QWEN3MOE_GOLDEN);
 }
 
-// Captured + verified coherent on the GPU (Qwen3-30B-A3B Q4_K_M: routed-expert FFN, ~3B active).
-// Re-blessed 2026-07-02 (second time): the previous hash (0xa68ab7f4d15ad931, blessed alongside the
-// calloc-alloc change) did NOT reproduce even at its own bless commit (ddb350f) — every commit from
-// ddb350f..HEAD deterministically produces THIS hash (stable across reruns, rebuilds, and with
-// INFR_POISON_UNINIT=1 poisoning alloc_uninit memory), so the prior bless captured a since-vanished
-// environment/working-tree state, not the committed code. Output verified coherent
-// ("<think>\nOkay, so I need to figure out what the capital of France is…").
-const QWEN3MOE_GPU_GOLDEN: &[(&str, usize, u64)] =
-    &[("The capital of France is", 24, 0x193c084bdd8c8c48)];
-
-/// GPU qwen3moe golden-hash lock (routed-expert FFN: softmax router → top-k → renormalized weighted
-/// SwiGLU sum). Only `n_used` of 128 experts run per token; uses the dedicated MoE GPU forward.
-#[test]
-fn gpu_golden_qwen3moe() {
-    let path = need_model!(qwen3moe_30b(), "Qwen3-30B-A3B");
-    need_gpu!();
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
-    let llama = infr_llama::Llama::load_opt(&path, None).expect("load");
-    check_gpu_golden(|p, n| gpu_gen_moe(&llama, p, n), QWEN3MOE_GPU_GOLDEN);
-}
-
-// ─── Gemma 4 E2B (gemma3n: per-layer embeds + KV sharing) ───────────────────────
-
-fn gemma4_e2b() -> Option<PathBuf> {
-    find_gguf("unsloth--gemma-4-E2B-it-GGUF", "gemma-4-E2B-it-Q4_K_M.gguf")
-}
-
-// Captured + verified coherent (gemma4 E2B: per-layer input embeds + KV sharing): "The capital of
-// France is **Paris**.", a brave-knight story ("Sir Kaelan … kingdom of Eldoria …").
-const GEMMA4_E2B_GOLDEN: &[(&str, usize, u64)] = &[
-    ("The capital of France is", 32, 0xfd644a0cebde4e73),
-    (
-        "Tell me a short story about a brave knight.",
-        48,
-        0xd1281a5e24ad58b9,
-    ),
-];
-
 /// CPU-only: Gemma 4 E2B golden-hash lock.
 #[test]
 fn cpu_golden_gemma4_e2b() {
@@ -859,42 +661,8 @@ fn cpu_golden_gemma4_e2b() {
     check_golden(&model, GEMMA4_E2B_GOLDEN);
 }
 
-// Captured + verified coherent on the GPU (gemma-4-E2B Q4_K_M: per-layer input embeds + KV sharing).
-const GEMMA4_E2B_GPU_GOLDEN: &[(&str, usize, u64)] =
-    &[("The capital of France is", 32, 0xfd644a0cebde4e73)];
-
-/// GPU Gemma 4 E2B (gemma3n) golden-hash lock: per-layer input embeddings + KV-layer sharing on top
-/// of the gemma4 dense path.
-#[test]
-fn gpu_golden_gemma4_e2b() {
-    let path = need_model!(gemma4_e2b(), "gemma-4-E2B");
-    need_gpu!();
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
-    let llama = infr_llama::Llama::load_opt(&path, None).expect("load");
-    check_gpu_golden(|p, n| gpu_gen(&llama, p, n), GEMMA4_E2B_GPU_GOLDEN);
-}
-
 // ─── Gemma 4 12b (dense) ────────────────────────────────────────────────────────
 
 fn gemma4_12b() -> Option<PathBuf> {
     find_gguf("unsloth--gemma-4-12b-it-GGUF", "gemma-4-12b-it-Q4_K_M.gguf")
-}
-
-// Captured + verified coherent on the GPU (gemma-4-12b Q4_K_M: per-layer SWA/full head dims,
-// weightless V-norm, V=K reuse, freq_factors, attn scale 1.0, per-layer output scale, final softcap).
-const GEMMA4_12B_GPU_GOLDEN: &[(&str, usize, u64)] =
-    &[("The capital of France is", 32, 0xfd644a0cebde4e73)];
-
-/// GPU dense Gemma 4 (12b) golden-hash lock: per-layer SWA/full head dims, weightless V-norm, V=K
-/// reuse on full layers, proportional-RoPE freq_factors, attn scale 1.0, per-layer output scale,
-/// final softcap.
-#[test]
-fn gpu_golden_gemma4() {
-    let path = need_model!(gemma4_12b(), "gemma-4-12b");
-    need_gpu!();
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
-    let llama = infr_llama::Llama::load_opt(&path, None).expect("load");
-    check_gpu_golden(|p, n| gpu_gen(&llama, p, n), GEMMA4_12B_GPU_GOLDEN);
 }

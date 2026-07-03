@@ -13,7 +13,7 @@
 //! `ChatSession` (which borrows `&Llama`) needs no ownership change — the caller owns the `Llama`,
 //! the box borrows it.
 
-use crate::{no_template_err, ChatSession, CpuModel, GenStats, Llama};
+use crate::{no_template_err, CpuModel, GenStats};
 use anyhow::Result;
 use std::time::Instant;
 
@@ -166,66 +166,6 @@ fn timed(
         n_gen,
         decode_secs: now.duration_since(tf).as_secs_f64(),
     })
-}
-
-/// Dense Qwen3/Llama/Gemma: the stateful multi-turn `ChatSession` over a persistent KV cache. Its
-/// `generate` keeps the cache warm — only the token suffix that differs from the cached prefix is
-/// prefilled (incremental prefill), so KV-cache reuse survives the shared-orchestration refactor.
-impl ChatModel for ChatSession<'_> {
-    fn render(&self, messages: &[(&str, &str)]) -> Result<String> {
-        ChatSession::render(self, messages)
-    }
-
-    fn generate(
-        &mut self,
-        prompt: &str,
-        max_new: usize,
-        on_piece: &mut dyn FnMut(&str),
-    ) -> Result<GenStats> {
-        ChatSession::generate(self, prompt, max_new, |p| on_piece(p))
-    }
-
-    fn status(&self) -> Option<String> {
-        Some(format!("ctx {}/{}", self.ctx_len(), self.max_ctx()))
-    }
-}
-
-/// qwen3moe: the eager MoE forward (`generate_moe`) with a GPU KV cache. Stateless full-prefill each
-/// turn (MoE KV-reuse via `forward_moe_chunk` is a separate future item) — acceptable, the point is
-/// the shared history-based REPL.
-pub struct MoeChat<'a> {
-    llama: &'a Llama,
-}
-
-impl<'a> MoeChat<'a> {
-    pub fn new(llama: &'a Llama) -> Self {
-        Self { llama }
-    }
-}
-
-impl ChatModel for MoeChat<'_> {
-    fn render(&self, messages: &[(&str, &str)]) -> Result<String> {
-        self.llama
-            .render_chat_messages(messages, true)
-            .ok_or_else(no_template_err)
-    }
-
-    fn generate(
-        &mut self,
-        prompt: &str,
-        max_new: usize,
-        on_piece: &mut dyn FnMut(&str),
-    ) -> Result<GenStats> {
-        let n_prompt = self
-            .llama
-            .tokenizer
-            .encode(prompt, false)
-            .map(|e| e.get_ids().len())
-            .unwrap_or(0);
-        timed(on_piece, n_prompt, |cb| {
-            self.llama.generate_moe(prompt, max_new, cb).map(|_| ())
-        })
-    }
 }
 
 /// Which compute backend a [`Qwen35Chat`] loads its [`crate::qwen35::SeamModel`] on. All variants

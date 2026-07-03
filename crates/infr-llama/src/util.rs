@@ -15,6 +15,18 @@ pub(crate) const QWEN2_PRE_RE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}
 /// Build the gemma4 E2B per-layer-embedding global tensors from the GGUF (host f32 — no GPU). The
 /// big `per_layer_token_embd` stays quantized in the mmap and is gathered per token at forward time.
 /// `None` for models without per-layer embeddings. Shared by the GPU and CPU loaders.
+/// gemma4 E2B (gemma3n) per-layer input-embedding global tensors. The per-(token,layer) input vector
+/// is `((model_proj·scaled_embd)·1/√n_embd, RMSNorm'd) + (tok_embd_row × √npl)) × 1/√2`.
+pub(crate) struct PerLayerEmbd {
+    pub(crate) npl: usize,                       // per-layer embedding width (256)
+    pub(crate) n_layer: usize,                   // number of layers (35)
+    pub(crate) n_embd: usize,                    // model width (1536)
+    pub(crate) model_proj: Vec<f32>, // [npl*n_layer rows, n_embd] host f32 (row k = the n_embd vector to dot)
+    pub(crate) proj_norm: Vec<f32>,  // [npl] RMSNorm weight over the per-layer dim
+    pub(crate) tok_embd_dtype: infr_core::DType, // per_layer_token_embd dtype (gathered per token from the gguf)
+    pub(crate) tok_embd_row_bytes: usize,        // bytes per token row (npl*n_layer elements)
+}
+
 pub(crate) fn build_per_layer_embd(g: &Gguf, cfg: &Config) -> Result<Option<PerLayerEmbd>> {
     if cfg.n_embd_per_layer == 0 {
         return Ok(None);

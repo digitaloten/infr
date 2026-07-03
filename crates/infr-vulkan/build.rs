@@ -95,11 +95,6 @@ fn main() {
             "qk_norm_rope_dyn_ff",
             &["-DUSE_PARAMS", "-DFREQ_FACTORS"],
         ),
-        ("attn_in", "attn_in", &[]),
-        ("attn_in", "attn_in_dyn", &["-DUSE_PARAMS"]),
-        ("ffn_in", "ffn_in", &[]),
-        ("ffn_in_q", "ffn_in_q", &[]),
-        ("attn_in_q", "attn_in_q", &[]),
         // Native-block dequant GEMVs: one .spv per (quant format, residual) from one source.
         ("native_gemv", "native_q8_0", &["-DFMT_Q8_0"]),
         (
