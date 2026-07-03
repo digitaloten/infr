@@ -166,10 +166,14 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
     let mut has_attn = false;
     for op in &g.ops {
         match op {
-            Op::RmsNorm { .. } | Op::Linear { .. } | Op::GatedAct { .. } | Op::Add { .. } => {}
+            Op::RmsNorm { .. }
+            | Op::Linear { .. }
+            | Op::GatedAct { .. }
+            | Op::GatedActFused { .. }
+            | Op::Add { .. } => {}
             Op::QkNormRope { .. } => has_rope = true,
             Op::WriteKv { cache, .. } => {
-                if g.desc(*cache).dtype != DType::F16 {
+                if !matches!(g.desc(*cache).dtype, DType::F16 | DType::Q8_0) {
                     return false;
                 }
             }
@@ -182,7 +186,7 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
                 has_attn = true;
                 if *rows != 1
                     || !matches!(*head_dim, 64 | 128)
-                    || g.desc(*k_cache).dtype != DType::F16
+                    || !matches!(g.desc(*k_cache).dtype, DType::F16 | DType::Q8_0)
                 {
                     return false;
                 }
@@ -269,6 +273,17 @@ impl MetalBackend {
     fn zeros_buf(&self, n: usize) -> MtlBuffer {
         self.device
             .new_buffer((n.max(1) * 4) as u64, MTLResourceOptions::StorageModeShared)
+    }
+
+    /// A reusable op-scratch buffer (see `MetalBackend::scratch`): get-or-create by
+    /// (f32 count, tag).
+    fn scratch_buf(&self, n: usize, tag: u8) -> Arc<MtlBuffer> {
+        self.scratch
+            .lock()
+            .unwrap()
+            .entry((n, tag))
+            .or_insert_with(|| Arc::new(self.zeros_buf(n)))
+            .clone()
     }
 
     /// Read `n` f32s out of a device buffer.
@@ -480,8 +495,16 @@ impl MetalBackend {
         // gated on its pipeline cap — a capped device (CI paravirtual) keeps the per-token path.
         let dyn_cap_ok = || -> bool {
             let kern = g.ops.iter().find_map(|op| match op {
-                Op::Attention { head_dim: 64, .. } => Some("attnvec_dyn_f16kv_hd64"),
-                Op::Attention { head_dim: 128, .. } => Some("attnvec_dyn_f16kv_hd128"),
+                Op::Attention {
+                    head_dim: hd @ (64 | 128),
+                    k_cache,
+                    ..
+                } => Some(match (g.desc(*k_cache).dtype == DType::Q8_0, hd) {
+                    (false, 64) => "attnvec_dyn_f16kv_hd64",
+                    (false, _) => "attnvec_dyn_f16kv_hd128",
+                    (true, 64) => "attnvec_dyn_q8kv_hd64",
+                    (true, _) => "attnvec_dyn_q8kv_hd128",
+                }),
                 _ => None,
             });
             kern.is_some_and(|kn| {
@@ -1221,10 +1244,28 @@ impl MetalBackend {
             }
             // Only produced when `Capabilities::combined_gu` is set — Metal leaves it false (the
             // reference backend keeps the separate gate/up form), so this arm is unreachable.
-            Op::GatedActFused { .. } => {
-                return Err(Error::Unsupported(
-                    "metal: GatedActFused unsupported (combined_gu is false)".into(),
-                ))
+            Op::GatedActFused {
+                gu,
+                dst,
+                rows,
+                nff,
+                act,
+            } => {
+                let (rows, nff) = (rows as usize, nff as usize);
+                let bg = self.ensure_device(r, gu);
+                let bd = self.dev_dst(r, dst, rows * nff);
+                let pso = self.pipelines.get("gatedactfused_f32")?;
+                let act_code: u32 = match act {
+                    infr_core::graph::Activation::Silu => 0,
+                    infr_core::graph::Activation::Gelu => 1,
+                    infr_core::graph::Activation::Sigmoid => 2,
+                };
+                let mut p = (rows as u32).to_ne_bytes().to_vec();
+                p.extend_from_slice(&(nff as u32).to_ne_bytes());
+                p.extend_from_slice(&act_code.to_ne_bytes());
+                p.extend_from_slice(&0u32.to_ne_bytes()); // pad to GatedParams
+                self.encode(r, &pso, &[bg.as_ref(), bd.as_ref()], &p, rows * nff);
+                r.loc[dst.0 as usize] = Loc::Device;
             }
             Op::WriteKv {
                 src,
@@ -1248,22 +1289,30 @@ impl MetalBackend {
                 );
                 let base = pos * rs;
                 let n = rows * rs;
+                let q8 = g.desc(cache).dtype == DType::Q8_0;
                 if let Some(posbuf) = r.posbuf.clone() {
                     // Recording a replay tape: the row offset must come from the positions buffer
-                    // (the baked `pos` is this token's only) — f16 cache guaranteed by the gate.
-                    let pso = self.pipelines.get("writekv_dyn_f16")?;
+                    // (the baked `pos` is this token's only) — f16/q8 cache guaranteed by the gate.
+                    let pso = self.pipelines.get(if q8 {
+                        "writekv_dyn_q8"
+                    } else {
+                        "writekv_dyn_f16"
+                    })?;
                     let mut p = (n as u32).to_ne_bytes().to_vec();
                     p.extend_from_slice(&(rs as u32).to_ne_bytes());
-                    self.encode(r, &pso, &[bsrc.as_ref(), &cbuf.raw, &posbuf], &p, n);
+                    let threads = if q8 { n / 32 } else { n };
+                    self.encode(r, &pso, &[bsrc.as_ref(), &cbuf.raw, &posbuf], &p, threads);
                 } else {
                     let kern = match g.desc(cache).dtype {
+                        DType::Q8_0 => "writekv_q8",
                         DType::F16 => "writekv_f16",
                         _ => "writekv_f32",
                     };
                     let pso = self.pipelines.get(kern)?;
                     let mut p = (n as u32).to_ne_bytes().to_vec();
                     p.extend_from_slice(&(base as u32).to_ne_bytes());
-                    self.encode(r, &pso, &[bsrc.as_ref(), &cbuf.raw], &p, n);
+                    let threads = if q8 { n / 32 } else { n };
+                    self.encode(r, &pso, &[bsrc.as_ref(), &cbuf.raw], &p, threads);
                 }
             }
             Op::Attention {
@@ -1310,15 +1359,16 @@ impl MetalBackend {
                     infr_core::graph::AttnMask::SlidingWindow(w) => w as u32,
                 };
                 if let Some(posbuf) = r.posbuf.clone() {
-                    // Recording a replay tape (rows==1, f16 cache, hd 64/128 — checked by the
+                    // Recording a replay tape (rows==1, f16/q8 cache, hd 64/128 — checked by the
                     // gate): route straight to the dynamic-pos vector flash kernel, which reads
                     // pos from the positions buffer and covers every kv_len from 1 up. The usual
                     // shape routing below would bake this token's kv_len into the kernel CHOICE,
                     // which is exactly what a replayed tape can't have.
-                    let kern = if hd == 64 {
-                        "attnvec_dyn_f16kv_hd64"
-                    } else {
-                        "attnvec_dyn_f16kv_hd128"
+                    let kern = match (g.desc(k_cache).dtype == DType::Q8_0, hd) {
+                        (false, 64) => "attnvec_dyn_f16kv_hd64",
+                        (false, _) => "attnvec_dyn_f16kv_hd128",
+                        (true, 64) => "attnvec_dyn_q8kv_hd64",
+                        (true, _) => "attnvec_dyn_q8kv_hd128",
                     };
                     let pso = self.pipelines.get(kern)?;
                     let mut p = (rows as u32).to_ne_bytes().to_vec();
@@ -1336,6 +1386,99 @@ impl MetalBackend {
                         &p,
                         rows * nh * 32 * 32,
                         32 * 32,
+                    );
+                    r.loc[dst.0 as usize] = Loc::Device;
+                    return Ok(());
+                }
+                // Q8_0 cache: rows==1 decode takes the q8 vector kernel (hd 64/128); every
+                // other shape the scalar dequant-on-read fallback (prefill lives here until a
+                // q8 flash port). Both dequantize exactly — reassociation-only vs the f16 math.
+                if g.desc(k_cache).dtype == DType::Q8_0 {
+                    // Prefill-wide launches take the q8 cooperative flash (dequant-staged KV
+                    // tiles) — the same gate shape as the f16 flash.
+                    let fq8 = rows * nh >= 128 && kv_len >= 64 && matches!(hd, 64 | 128) && {
+                        let kn = if hd == 64 {
+                            "attnflash2_q8kv_hd64"
+                        } else {
+                            "attnflash2_q8kv_hd128"
+                        };
+                        self.pipelines
+                            .get(kn)
+                            .map(|pl| pl.max_total_threads_per_threadgroup() >= 128)
+                            .unwrap_or(false)
+                    };
+                    if fq8 {
+                        let kern = if hd == 64 {
+                            "attnflash2_q8kv_hd64"
+                        } else {
+                            "attnflash2_q8kv_hd128"
+                        };
+                        let pso = self.pipelines.get(kern)?;
+                        let mut p = (rows as u32).to_ne_bytes().to_vec();
+                        p.extend_from_slice(&(kv_len as u32).to_ne_bytes());
+                        p.extend_from_slice(&(nh as u32).to_ne_bytes());
+                        p.extend_from_slice(&(nkv as u32).to_ne_bytes());
+                        p.extend_from_slice(&(hd as u32).to_ne_bytes());
+                        p.extend_from_slice(&scale.to_ne_bytes());
+                        p.extend_from_slice(&window.to_ne_bytes());
+                        p.extend_from_slice(&pos.to_ne_bytes());
+                        let n = rows * nh * hd;
+                        let qh = Arc::new(self.device.new_buffer(
+                            (n * 2).max(4) as u64,
+                            MTLResourceOptions::StorageModeShared,
+                        ));
+                        let cast = self.pipelines.get("cast_f32_f16")?;
+                        self.encode(r, &cast, &[bq.as_ref(), &qh], &(n as u32).to_ne_bytes(), n);
+                        self.encode_tg(
+                            r,
+                            &pso,
+                            &[qh.as_ref(), &kbuf.raw, &vbuf.raw, bd.as_ref()],
+                            &p,
+                            rows.div_ceil(8) * nh * 128,
+                            128,
+                        );
+                        r.loc[dst.0 as usize] = Loc::Device;
+                        return Ok(());
+                    }
+                    // The vector kernel runs one threadgroup per (row, head), covering decode
+                    // and any prefill shape the flash gate declined.
+                    let vq8 = matches!(hd, 64 | 128) && kv_len >= 128 && {
+                        let kn = if hd == 64 {
+                            "attnvec_q8kv_hd64"
+                        } else {
+                            "attnvec_q8kv_hd128"
+                        };
+                        self.pipelines
+                            .get(kn)
+                            .map(|pl| pl.max_total_threads_per_threadgroup() >= 1024)
+                            .unwrap_or(false)
+                    };
+                    let kern = if vq8 {
+                        if hd == 64 {
+                            "attnvec_q8kv_hd64"
+                        } else {
+                            "attnvec_q8kv_hd128"
+                        }
+                    } else {
+                        "attention_q8kv"
+                    };
+                    let pso = self.pipelines.get(kern)?;
+                    let mut p = (rows as u32).to_ne_bytes().to_vec();
+                    p.extend_from_slice(&(kv_len as u32).to_ne_bytes());
+                    p.extend_from_slice(&(nh as u32).to_ne_bytes());
+                    p.extend_from_slice(&(nkv as u32).to_ne_bytes());
+                    p.extend_from_slice(&(hd as u32).to_ne_bytes());
+                    p.extend_from_slice(&scale.to_ne_bytes());
+                    p.extend_from_slice(&window.to_ne_bytes());
+                    p.extend_from_slice(&pos.to_ne_bytes());
+                    let nsg = if vq8 { 32 } else { 1 };
+                    self.encode_tg(
+                        r,
+                        &pso,
+                        &[bq.as_ref(), &kbuf.raw, &vbuf.raw, bd.as_ref()],
+                        &p,
+                        rows * nh * nsg * 32,
+                        nsg * 32,
                     );
                     r.loc[dst.0 as usize] = Loc::Device;
                     return Ok(());
@@ -1510,6 +1653,290 @@ impl MetalBackend {
                     n_used as usize,
                     n_ff_exp as usize,
                 );
+                // Rows inferred from the bound activation shape (the seam's batched prefill
+                // passes [rows, ne]); each row routes independently.
+                let rows = g.desc(x).numel() / ne;
+                // Device path for K-quant experts (the shapes real MoE checkpoints ship): router
+                // GEMV -> on-device top-k -> expert-BATCHED GEMV stages picking their weight
+                // slices from the device expert table, weighted sum via a final reduce. Seven
+                // dispatches, no expert bytes or activations on the host. Falls back to the host
+                // path below for other dtypes (INFR_METAL_NOMOE forces it).
+                let moe_kern = |dt: DType| -> Option<(&'static str, &'static str)> {
+                    match dt {
+                        DType::Q4K => Some(("linear_q4k_moe", "linear_q4k_moe_acc")),
+                        DType::Q6K => Some(("linear_q6k_moe", "linear_q6k_moe_acc")),
+                        _ => None,
+                    }
+                };
+                let (gdt2, udt2, ddt2) = (
+                    g.desc(gate_exps).dtype,
+                    g.desc(up_exps).dtype,
+                    g.desc(down_exps).dtype,
+                );
+                let device_ok = n_used <= 16
+                    && ne % 256 == 0
+                    && nffx % 256 == 0
+                    && std::env::var("INFR_METAL_NOMOE").is_err()
+                    && moe_kern(gdt2).is_some()
+                    && moe_kern(udt2).is_some()
+                    && moe_kern(ddt2).is_some();
+                if device_ok {
+                    let bx = self.ensure_device(r, x);
+                    let bd = self.dev_dst(r, dst, rows * ne);
+                    // Router logits for ALL rows (one GEMV-per-(row, expert) dispatch over the
+                    // dequant-cached router weight), then per-row top-k into the [rows, 32]
+                    // expert table (idx in slots 0..16, f32 weights in 16..32).
+                    let rw = self.weight_buf(router, g, bindings);
+                    let logits = self.scratch_buf(rows * n_expert, 0);
+                    let pso = self.pipelines.get("linear_f32")?;
+                    let mut p = (rows as u32).to_ne_bytes().to_vec();
+                    p.extend_from_slice(&(ne as u32).to_ne_bytes());
+                    p.extend_from_slice(&(n_expert as u32).to_ne_bytes());
+                    self.encode_tg(
+                        r,
+                        &pso,
+                        &[bx.as_ref(), rw.as_ref(), logits.as_ref()],
+                        &p,
+                        rows * n_expert * 32,
+                        32,
+                    );
+                    let tbl = self.scratch_buf(rows * 32, 1);
+                    let pso = self.pipelines.get("moe_topk")?;
+                    let mut p = (n_expert as u32).to_ne_bytes().to_vec();
+                    p.extend_from_slice(&(n_used as u32).to_ne_bytes());
+                    p.extend_from_slice(&scale.to_ne_bytes());
+                    self.encode_tg(r, &pso, &[logits.as_ref(), tbl.as_ref()], &p, rows * 32, 32);
+                    // Expert FFN, batched over (chunk rows x selected experts) — one dispatch per
+                    // stage per chunk; chunking bounds the expert scratch (a full 8k-row prefill
+                    // would need ~0.5 GB of it).
+                    let gq = self.weight_qui(gate_exps, g, bindings);
+                    let uq = self.weight_qui(up_exps, g, bindings);
+                    let dq = self.weight_qui(down_exps, g, bindings);
+                    const CHUNK: usize = 256;
+                    let chunk = rows.min(CHUNK);
+                    let gate_t = self.scratch_buf(chunk * n_used * nffx, 2);
+                    let up_t = self.scratch_buf(chunk * n_used * nffx, 3);
+                    let act_t = self.scratch_buf(chunk * n_used * nffx, 4);
+                    let ydown = self.scratch_buf(chunk * n_used * ne, 5);
+                    let act_code: u32 = match act {
+                        infr_core::graph::Activation::Silu => 0,
+                        infr_core::graph::Activation::Gelu => 1,
+                        infr_core::graph::Activation::Sigmoid => 2,
+                    };
+                    let pack = |in_f: usize, out_f: usize, row0: usize| -> Vec<u8> {
+                        let mut p = 1u32.to_ne_bytes().to_vec();
+                        p.extend_from_slice(&(in_f as u32).to_ne_bytes());
+                        p.extend_from_slice(&(out_f as u32).to_ne_bytes());
+                        p.extend_from_slice(&0u32.to_ne_bytes()); // dshift (native kernels)
+                        p.extend_from_slice(&(n_used as u32).to_ne_bytes());
+                        p.extend_from_slice(&(row0 as u32).to_ne_bytes());
+                        p
+                    };
+                    // Expert-grouped GEMM for prefill-width rows (the llama.cpp mul_mm_id
+                    // shape): group the chunk's (token, slot) pairs by expert on-device, then
+                    // run the cooperative-GEMM tile per expert over its token group — MMA
+                    // compute instead of one GEMV per pair. Small row counts (decode) keep the
+                    // GEMV stages below.
+                    let grouped =
+                        rows >= 16 && ne % 64 == 0 && nffx % 64 == 0 && n_expert <= 1024 && {
+                            let kn = if gdt2 == DType::Q4K {
+                                "linear_q4k_cmm_id"
+                            } else {
+                                "linear_q6k_cmm_id"
+                            };
+                            self.pipelines
+                                .get(kn)
+                                .map(|pl| pl.max_total_threads_per_threadgroup() >= 128)
+                                .unwrap_or(false)
+                        };
+                    let ids = self.scratch_buf(n_expert * rows.min(CHUNK), 6);
+                    let tpe = self.scratch_buf(n_expert, 7);
+                    let cmm_id = |dt: DType, scale: bool| -> &'static str {
+                        match (dt, scale) {
+                            (DType::Q4K, false) => "linear_q4k_cmm_id",
+                            (DType::Q4K, true) => "linear_q4k_cmm_id_w",
+                            (DType::Q6K, false) => "linear_q6k_cmm_id",
+                            _ => "linear_q6k_cmm_id_w",
+                        }
+                    };
+                    for row0 in (0..rows).step_by(CHUNK) {
+                        let cr = (rows - row0).min(CHUNK);
+                        if grouped {
+                            let cap = rows.min(CHUNK);
+                            // map: one thread per expert scans the chunk's routing table
+                            let pso = self.pipelines.get("moe_map")?;
+                            let mut p = (n_expert as u32).to_ne_bytes().to_vec();
+                            p.extend_from_slice(&(n_used as u32).to_ne_bytes());
+                            p.extend_from_slice(&(cr as u32).to_ne_bytes());
+                            p.extend_from_slice(&(row0 as u32).to_ne_bytes());
+                            p.extend_from_slice(&(cap as u32).to_ne_bytes());
+                            self.encode_tg(
+                                r,
+                                &pso,
+                                &[tbl.as_ref(), ids.as_ref(), tpe.as_ref()],
+                                &p,
+                                n_expert,
+                                n_expert,
+                            );
+                            let ntt = cr.div_ceil(32);
+                            let idpack = |in_f: usize, out_f: usize| -> Vec<u8> {
+                                let mut p = (in_f as u32).to_ne_bytes().to_vec();
+                                p.extend_from_slice(&(out_f as u32).to_ne_bytes());
+                                p.extend_from_slice(&(n_used as u32).to_ne_bytes());
+                                p.extend_from_slice(&(cap as u32).to_ne_bytes());
+                                p.extend_from_slice(&(row0 as u32).to_ne_bytes());
+                                p.extend_from_slice(&(ntt as u32).to_ne_bytes());
+                                p
+                            };
+                            let gemm = |me: &Self,
+                                        r: &mut Resident,
+                                        kern: &'static str,
+                                        xb: &MtlBuffer,
+                                        q: &QuiWeight,
+                                        db: &MtlBuffer,
+                                        in_f: usize,
+                                        out_f: usize|
+                             -> Result<()> {
+                                let pso = me.pipelines.get(kern)?;
+                                me.encode_tg(
+                                    r,
+                                    &pso,
+                                    &[
+                                        xb,
+                                        &q.codes,
+                                        &q.scm,
+                                        &q.dd,
+                                        db,
+                                        ids.as_ref(),
+                                        tpe.as_ref(),
+                                        tbl.as_ref(),
+                                    ],
+                                    &idpack(in_f, out_f),
+                                    n_expert * ntt * (out_f / 64) * 128,
+                                    128,
+                                );
+                                Ok(())
+                            };
+                            gemm(
+                                self,
+                                r,
+                                cmm_id(gdt2, false),
+                                bx.as_ref(),
+                                &gq,
+                                gate_t.as_ref(),
+                                ne,
+                                nffx,
+                            )?;
+                            gemm(
+                                self,
+                                r,
+                                cmm_id(udt2, false),
+                                bx.as_ref(),
+                                &uq,
+                                up_t.as_ref(),
+                                ne,
+                                nffx,
+                            )?;
+                            let pso = self.pipelines.get("gatedact_f32")?;
+                            let mut p = ((cr * n_used) as u32).to_ne_bytes().to_vec();
+                            p.extend_from_slice(&(nffx as u32).to_ne_bytes());
+                            p.extend_from_slice(&act_code.to_ne_bytes());
+                            p.extend_from_slice(&0u32.to_ne_bytes());
+                            self.encode(
+                                r,
+                                &pso,
+                                &[gate_t.as_ref(), up_t.as_ref(), act_t.as_ref()],
+                                &p,
+                                cr * n_used * nffx,
+                            );
+                            gemm(
+                                self,
+                                r,
+                                cmm_id(ddt2, true),
+                                act_t.as_ref(),
+                                &dq,
+                                ydown.as_ref(),
+                                nffx,
+                                ne,
+                            )?;
+                            let pso = self.pipelines.get("moe_reduce")?;
+                            let mut p = (ne as u32).to_ne_bytes().to_vec();
+                            p.extend_from_slice(&(n_used as u32).to_ne_bytes());
+                            p.extend_from_slice(&(cr as u32).to_ne_bytes());
+                            p.extend_from_slice(&(row0 as u32).to_ne_bytes());
+                            self.encode(r, &pso, &[ydown.as_ref(), bd.as_ref()], &p, cr * ne);
+                            continue;
+                        }
+                        let pso = self.pipelines.get(moe_kern(gdt2).unwrap().0)?;
+                        self.encode_tg(
+                            r,
+                            &pso,
+                            &[
+                                bx.as_ref(),
+                                &gq.codes,
+                                &gq.scm,
+                                &gq.dd,
+                                gate_t.as_ref(),
+                                tbl.as_ref(),
+                            ],
+                            &pack(ne, nffx, row0),
+                            cr * n_used * (nffx / 2) * 32,
+                            32,
+                        );
+                        let pso = self.pipelines.get(moe_kern(udt2).unwrap().0)?;
+                        self.encode_tg(
+                            r,
+                            &pso,
+                            &[
+                                bx.as_ref(),
+                                &uq.codes,
+                                &uq.scm,
+                                &uq.dd,
+                                up_t.as_ref(),
+                                tbl.as_ref(),
+                            ],
+                            &pack(ne, nffx, row0),
+                            cr * n_used * (nffx / 2) * 32,
+                            32,
+                        );
+                        let pso = self.pipelines.get("gatedact_f32")?;
+                        let mut p = ((cr * n_used) as u32).to_ne_bytes().to_vec();
+                        p.extend_from_slice(&(nffx as u32).to_ne_bytes());
+                        p.extend_from_slice(&act_code.to_ne_bytes());
+                        p.extend_from_slice(&0u32.to_ne_bytes()); // up_off
+                        self.encode(
+                            r,
+                            &pso,
+                            &[gate_t.as_ref(), up_t.as_ref(), act_t.as_ref()],
+                            &p,
+                            cr * n_used * nffx,
+                        );
+                        let pso = self.pipelines.get(moe_kern(ddt2).unwrap().1)?;
+                        self.encode_tg(
+                            r,
+                            &pso,
+                            &[
+                                act_t.as_ref(),
+                                &dq.codes,
+                                &dq.scm,
+                                &dq.dd,
+                                ydown.as_ref(),
+                                tbl.as_ref(),
+                            ],
+                            &pack(nffx, ne, row0),
+                            cr * n_used * (ne / 2) * 32,
+                            32,
+                        );
+                        let pso = self.pipelines.get("moe_reduce")?;
+                        let mut p = (ne as u32).to_ne_bytes().to_vec();
+                        p.extend_from_slice(&(n_used as u32).to_ne_bytes());
+                        p.extend_from_slice(&(cr as u32).to_ne_bytes());
+                        p.extend_from_slice(&(row0 as u32).to_ne_bytes());
+                        self.encode(r, &pso, &[ydown.as_ref(), bd.as_ref()], &p, cr * ne);
+                    }
+                    r.loc[dst.0 as usize] = Loc::Device;
+                    return Ok(());
+                }
                 self.ensure_host(r, g, x);
                 let xs = r.vals[x.0 as usize].clone();
                 // `x` may hold several rows (the seam's batched prefill) — route + run per row,

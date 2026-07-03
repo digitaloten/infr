@@ -784,6 +784,109 @@ fn writekv_f16_parity() {
     assert_eq!(cpu, mtl, "WriteKv f16 cache bytes must be identical");
 }
 
+// Q8_0 KV cache (INFR_KV_Q8): the quantization on write must be BYTE-identical between the CPU
+// reference and the Metal kernel (d = amax/127 as f16, q = rint(x/d)).
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn writekv_q8_parity() {
+    let (rows, row_stride, max_ctx, pos) = (2usize, 256usize, 8usize, 3usize);
+    let cache_bytes = max_ctx * row_stride / 32 * 34;
+    let mut g = Graph::new();
+    let src = g.input(TensorDesc::new(vec![rows, row_stride], DType::F32));
+    let cache = g.input(TensorDesc::new(vec![max_ctx * row_stride], DType::Q8_0));
+    g.push(Op::WriteKv {
+        src,
+        cache,
+        rows: rows as u32,
+        row_stride: row_stride as u32,
+        pos: pos as u32,
+    });
+    let bound = vec![
+        (src, f32_bytes(&rand_f32(rows * row_stride, 44))),
+        (cache, vec![0u8; cache_bytes]),
+    ];
+    let cpu = run_readback(&CpuBackend::new(), &g, &bound, cache, cache_bytes);
+    let mtl = run_readback(
+        &MetalBackend::new().expect("metal backend"),
+        &g,
+        &bound,
+        cache,
+        cache_bytes,
+    );
+    assert_eq!(cpu, mtl, "WriteKv q8 cache bytes must be identical");
+}
+
+// Attention over a Q8_0 cache: WriteKv quantizes, Attention dequantizes on read. Both routes:
+// the scalar fallback (prefill shape) and the rows==1 vector kernel (decode at depth).
+fn q8_attention_test(rows: usize, kv_len: usize, hd: usize, pos: usize, tol: f32, seed: u64) {
+    let (nh, nkv) = (8usize, 2usize);
+    let mut g = Graph::new();
+    let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::Q8_0));
+    let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::Q8_0));
+    let ksrc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F32));
+    let vsrc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F32));
+    let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let row = (nkv * hd) as u32;
+    g.push(Op::WriteKv {
+        src: ksrc,
+        cache: kc,
+        rows: kv_len as u32,
+        row_stride: row,
+        pos: 0,
+    });
+    g.push(Op::WriteKv {
+        src: vsrc,
+        cache: vc,
+        rows: kv_len as u32,
+        row_stride: row,
+        pos: 0,
+    });
+    g.push(Op::Attention {
+        q,
+        k_cache: kc,
+        v_cache: vc,
+        dst,
+        rows: rows as u32,
+        kv_len: kv_len as u32,
+        n_head: nh as u32,
+        n_kv: nkv as u32,
+        head_dim: hd as u32,
+        scale: 1.0 / (hd as f32).sqrt(),
+        mask: infr_core::graph::AttnMask::Causal,
+        pos: pos as u32,
+    });
+    let nkv_elems = kv_len * nkv * hd;
+    let bound = vec![
+        (q, f32_bytes(&rand_f32(rows * nh * hd, seed))),
+        (kc, vec![0u8; nkv_elems / 32 * 34]),
+        (vc, vec![0u8; nkv_elems / 32 * 34]),
+        (ksrc, f32_bytes(&rand_f32(nkv_elems, seed + 1))),
+        (vsrc, f32_bytes(&rand_f32(nkv_elems, seed + 2))),
+    ];
+    assert_parity(&g, &bound, dst, rows * nh * hd, tol);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_q8_scalar_parity() {
+    q8_attention_test(3, 6, 64, 3, 1e-4, 240);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_q8_vec_parity() {
+    q8_attention_test(1, 200, 128, 199, 1e-4, 250);
+}
+
+// Wide q8 launch: routes to the cooperative q8 flash (dequant-staged KV tiles). Q rounds to f16
+// on this path (the flash trade), hence the flash-class tolerance.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_q8_flash_parity() {
+    q8_attention_test(17, 136, 128, 119, 5e-3, 260);
+}
+
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn attention_gqa_causal_parity() {
@@ -1162,6 +1265,24 @@ fn gatedact_upoff_parity() {
 
 #[test]
 #[ignore = "requires a Metal GPU"]
+fn gatedactfused_parity() {
+    let (rows, nff) = (3usize, 256usize);
+    let mut g = Graph::new();
+    let gu = g.input(TensorDesc::new(vec![rows, 2 * nff], DType::F32));
+    let dst = g.output(TensorDesc::new(vec![rows, nff], DType::F32));
+    g.push(Op::GatedActFused {
+        gu,
+        dst,
+        rows: rows as u32,
+        nff: nff as u32,
+        act: infr_core::graph::Activation::Silu,
+    });
+    let bound = vec![(gu, f32_bytes(&rand_f32(rows * 2 * nff, 270)))];
+    assert_parity(&g, &bound, dst, rows * nff, 1e-5);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
 fn moe_ffn_parity() {
     let (ne, n_expert, n_used, nff) = (64usize, 8usize, 2usize, 128usize);
     let mut g = Graph::new();
@@ -1193,6 +1314,157 @@ fn moe_ffn_parity() {
         (down, f32_bytes(&rand_f32(n_expert * ne * nff, 64))),
     ];
     assert_parity(&g, &bound, dst, ne, 1e-3);
+}
+
+// Quantized experts route to the DEVICE MoE path (router GEMV + on-device top-k + expert-table
+// GEMVs); the f32 test above keeps the host fallback covered. CPU is the oracle here (its MoE
+// matvec dequants the same bytes and dots in f32 — no Q8 activation quantization).
+fn moe_quant_test(dtype: DType, synth: fn(usize, u32) -> Vec<u8>, seed: u32) {
+    let (ne, n_expert, n_used, nff) = (256usize, 8usize, 3usize, 256usize);
+    let mut g = Graph::new();
+    let x = g.input(TensorDesc::new(vec![ne], DType::F32));
+    let router = g.weight(TensorDesc::new(vec![n_expert, ne], DType::F32));
+    let gate = g.weight(TensorDesc::new(vec![n_expert, nff, ne], dtype));
+    let up = g.weight(TensorDesc::new(vec![n_expert, nff, ne], dtype));
+    let down = g.weight(TensorDesc::new(vec![n_expert, ne, nff], dtype));
+    let dst = g.output(TensorDesc::new(vec![ne], DType::F32));
+    g.push(Op::MoeFfn {
+        x,
+        router,
+        gate_exps: gate,
+        up_exps: up,
+        down_exps: down,
+        dst,
+        ne: ne as u32,
+        n_expert: n_expert as u32,
+        n_used: n_used as u32,
+        n_ff_exp: nff as u32,
+        scale: 1.0,
+        act: infr_core::graph::Activation::Silu,
+    });
+    let bound = vec![
+        (x, f32_bytes(&rand_f32(ne, seed as u64))),
+        (router, f32_bytes(&rand_f32(n_expert * ne, seed as u64 + 1))),
+        (gate, synth(n_expert * nff * ne, seed + 2)),
+        (up, synth(n_expert * nff * ne, seed + 3)),
+        (down, synth(n_expert * ne * nff, seed + 4)),
+    ];
+    assert_parity(&g, &bound, dst, ne, 1e-3);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn moe_ffn_q4k_device_parity() {
+    moe_quant_test(DType::Q4K, synth_q4k, 80);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn moe_ffn_q6k_device_parity() {
+    moe_quant_test(DType::Q6K, synth_q6k, 90);
+}
+
+// Batched rows through the device MoE path (rows spanning two 256-row chunks): every row routes
+// independently; parity vs the CPU reference's per-row loop.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn moe_ffn_batched_rows_parity() {
+    let (rows, ne, n_expert, n_used, nff) = (300usize, 256usize, 8usize, 3usize, 256usize);
+    let mut g = Graph::new();
+    let x = g.input(TensorDesc::new(vec![rows, ne], DType::F32));
+    let router = g.weight(TensorDesc::new(vec![n_expert, ne], DType::F32));
+    let gate = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::Q4K));
+    let up = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::Q4K));
+    let down = g.weight(TensorDesc::new(vec![n_expert, ne, nff], DType::Q4K));
+    let dst = g.output(TensorDesc::new(vec![rows, ne], DType::F32));
+    g.push(Op::MoeFfn {
+        x,
+        router,
+        gate_exps: gate,
+        up_exps: up,
+        down_exps: down,
+        dst,
+        ne: ne as u32,
+        n_expert: n_expert as u32,
+        n_used: n_used as u32,
+        n_ff_exp: nff as u32,
+        scale: 1.0,
+        act: infr_core::graph::Activation::Silu,
+    });
+    // x scaled down: the ~50x-real synthetic weights would push gate/up activations past f16
+    // range (the kernels' operand precision) with unit-scale inputs — real hidden states don't.
+    let xs_small: Vec<f32> = rand_f32(rows * ne, 95).iter().map(|v| v * 0.02).collect();
+    let bound = vec![
+        (x, f32_bytes(&xs_small)),
+        (router, f32_bytes(&rand_f32(n_expert * ne, 96))),
+        (gate, synth_q4k(n_expert * nff * ne, 97)),
+        (up, synth_q4k(n_expert * nff * ne, 98)),
+        (down, synth_q4k(n_expert * ne * nff, 99)),
+    ];
+    // Reference mirrors the grouped-GEMM path's numerics (same policy as the dense GEMM parity
+    // tests): expert weights and stage inputs round to f16 (the kernels' operand precision, f32
+    // accumulate), router/top-k stay f32. Residual tolerance covers reassociation over the
+    // ~50x-real-magnitude synthetic weights' cancellation tail.
+    let r16 =
+        |v: &[f32]| -> Vec<f32> { v.iter().map(|&x| half::f16::from_f32(x).to_f32()).collect() };
+    let xs: Vec<f32> = {
+        let (_, b) = &bound[0];
+        bytemuck::cast_slice::<u8, f32>(b).to_vec()
+    };
+    let rw: Vec<f32> = {
+        let (_, b) = &bound[1];
+        bytemuck::cast_slice::<u8, f32>(b).to_vec()
+    };
+    use infr_gguf::dequant::dequant_block;
+    let gw = r16(&dequant_block(DType::Q4K, &bound[2].1).unwrap());
+    let uw = r16(&dequant_block(DType::Q4K, &bound[3].1).unwrap());
+    let dw = r16(&dequant_block(DType::Q4K, &bound[4].1).unwrap());
+    let mut reference = vec![0f32; rows * ne];
+    for row in 0..rows {
+        let x = &xs[row * ne..(row + 1) * ne];
+        let logits: Vec<f32> = (0..n_expert)
+            .map(|e| (0..ne).map(|i| rw[e * ne + i] * x[i]).sum::<f32>())
+            .collect();
+        let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let probs: Vec<f32> = logits.iter().map(|&v| (v - maxl).exp()).collect();
+        let psum: f32 = probs.iter().sum();
+        let mut idx: Vec<usize> = (0..n_expert).collect();
+        idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+        idx.truncate(n_used);
+        let wsum: f32 = idx.iter().map(|&e| probs[e] / psum).sum::<f32>().max(1e-20);
+        let x16 = r16(x);
+        for &e in &idx {
+            let gs = &gw[e * nff * ne..(e + 1) * nff * ne];
+            let us = &uw[e * nff * ne..(e + 1) * nff * ne];
+            let ds = &dw[e * ne * nff..(e + 1) * ne * nff];
+            let gate: Vec<f32> = (0..nff)
+                .map(|o| (0..ne).map(|i| gs[o * ne + i] * x16[i]).sum::<f32>())
+                .collect();
+            let up: Vec<f32> = (0..nff)
+                .map(|o| (0..ne).map(|i| us[o * ne + i] * x16[i]).sum::<f32>())
+                .collect();
+            let act: Vec<f32> = (0..nff)
+                .map(|i| {
+                    let g = gate[i];
+                    (g / (1.0 + (-g).exp())) * up[i]
+                })
+                .collect();
+            let a16 = r16(&act);
+            let w_e = (probs[e] / psum) / wsum;
+            for o in 0..ne {
+                let y: f32 = (0..nff).map(|i| ds[o * nff + i] * a16[i]).sum();
+                reference[row * ne + o] += w_e * y;
+            }
+        }
+    }
+    let mtl = run(
+        &MetalBackend::new().expect("metal backend"),
+        &g,
+        &bound,
+        dst,
+        rows * ne,
+    );
+    assert_close(&reference, &mtl, 5e-3, "moe batched grouped");
 }
 
 #[test]

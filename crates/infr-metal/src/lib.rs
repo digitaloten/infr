@@ -89,6 +89,11 @@ pub struct MetalBackend {
     /// single slot, same single-generation lifetime as the weight caches (one backend per
     /// generation, bindings stable across the decode loop).
     pub(crate) replay: std::sync::Mutex<Option<exec::Tape>>,
+    /// Op-scratch buffers reused across ops/executes (keyed by (f32 count, tag) — distinct tags
+    /// for same-size buffers alive in one op). Reuse across layers is safe: the batch's hazard
+    /// tracking orders each layer's writes after the previous layer's reads.
+    pub(crate) scratch:
+        std::sync::Mutex<std::collections::HashMap<(usize, u8), std::sync::Arc<metal::Buffer>>>,
 }
 
 // MTLDevice / MTLCommandQueue are documented thread-safe; the pipeline states are immutable after
@@ -112,6 +117,7 @@ impl MetalBackend {
             prof_ops: std::env::var("INFR_METAL_PROFILE").as_deref() == Ok("2"),
             prof: std::sync::Mutex::new(profile::Profile::default()),
             replay: std::sync::Mutex::new(None),
+            scratch: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 }
@@ -169,7 +175,9 @@ impl Backend for MetalBackend {
             decode_replay: true,
             // The reference backend keeps the separate gate/up FFN form (no GatedActFused
             // lowering); the runner's combined-gu upload stays Vulkan-only.
-            combined_gu: false,
+            // One fused [2*nff, ne] gate+up Linear + GatedActFused per FFN — one dispatch and
+            // one contiguous weight stream instead of two.
+            combined_gu: true,
         }
     }
 
