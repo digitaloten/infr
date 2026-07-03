@@ -809,6 +809,17 @@ pub(crate) fn linear_f32r_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(LINEAR_F32R_SPV_BYTES))
 }
+/// SPIR-V for the ROW-TILED f32 GEMM (8 rows/workgroup — prefill weight reuse). Bit-identical to
+/// `linear_f32r_spv` per output (same K-accumulation order); grid = out_f·ceil(rows/8).
+pub(crate) fn linear_f32r_mrow8_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/linear_f32r_mrow8.spv"
+        )))
+    })
+}
 /// SPIR-V for the bf16-weight GEMV (`y=x·Wᵀ`).
 pub(crate) fn linear_bf16_spv() -> &'static [u32] {
     static LINEAR_BF16_SPV: OnceLock<Vec<u32>> = OnceLock::new();

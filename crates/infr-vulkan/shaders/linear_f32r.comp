@@ -10,6 +10,43 @@ layout(binding = 0) readonly buffer WB { float w[]; };     // [out, in] f32
 layout(binding = 1) readonly buffer XB { float x[]; };     // [rows, in]
 layout(binding = 2) buffer YB { float y[]; };              // [rows, out]
 
+#ifdef MROW
+// Row-tiled prefill GEMM: one workgroup = one output column × MROW rows. Each weight element w[o,i]
+// is read ONCE by thread t and reused across all MROW rows, so the per-row weight re-read of the
+// 1-row kernel (grid = rows·out_f) drops to weight-once-per-MROW-rows (grid = out_f·ceil(rows/MROW)).
+// The per-(o,r) accumulation + tree-reduce order is IDENTICAL to the 1-row kernel → bit-identical.
+shared float red[64 * MROW];
+
+void main() {
+    uint o = gl_WorkGroupID.x % pc.out_f;
+    uint r0 = (gl_WorkGroupID.x / pc.out_f) * uint(MROW);
+    uint t = gl_LocalInvocationID.x;
+    uint wbase = o * pc.in_f;
+    float acc[MROW];
+    for (uint j = 0u; j < uint(MROW); j++) { acc[j] = 0.0; }
+    for (uint i = t; i < pc.in_f; i += 64u) {
+        float wv = w[wbase + i];
+        for (uint j = 0u; j < uint(MROW); j++) {
+            uint r = r0 + j;
+            if (r < pc.rows) { acc[j] += wv * x[r * pc.in_f + i]; }
+        }
+    }
+    for (uint j = 0u; j < uint(MROW); j++) { red[j * 64u + t] = acc[j]; }
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride /= 2u) {
+        if (t < stride) {
+            for (uint j = 0u; j < uint(MROW); j++) { red[j * 64u + t] += red[j * 64u + t + stride]; }
+        }
+        barrier();
+    }
+    if (t == 0u) {
+        for (uint j = 0u; j < uint(MROW); j++) {
+            uint r = r0 + j;
+            if (r < pc.rows) { y[r * pc.out_f + o] = red[j * 64u]; }
+        }
+    }
+}
+#else
 shared float red[64];
 
 void main() {
@@ -29,3 +66,4 @@ void main() {
     }
     if (t == 0u) { y[unit] = red[0]; }
 }
+#endif

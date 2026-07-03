@@ -481,9 +481,25 @@ impl<'a> Recorder<'a> {
         out_f: usize,
     ) {
         self.stamp("lm_head");
-        let k = self
-            .be
-            .kernel("linear_f32r", crate::gemm::linear_f32r_spv(), 3, 12);
+        // Prefill (rows>1): the ROW-TILED f32 GEMM reads each weight once per 8 rows (grid
+        // out_f·ceil(rows/8)) instead of once per row — bit-identical, cuts the F32-projection
+        // weight re-reads (E2B inp_gate/proj, qwen3moe router). Decode (rows==1) keeps the 1-row
+        // kernel. INFR_NO_F32_MROW forces the 1-row path (A/B).
+        let use_mrow = rows > 1 && std::env::var("INFR_NO_F32_MROW").is_err();
+        let (name, spv, groups) = if use_mrow {
+            (
+                "linear_f32r_mrow8",
+                crate::gemm::linear_f32r_mrow8_spv(),
+                (out_f * rows.div_ceil(8)) as u32,
+            )
+        } else {
+            (
+                "linear_f32r",
+                crate::gemm::linear_f32r_spv(),
+                (rows * out_f) as u32,
+            )
+        };
+        let k = self.be.kernel(name, spv, 3, 12);
         let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
@@ -493,7 +509,7 @@ impl<'a> Recorder<'a> {
             &[Self::vkb(w), Self::vkb(x), Self::vkb(y)],
             1,
             &push,
-            (rows * out_f) as u32, // one workgroup per output (64-thread K reduce)
+            groups,
         );
     }
 
