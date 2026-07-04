@@ -1247,7 +1247,7 @@ fn lower_op(
                         pool[&pl].as_ref(),
                         pool[&pacc].as_ref(),
                         rows,
-                        pos as usize,
+                        pos,
                         kv_len,
                         nh,
                         nkv,
