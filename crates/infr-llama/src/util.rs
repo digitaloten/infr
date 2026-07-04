@@ -115,3 +115,9 @@ pub(crate) fn add_chat_eos(cfg: &mut Config, tokenizer: &Tokenizer) {
 pub(crate) fn meta_u64(g: &Gguf, key: &str) -> Option<u64> {
     g.metadata().u64(key)
 }
+
+/// Float metadata lookup (diffusion-gemma's `eb_*` sampler params are stored as GGUF strings —
+/// same KV store, no typed float accessor on `Metadata` — so parse through `as_f64`).
+pub(crate) fn meta_f64(g: &Gguf, key: &str) -> Option<f64> {
+    g.metadata().get(key).and_then(|v| v.as_f64())
+}

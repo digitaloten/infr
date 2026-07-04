@@ -612,6 +612,156 @@ impl ChatModel for CpuDenseChat {
     }
 }
 
+/// Either DiffusionGemma session (Phase 2, `cpu_model.rs`) behind [`crate::diffusion::DiffusionSession`]
+/// — lets [`DiffusionGemmaChat`] hold ONE persistent session across turns regardless of backend.
+enum DiffusionSess {
+    Cpu(crate::cpu_model::DiffusionGemmaCpuSession),
+    Vulkan(crate::cpu_model::DiffusionGemmaVulkanSession),
+}
+
+impl crate::diffusion::DiffusionSession for DiffusionSess {
+    fn prefill(&mut self, model: &CpuModel, tokens: &[u32]) -> Result<()> {
+        match self {
+            DiffusionSess::Cpu(s) => s.prefill(model, tokens),
+            DiffusionSess::Vulkan(s) => s.prefill(model, tokens),
+        }
+    }
+    fn denoise(
+        &mut self,
+        model: &CpuModel,
+        canvas_tokens: &[u32],
+        sc_logits: Option<&[f32]>,
+        temp_inv: f32,
+    ) -> Result<Vec<f32>> {
+        match self {
+            DiffusionSess::Cpu(s) => s.denoise(model, canvas_tokens, sc_logits, temp_inv),
+            DiffusionSess::Vulkan(s) => s.denoise(model, canvas_tokens, sc_logits, temp_inv),
+        }
+    }
+}
+
+/// diffusion-gemma (Phase 3 — block text-diffusion, see `docs/DIFFUSIONGEMMA.md` and
+/// `crate::diffusion`): the entropy-bound decode loop over a persistent session, Vulkan by default
+/// or the CPU reference backend under `INFR_CPU`/`INFR_METAL` (no Metal session exists for this
+/// arch yet — Phase 2 only built CPU/Vulkan). The session is opened lazily on the first turn (its
+/// KV cache is sized once the model's `n_ctx_train`/`INFR_MAX_CTX` is known) and stays open across
+/// turns: multi-turn REPL re-sends the WHOLE running token stream as the "prefix" each turn, and
+/// the session's own prefix-diff prefill (see `DiffusionGemmaCpuSession::prefill`'s doc) re-sends
+/// only the un-cached suffix, exactly like every other seam session on this crate.
+pub struct DiffusionGemmaChat {
+    model: CpuModel,
+    cpu: bool,
+    sess: Option<DiffusionSess>,
+    max_ctx: usize,
+}
+
+impl DiffusionGemmaChat {
+    /// Production Vulkan session.
+    pub fn new(model: CpuModel) -> Self {
+        Self {
+            model,
+            cpu: false,
+            sess: None,
+            max_ctx: 0,
+        }
+    }
+
+    /// Reference CPU session (`INFR_CPU=1`).
+    pub fn new_cpu(model: CpuModel) -> Self {
+        Self {
+            model,
+            cpu: true,
+            sess: None,
+            max_ctx: 0,
+        }
+    }
+}
+
+impl ChatModel for DiffusionGemmaChat {
+    fn render(&self, messages: &[(&str, &str)]) -> Result<String> {
+        self.model.render_chat_messages(messages)
+    }
+
+    fn generate(
+        &mut self,
+        prompt: &str,
+        max_new: usize,
+        on_piece: &mut dyn FnMut(&str),
+    ) -> Result<GenStats> {
+        let enc = self
+            .model
+            .tokenizer()
+            .encode(prompt, false)
+            .map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+        let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
+
+        let cfg = self.model.config();
+        let canvas_len = cfg.canvas_length;
+        let vocab = cfg.vocab;
+        let eos_ids = cfg.eos_ids.clone();
+        let eb = crate::diffusion::EbConfig::from_config(cfg);
+        // Seed determinism (see `crate::diffusion::diffusion_generate`'s doc): the reference
+        // reseeds its RNG from a fixed value every block, so a fixed INFR_SEED (default 42,
+        // matching the oracle's `-s 42`) makes every turn reproducible.
+        let seed: u64 = std::env::var("INFR_SEED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(42);
+
+        // Size the session to THIS turn's [prompt | every block's canvas] plus REPL headroom —
+        // NOT n_ctx_train: DG's per-token KV is heavy (hd 256/512 across 30 layers ≈ 225 KB/tok)
+        // and this model trains at 262144 ctx, so the n_ctx_train default every AR chat uses
+        // would ask the backend for a ~59 GB KV cache (observed: radv device-lost at submit).
+        // Default headroom is min(n_ctx_train, 8192) ≈ 1.8 GB — the same clamp the spec-decode
+        // pair uses. A later REPL turn that outgrows the session reopens it bigger (the KV is
+        // rebuilt by a from-scratch prefill; correct, just slower for that one turn).
+        let blocks = max_new.div_ceil(canvas_len.max(1)).max(1);
+        let needed = prompt_tokens.len() + blocks * canvas_len + 64;
+        if self.sess.is_none() || needed > self.max_ctx {
+            let max_ctx = std::env::var("INFR_MAX_CTX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| cfg.n_ctx_train.min(8192))
+                .max(needed);
+            self.max_ctx = max_ctx;
+            self.sess = Some(if self.cpu {
+                DiffusionSess::Cpu(self.model.diffusion_gemma_cpu_session(max_ctx))
+            } else {
+                DiffusionSess::Vulkan(self.model.diffusion_gemma_vulkan_session(max_ctx)?)
+            });
+        }
+
+        let result = crate::diffusion::diffusion_generate(
+            self.sess.as_mut().unwrap(),
+            &self.model,
+            &prompt_tokens,
+            canvas_len,
+            vocab,
+            &eos_ids,
+            &eb,
+            max_new,
+            seed,
+            self.max_ctx,
+        )?;
+
+        // Stream the committed tokens through the shared incremental UTF-8-safe detok — the same
+        // helper every other backend's per-token decode loop uses (`crate::stream_token`), so a
+        // block's text appears exactly like any other backend's piecewise output.
+        let mut acc: Vec<u32> = Vec::new();
+        let mut printed = 0usize;
+        for &id in &result.tokens {
+            crate::stream_token(
+                self.model.tokenizer(),
+                &mut acc,
+                &mut printed,
+                id,
+                &mut |p: &str| on_piece(p),
+            );
+        }
+        Ok(result.stats)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

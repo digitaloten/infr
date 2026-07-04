@@ -1,5 +1,5 @@
 //! Model hyper-parameters parsed from GGUF metadata. Mechanically split out of `lib.rs`.
-use crate::{meta_u64, MoeConfig};
+use crate::{meta_f64, meta_u64, MoeConfig};
 use anyhow::{bail, Context, Result};
 use infr_core::loader::MetaValue;
 use infr_core::WeightSource;
@@ -68,6 +68,17 @@ pub struct Config {
     /// diffusion-gemma: the vocab id used to pad an unfinished canvas block (`tokenizer.ggml.
     /// mask_token_id`). Unused until the denoise decode loop (Phase 3). `0` for every other model.
     pub mask_token_id: u32,
+    /// diffusion-gemma: the entropy-bound sampler's parameters (Phase 3 — see
+    /// `docs/DIFFUSIONGEMMA.md`'s "Decode loop" section and `diffusion_generate_entropy_bound` in
+    /// the reference `examples/diffusion/diffusion.cpp`). Parsed from `diffusion.eb_*` GGUF
+    /// metadata with the reference's own fallbacks (`diffusion-cli.cpp`'s `meta_f`/`meta_i`
+    /// defaults) when a key is absent. All zero/unused for every non-diffusion-gemma model.
+    pub eb_max_steps: usize,
+    pub eb_t_min: f32,
+    pub eb_t_max: f32,
+    pub eb_entropy_bound: f32,
+    pub eb_stability_threshold: usize,
+    pub eb_confidence_threshold: f32,
     /// Per-layer dims for the SWA (local) layers when they differ from the full (global) layers
     /// (gemma4). Equal to `head_dim` / `n_kv` / `rope_dim` for uniform-dim models.
     pub head_dim_swa: usize,
@@ -466,6 +477,27 @@ impl Config {
         } else {
             0
         };
+        // Entropy-bound sampler params (`diffusion.eb_*`), fallbacks matching
+        // `diffusion-cli.cpp`'s `meta_f`/`meta_i` defaults exactly.
+        let (
+            eb_max_steps,
+            eb_t_min,
+            eb_t_max,
+            eb_entropy_bound,
+            eb_stability_threshold,
+            eb_confidence_threshold,
+        ) = if diffusion_gemma {
+            (
+                meta_u64(g, "diffusion.eb_max_steps").unwrap_or(48) as usize,
+                meta_f64(g, "diffusion.eb_t_min").unwrap_or(0.4) as f32,
+                meta_f64(g, "diffusion.eb_t_max").unwrap_or(0.8) as f32,
+                meta_f64(g, "diffusion.eb_entropy_bound").unwrap_or(0.1) as f32,
+                meta_u64(g, "diffusion.eb_stability_threshold").unwrap_or(1) as usize,
+                meta_f64(g, "diffusion.eb_confidence_threshold").unwrap_or(0.005) as f32,
+            )
+        } else {
+            (0, 0.0, 0.0, 0.0, 0, 0.0)
+        };
         Ok(Config {
             n_layer,
             n_head,
@@ -490,6 +522,12 @@ impl Config {
             diffusion_gemma,
             canvas_length,
             mask_token_id,
+            eb_max_steps,
+            eb_t_min,
+            eb_t_max,
+            eb_entropy_bound,
+            eb_stability_threshold,
+            eb_confidence_threshold,
             head_dim_swa,
             n_kv_swa,
             rope_dim_swa,

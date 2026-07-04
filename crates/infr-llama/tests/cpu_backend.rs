@@ -1272,7 +1272,7 @@ fn cpu_diffusion_gemma_denoise_step() {
 
     let mut session = model.diffusion_gemma_cpu_session(tokens.len() + canvas_len + 8);
     let t0 = std::time::Instant::now();
-    session.prefill(&tokens).expect("cpu prefill");
+    session.prefill(&model, &tokens).expect("cpu prefill");
     eprintln!(
         "cpu_diffusion_gemma_denoise_step: prefill {} tokens in {:.1}s",
         tokens.len(),
@@ -1282,7 +1282,7 @@ fn cpu_diffusion_gemma_denoise_step() {
     let canvas: Vec<u32> = vec![mask_id; canvas_len];
     let t1 = std::time::Instant::now();
     let logits1 = session
-        .denoise(&canvas, None, 1.0)
+        .denoise(&model, &canvas, None, 1.0)
         .expect("cpu denoise step 1 (no SC)");
     eprintln!(
         "cpu_diffusion_gemma_denoise_step: denoise (no SC) {:.1}s",
@@ -1317,7 +1317,7 @@ fn cpu_diffusion_gemma_denoise_step() {
     );
     let t2 = std::time::Instant::now();
     let logits2 = session
-        .denoise(&canvas2, None, 1.0)
+        .denoise(&model, &canvas2, None, 1.0)
         .expect("cpu denoise step 2 (different canvas)");
     eprintln!(
         "cpu_diffusion_gemma_denoise_step: denoise (overwrite check) {:.1}s",
@@ -1337,7 +1337,7 @@ fn cpu_diffusion_gemma_denoise_step() {
     // Self-conditioning smoke test: feed the first call's raw logits back as sc_logits.
     let t3 = std::time::Instant::now();
     let logits_sc = session
-        .denoise(&canvas, Some(&logits1), 1.0)
+        .denoise(&model, &canvas, Some(&logits1), 1.0)
         .expect("cpu denoise with self-conditioning");
     eprintln!(
         "cpu_diffusion_gemma_denoise_step: denoise (self-cond) {:.1}s",
@@ -1380,21 +1380,21 @@ fn gpu_seam_matches_cpu_diffusion_gemma_denoise() {
         .expect("encode");
 
     let mut cpu_session = model.diffusion_gemma_cpu_session(tokens.len() + canvas_len + 8);
-    cpu_session.prefill(&tokens).expect("cpu prefill");
+    cpu_session.prefill(&model, &tokens).expect("cpu prefill");
     let canvas: Vec<u32> = vec![mask_id; canvas_len];
     let t0 = std::time::Instant::now();
     let cpu_logits = cpu_session
-        .denoise(&canvas, None, 1.0)
+        .denoise(&model, &canvas, None, 1.0)
         .expect("cpu denoise");
     let cpu_secs = t0.elapsed().as_secs_f64();
 
     let mut vk_session = model
         .diffusion_gemma_vulkan_session(tokens.len() + canvas_len + 8)
         .expect("vulkan session");
-    vk_session.prefill(&tokens).expect("vulkan prefill");
+    vk_session.prefill(&model, &tokens).expect("vulkan prefill");
     let t1 = std::time::Instant::now();
     let gpu_logits = vk_session
-        .denoise(&canvas, None, 1.0)
+        .denoise(&model, &canvas, None, 1.0)
         .expect("vulkan denoise");
     let gpu_secs = t1.elapsed().as_secs_f64();
     eprintln!(
@@ -1431,5 +1431,89 @@ fn gpu_seam_matches_cpu_diffusion_gemma_denoise() {
     }
     println!(
         "gpu_seam_matches_cpu_diffusion_gemma_denoise: min row cosine over checked rows = {min_cos:.3}"
+    );
+}
+
+// ─── DiffusionGemma Phase 3: entropy-bound decode loop vs the oracle ────────────────────────────
+//
+// The full block-diffusion decode (`infr_llama::diffusion::diffusion_generate`) driven on the
+// Vulkan session, for the same chat-templated prompt the oracle (`llama-diffusion-cli`) was run
+// on (see docs/DIFFUSIONGEMMA.md's "Oracle reference outputs"). NOT a token-identical check (a
+// 128-expert top-8 MoE model's CPU-vs-Vulkan routing legitimately diverges — the same class of
+// divergence `gpu_seam_matches_cpu_diffusion_gemma[_denoise]` above already calibrate against);
+// this asserts the DECODED TEXT is coherent (contains "Paris") and prints both texts + step/block
+// counts side by side so a human can eyeball the match.
+
+/// Vulkan-gated (like Phase 2's GPU tests): the entropy-bound decode loop end-to-end for "What is
+/// the capital of France?", `n_predict=64`, greedy (`INFR_SEED` default 42). Prints the decoded
+/// text, step count and block count; asserts the post-thought answer contains "Paris".
+#[test]
+fn diffusion_gemma_decode_matches_oracle() {
+    let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
+    need_gpu!();
+    let _tlk = test_serial_lock();
+    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    assert!(
+        model.config().diffusion_gemma,
+        "arch not parsed as diffusion-gemma"
+    );
+
+    let prompt = model
+        .render_chat_messages(&[("user", "What is the capital of France?")])
+        .expect("render chat template");
+    let tokens = model.encode(&prompt).expect("encode");
+    assert!(!tokens.is_empty(), "empty prompt");
+
+    let cfg = model.config();
+    let canvas_len = cfg.canvas_length;
+    let vocab = cfg.vocab;
+    let eos_ids = cfg.eos_ids.clone();
+    let eb = infr_llama::diffusion::EbConfig::from_config(cfg);
+
+    let n_predict = 64usize;
+    let blocks = n_predict.div_ceil(canvas_len).max(1);
+    let max_ctx = tokens.len() + blocks * canvas_len + 64;
+    let mut session = model
+        .diffusion_gemma_vulkan_session(max_ctx)
+        .expect("vulkan session");
+
+    let t0 = std::time::Instant::now();
+    let result = infr_llama::diffusion::diffusion_generate(
+        &mut session,
+        &model,
+        &tokens,
+        canvas_len,
+        vocab,
+        &eos_ids,
+        &eb,
+        n_predict,
+        /* seed */ 42,
+        max_ctx,
+    )
+    .expect("diffusion_generate");
+    let secs = t0.elapsed().as_secs_f64();
+
+    let text = model.decode(&result.tokens).expect("decode");
+    eprintln!(
+        "diffusion_gemma_decode_matches_oracle: {} steps over {} block(s) in {secs:.1}s \
+         ({} tok generated)",
+        result.steps,
+        result.blocks,
+        result.tokens.len()
+    );
+    println!("infr   text: {text:?}");
+    // Oracle reference (CPU, `-p \"What is the capital of France?\" -n 64 -s 42 --temp 0`, captured
+    // 2026-07-05 — see docs/DIFFUSIONGEMMA.md): 10 EB steps, 1 block, thinking span then "The
+    // capital of France is Paris."
+    println!(
+        "oracle text: \"<|channel>thought\\nThe user is asking for the capital of France.\\n    \
+         *   Country: France.\\n    *   Capital: Paris.\\nProvide the direct answer \
+         clearly.<channel|>The capital of France is Paris.\" (10 EB steps, 1 block)"
+    );
+
+    let (_thought, answer) = infr_chat::split_channels(&text);
+    assert!(
+        answer.contains("Paris") || text.contains("Paris"),
+        "decoded answer doesn't mention Paris: {text:?}"
     );
 }

@@ -13,6 +13,7 @@ mod config;
 pub mod cpu_backend;
 mod cpu_model;
 pub use cpu_model::CpuModel;
+pub mod diffusion;
 mod util;
 pub use util::gpu_available;
 pub(crate) use util::*;

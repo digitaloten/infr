@@ -288,6 +288,23 @@ impl CpuModel {
             .to_vec())
     }
 
+    /// Raw tokenizer accessor for callers outside this module that need incremental detok (the
+    /// diffusion decode loop, Phase 3) via the shared [`crate::stream_token`] helper.
+    pub(crate) fn tokenizer(&self) -> &Tokenizer {
+        &self.tokenizer
+    }
+
+    /// Detokenize ids back to text (`encode`'s twin, `skip_special_tokens=true` — matches
+    /// [`crate::stream_token`]'s convention so a thinking model's `<|channel>thought`/`<channel|>`
+    /// markers, which aren't in the tokenizer's added-specials set, still come through as text) —
+    /// for callers that drive a decode loop directly on token ids (the diffusion decode loop's own
+    /// tests) instead of through one of the `generate_*` string-in/string-out helpers.
+    pub fn decode(&self, ids: &[u32]) -> Result<String> {
+        self.tokenizer
+            .decode(ids, true)
+            .map_err(|e| anyhow!("decode: {e}"))
+    }
+
     /// DiffusionGemma Phase-1 validation: a causal prefill of `tokens` on the CPU reference
     /// backend, returning the LAST token's raw logits (`[vocab]`, pre-softmax, post-softcap). Not
     /// specific to diffusion-gemma — works for any arch on this seam — but this is its only
@@ -324,9 +341,8 @@ impl CpuModel {
     /// KV rows `P..P+C`, so a caller can denoise the same block with a different partially-
     /// unmasked canvas over and over (the loop Phase 3 drives). `max_ctx` sizes the session's KV
     /// cache (must fit the whole prompt + canvas_length + any headroom for later blocks).
-    pub fn diffusion_gemma_cpu_session(&self, max_ctx: usize) -> DiffusionGemmaCpuSession<'_> {
+    pub fn diffusion_gemma_cpu_session(&self, max_ctx: usize) -> DiffusionGemmaCpuSession {
         DiffusionGemmaCpuSession {
-            model: self,
             be: CpuBackend::new(),
             state: None,
             max_ctx,
@@ -338,10 +354,9 @@ impl CpuModel {
     pub fn diffusion_gemma_vulkan_session(
         &self,
         max_ctx: usize,
-    ) -> Result<DiffusionGemmaVulkanSession<'_>> {
+    ) -> Result<DiffusionGemmaVulkanSession> {
         let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
         Ok(DiffusionGemmaVulkanSession {
-            model: self,
             be: vk,
             state: None,
             max_ctx,
@@ -825,29 +840,30 @@ impl CpuModel {
 }
 
 /// A persistent CPU-reference session for DiffusionGemma's two-pass forward (Phase 2 — see
-/// docs/DIFFUSIONGEMMA.md and [`CpuModel::diffusion_gemma_cpu_session`]).
-pub struct DiffusionGemmaCpuSession<'m> {
-    model: &'m CpuModel,
+/// docs/DIFFUSIONGEMMA.md and [`CpuModel::diffusion_gemma_cpu_session`]). Model-independent (like
+/// [`DenseVulkanSession`]/[`DenseMetalSession`]) — `prefill`/`denoise` take the `&CpuModel` per
+/// call instead of borrowing it at construction, so a [`crate::model::ChatModel`] can hold both an
+/// owned `CpuModel` and a persistent session side by side (Phase 3 — no self-referential borrow).
+pub struct DiffusionGemmaCpuSession {
     be: CpuBackend,
     state: Option<crate::cpu_backend::SeamKv>,
     max_ctx: usize,
 }
 
 /// [`DiffusionGemmaCpuSession`]'s Vulkan twin (see [`CpuModel::diffusion_gemma_vulkan_session`]).
-pub struct DiffusionGemmaVulkanSession<'m> {
-    model: &'m CpuModel,
+pub struct DiffusionGemmaVulkanSession {
     be: infr_vulkan::VulkanBackend,
     state: Option<crate::cpu_backend::SeamKv>,
     max_ctx: usize,
 }
 
-impl DiffusionGemmaCpuSession<'_> {
+impl DiffusionGemmaCpuSession {
     /// Causal prefill of `tokens` (encoder scalars, chunked/per-token like every other dense
     /// prefill on this seam) — writes KV rows `0..tokens.len()`. Call once per block before
     /// [`denoise`](Self::denoise); a second call with a prompt that EXTENDS the previous one
     /// continues the session (ChatSession-style prefix reuse), matching every other session on
     /// this seam.
-    pub fn prefill(&mut self, tokens: &[u32]) -> Result<()> {
+    pub fn prefill(&mut self, model: &CpuModel, tokens: &[u32]) -> Result<()> {
         crate::cpu_backend::generate_dense_backend(
             &self.be,
             &|_name, tb, dt, _n| match tb {
@@ -863,10 +879,10 @@ impl DiffusionGemmaCpuSession<'_> {
                     Ok((buf, dt))
                 }
             },
-            &self.model.gguf,
-            &self.model.cfg,
-            &self.model.token_embd,
-            self.model.per_layer_embd.as_ref(),
+            &model.gguf,
+            &model.cfg,
+            &model.token_embd,
+            model.per_layer_embd.as_ref(),
             tokens,
             1, // rides the ordinary per-token causal-prefill loop (see `verify_dense_cpu`'s doc)
             |_| {},
@@ -889,6 +905,7 @@ impl DiffusionGemmaCpuSession<'_> {
     /// ever called — errors instead (an empty prompt, P=0).
     pub fn denoise(
         &mut self,
+        model: &CpuModel,
         canvas_tokens: &[u32],
         sc_logits: Option<&[f32]>,
         temp_inv: f32,
@@ -909,10 +926,10 @@ impl DiffusionGemmaCpuSession<'_> {
                     Ok((buf, dt))
                 }
             },
-            &self.model.gguf,
-            &self.model.cfg,
-            &self.model.token_embd,
-            self.model.per_layer_embd.as_ref(),
+            &model.gguf,
+            &model.cfg,
+            &model.token_embd,
+            model.per_layer_embd.as_ref(),
             &[], // denoise never touches the prompt/generation token stream — see `DenoiseReq`
             0,
             |_| {},
@@ -932,9 +949,9 @@ impl DiffusionGemmaCpuSession<'_> {
     }
 }
 
-impl DiffusionGemmaVulkanSession<'_> {
+impl DiffusionGemmaVulkanSession {
     /// [`DiffusionGemmaCpuSession::prefill`]'s Vulkan twin.
-    pub fn prefill(&mut self, tokens: &[u32]) -> Result<()> {
+    pub fn prefill(&mut self, model: &CpuModel, tokens: &[u32]) -> Result<()> {
         crate::cpu_backend::generate_dense_backend(
             &self.be,
             &|_name, tb, dt, _n| {
@@ -948,10 +965,10 @@ impl DiffusionGemmaVulkanSession<'_> {
                     .map_err(|e| anyhow!("{e}"))?;
                 Ok((buf, dt))
             },
-            &self.model.gguf,
-            &self.model.cfg,
-            &self.model.token_embd,
-            self.model.per_layer_embd.as_ref(),
+            &model.gguf,
+            &model.cfg,
+            &model.token_embd,
+            model.per_layer_embd.as_ref(),
             tokens,
             1,
             |_| {},
@@ -968,6 +985,7 @@ impl DiffusionGemmaVulkanSession<'_> {
     /// [`DiffusionGemmaCpuSession::denoise`]'s Vulkan twin.
     pub fn denoise(
         &mut self,
+        model: &CpuModel,
         canvas_tokens: &[u32],
         sc_logits: Option<&[f32]>,
         temp_inv: f32,
@@ -986,10 +1004,10 @@ impl DiffusionGemmaVulkanSession<'_> {
                     .map_err(|e| anyhow!("{e}"))?;
                 Ok((buf, dt))
             },
-            &self.model.gguf,
-            &self.model.cfg,
-            &self.model.token_embd,
-            self.model.per_layer_embd.as_ref(),
+            &model.gguf,
+            &model.cfg,
+            &model.token_embd,
+            model.per_layer_embd.as_ref(),
             &[],
             0,
             |_| {},

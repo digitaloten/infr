@@ -405,10 +405,17 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
             .and_then(|v| v.parse().ok())
             .unwrap_or(d)
     };
+    let (gguf, tok) = resolve(model)?;
+    // diffusion-gemma (block text-diffusion, Phase 3 — docs/DIFFUSIONGEMMA.md): a cheap arch peek
+    // (no full CpuModel load) so the default token budget below and the ChatModel selection further
+    // down can both branch on it. -n/max_new drives `blocks = ceil(n_predict / canvas_length)`
+    // (256-token canvas) rather than autoregressive tokens, so the AR default of 2048 would run 8
+    // whole blocks for a "Hi" reply; 1024 (4 blocks) is the same order of magnitude as a normal
+    // chat reply and still overridable via INFR_MAX_NEW.
+    let is_dg = infr_llama::diffusion::is_diffusion_gemma(&gguf);
     // Generation ceiling per reply (a turn also caps to remaining context). High enough for long
     // answers (lists/stories); override with INFR_MAX_NEW.
-    let max_new = envu("INFR_MAX_NEW", 2048);
-    let (gguf, tok) = resolve(model)?;
+    let max_new = envu("INFR_MAX_NEW", if is_dg { 1024 } else { 2048 });
 
     // Build the per-backend generation primitive (`ChatModel`), then wrap it in the ONE shared `Chat`
     // (infr_llama::model) that owns history + `<think>`-stripping and drives the single REPL below:
@@ -427,7 +434,23 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     let use_old_seam = is_q35 && std::env::var("INFR_QWEN35_OLD").is_ok();
     // Chat-default sampling for every backend (the bespoke branch reads the same envs below).
     set_default_sampling_env();
-    let model: Box<dyn infr_llama::model::ChatModel + '_> = if std::env::var("INFR_METAL").is_ok() {
+    let model: Box<dyn infr_llama::model::ChatModel + '_> = if is_dg {
+        // diffusion-gemma (Phase 3): the entropy-bound block-diffusion loop (`infr_llama::diffusion`)
+        // over a persistent session — Vulkan by default, CPU under INFR_CPU like every other arch.
+        // No Metal session exists for this arch yet (Phase 2 only built CPU/Vulkan) — fall through
+        // to the CPU reference backend under INFR_METAL rather than hard-erroring.
+        let cpu = std::env::var("INFR_CPU").is_ok() || std::env::var("INFR_METAL").is_ok();
+        eprintln!(
+            "[{} — diffusion-gemma entropy-bound block decode]",
+            if cpu { "cpu backend" } else { "vulkan seam" }
+        );
+        let loaded = infr_llama::CpuModel::load(&gguf, tok.as_deref())?;
+        Box::new(if cpu {
+            infr_llama::model::DiffusionGemmaChat::new_cpu(loaded)
+        } else {
+            infr_llama::model::DiffusionGemmaChat::new(loaded)
+        })
+    } else if std::env::var("INFR_METAL").is_ok() {
         if use_old_seam {
             eprintln!(
                 "[metal backend — qwen35 (Qwen3.5) on the OLD seam (INFR_QWEN35_OLD=1), Apple GPU (reference)]"
@@ -1358,7 +1381,17 @@ fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
     // this + the old seam entirely.
     let is_q35 = infr_llama::qwen35::is_qwen35(&gguf);
     let use_old_seam = is_q35 && std::env::var("INFR_QWEN35_OLD").is_ok();
-    let mut m: Box<dyn infr_llama::model::ChatModel + Send> = if use_old_seam {
+    let is_dg = infr_llama::diffusion::is_diffusion_gemma(&gguf);
+    let mut m: Box<dyn infr_llama::model::ChatModel + Send> = if is_dg {
+        // diffusion-gemma (Phase 3): same selection as `cmd_run` — see its matching comment.
+        let cpu = std::env::var("INFR_CPU").is_ok() || std::env::var("INFR_METAL").is_ok();
+        let loaded = infr_llama::CpuModel::load(&gguf, tok.as_deref())?;
+        Box::new(if cpu {
+            infr_llama::model::DiffusionGemmaChat::new_cpu(loaded)
+        } else {
+            infr_llama::model::DiffusionGemmaChat::new(loaded)
+        })
+    } else if use_old_seam {
         Box::new(if std::env::var("INFR_METAL").is_ok() {
             infr_llama::model::Qwen35Chat::new_metal(gguf.clone())
         } else if std::env::var("INFR_CPU").is_ok() {
