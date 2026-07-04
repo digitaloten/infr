@@ -54,10 +54,26 @@ struct AttnW {
     wo: TensorId,
 }
 
-/// The layer's token mixer. Only attention exists today; qwen35's gated-DeltaNet mixer lands in
-/// a later phase.
+/// qwen35 gated-DeltaNet linear-attention mixer weights (see `docs/QWEN35.md`). Unlike `AttnW` this
+/// mixer owns no KV cache — its recurrent state (a rolling conv history + the DeltaNet `S` matrix)
+/// is session state, held in the SAME `kbufs`/`vbufs` slots a KV-caching layer would use (see
+/// `SeamKv` and the state-buffer alloc in `generate_dense_backend`).
+struct DeltaW {
+    qkv: TensorId,
+    gate: TensorId,
+    conv1d: TensorId,
+    alpha: TensorId,
+    beta: TensorId,
+    ssm_a: TensorId,
+    dt_bias: TensorId,
+    ssm_norm: TensorId,
+    out: TensorId,
+}
+
+/// The layer's token mixer: classic attention, or (qwen35) gated-DeltaNet linear attention.
 enum MixerW {
     Attn(AttnW),
+    DeltaNet(DeltaW),
 }
 
 /// Per-layer weight handles captured while building one decode graph (sandwich norms optional).
@@ -524,6 +540,21 @@ impl SeamKv {
         let mut kbufs: Vec<Box<dyn Buffer>> = Vec::new();
         let mut vbufs: Vec<Box<dyn Buffer>> = Vec::new();
         for l in 0..cfg.n_layer {
+            // qwen35 DeltaNet layers: fixed-size conv/S state, NOT a `max_ctx`-scaled KV cache (see
+            // the matching alloc in `generate_dense_backend`'s state init and `MixerW::DeltaNet`).
+            if cfg.qwen35 && !cfg.is_qwen35_attn_layer(l) {
+                let conv_elems = (cfg.ssm_d_conv - 1) * cfg.q35_conv_channels();
+                let s_elems = cfg.q35_num_v_heads() * cfg.q35_head_k_dim() * cfg.q35_head_v_dim();
+                kbufs.push(
+                    be.alloc(conv_elems * 4, BufferUsage::Activations)
+                        .map_err(|e| anyhow!("{e}"))?,
+                );
+                vbufs.push(
+                    be.alloc(s_elems * 4, BufferUsage::Activations)
+                        .map_err(|e| anyhow!("{e}"))?,
+                );
+                continue;
+            }
             let kvrow_l = cfg.layer_n_kv(l) * cfg.layer_head_dim(l);
             kbufs.push(
                 be.alloc(
@@ -571,6 +602,13 @@ impl SeamKv {
     /// Seed this slot's KV cache with the first `p` rows of `src`'s (the shared conversation
     /// prefix — e.g. the system prompt) via a device-side buffer copy, so the new conversation
     /// skips re-prefilling it. `p` must be ≤ src's materialized length.
+    ///
+    /// qwen35: a no-op. The gated-DeltaNet recurrent state is a single fixed-size summary of
+    /// EVERY token fed so far — there's no "first `p` tokens' worth" of it to slice out and copy
+    /// the way a real per-position KV cache allows (see `docs/QWEN35.md` and the no-rewind rule in
+    /// `generate_dense_backend`). Leaving `self.cached` empty (this slot's `fork()` already zeroed
+    /// its state) is the CORRECT fallback: the next call on this slot fully re-prefills, exactly
+    /// like the single-slot session's divergent-prompt reset.
     pub(crate) fn seed_from(
         &mut self,
         be: &dyn Backend,
@@ -578,6 +616,9 @@ impl SeamKv {
         src: &SeamKv,
         p: usize,
     ) -> AResult<()> {
+        if cfg.qwen35 {
+            return Ok(());
+        }
         let p = p.min(src.cached.len()).min(self.max_ctx);
         if p == 0 {
             return Ok(());
@@ -915,8 +956,21 @@ pub(crate) fn generate_dense_backend(
         };
         for l in 0..c.n_layer {
             let p = |s: &str| format!("blk.{l}.{s}");
+            // qwen35 gated-DeltaNet linear-attention layer (see docs/QWEN35.md): a wholly different
+            // mixer, no q/k/v/qk_norm/attn_output/bias at all. `false` for every non-qwen35 model.
+            let is_delta = c.qwen35 && !c.is_qwen35_attn_layer(l);
             wload(&[&p("attn_norm.weight")])?;
-            if fuse_qkv {
+            if is_delta {
+                wload(&[&p("attn_qkv.weight")])?;
+                wload(&[&p("attn_gate.weight")])?;
+                wload(&[&p("ssm_conv1d.weight")])?;
+                wload(&[&p("ssm_alpha.weight")])?;
+                wload(&[&p("ssm_beta.weight")])?;
+                wload(&[&p("ssm_a")])?;
+                wload(&[&p("ssm_dt.bias")])?;
+                wload(&[&p("ssm_norm.weight")])?;
+                wload(&[&p("ssm_out.weight")])?;
+            } else if fuse_qkv {
                 wload(&[
                     &p("attn_q.weight"),
                     &p("attn_k.weight"),
@@ -936,15 +990,24 @@ pub(crate) fn generate_dense_backend(
                 wload(&[&p("attn_k.bias")])?;
                 wload(&[&p("attn_v.bias")])?;
             }
-            if qk_norm {
+            if qk_norm && !is_delta {
                 wload(&[&p("attn_q_norm.weight")])?;
                 wload(&[&p("attn_k_norm.weight")])?;
             }
-            wload(&[&p("attn_output.weight")])?;
+            if !is_delta {
+                wload(&[&p("attn_output.weight")])?;
+            }
             if gemma {
                 wload(&[&p("post_attention_norm.weight")])?;
             }
-            wload(&[&p("ffn_norm.weight")])?;
+            // qwen35 names its post-mixer/pre-FFN norm `post_attention_norm.weight` on BOTH layer
+            // kinds (not `ffn_norm.weight`) — same role (`lw.ffn_norm`), different tensor name.
+            let ffn_norm_name = if c.qwen35 {
+                "post_attention_norm.weight"
+            } else {
+                "ffn_norm.weight"
+            };
+            wload(&[&p(ffn_norm_name)])?;
             if c.moe.is_some() {
                 // qwen3moe: router + stacked per-expert gate/up/down banks.
                 wload(&[&p("ffn_gate_inp.weight")])?;
@@ -1006,9 +1069,26 @@ pub(crate) fn generate_dense_backend(
 
         // ── persistent KV cache buffers, sized per-layer (gemma4 SWA layers are narrower) and
         //    per-side (K and V pick their dtype independently) ────────────────────────────────
+        // qwen35 DeltaNet layers have NO KV cache: `kbufs[l]`/`vbufs[l]` instead hold that layer's
+        // conv-history state (`[(d_conv-1), conv_channels]` f32) and DeltaNet recurrent state
+        // (`[n_vhead, head_k, head_v]` f32) — fixed-size (NOT `want_ctx`-scaled) and always f32
+        // regardless of the session's chosen KV dtype (see `MixerW::DeltaNet` / the `build` closure).
         let mut kbufs: Vec<Box<dyn Buffer>> = Vec::new();
         let mut vbufs: Vec<Box<dyn Buffer>> = Vec::new();
         for l in 0..c.n_layer {
+            if c.qwen35 && !c.is_qwen35_attn_layer(l) {
+                let conv_elems = (c.ssm_d_conv - 1) * c.q35_conv_channels();
+                let s_elems = c.q35_num_v_heads() * c.q35_head_k_dim() * c.q35_head_v_dim();
+                kbufs.push(
+                    be.alloc(conv_elems * 4, BufferUsage::Activations)
+                        .map_err(|e| anyhow!("{e}"))?,
+                );
+                vbufs.push(
+                    be.alloc(s_elems * 4, BufferUsage::Activations)
+                        .map_err(|e| anyhow!("{e}"))?,
+                );
+                continue;
+            }
             let kvrow_l = c.layer_n_kv(l) * c.layer_head_dim(l);
             kbufs.push(
                 be.alloc(
@@ -1103,7 +1183,42 @@ pub(crate) fn generate_dense_backend(
     // ChatSession-style prefix reuse: KV rows 0..start are already materialized for `cached`'s
     // shared prefix — prefill only the suffix. Always leave ≥1 prompt token to process so the
     // first generated token samples from fresh logits.
-    let start = common_prefix_len(cached, prompt).min(prompt.len() - 1);
+    //
+    // qwen35's gated-DeltaNet recurrent state is an APPEND-ONLY summary, not a per-position cache —
+    // it can't rewind to an arbitrary shared prefix the way a real KV cache can. So a turn reuses it
+    // ONLY when `prompt` exactly EXTENDS `cached` (mirrors the old seam's `SeamState` rule); anything
+    // else (divergent prompt, identical resend, first-ever call) zero-resets every DeltaNet layer's
+    // conv/S state and re-prefills from scratch. Dense/attention models keep the generic
+    // longest-common-prefix diff.
+    let start = if c.qwen35 {
+        let pfx = common_prefix_len(cached, prompt);
+        if pfx == cached.len() && pfx < prompt.len() {
+            pfx
+        } else {
+            if !cached.is_empty() {
+                let conv_elems = (c.ssm_d_conv - 1) * c.q35_conv_channels();
+                let s_elems = c.q35_num_v_heads() * c.q35_head_k_dim() * c.q35_head_v_dim();
+                for l in 0..c.n_layer {
+                    if !c.is_qwen35_attn_layer(l) {
+                        be.upload(
+                            kbufs[l].as_ref(),
+                            bytemuck::cast_slice(&vec![0f32; conv_elems]),
+                        )
+                        .map_err(|e| anyhow!("{e}"))?;
+                        be.upload(
+                            vbufs[l].as_ref(),
+                            bytemuck::cast_slice(&vec![0f32; s_elems]),
+                        )
+                        .map_err(|e| anyhow!("{e}"))?;
+                    }
+                }
+                cached.clear();
+            }
+            0
+        }
+    } else {
+        common_prefix_len(cached, prompt).min(prompt.len() - 1)
+    };
     cached.truncate(start);
 
     // Build a forward graph for `batch` tokens starting at absolute position `start_pos`.
@@ -1134,9 +1249,19 @@ pub(crate) fn generate_dense_backend(
         } else {
             None
         };
+        // qwen35 DeltaNet layers have no KV cache — `k_cache[l]`/`v_cache[l]` instead declare that
+        // layer's conv-state / DeltaNet-S-state Inputs (see the matching alloc in
+        // `generate_dense_backend` and `MixerW::DeltaNet`'s use of them below).
         let mut k_cache = Vec::new();
         let mut v_cache = Vec::new();
         for l in 0..c.n_layer {
+            if c.qwen35 && !c.is_qwen35_attn_layer(l) {
+                let conv_elems = (c.ssm_d_conv - 1) * c.q35_conv_channels();
+                let s_elems = c.q35_num_v_heads() * c.q35_head_k_dim() * c.q35_head_v_dim();
+                k_cache.push(g.input(f32d(conv_elems)));
+                v_cache.push(g.input(f32d(s_elems)));
+                continue;
+            }
             let kvrow_l = c.layer_n_kv(l) * c.layer_head_dim(l);
             k_cache.push(g.input(kd(max_ctx * kvrow_l)));
             v_cache.push(g.input(vd(max_ctx * kvrow_l)));
@@ -1157,42 +1282,79 @@ pub(crate) fn generate_dense_backend(
         let mut lw: Vec<LayerW> = Vec::new();
         for l in 0..c.n_layer {
             let attn_norm = wpush(&mut g, &mut weights);
-            // Fused QKV: ONE concatenated weight handle serves q/k/v (the builder bakes each
-            // projection's `w_off` slice); split form declares three.
-            let (wq, wk, wv) = if fuse_qkv {
-                let wqkv = wpush(&mut g, &mut weights);
-                (wqkv, wqkv, Some(wqkv))
+            // qwen35 gated-DeltaNet layer: 9 mixer weights, no q/k/v/qk_norm/bias/wo at all (mirrors
+            // the `wload` skip above). `is_delta` is `false` for every non-qwen35 model.
+            let is_delta = c.qwen35 && !c.is_qwen35_attn_layer(l);
+            let mixer = if is_delta {
+                let qkv = wpush(&mut g, &mut weights);
+                let gate = wpush(&mut g, &mut weights);
+                let conv1d = wpush(&mut g, &mut weights);
+                let alpha = wpush(&mut g, &mut weights);
+                let beta = wpush(&mut g, &mut weights);
+                let ssm_a = wpush(&mut g, &mut weights);
+                let dt_bias = wpush(&mut g, &mut weights);
+                let ssm_norm = wpush(&mut g, &mut weights);
+                let out = wpush(&mut g, &mut weights);
+                MixerW::DeltaNet(DeltaW {
+                    qkv,
+                    gate,
+                    conv1d,
+                    alpha,
+                    beta,
+                    ssm_a,
+                    dt_bias,
+                    ssm_norm,
+                    out,
+                })
             } else {
-                let wq = wpush(&mut g, &mut weights);
-                let wk = wpush(&mut g, &mut weights);
-                let wv = if has_wv[l] {
-                    Some(wpush(&mut g, &mut weights))
+                // Fused QKV: ONE concatenated weight handle serves q/k/v (the builder bakes each
+                // projection's `w_off` slice); split form declares three.
+                let (wq, wk, wv) = if fuse_qkv {
+                    let wqkv = wpush(&mut g, &mut weights);
+                    (wqkv, wqkv, Some(wqkv))
                 } else {
-                    None
+                    let wq = wpush(&mut g, &mut weights);
+                    let wk = wpush(&mut g, &mut weights);
+                    let wv = if has_wv[l] {
+                        Some(wpush(&mut g, &mut weights))
+                    } else {
+                        None
+                    };
+                    (wq, wk, wv)
                 };
-                (wq, wk, wv)
+                // Qwen2 q/k/v biases — pushed here to match the `wload` order (after the q/k/v
+                // weights, before qk_norm). Always three separate handles (they add to the SPLIT
+                // q/k/v buffers, independent of whether the weights were fused).
+                let (qb, kb, vb) = if c.qkv_bias {
+                    (
+                        Some(wpush(&mut g, &mut weights)),
+                        Some(wpush(&mut g, &mut weights)),
+                        Some(wpush(&mut g, &mut weights)),
+                    )
+                } else {
+                    (None, None, None)
+                };
+                let (q_norm, k_norm) = if qk_norm {
+                    (
+                        Some(wpush(&mut g, &mut weights)),
+                        Some(wpush(&mut g, &mut weights)),
+                    )
+                } else {
+                    (None, None)
+                };
+                let wo = wpush(&mut g, &mut weights);
+                MixerW::Attn(AttnW {
+                    wq,
+                    wk,
+                    wv,
+                    qb,
+                    kb,
+                    vb,
+                    q_norm,
+                    k_norm,
+                    wo,
+                })
             };
-            // Qwen2 q/k/v biases — pushed here to match the `wload` order (after the q/k/v weights,
-            // before qk_norm). Always three separate handles (they add to the SPLIT q/k/v buffers,
-            // independent of whether the weights were fused).
-            let (qb, kb, vb) = if c.qkv_bias {
-                (
-                    Some(wpush(&mut g, &mut weights)),
-                    Some(wpush(&mut g, &mut weights)),
-                    Some(wpush(&mut g, &mut weights)),
-                )
-            } else {
-                (None, None, None)
-            };
-            let (q_norm, k_norm) = if qk_norm {
-                (
-                    Some(wpush(&mut g, &mut weights)),
-                    Some(wpush(&mut g, &mut weights)),
-                )
-            } else {
-                (None, None)
-            };
-            let wo = wpush(&mut g, &mut weights);
             let post_attn = if gemma {
                 Some(wpush(&mut g, &mut weights))
             } else {
@@ -1234,17 +1396,7 @@ pub(crate) fn generate_dense_backend(
             };
             lw.push(LayerW {
                 attn_norm,
-                mixer: MixerW::Attn(AttnW {
-                    wq,
-                    wk,
-                    wv,
-                    qb,
-                    kb,
-                    vb,
-                    q_norm,
-                    k_norm,
-                    wo,
-                }),
+                mixer,
                 post_attn,
                 ffn_norm,
                 ffn,
@@ -1307,6 +1459,35 @@ pub(crate) fn generate_dense_backend(
         let plg = g.internal(f32d(batch * npl.max(1)));
         let plp = g.internal(f32d(batch * ne));
 
+        // qwen35 attention out-gate scratch (the interleaved q+gate trap — see docs/QWEN35.md):
+        // `qg` holds the RAW `attn_q` projection (`[batch, nh*2*hd]`, q and gate interleaved per
+        // head); `gate_a` holds the split-out gate, packed like `q` (`[batch, nh*hd]`), consumed by
+        // the post-attention `GatedAct(Sigmoid)`. Unused (but harmlessly allocated) on every other
+        // arch, exactly like the E2B scratch above.
+        let qg = g.internal(f32d(batch * max_qrow * 2));
+        let gate_a = g.internal(f32d(batch * max_qrow));
+
+        // qwen35 gated-DeltaNet mixer scratch (see docs/QWEN35.md), reused across every DeltaNet
+        // layer exactly like `hn`/`sub` above (qwen35's SSM dims are uniform across layers, unlike
+        // gemma4's per-layer varying attention dims). `.max(1)`-guarded so a non-qwen35 model (every
+        // q35_* dim is 0) still gets a valid, harmlessly-tiny allocation.
+        let q35_cc = c.q35_conv_channels();
+        let q35_di = c.ssm_d_inner;
+        let q35_nk = c.q35_num_k_heads();
+        let q35_kd = c.q35_head_k_dim();
+        let q35_nv = c.q35_num_v_heads();
+        let q35_vd = c.q35_head_v_dim();
+        let q35_keydim = q35_nk * q35_kd;
+        let dn_qkvbuf = g.internal(f32d(batch * q35_cc.max(1)));
+        let dn_zbuf = g.internal(f32d(batch * q35_di.max(1)));
+        let dn_convout = g.internal(f32d(batch * q35_cc.max(1)));
+        let dn_qbuf = g.internal(f32d(batch * q35_keydim.max(1)));
+        let dn_kbuf = g.internal(f32d(batch * q35_keydim.max(1)));
+        let dn_vbuf = g.internal(f32d(batch * (q35_nv * q35_vd).max(1)));
+        let dn_bbuf = g.internal(f32d(batch * q35_nv.max(1)));
+        let dn_abuf = g.internal(f32d(batch * q35_nv.max(1)));
+        let dn_out = g.internal(f32d(batch * (q35_nv * q35_vd).max(1)));
+
         let eps = c.rms_eps;
 
         // gemma4 E2B prologue: compute the full per-(token,layer) input vector `per_layer_inp`
@@ -1362,7 +1543,6 @@ pub(crate) fn generate_dense_backend(
             };
 
         for (l, lw) in lw.iter().enumerate() {
-            let MixerW::Attn(aw) = &lw.mixer;
             // Per-layer dims (gemma4 SWA vs full; uniform for every other model).
             let hd = c.layer_head_dim(l);
             let nkv = c.layer_n_kv(l);
@@ -1398,254 +1578,435 @@ pub(crate) fn generate_dense_backend(
             // layer's cache. `own_kv`/`kv_src` are `true`/`l` for every layer of a non-sharing model.
             let own_kv = c.has_own_kv(l);
             let kv_src = c.kv_src_layer(l);
-            if let Some(qkv) = qkvbuf {
-                // Fused QKV (prefill): ONE wide GEMM over the concatenated weight — the separate
-                // q/k/v GEMMs are narrow-n and underfill the GPU — then split rows into q/k/v.
-                let stride = (qrow + 2 * kvrow) as u32;
+            if let MixerW::DeltaNet(dw) = &lw.mixer {
+                // gated-DeltaNet linear attention (see docs/QWEN35.md) — no KV cache; the
+                // recurrent state lives in `k_cache[l]`/`v_cache[l]` (repurposed as
+                // conv_state/s_state, see the matching alloc in `generate_dense_backend`).
                 g.push(Op::Linear {
                     x: hn,
-                    weight: aw.wq,
-                    dst: qkv,
+                    weight: dw.qkv,
+                    dst: dn_qkvbuf,
                     m: batch as u32,
                     in_f: ne as u32,
-                    out_f: stride,
+                    out_f: q35_cc as u32,
                     w_off: 0,
                 });
-                for (dst, off, n) in [
-                    (q, 0u32, qrow as u32),
-                    (k, qrow as u32, kvrow as u32),
-                    (v, (qrow + kvrow) as u32, kvrow as u32),
-                ] {
-                    g.push(Op::CopyStrided {
-                        src: qkv,
-                        src_off: off,
-                        src_stride: stride,
-                        dst,
-                        dst_off: 0,
-                        dst_stride: n,
-                        rows: batch as u32,
-                        n,
-                    });
-                }
-            } else if fuse_qkv {
-                // Fused QKV (decode): three offset GEMVs into the concatenated weight — the same
-                // dispatch count as the split form, no staging copies.
-                for (dst, off, n) in [
-                    (q, 0usize, qrow),
-                    (k, qrow * ne, kvrow),
-                    (v, (qrow + kvrow) * ne, kvrow),
-                ] {
+                g.push(Op::Linear {
+                    x: hn,
+                    weight: dw.gate,
+                    dst: dn_zbuf,
+                    m: batch as u32,
+                    in_f: ne as u32,
+                    out_f: q35_di as u32,
+                    w_off: 0,
+                });
+                g.push(Op::Conv1dSilu {
+                    x: dn_qkvbuf,
+                    weight: dw.conv1d,
+                    state: k_cache[l],
+                    dst: dn_convout,
+                    rows: batch as u32,
+                    channels: q35_cc as u32,
+                    kernel: c.ssm_d_conv as u32,
+                });
+                // split conv_out [batch, cc=q|k|v] → packed [batch, *] q / k / v (strided/token).
+                g.push(Op::CopyStrided {
+                    src: dn_convout,
+                    src_off: 0,
+                    src_stride: q35_cc as u32,
+                    dst: dn_qbuf,
+                    dst_off: 0,
+                    dst_stride: q35_keydim as u32,
+                    rows: batch as u32,
+                    n: q35_keydim as u32,
+                });
+                g.push(Op::CopyStrided {
+                    src: dn_convout,
+                    src_off: q35_keydim as u32,
+                    src_stride: q35_cc as u32,
+                    dst: dn_kbuf,
+                    dst_off: 0,
+                    dst_stride: q35_keydim as u32,
+                    rows: batch as u32,
+                    n: q35_keydim as u32,
+                });
+                g.push(Op::CopyStrided {
+                    src: dn_convout,
+                    src_off: (2 * q35_keydim) as u32,
+                    src_stride: q35_cc as u32,
+                    dst: dn_vbuf,
+                    dst_off: 0,
+                    dst_stride: (q35_nv * q35_vd) as u32,
+                    rows: batch as u32,
+                    n: (q35_nv * q35_vd) as u32,
+                });
+                g.push(Op::Linear {
+                    x: hn,
+                    weight: dw.beta,
+                    dst: dn_bbuf,
+                    m: batch as u32,
+                    in_f: ne as u32,
+                    out_f: q35_nv as u32,
+                    w_off: 0,
+                });
+                g.push(Op::Linear {
+                    x: hn,
+                    weight: dw.alpha,
+                    dst: dn_abuf,
+                    m: batch as u32,
+                    in_f: ne as u32,
+                    out_f: q35_nv as u32,
+                    w_off: 0,
+                });
+                g.push(Op::DeltaNet {
+                    q: dn_qbuf,
+                    k: dn_kbuf,
+                    v: dn_vbuf,
+                    b: dn_bbuf,
+                    a: dn_abuf,
+                    a_coef: dw.ssm_a,
+                    dt_bias: dw.dt_bias,
+                    state: v_cache[l],
+                    dst: dn_out,
+                    rows: batch as u32,
+                    n_vhead: q35_nv as u32,
+                    n_khead: q35_nk as u32,
+                    head_k: q35_kd as u32,
+                    head_v: q35_vd as u32,
+                    eps: 1e-6,
+                });
+                // silu-gated RMSNorm per v-head: rmsnorm(out, ssm_norm) then * silu(z)
+                g.push(Op::QkNorm {
+                    x: dn_out,
+                    weight: dw.ssm_norm,
+                    dst: dn_out,
+                    rows: batch as u32,
+                    n_head: q35_nv as u32,
+                    head_dim: q35_vd as u32,
+                    eps,
+                });
+                g.push(Op::GatedAct {
+                    gate: dn_zbuf,
+                    up: dn_out,
+                    dst: dn_out,
+                    rows: batch as u32,
+                    nff: (q35_nv * q35_vd) as u32,
+                    act: Activation::Silu,
+                    up_off: 0,
+                });
+                g.push(Op::Linear {
+                    x: dn_out,
+                    weight: dw.out,
+                    dst: sub,
+                    m: batch as u32,
+                    in_f: q35_di as u32,
+                    out_f: ne as u32,
+                    w_off: 0,
+                });
+                // DeltaNet's residual contribution is already in `sub` — skip the attention-only
+                // code below (query/key/value projections, RoPE, Attention, o-proj) entirely.
+            } else {
+                let MixerW::Attn(aw) = &lw.mixer else {
+                    unreachable!("qwen35 DeltaNet handled above")
+                };
+                if let Some(qkv) = qkvbuf {
+                    // Fused QKV (prefill): ONE wide GEMM over the concatenated weight — the separate
+                    // q/k/v GEMMs are narrow-n and underfill the GPU — then split rows into q/k/v.
+                    let stride = (qrow + 2 * kvrow) as u32;
                     g.push(Op::Linear {
                         x: hn,
                         weight: aw.wq,
-                        dst,
+                        dst: qkv,
                         m: batch as u32,
                         in_f: ne as u32,
-                        out_f: n as u32,
-                        w_off: off as u32,
-                    });
-                }
-            } else {
-                g.push(Op::Linear {
-                    x: hn,
-                    weight: aw.wq,
-                    dst: q,
-                    m: batch as u32,
-                    in_f: ne as u32,
-                    out_f: qrow as u32,
-                    w_off: 0,
-                });
-            }
-            // Qwen2 q-bias: `q += qb` after the projection (all three projection paths converge on
-            // `q` here), before RoPE. `Wx + b`.
-            if let Some(qb) = aw.qb {
-                g.push(Op::AddBias {
-                    x: q,
-                    bias: qb,
-                    dst: q,
-                    rows: batch as u32,
-                    n: qrow as u32,
-                });
-            }
-            if own_kv {
-                if !fuse_qkv {
-                    g.push(Op::Linear {
-                        x: hn,
-                        weight: aw.wk,
-                        dst: k,
-                        m: batch as u32,
-                        in_f: ne as u32,
-                        out_f: kvrow as u32,
+                        out_f: stride,
                         w_off: 0,
                     });
-                    // V projection, or (gemma4 full layers) V = the raw K projection, copied BEFORE
-                    // K is QK-normed + RoPE'd.
-                    match aw.wv {
-                        Some(wv) => g.push(Op::Linear {
+                    for (dst, off, n) in [
+                        (q, 0u32, qrow as u32),
+                        (k, qrow as u32, kvrow as u32),
+                        (v, (qrow + kvrow) as u32, kvrow as u32),
+                    ] {
+                        g.push(Op::CopyStrided {
+                            src: qkv,
+                            src_off: off,
+                            src_stride: stride,
+                            dst,
+                            dst_off: 0,
+                            dst_stride: n,
+                            rows: batch as u32,
+                            n,
+                        });
+                    }
+                } else if fuse_qkv {
+                    // Fused QKV (decode): three offset GEMVs into the concatenated weight — the same
+                    // dispatch count as the split form, no staging copies.
+                    for (dst, off, n) in [
+                        (q, 0usize, qrow),
+                        (k, qrow * ne, kvrow),
+                        (v, (qrow + kvrow) * ne, kvrow),
+                    ] {
+                        g.push(Op::Linear {
                             x: hn,
-                            weight: wv,
-                            dst: v,
+                            weight: aw.wq,
+                            dst,
+                            m: batch as u32,
+                            in_f: ne as u32,
+                            out_f: n as u32,
+                            w_off: off as u32,
+                        });
+                    }
+                } else if c.attn_out_gate {
+                    // qwen35 attention layers pack q + a SIGMOID output gate INTERLEAVED per head in
+                    // `attn_q` (`[h0 q(hd) | h0 gate(hd) | h1 q | h1 gate | …]`, NOT two contiguous
+                    // blocks — see docs/QWEN35.md). Project into `qg` (width 2*qrow) then split each
+                    // head's two halves into the packed `q` / `gate_a` scratch.
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: aw.wq,
+                        dst: qg,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: (qrow * 2) as u32,
+                        w_off: 0,
+                    });
+                    for h in 0..nh {
+                        g.push(Op::CopyStrided {
+                            src: qg,
+                            src_off: (h * 2 * hd) as u32,
+                            src_stride: (nh * 2 * hd) as u32,
+                            dst: q,
+                            dst_off: (h * hd) as u32,
+                            dst_stride: (nh * hd) as u32,
+                            rows: batch as u32,
+                            n: hd as u32,
+                        });
+                        g.push(Op::CopyStrided {
+                            src: qg,
+                            src_off: (h * 2 * hd + hd) as u32,
+                            src_stride: (nh * 2 * hd) as u32,
+                            dst: gate_a,
+                            dst_off: (h * hd) as u32,
+                            dst_stride: (nh * hd) as u32,
+                            rows: batch as u32,
+                            n: hd as u32,
+                        });
+                    }
+                } else {
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: aw.wq,
+                        dst: q,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: qrow as u32,
+                        w_off: 0,
+                    });
+                }
+                // Qwen2 q-bias: `q += qb` after the projection (all three projection paths converge on
+                // `q` here), before RoPE. `Wx + b`.
+                if let Some(qb) = aw.qb {
+                    g.push(Op::AddBias {
+                        x: q,
+                        bias: qb,
+                        dst: q,
+                        rows: batch as u32,
+                        n: qrow as u32,
+                    });
+                }
+                if own_kv {
+                    if !fuse_qkv {
+                        g.push(Op::Linear {
+                            x: hn,
+                            weight: aw.wk,
+                            dst: k,
                             m: batch as u32,
                             in_f: ne as u32,
                             out_f: kvrow as u32,
                             w_off: 0,
-                        }),
-                        None => g.push(Op::Copy {
-                            src: k,
-                            src_off: 0,
-                            dst: v,
-                            dst_off: 0,
-                            n: (batch * kvrow) as u32,
-                        }),
+                        });
+                        // V projection, or (gemma4 full layers) V = the raw K projection, copied BEFORE
+                        // K is QK-normed + RoPE'd.
+                        match aw.wv {
+                            Some(wv) => g.push(Op::Linear {
+                                x: hn,
+                                weight: wv,
+                                dst: v,
+                                m: batch as u32,
+                                in_f: ne as u32,
+                                out_f: kvrow as u32,
+                                w_off: 0,
+                            }),
+                            None => g.push(Op::Copy {
+                                src: k,
+                                src_off: 0,
+                                dst: v,
+                                dst_off: 0,
+                                n: (batch * kvrow) as u32,
+                            }),
+                        }
                     }
-                }
-                // Qwen2 k/v-bias: `k += kb`, `v += vb` after the projections (here q/k/v are all
-                // materialized in every path — fused prefill/decode projected k/v above, the split
-                // form just did), BEFORE the K RoPE and the V-norm/WriteKv. Emitted before the K
-                // QkNormRope so that op stays adjacent to its WriteKv (see below).
-                if let Some(kb) = aw.kb {
-                    g.push(Op::AddBias {
-                        x: k,
-                        bias: kb,
-                        dst: k,
-                        rows: batch as u32,
-                        n: kvrow as u32,
-                    });
-                }
-                if let Some(vb) = aw.vb {
-                    g.push(Op::AddBias {
-                        x: v,
-                        bias: vb,
-                        dst: v,
-                        rows: batch as u32,
-                        n: kvrow as u32,
-                    });
-                }
-                // gemma4 weightless per-head RMSNorm on V (= x/rms) before caching. Emitted BEFORE
-                // the K QkNormRope so that op stays ADJACENT to its WriteKv — the Vulkan adapter's
-                // kv_write_peephole only fuses an immediately-following pair, and the record-once
-                // decode path REQUIRES the K write fused (a standalone f16 WriteKv has no dyn
-                // kernel). V only depends on the raw K projection, so the order is free.
-                if let Some(ones) = v_ones {
-                    g.push(Op::QkNorm {
-                        x: v,
-                        weight: ones,
-                        dst: v,
-                        rows: batch as u32,
-                        n_head: nkv as u32,
-                        head_dim: hd as u32,
-                        eps,
-                    });
-                }
-                // K: fused QkNorm+RoPE (qwen3/gemma) → f16 `k16`, else RoPE alone (llama) in-place f32.
-                let k_write = match aw.k_norm {
-                    Some(kn) => {
-                        g.push(Op::QkNormRope {
+                    // Qwen2 k/v-bias: `k += kb`, `v += vb` after the projections (here q/k/v are all
+                    // materialized in every path — fused prefill/decode projected k/v above, the split
+                    // form just did), BEFORE the K RoPE and the V-norm/WriteKv. Emitted before the K
+                    // QkNormRope so that op stays adjacent to its WriteKv (see below).
+                    if let Some(kb) = aw.kb {
+                        g.push(Op::AddBias {
                             x: k,
-                            weight: kn,
-                            positions,
-                            dst: k16,
+                            bias: kb,
+                            dst: k,
+                            rows: batch as u32,
+                            n: kvrow as u32,
+                        });
+                    }
+                    if let Some(vb) = aw.vb {
+                        g.push(Op::AddBias {
+                            x: v,
+                            bias: vb,
+                            dst: v,
+                            rows: batch as u32,
+                            n: kvrow as u32,
+                        });
+                    }
+                    // gemma4 weightless per-head RMSNorm on V (= x/rms) before caching. Emitted BEFORE
+                    // the K QkNormRope so that op stays ADJACENT to its WriteKv — the Vulkan adapter's
+                    // kv_write_peephole only fuses an immediately-following pair, and the record-once
+                    // decode path REQUIRES the K write fused (a standalone f16 WriteKv has no dyn
+                    // kernel). V only depends on the raw K projection, so the order is free.
+                    if let Some(ones) = v_ones {
+                        g.push(Op::QkNorm {
+                            x: v,
+                            weight: ones,
+                            dst: v,
                             rows: batch as u32,
                             n_head: nkv as u32,
+                            head_dim: hd as u32,
+                            eps,
+                        });
+                    }
+                    // K: fused QkNorm+RoPE (qwen3/gemma) → f16 `k16`, else RoPE alone (llama) in-place f32.
+                    let k_write = match aw.k_norm {
+                        Some(kn) => {
+                            g.push(Op::QkNormRope {
+                                x: k,
+                                weight: kn,
+                                positions,
+                                dst: k16,
+                                rows: batch as u32,
+                                n_head: nkv as u32,
+                                head_dim: hd as u32,
+                                rope_dim: rope_dim as u32,
+                                theta,
+                                eps,
+                                freq_factors: layer_ff,
+                            });
+                            k16
+                        }
+                        None => {
+                            // llama (no k-norm): interleaved RoPE straight to the f16 scratch — the
+                            // same fused shape as the qk-norm path, so the Vulkan peephole redirects
+                            // the write into the KV cache and the decode replays via rope_f16_dyn.
+                            g.push(Op::Rope {
+                                x: k,
+                                positions,
+                                dst: k16,
+                                rows: batch as u32,
+                                n_head: nkv as u32,
+                                head_dim: hd as u32,
+                                rope_dim: rope_dim as u32,
+                                theta,
+                                freq_factors: layer_ff,
+                            });
+                            k16
+                        }
+                    };
+                    g.push(Op::WriteKv {
+                        src: k_write,
+                        cache: k_cache[l],
+                        rows: batch as u32,
+                        row_stride: kvrow as u32,
+                        pos: start_pos as u32,
+                    });
+                    g.push(Op::WriteKv {
+                        src: v,
+                        cache: v_cache[l],
+                        rows: batch as u32,
+                        row_stride: kvrow as u32,
+                        pos: start_pos as u32,
+                    });
+                }
+                // Q: fused QkNorm+RoPE (qwen3/gemma) → f16 `q16`, else RoPE alone (llama) in-place f32.
+                let q_attn = match aw.q_norm {
+                    Some(qn) => {
+                        g.push(Op::QkNormRope {
+                            x: q,
+                            weight: qn,
+                            positions,
+                            dst: q16,
+                            rows: batch as u32,
+                            n_head: nh as u32,
                             head_dim: hd as u32,
                             rope_dim: rope_dim as u32,
                             theta,
                             eps,
                             freq_factors: layer_ff,
                         });
-                        k16
+                        q16
                     }
                     None => {
-                        // llama (no k-norm): interleaved RoPE straight to the f16 scratch — the
-                        // same fused shape as the qk-norm path, so the Vulkan peephole redirects
-                        // the write into the KV cache and the decode replays via rope_f16_dyn.
+                        // llama: Q roped to the f16 scratch (the attention kernels read f16 q).
                         g.push(Op::Rope {
-                            x: k,
+                            x: q,
                             positions,
-                            dst: k16,
+                            dst: q16,
                             rows: batch as u32,
-                            n_head: nkv as u32,
+                            n_head: nh as u32,
                             head_dim: hd as u32,
                             rope_dim: rope_dim as u32,
                             theta,
                             freq_factors: layer_ff,
                         });
-                        k16
+                        q16
                     }
                 };
-                g.push(Op::WriteKv {
-                    src: k_write,
-                    cache: k_cache[l],
+                g.push(Op::Attention {
+                    q: q_attn,
+                    k_cache: k_cache[kv_src],
+                    v_cache: v_cache[kv_src],
+                    dst: attn,
                     rows: batch as u32,
-                    row_stride: kvrow as u32,
+                    kv_len: (start_pos + batch) as u32,
+                    n_head: nh as u32,
+                    n_kv: nkv as u32,
+                    head_dim: hd as u32,
+                    scale,
+                    mask,
                     pos: start_pos as u32,
                 });
-                g.push(Op::WriteKv {
-                    src: v,
-                    cache: v_cache[l],
-                    rows: batch as u32,
-                    row_stride: kvrow as u32,
-                    pos: start_pos as u32,
+                // qwen35: per-head SIGMOID output gate applied to the attention output BEFORE the
+                // o-projection (`gate_a` was split out of the interleaved `attn_q` projection above).
+                if c.attn_out_gate {
+                    g.push(Op::GatedAct {
+                        gate: gate_a,
+                        up: attn,
+                        dst: attn,
+                        rows: batch as u32,
+                        nff: qrow as u32,
+                        act: Activation::Sigmoid,
+                        up_off: 0,
+                    });
+                }
+                g.push(Op::Linear {
+                    x: attn,
+                    weight: aw.wo,
+                    dst: sub,
+                    m: batch as u32,
+                    in_f: qrow as u32,
+                    out_f: ne as u32,
+                    w_off: 0,
                 });
-            }
-            // Q: fused QkNorm+RoPE (qwen3/gemma) → f16 `q16`, else RoPE alone (llama) in-place f32.
-            let q_attn = match aw.q_norm {
-                Some(qn) => {
-                    g.push(Op::QkNormRope {
-                        x: q,
-                        weight: qn,
-                        positions,
-                        dst: q16,
-                        rows: batch as u32,
-                        n_head: nh as u32,
-                        head_dim: hd as u32,
-                        rope_dim: rope_dim as u32,
-                        theta,
-                        eps,
-                        freq_factors: layer_ff,
-                    });
-                    q16
-                }
-                None => {
-                    // llama: Q roped to the f16 scratch (the attention kernels read f16 q).
-                    g.push(Op::Rope {
-                        x: q,
-                        positions,
-                        dst: q16,
-                        rows: batch as u32,
-                        n_head: nh as u32,
-                        head_dim: hd as u32,
-                        rope_dim: rope_dim as u32,
-                        theta,
-                        freq_factors: layer_ff,
-                    });
-                    q16
-                }
-            };
-            g.push(Op::Attention {
-                q: q_attn,
-                k_cache: k_cache[kv_src],
-                v_cache: v_cache[kv_src],
-                dst: attn,
-                rows: batch as u32,
-                kv_len: (start_pos + batch) as u32,
-                n_head: nh as u32,
-                n_kv: nkv as u32,
-                head_dim: hd as u32,
-                scale,
-                mask,
-                pos: start_pos as u32,
-            });
-            g.push(Op::Linear {
-                x: attn,
-                weight: aw.wo,
-                dst: sub,
-                m: batch as u32,
-                in_f: qrow as u32,
-                out_f: ne as u32,
-                w_off: 0,
-            });
-            // gemma sandwich: post-attention norm on the sublayer output BEFORE the residual add.
+            } // else (MixerW::Attn) — matches the `if let MixerW::DeltaNet` above
+              // gemma sandwich: post-attention norm on the sublayer output BEFORE the residual add.
             if let Some(pa) = lw.post_attn {
                 g.push(Op::RmsNorm {
                     x: sub,
@@ -2140,7 +2501,13 @@ pub(crate) fn generate_dense_backend(
         && !kv_forces_static(k_fmt)
         && !kv_forces_static(v_fmt)
         && (0..c.n_layer)
-            .all(|l| c.layer_head_dim(l).is_multiple_of(4) && c.layer_head_dim(l) <= 512);
+            .all(|l| c.layer_head_dim(l).is_multiple_of(4) && c.layer_head_dim(l) <= 512)
+        // qwen35's gated-DeltaNet layers (`Op::Conv1dSilu`/`Op::DeltaNet`) were never exercised
+        // under record-once replay (the old seam always rebuilds per token) and the adapter's
+        // replay tape isn't proven to re-read their `state` bindings correctly per replay —
+        // measured to silently diverge from the static per-token rebuild after a few decode steps.
+        // Force the static path for qwen35 until that's audited; every other arch is unaffected.
+        && !c.qwen35;
     let ro = if dyn_replay {
         let (g, h) = build(1, 0, 1);
         let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;

@@ -958,6 +958,126 @@ fn cpu_golden_qwen35() {
     }
 }
 
+// ─── qwen35 on the UNIFIED shared-transformer path (Phase 2) ──────────────────────
+//
+// `Config::from_gguf` now accepts `arch == "qwen35"` and `cpu_backend`'s layer loop has a
+// `MixerW::DeltaNet` branch (see `docs/QWEN35.md`) — so `CpuModel::load` on a qwen35 GGUF drives
+// the SAME shared runner every other arch uses, in parallel with the old hand-written seam above.
+// Production routing is UNCHANGED (the CLI's `is_qwen35` gate still sends qwen35 to
+// `qwen35::SeamModel` first) — these tests are the only callers of the unified path for this arch.
+
+/// The unified CPU path (`CpuModel::generate_cpu`, i.e. `cpu_backend::generate_dense_cpu`) must
+/// produce IDENTICAL output to the old hand-written seam (`qwen35::generate_cpu`) for the same
+/// chat-rendered prompt: both run the same op sequence (RmsNorm/Linear/Conv1dSilu/DeltaNet/
+/// QkNorm/GatedAct for the DeltaNet layers; the interleaved-gate split + sigmoid gate for the
+/// attention layers) through the identical f32 CPU kernels, so greedy decode should match
+/// token-for-token, not just golden-hash-coherent.
+#[test]
+fn unified_qwen35_cpu_matches_old_seam() {
+    let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
+    let _tlk = test_serial_lock();
+    std::env::set_var("INFR_TEMP", "0");
+    let prompt =
+        infr_llama::qwen35::render_chat(&path, "The capital of France is").expect("render");
+
+    let mut old_out = String::new();
+    infr_llama::qwen35::generate_cpu(&path, &prompt, 24, |p| old_out.push_str(p))
+        .expect("old seam gen");
+
+    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let mut new_out = String::new();
+    model
+        .generate_cpu(&prompt, 24, |p| new_out.push_str(p))
+        .expect("unified cpu gen");
+
+    assert_eq!(
+        old_out, new_out,
+        "unified shared-transformer CPU path diverged from the old qwen35 seam"
+    );
+}
+
+/// The unified Vulkan seam (`CpuModel::generate_dense_vulkan`) must match the unified CPU oracle
+/// (`CpuModel::generate_cpu`) token-for-token — the seam twin of every other arch's
+/// `gpu_seam_matches_cpu_*` test, now exercising `MixerW::DeltaNet` (Conv1dSilu/DeltaNet ops) AND
+/// the qwen35 attention layers' interleaved q+gate split + sigmoid output gate through Vulkan.
+#[test]
+fn unified_qwen35_gpu_seam_matches_cpu() {
+    let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
+    need_gpu!();
+    let _tlk = test_serial_lock();
+    seam_vulkan_matches_cpu(&path, "What is bash? Answer briefly.", 24);
+}
+
+/// qwen35's gated-DeltaNet recurrent state is an APPEND-ONLY summary — it can't rewind to an
+/// arbitrary shared prefix the way a real KV cache can (see docs/QWEN35.md and the no-rewind rule
+/// in `cpu_backend::generate_dense_backend`). On the unified Vulkan session (`vulkan_session` /
+/// `generate_vulkan_session`, the seam twin of `gpu_seam_kv_reuse_matches_fresh`):
+///   (a) a prompt that EXACTLY EXTENDS the previous turn's fed sequence continues the recurrent
+///       state — suffix-only prefill (`n_prompt` shrinks), output identical to a fresh full prefill.
+///   (b) a prompt that does NOT extend it (a divergent turn) must fall back to a FULL re-prefill —
+///       `n_prompt` equal to what a brand-new session prefills for the same prompt (proving the
+///       state was zero-reset, not silently reused from a wrong point).
+#[test]
+fn unified_qwen35_session_no_rewind() {
+    let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
+    need_gpu!();
+    let _tlk = test_serial_lock();
+    std::env::set_var("INFR_TEMP", "0");
+    std::env::set_var("INFR_IGNORE_EOS", "1"); // fixed-length turns, no early EOS stop
+    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let mut sess = model.vulkan_session(512).expect("session");
+
+    let p1 = "The quick brown fox jumps over the lazy dog. The capital of France is";
+    let mut t1 = String::new();
+    let s1 = model
+        .generate_vulkan_session(&mut sess, p1, 8, |p| t1.push_str(p))
+        .expect("turn 1");
+    assert!(s1.n_prompt > 0);
+
+    // (a) EXTENDS turn 1 — suffix-only prefill, must match a fresh full prefill exactly.
+    let p2 = format!("{p1}{t1} And the capital of Germany is");
+    let mut t2 = String::new();
+    let s2 = model
+        .generate_vulkan_session(&mut sess, &p2, 8, |p| t2.push_str(p))
+        .expect("turn 2 (extend)");
+    let fresh2 = model.generate_dense_vulkan(&p2, 8).expect("fresh turn 2");
+    assert_eq!(
+        t2.trim(),
+        fresh2.trim(),
+        "extend-session output diverged from a fresh full prefill"
+    );
+    assert!(
+        s2.n_prompt < s1.n_prompt,
+        "turn 2 prefilled {} tokens — session reuse (extend) didn't kick in",
+        s2.n_prompt
+    );
+
+    // (b) does NOT extend turn 2 (divergent subject) — the recurrent state can't rewind, so this
+    // must be a FULL re-prefill: n_prompt must equal what a BRAND-NEW session prefills (its first
+    // call always fully prefills, on every arch), not some smaller partial-prefix reuse.
+    let p3 = "Completely different subject entirely: photosynthesis converts";
+    let mut t3 = String::new();
+    let s3 = model
+        .generate_vulkan_session(&mut sess, p3, 8, |p| t3.push_str(p))
+        .expect("turn 3 (divergent)");
+    let mut fresh_sess = model.vulkan_session(512).expect("fresh session");
+    let mut tf3 = String::new();
+    let sf3 = model
+        .generate_vulkan_session(&mut fresh_sess, p3, 8, |p| tf3.push_str(p))
+        .expect("fresh turn 3");
+    assert_eq!(
+        t3.trim(),
+        tf3.trim(),
+        "post-reset generation diverged from a fresh prefill"
+    );
+    assert_eq!(
+        s3.n_prompt, sf3.n_prompt,
+        "divergent turn didn't fully re-prefill (no-rewind rule violated): got {} vs fresh {}",
+        s3.n_prompt, sf3.n_prompt
+    );
+    std::env::remove_var("INFR_IGNORE_EOS");
+}
+
 // ─── Qwen3-MoE (routed experts) ─────────────────────────────────────────────────
 
 fn qwen3moe_30b() -> Option<PathBuf> {

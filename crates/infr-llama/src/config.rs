@@ -76,6 +76,30 @@ pub struct Config {
     /// default KV-cache size when the caller doesn't request a custom context (overridable). Falls
     /// back to 8192 if the GGUF omits it.
     pub n_ctx_train: usize,
+    /// qwen35 (Qwen3.5/3.6 gated-DeltaNet hybrid): `true` only for `arch == "qwen35"`. Gates every
+    /// field below plus the DeltaNet mixer branch in `cpu_backend`'s layer loop. In production this
+    /// `Config` is never built for a qwen35 GGUF (the runners route it to `crate::qwen35::SeamModel`
+    /// first) — this flag exists so the shared transformer skeleton CAN run it (tests only, so far).
+    pub qwen35: bool,
+    /// qwen35: attention layers sit at `i` where `(i+1) % full_attn_interval == 0`; every other
+    /// layer is gated-DeltaNet linear attention. `0` for every non-qwen35 model (never read).
+    pub full_attn_interval: usize,
+    /// qwen35 SSM (gated-DeltaNet) dims — see `docs/QWEN35.md`. `0` for non-qwen35 models.
+    pub ssm_d_conv: usize,
+    pub ssm_d_state: usize,
+    pub ssm_d_inner: usize,
+    pub ssm_n_group: usize,
+    pub ssm_dt_rank: usize,
+    /// qwen35 sectioned RoPE (`rope.dimension_sections`, e.g. `[11,11,10,0]`). Parsed for parity
+    /// with the old seam's `Cfg`, but — like the old seam — NOT applied differently from plain
+    /// NEOX rope: with every section sharing the same 1-D position id, a sectioned rotation over
+    /// `rope_dim` collapses to the standard `QkNormRope`, so `layer_rope_dim`/`layer_rope_theta`
+    /// alone drive qwen35's rope emission. `[0;4]` for non-qwen35 models.
+    pub rope_sections: [u32; 4],
+    /// qwen35 attention layers pack `q` and an output SIGMOID gate INTERLEAVED per head in
+    /// `attn_q` (`[h0 q(hd) | h0 gate(hd) | h1 q | h1 gate | …]`, NOT two contiguous blocks) —
+    /// the one real trap in `docs/QWEN35.md`. `true` only for qwen35.
+    pub attn_out_gate: bool,
 }
 
 impl Config {
@@ -155,6 +179,31 @@ impl Config {
         self.n_kv.max(self.n_kv_swa)
     }
 
+    /// qwen35: whether layer `il` is one of the FULL-attention layers (vs gated-DeltaNet linear
+    /// attention). `false` for every non-qwen35 model. Mirrors the old seam's `Cfg::is_attn_layer`.
+    pub fn is_qwen35_attn_layer(&self, il: usize) -> bool {
+        self.qwen35
+            && self.full_attn_interval > 0
+            && (il + 1).is_multiple_of(self.full_attn_interval)
+    }
+    /// qwen35 gated-DeltaNet derived dims (see `docs/QWEN35.md`) — ports of the old seam's `Cfg`
+    /// helpers of the same name, now living on the shared `Config`.
+    pub fn q35_num_k_heads(&self) -> usize {
+        self.ssm_n_group
+    }
+    pub fn q35_num_v_heads(&self) -> usize {
+        self.ssm_dt_rank
+    }
+    pub fn q35_head_k_dim(&self) -> usize {
+        self.ssm_d_state
+    }
+    pub fn q35_head_v_dim(&self) -> usize {
+        self.ssm_d_inner / self.ssm_dt_rank.max(1)
+    }
+    pub fn q35_conv_channels(&self) -> usize {
+        self.ssm_d_inner + 2 * self.ssm_n_group * self.ssm_d_state
+    }
+
     /// Parse the model config purely from GGUF metadata + tensor shapes — no GPU/Vulkan, no weight
     /// upload. The single source of truth for both the GPU loader ([`Llama::load_opt`]) and the
     /// CPU-only loader ([`CpuModel::load`]). `eos_ids` holds only the GGUF `eos` here; chat-end
@@ -171,9 +220,12 @@ impl Config {
             | crate::arch::QWEN3_MOE
             | crate::arch::GEMMA3
             | crate::arch::GEMMA4 => true,
-            // (qwen35 — Qwen3.5's DeltaNet hybrid — never reaches this Config: the runners route
-            // it to `qwen35::SeamModel` first. The message renders from `arch::TRANSFORMER` so
-            // the supported list can't drift from the match arms above.)
+            // qwen35's full-attention layers are qk-normed like qwen3/gemma. In PRODUCTION this
+            // Config is never built for a qwen35 GGUF (the runners route it to `qwen35::SeamModel`
+            // first via `is_qwen35`) — accepting it here only lets tests drive the shared skeleton
+            // directly (see `docs/QWEN35.md`, Phase 2). The message renders from `arch::TRANSFORMER`
+            // so the supported list can't drift from the match arms above.
+            crate::arch::QWEN35 => true,
             other => bail!(
                 "infr-llama supports architecture={} (plus {} via its own seam), got {other:?}",
                 crate::arch::TRANSFORMER.join("|"),
@@ -187,6 +239,7 @@ impl Config {
         let permute_qk_neox = arch == crate::arch::QWEN2;
         let gemma4 = arch == crate::arch::GEMMA4;
         let gemma = arch == crate::arch::GEMMA3 || gemma4;
+        let qwen35 = arch == crate::arch::QWEN35;
         let mk = |k: &str| format!("{arch}.{k}");
         let n_layer = meta_u64(g, &mk("block_count")).context("block_count")? as usize;
         let n_embd = meta_u64(g, &mk("embedding_length")).context("embedding_length")? as usize;
@@ -236,7 +289,8 @@ impl Config {
                 MetaValue::U64(u) => Some(*u as f32),
                 _ => None,
             })
-            .unwrap_or(10000.0);
+            // qwen35's GGUF sets this explicitly (1e7); the fallback only matters if it's absent.
+            .unwrap_or(if qwen35 { 1e7 } else { 10000.0 });
         let rms_eps = g
             .metadata()
             .get(&mk("attention.layer_norm_rms_epsilon"))
@@ -244,7 +298,8 @@ impl Config {
                 MetaValue::F64(f) => Some(*f as f32),
                 _ => None,
             })
-            .unwrap_or(1e-5);
+            // qwen35's old seam (`Cfg::from_gguf`) defaults this to 1e-6, not the generic 1e-5.
+            .unwrap_or(if qwen35 { 1e-6 } else { 1e-5 });
         let swa_window = if gemma {
             meta_u64(g, &mk("attention.sliding_window")).unwrap_or(0) as usize
         } else {
@@ -333,6 +388,42 @@ impl Config {
             .find(|t| t.name == "token_embd.weight")
             .and_then(|t| t.shape.last().copied())
             .context("token_embd.weight shape")?;
+        // qwen35 (gated-DeltaNet hybrid) extras — ports of the old seam's `qwen35::Cfg::from_gguf`.
+        // These metadata keys sit directly under `qwen35.*` (NOT `qwen35.attention.*`), matching the
+        // old seam's parser exactly.
+        let full_attn_interval = if qwen35 {
+            meta_u64(g, &mk("full_attention_interval")).unwrap_or(4) as usize
+        } else {
+            0
+        };
+        let (ssm_d_conv, ssm_d_state, ssm_d_inner, ssm_n_group, ssm_dt_rank) = if qwen35 {
+            (
+                meta_u64(g, &mk("ssm.conv_kernel")).context("qwen35 ssm.conv_kernel")? as usize,
+                meta_u64(g, &mk("ssm.state_size")).context("qwen35 ssm.state_size")? as usize,
+                meta_u64(g, &mk("ssm.inner_size")).context("qwen35 ssm.inner_size")? as usize,
+                meta_u64(g, &mk("ssm.group_count")).context("qwen35 ssm.group_count")? as usize,
+                meta_u64(g, &mk("ssm.time_step_rank")).context("qwen35 ssm.time_step_rank")?
+                    as usize,
+            )
+        } else {
+            (0, 0, 0, 0, 0)
+        };
+        let rope_sections: [u32; 4] = if qwen35 {
+            let mut s = [0u32; 4];
+            if let Some(arr) = g
+                .metadata()
+                .get(&mk("rope.dimension_sections"))
+                .and_then(MetaValue::as_arr)
+            {
+                for (i, v) in arr.iter().take(4).enumerate() {
+                    s[i] = v.as_u64().unwrap_or(0) as u32;
+                }
+            }
+            s
+        } else {
+            [0u32; 4]
+        };
+        let attn_out_gate = qwen35;
         Ok(Config {
             n_layer,
             n_head,
@@ -363,6 +454,15 @@ impl Config {
             swa_rope_theta,
             moe,
             n_ctx_train,
+            qwen35,
+            full_attn_interval,
+            ssm_d_conv,
+            ssm_d_state,
+            ssm_d_inner,
+            ssm_n_group,
+            ssm_dt_rank,
+            rope_sections,
+            attn_out_gate,
         })
     }
 }
