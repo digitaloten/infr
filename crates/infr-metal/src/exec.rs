@@ -1836,7 +1836,7 @@ impl MetalBackend {
                 let (rows, n) = (rows as usize, n as usize);
                 let total = rows * n;
                 let bx = self.ensure_device(r, x);
-                let bb = self.weight_buf(bias, g, bindings);
+                let bb = self.weight_buf(bias, g, bindings)?;
                 let bd = self.dev_dst(r, dst, total);
                 let pso = self.pipelines.get("add_bias_f32")?;
                 let mut p = (n as u32).to_ne_bytes().to_vec();
