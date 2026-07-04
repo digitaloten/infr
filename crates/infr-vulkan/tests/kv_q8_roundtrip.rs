@@ -171,6 +171,7 @@ fn planar_q8_attn_partial_matches_f16() {
         0.0,
         0,
         false,
+        false,
         0,
     );
     rec.finish().unwrap();
@@ -207,6 +208,7 @@ fn planar_q8_attn_partial_matches_f16() {
         0.0,
         0,
         true,
+        true,
         cap,
     );
     rec.finish().unwrap();
@@ -223,6 +225,98 @@ fn planar_q8_attn_partial_matches_f16() {
         assert!(err < 0.02, "out {i}: f16 {a}, q8 {b}, err {err}");
     }
     eprintln!("attn_partial_q8 matches f16, max_err = {max_err}");
+}
+
+/// DECOUPLED K/V: mixed caches (K=q8 V=f16, and K=f16 V=q8) via the per-side attn_partial variants
+/// must match the all-f16 split within Q8 tolerance. Proves KQ8 and VQ8 are independent.
+#[test]
+fn planar_q8_attn_partial_mixed_kv() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let (nh, nkv, hd) = (4usize, 2usize, 128usize);
+    let kv_len = 96usize;
+    let n = kv_len * nkv * hd;
+    let q: Vec<f32> = (0..nh * hd)
+        .map(|i| ((i % 17) as f32 - 8.0) * 0.02)
+        .collect();
+    let kv: Vec<f32> = (0..n).map(|i| ((i % 31) as f32 - 15.0) * 0.03).collect();
+    let qb = be.alloc(nh * hd * 2, BufferUsage::Activations).unwrap();
+    be.upload(qb.as_ref(), &to_f16_bytes(&q)).unwrap();
+    let kf = be.alloc(n * 2, BufferUsage::Activations).unwrap();
+    let vf = be.alloc(n * 2, BufferUsage::Activations).unwrap();
+    be.upload(kf.as_ref(), &to_f16_bytes(&kv)).unwrap();
+    be.upload(vf.as_ref(), &to_f16_bytes(&kv)).unwrap();
+    let cap = 200 * nkv * hd;
+    let cbytes = (cap / 32 * 34).next_multiple_of(4);
+    let kq = be.alloc(cbytes, BufferUsage::Activations).unwrap();
+    let vq = be.alloc(cbytes, BufferUsage::Activations).unwrap();
+    let chunk = (kv_len / 32).clamp(64, 512);
+    let n_chunks = kv_len.div_ceil(chunk);
+    let split = |k: &dyn infr_core::backend::Buffer,
+                 v: &dyn infr_core::backend::Buffer,
+                 k_q8: bool,
+                 v_q8: bool,
+                 c: usize|
+     -> Vec<f32> {
+        let o = be.alloc(nh * hd * 4, BufferUsage::Activations).unwrap();
+        let pm = be
+            .alloc(nh * n_chunks * 4, BufferUsage::Activations)
+            .unwrap();
+        let pl = be
+            .alloc(nh * n_chunks * 4, BufferUsage::Activations)
+            .unwrap();
+        let pacc = be
+            .alloc(nh * n_chunks * hd * 4, BufferUsage::Activations)
+            .unwrap();
+        let rec = be.recorder().unwrap();
+        if k_q8 {
+            rec.store_q8(kf.as_ref(), kq.as_ref(), n, 0, cap, true);
+        }
+        if v_q8 {
+            rec.store_q8(vf.as_ref(), vq.as_ref(), n, 0, cap, true);
+        }
+        rec.attention_kv_split(
+            qb.as_ref(),
+            k,
+            v,
+            o.as_ref(),
+            pm.as_ref(),
+            pl.as_ref(),
+            pacc.as_ref(),
+            kv_len,
+            nh,
+            nkv,
+            hd,
+            chunk,
+            n_chunks,
+            0.0,
+            0,
+            k_q8,
+            v_q8,
+            c,
+        );
+        rec.finish().unwrap();
+        let mut ob = vec![0u8; nh * hd * 4];
+        be.download(o.as_ref(), &mut ob).unwrap();
+        bytemuck::cast_slice::<u8, f32>(&ob).to_vec()
+    };
+
+    let ref_f16 = split(kf.as_ref(), vf.as_ref(), false, false, 0);
+    let mixed_kq8 = split(kq.as_ref(), vf.as_ref(), true, false, cap); // K=q8, V=f16
+    let mixed_vq8 = split(kf.as_ref(), vq.as_ref(), false, true, cap); // K=f16, V=q8
+    for (name, got) in [("K=q8,V=f16", &mixed_kq8), ("K=f16,V=q8", &mixed_vq8)] {
+        let mut max_err = 0.0f32;
+        for (i, (&a, &b)) in ref_f16.iter().zip(got.iter()).enumerate() {
+            let err = (a - b).abs();
+            if err > max_err {
+                max_err = err;
+            }
+            assert!(err < 0.02, "{name} out {i}: f16 {a}, mixed {b}, err {err}");
+        }
+        eprintln!("{name} matches f16, max_err = {max_err}");
+    }
 }
 
 /// The record-once self-chunking planar-Q8 decode (attn_partial_dynac_q8) must match the f16 dynac.

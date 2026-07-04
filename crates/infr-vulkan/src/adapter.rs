@@ -93,17 +93,20 @@ fn decode_eligible(graph: &Graph) -> bool {
                 rows,
                 head_dim,
                 k_cache,
+                v_cache,
                 ..
             } => {
                 has_attn = true;
                 if *rows != 1 || *head_dim % 4 != 0 || *head_dim > 512 {
                     return false;
                 }
-                // A Q8_0 KV cache forces the per-execute STATIC decode: the record-once replay of the
-                // un-fused Q8 K-write (store_q8_dyn) mis-decodes despite correct kernels/barriers (the
-                // static path with the same kernels is bit-correct). TODO: fix the replay and drop
-                // this so Q8 decode gets the record-once speedup too.
-                if matches!(graph.desc(*k_cache).dtype, infr_core::DType::Q8_0) {
+                // A Q8_0 KV cache (either side) forces the per-execute STATIC decode: the record-once
+                // replay of the un-fused Q8 K-write (store_q8_dyn) mis-decodes despite correct
+                // kernels/barriers (the static path with the same kernels is bit-correct). TODO: fix
+                // the replay and drop this so Q8 decode gets the record-once speedup too.
+                if matches!(graph.desc(*k_cache).dtype, infr_core::DType::Q8_0)
+                    || matches!(graph.desc(*v_cache).dtype, infr_core::DType::Q8_0)
+                {
                     return false;
                 }
             }
@@ -903,11 +906,14 @@ fn lower_op(
                 *head_dim as usize,
                 *pos as usize,
             );
-            // Coupled Q8_0 KV cache (K==V==q8): the coalesced f16 flash/split kernels can't read Q8
-            // blocks, so route through the scalar dequant-on-read attention_kv (static) /
-            // attention_kv_dyn (decode) instead. (Native-Q8 coalesced kernels are a follow-up.)
-            let kv_q8 = matches!(graph.desc(*k_cache).dtype, infr_core::DType::Q8_0);
-            // Planar Q8 scales region base = total cache elements (unused for f16).
+            // Planar Q8_0 KV cache, chosen PER-SIDE (K and V independent). The coalesced f16
+            // flash/split kernels can't read Q8, so a Q8 side routes decode through the native-Q8
+            // split (attn_partial_{k,v}q8) and prefill through a dequant→f16 prepass. A Q8 cache
+            // forces STATIC decode (see decode_eligible), so the Dynamic branch below never sees Q8.
+            let k_q8 = matches!(graph.desc(*k_cache).dtype, infr_core::DType::Q8_0);
+            let v_q8 = matches!(graph.desc(*v_cache).dtype, infr_core::DType::Q8_0);
+            let kv_q8 = k_q8 && v_q8; // coupled (Dynamic-branch kernels; unreachable for Q8)
+                                      // Planar Q8 scales region base = total cache elements (K and V caches share numel).
             let cap = graph.desc(*k_cache).numel();
             if let RopeMode::Dynamic(params) = mode {
                 // Eligibility guarantees rows==1. Scale rides a push constant (gemma4 uses 1.0;
@@ -1006,19 +1012,25 @@ fn lower_op(
                 // prefix → a transient f16 scratch once (O(kv)) and run the fast f16 prefill on it;
                 // the persistent cache stays Q8 (footprint preserved). DECODE (rows==1) reads Q8
                 // natively via the split / scalar kernels, so it keeps the cache directly.
-                let deq_prefill = kv_q8 && rows > 1;
-                let (kc_key, vc_key) = if deq_prefill {
-                    let ne = kv_len * nkv * hd;
-                    let ks = pooled(pool, be_, "q8deq_k", ne * 2)?;
-                    let vs = pooled(pool, be_, "q8deq_v", ne * 2)?;
-                    rec.dequant_q8_f16(r(*k_cache)?, pool[&ks].as_ref(), ne, cap);
-                    rec.dequant_q8_f16(r(*v_cache)?, pool[&vs].as_ref(), ne, cap);
-                    (Some(ks), Some(vs))
+                let deq_prefill = (k_q8 || v_q8) && rows > 1;
+                let ne = kv_len * nkv * hd;
+                let kc_key = if deq_prefill && k_q8 {
+                    let k = pooled(pool, be_, "q8deq_k", ne * 2)?;
+                    rec.dequant_q8_f16(r(*k_cache)?, pool[&k].as_ref(), ne, cap);
+                    Some(k)
                 } else {
-                    (None, None)
+                    None
+                };
+                let vc_key = if deq_prefill && v_q8 {
+                    let k = pooled(pool, be_, "q8deq_v", ne * 2)?;
+                    rec.dequant_q8_f16(r(*v_cache)?, pool[&k].as_ref(), ne, cap);
+                    Some(k)
+                } else {
+                    None
                 };
                 // Native Q8 read only on the decode path; prefill reads the dequanted f16 scratch.
-                let kv_q8_eff = kv_q8 && !deq_prefill;
+                let k_q8_eff = k_q8 && !deq_prefill;
+                let v_q8_eff = v_q8 && !deq_prefill;
                 // Prefill (rows≥64), causal, hd==128, standard 1/√hd scale: FlashAttention-2 (split-K
                 // online softmax, no materialized [m,kv] scores). The flash kernel hardcodes 1/√hd and
                 // writes ceil(rows/64)*64 output rows, so guard the scale and copy the real rows.
@@ -1026,7 +1038,7 @@ fn lower_op(
                     && hd == 128
                     && matches!(mask, AttnMask::Causal)
                     && (*scale - 1.0 / (hd as f32).sqrt()).abs() < 1e-6
-                    && !kv_q8_eff;
+                    && !(k_q8_eff || v_q8_eff);
                 // Prefill at hd≠128 (qwen35/gemma hd=256): the non-FA coopmat pipeline
                 // (attn_qk → softmax → attn_pv) is hd-general and ~an order faster than the scalar
                 // attention_kv. Needs 64-row-padded q/dst (Internal buffers are row-padded), so
@@ -1035,7 +1047,7 @@ fn lower_op(
                     && rows >= 64
                     && hd % 64 == 0
                     && hd <= 512
-                    && !kv_q8_eff
+                    && !(k_q8_eff || v_q8_eff)
                     && matches!(graph.tensors[q.0 as usize].kind, TensorKind::Internal)
                     && matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal);
                 // Decode (rows==1): flash-decoding split-K — each head's KV range splits across
@@ -1146,7 +1158,8 @@ fn lower_op(
                         n_chunks,
                         *scale,
                         window,
-                        kv_q8_eff,
+                        k_q8_eff,
+                        v_q8_eff,
                         cap,
                     );
                 } else {
@@ -1175,7 +1188,8 @@ fn lower_op(
                         pos,
                         window,
                         *scale,
-                        kv_q8_eff,
+                        k_q8_eff,
+                        v_q8_eff,
                         cap,
                     );
                 }

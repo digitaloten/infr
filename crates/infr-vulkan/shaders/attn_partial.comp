@@ -17,35 +17,38 @@ layout(push_constant) uniform PC {
     uint cap;   // KVQ8: total cache elements — the planar scales region begins at word cap/4
 } pc;
 layout(binding = 0) readonly buffer QB { f16vec4 q4[]; };    // [nh, hd] as vec4
-#ifdef KVQ8
-// Coupled PLANAR Q8_0 KV cache: codes int8[cap] then scales f16[cap/32] (see store_q8). Read as
-// `uint` words — each `f16vec4` load becomes ONE aligned u32 (4 codes) + one scale word shared by
-// the 8 vec4s of a block. Far fewer memory transactions than GGUF-interleaved byte reads, and it
-// moves half the KV bytes of the f16 cache at decode depth.
-layout(binding = 1) readonly buffer KB { uint ku[]; };
-layout(binding = 2) readonly buffer VB { uint vu[]; };
-// vec4 at vec4-index `i4` (elements 4*i4..4*i4+3): word i4 holds the 4 packed int8 codes; the block's
+// PLANAR Q8_0 KV cache (per-side): codes int8[cap] then scales f16[cap/32] (see store_q8), read as
+// `uint` words — each `f16vec4` load becomes ONE aligned u32 (4 codes) + one scale word shared by the
+// 8 vec4s of a block. K and V pick their dtype INDEPENDENTLY (-DKQ8 / -DVQ8), so the four f16/q8
+// combinations are separate pipeline variants. Q8 moves half the KV bytes at decode depth.
+// A planar-Q8 vec4 at vec4-index i4 (elements 4*i4..+3): word i4 = 4 packed int8 codes; the block's
 // f16 scale is at scale-word cap/4 + block/2 (block = 4*i4/32 = i4/8), lane picked by block&1.
-vec4 kq8(uint i4) {
+#ifdef KQ8
+layout(binding = 1) readonly buffer KB { uint ku[]; };
+vec4 kvec4(uint i4) {
     int cw = int(ku[i4]);
     uint bk = i4 >> 3u;
     float d = unpackHalf2x16(ku[(pc.cap >> 2u) + (bk >> 1u)])[bk & 1u];
     return d * vec4(bitfieldExtract(cw, 0, 8), bitfieldExtract(cw, 8, 8),
                     bitfieldExtract(cw, 16, 8), bitfieldExtract(cw, 24, 8));
 }
-vec4 vq8(uint i4) {
+#define KVEC4(i) kvec4(i)
+#else
+layout(binding = 1) readonly buffer KB { f16vec4 k4[]; };    // cache [kv_len, nkv, hd] as vec4
+#define KVEC4(i) vec4(k4[i])
+#endif
+#ifdef VQ8
+layout(binding = 2) readonly buffer VB { uint vu[]; };
+vec4 vvec4(uint i4) {
     int cw = int(vu[i4]);
     uint bk = i4 >> 3u;
     float d = unpackHalf2x16(vu[(pc.cap >> 2u) + (bk >> 1u)])[bk & 1u];
     return d * vec4(bitfieldExtract(cw, 0, 8), bitfieldExtract(cw, 8, 8),
                     bitfieldExtract(cw, 16, 8), bitfieldExtract(cw, 24, 8));
 }
-#define KVEC4(i) kq8(i)
-#define VVEC4(i) vq8(i)
+#define VVEC4(i) vvec4(i)
 #else
-layout(binding = 1) readonly buffer KB { f16vec4 k4[]; };    // cache [kv_len, nkv, hd] as vec4
 layout(binding = 2) readonly buffer VB { f16vec4 v4[]; };
-#define KVEC4(i) vec4(k4[i])
 #define VVEC4(i) vec4(v4[i])
 #endif
 #ifdef USE_PARAMS

@@ -897,6 +897,8 @@ dyn_spv!(attn_partial_dyn_spv, "attn_partial_dyn");
 // Coupled Q8_0 KV cache: scalar dequant-on-read attention (static + record-once) and the row
 // quantize-store kernels (f32 V + f16 K sources, each with a params/decode variant).
 dyn_spv!(attention_kv_q8_spv, "attention_kv_q8");
+dyn_spv!(attention_kv_kq8_spv, "attention_kv_kq8");
+dyn_spv!(attention_kv_vq8_spv, "attention_kv_vq8");
 dyn_spv!(attention_kv_dyn_q8_spv, "attention_kv_dyn_q8");
 dyn_spv!(store_q8_spv, "store_q8");
 dyn_spv!(store_q8_dyn_spv, "store_q8_dyn");
@@ -904,6 +906,8 @@ dyn_spv!(store_q8_f16_spv, "store_q8_f16");
 dyn_spv!(store_q8_f16_dyn_spv, "store_q8_f16_dyn");
 // Coupled Q8_0 KV: coalesced split-K decode partials reading Q8 blocks (static / dyn / self-chunk).
 dyn_spv!(attn_partial_q8_spv, "attn_partial_q8");
+dyn_spv!(attn_partial_kq8_spv, "attn_partial_kq8");
+dyn_spv!(attn_partial_vq8_spv, "attn_partial_vq8");
 dyn_spv!(attn_partial_dyn_q8_spv, "attn_partial_dyn_q8");
 dyn_spv!(attn_partial_dynac_q8_spv, "attn_partial_dynac_q8");
 dyn_spv!(dequant_q8_f16_spv, "dequant_q8_f16");

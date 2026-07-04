@@ -568,7 +568,8 @@ fn decode_attn_variants_bench() {
             n_chunks,
             0.0,
             0,
-            false, // f16 KV cache
+            false, // k f16
+            false, // v f16
             0,     // cap (unused for f16)
         );
     });

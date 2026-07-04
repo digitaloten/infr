@@ -7,34 +7,33 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC { uint q_len; uint kv_len; uint nh; uint nkv; uint hd; uint pos_offset; uint window; float scale; uint cap; } pc;
 layout(binding = 0) readonly buffer QB { float16_t q[]; };
-#ifdef KVQ8
-// Coupled PLANAR Q8_0 KV cache: codes int8[cap] then scales f16[cap/32] (see store_q8). Read as
-// `uint` words; per element = one byte code (from a u32 word) + the block's f16 scale (from the
-// scales region at word cap/4). Coupled K==V==q8 (mixed K/V is CPU-only for now).
+// PLANAR Q8_0 KV cache (per-side, -DKQ8 / -DVQ8): codes int8[cap] then scales f16[cap/32] (see
+// store_q8). Read as `uint` words; per element = one byte code (from a u32 word) + the block's f16
+// scale (scales region at word cap/4). K and V pick their dtype independently → four variants.
+// Dequant element `idx`: code byte = word idx/4, lane idx%4 (sign-extended); block = idx/32, scale at
+// scale-word cap/4 + block/2, half block&1.
+#ifdef KQ8
 layout(binding = 1) readonly buffer KB { uint ku[]; };
-layout(binding = 2) readonly buffer VB { uint vu[]; };
-// Dequant element `idx`: code byte = word idx/4, lane idx%4 (sign-extended); block = idx/32, scale in
-// the scales region at word cap/4 + block/2, half block&1.
 float dq8k(uint idx) {
-    int cw = int(ku[idx >> 2u]);
-    int c = bitfieldExtract(cw, int((idx & 3u) * 8u), 8);
+    int c = bitfieldExtract(int(ku[idx >> 2u]), int((idx & 3u) * 8u), 8);
     uint bk = idx >> 5u;
-    float d = unpackHalf2x16(ku[(pc.cap >> 2u) + (bk >> 1u)])[bk & 1u];
-    return d * float(c);
-}
-float dq8v(uint idx) {
-    int cw = int(vu[idx >> 2u]);
-    int c = bitfieldExtract(cw, int((idx & 3u) * 8u), 8);
-    uint bk = idx >> 5u;
-    float d = unpackHalf2x16(vu[(pc.cap >> 2u) + (bk >> 1u)])[bk & 1u];
-    return d * float(c);
+    return unpackHalf2x16(ku[(pc.cap >> 2u) + (bk >> 1u)])[bk & 1u] * float(c);
 }
 #define KREAD(i) dq8k(i)
-#define VREAD(i) dq8v(i)
 #else
 layout(binding = 1) readonly buffer KB { float16_t k[]; };
-layout(binding = 2) readonly buffer VB { float16_t v[]; };
 #define KREAD(i) float(k[i])
+#endif
+#ifdef VQ8
+layout(binding = 2) readonly buffer VB { uint vu[]; };
+float dq8v(uint idx) {
+    int c = bitfieldExtract(int(vu[idx >> 2u]), int((idx & 3u) * 8u), 8);
+    uint bk = idx >> 5u;
+    return unpackHalf2x16(vu[(pc.cap >> 2u) + (bk >> 1u)])[bk & 1u] * float(c);
+}
+#define VREAD(i) dq8v(i)
+#else
+layout(binding = 2) readonly buffer VB { float16_t v[]; };
 #define VREAD(i) float(v[i])
 #endif
 #ifdef USE_PARAMS

@@ -390,7 +390,7 @@ fn gpu_seam_kv_q8_coherent() {
         "Q8 static Vulkan output degenerate: {:?}",
         head(&g_static)
     );
-    // (b) record-once session path (Dynamic store_q8_dyn + attention_kv_dyn_q8).
+    // (b) session path (Q8 forces static decode, so this also exercises the static kernels).
     let mut sess = model.vulkan_session(512).expect("q8 session");
     let mut g_sess = String::new();
     model
@@ -402,6 +402,22 @@ fn gpu_seam_kv_q8_coherent() {
         head(&g_sess)
     );
     std::env::remove_var("INFR_KV_Q8");
+
+    // (c) DECOUPLED K/V: each mixed side (K=q8/V=f16 and K=f16/V=q8) must also stay coherent — the
+    // per-side attn_partial_{k,v}q8 / attention_kv_{k,v}q8 variants read one Q8 side + one f16 side.
+    for (k, v) in [("q8_0", "f16"), ("f16", "q8_0")] {
+        std::env::set_var("INFR_KV_TYPE_K", k);
+        std::env::set_var("INFR_KV_TYPE_V", v);
+        let m = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+        let out = m.generate_dense_vulkan(&long, 20).expect("mixed gen");
+        assert!(
+            !is_degenerate(&out),
+            "mixed K={k} V={v} Vulkan output degenerate: {:?}",
+            head(&out)
+        );
+    }
+    std::env::remove_var("INFR_KV_TYPE_K");
+    std::env::remove_var("INFR_KV_TYPE_V");
 }
 
 /// Multi-slot KV prefix sharing: two INTERLEAVED conversations with a common long prefix (a

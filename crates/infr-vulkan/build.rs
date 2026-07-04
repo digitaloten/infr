@@ -23,17 +23,22 @@ fn main() {
             "attn_partial_dynac",
             &["-DUSE_PARAMS", "-DSELF_CHUNK"],
         ),
-        // Coupled Q8_0 KV cache: coalesced split-K decode reading Q8 blocks (halves KV read traffic).
-        ("attn_partial", "attn_partial_q8", &["-DKVQ8"]),
+        // Planar Q8_0 KV cache: coalesced split-K decode reading Q8 blocks (halves KV read traffic).
+        // K and V decouple (-DKQ8 / -DVQ8) → 3 quant combos (kq8, vq8, both) for the STATIC split.
+        ("attn_partial", "attn_partial_q8", &["-DKQ8", "-DVQ8"]),
+        ("attn_partial", "attn_partial_kq8", &["-DKQ8"]),
+        ("attn_partial", "attn_partial_vq8", &["-DVQ8"]),
+        // Record-once (USE_PARAMS) is disabled for a Q8 cache (forced static), so only the coupled
+        // variant is kept for the dyn/dynac form-factors (referenced but unreachable at runtime).
         (
             "attn_partial",
             "attn_partial_dyn_q8",
-            &["-DKVQ8", "-DUSE_PARAMS"],
+            &["-DKQ8", "-DVQ8", "-DUSE_PARAMS"],
         ),
         (
             "attn_partial",
             "attn_partial_dynac_q8",
-            &["-DKVQ8", "-DUSE_PARAMS", "-DSELF_CHUNK"],
+            &["-DKQ8", "-DVQ8", "-DUSE_PARAMS", "-DSELF_CHUNK"],
         ),
         ("attn_qk", "attn_qk", &[]),
         ("attn_qk_warp", "attn_qk_warp", &[]),
@@ -108,12 +113,15 @@ fn main() {
         ("attn_live", "attn_live", &[]),
         ("attention_kv", "attention_kv", &[]),
         ("attention_kv", "attention_kv_dyn", &["-DUSE_PARAMS"]),
-        // Coupled Q8_0 KV cache (K==V==q8): scalar dequant-on-read variants (static + record-once).
-        ("attention_kv", "attention_kv_q8", &["-DKVQ8"]),
+        // Planar Q8_0 KV cache: scalar dequant-on-read variants. K/V decouple (-DKQ8 / -DVQ8) → 3
+        // quant combos for the STATIC scalar path; coupled-only for the record-once (dead for Q8).
+        ("attention_kv", "attention_kv_q8", &["-DKQ8", "-DVQ8"]),
+        ("attention_kv", "attention_kv_kq8", &["-DKQ8"]),
+        ("attention_kv", "attention_kv_vq8", &["-DVQ8"]),
         (
             "attention_kv",
             "attention_kv_dyn_q8",
-            &["-DKVQ8", "-DUSE_PARAMS"],
+            &["-DKQ8", "-DVQ8", "-DUSE_PARAMS"],
         ),
         ("qk_norm_rope", "qk_norm_rope", &[]),
         ("qk_norm_rope", "qk_norm_rope_dyn", &["-DUSE_PARAMS"]),

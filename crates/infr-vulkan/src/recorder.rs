@@ -1316,16 +1316,18 @@ impl<'a> Recorder<'a> {
         window: usize,
         // QK scale: `> 0` overrides the default 1/√hd (gemma4 passes 1.0). `0.0` = default.
         scale: f32,
-        // Q8_0 KV cache (K==V==q8): planar dequant-on-read variant. `false` = f16 cache.
-        q8: bool,
-        // Planar Q8 scales region base = total cache elements (`cap`). Unused when `q8` is false.
+        // Per-side planar Q8_0 KV read (K and V independent). `cap` = total cache elements (planar
+        // scales base), unused when both are f16.
+        k_q8: bool,
+        v_q8: bool,
         cap: usize,
     ) {
         self.stamp("attention_kv");
-        let (name, spv) = if q8 {
-            ("attention_kv_q8", crate::gemm::attention_kv_q8_spv())
-        } else {
-            ("attention_kv", crate::gemm::attention_kv_spv())
+        let (name, spv) = match (k_q8, v_q8) {
+            (false, false) => ("attention_kv", crate::gemm::attention_kv_spv()),
+            (true, false) => ("attention_kv_kq8", crate::gemm::attention_kv_kq8_spv()),
+            (false, true) => ("attention_kv_vq8", crate::gemm::attention_kv_vq8_spv()),
+            (true, true) => ("attention_kv_q8", crate::gemm::attention_kv_q8_spv()),
         };
         let kern = self.be.kernel(name, spv, 4, 36);
         let mut push = [0u8; 36];
@@ -1933,17 +1935,19 @@ impl<'a> Recorder<'a> {
         n_chunks: usize,
         scale: f32,
         window: usize,
-        // Q8_0 KV cache (K==V==q8): coalesced planar Q8 read variant. `false` = f16 cache.
-        q8: bool,
-        // Planar Q8 scales region base = total cache elements (`cap`). Unused when `q8` is false.
+        // Per-side planar Q8_0 KV read (K and V independent). Planar `cap` = total cache elements
+        // (the scales-region base), unused when both are f16.
+        k_q8: bool,
+        v_q8: bool,
         cap: usize,
     ) {
         // pass 1: per-chunk partials (subgroup-reduction QK; needs requiredSubgroupSize=32)
         self.stamp("attn_partial");
-        let (p1name, p1spv) = if q8 {
-            ("attn_partial_q8", crate::gemm::attn_partial_q8_spv())
-        } else {
-            ("attn_partial", crate::gemm::attn_partial_spv())
+        let (p1name, p1spv) = match (k_q8, v_q8) {
+            (false, false) => ("attn_partial", crate::gemm::attn_partial_spv()),
+            (true, false) => ("attn_partial_kq8", crate::gemm::attn_partial_kq8_spv()),
+            (false, true) => ("attn_partial_vq8", crate::gemm::attn_partial_vq8_spv()),
+            (true, true) => ("attn_partial_q8", crate::gemm::attn_partial_q8_spv()),
         };
         let k1 = self.be.kernel_sg(p1name, p1spv, 6, 36, 32);
         let mut p1 = [0u8; 36];
@@ -3748,7 +3752,8 @@ mod tests {
             pos_offset,
             0,     // full causal (no sliding window)
             0.0,   // default 1/√hd scale
-            false, // f16 KV cache
+            false, // k f16
+            false, // v f16
             0,     // cap (unused for f16)
         );
         rec.finish().unwrap();
@@ -3808,7 +3813,8 @@ mod tests {
             n_chunks,
             scale,
             win,
-            false, // f16 KV cache
+            false, // k f16
+            false, // v f16
             0,     // cap (unused for f16)
         );
         rec.finish().unwrap();
