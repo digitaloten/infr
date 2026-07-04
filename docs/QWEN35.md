@@ -88,11 +88,23 @@ attn_output.
 
 ## Status
 
-- **CPU reference: DONE & correct** (`crates/infr-llama/src/qwen35.rs`), wired
-  into `infr run` (CPU one-shot, chat-templated). The one real bug was the
-  attention q/gate split: `attn_q` packs query+gate INTERLEAVED PER HEAD
-  `[h0 q | h0 gate | h1 q | h1 gate | …]`, not two contiguous blocks. ~3 tok/s
-  (naive single-thread f32 matvec).
+- **UNIFIED (2026-07-04, phases 1–3 of the seam merge): qwen35 runs on the
+  SHARED transformer runner** (`cpu_backend::generate_dense_backend`) via
+  `MixerW::DeltaNet` — same run/serve/bench paths, SlotPool multi-slot serve,
+  and every shared-path optimization (mrow GEMV, small-m attention tiers).
+  Token-identical to the old seam (`unified_qwen35_*` tests), and FASTER: pp512
+  12.2k→14.7k t/s, tg64@d4096 228→243 on the 0.8B. DeltaNet layers keep conv/S
+  state in the session's per-layer buffers (fixed f32, no KV); the session
+  reuses state only on EXACT prompt extension (recurrent state can't rewind —
+  anything else zero-resets and re-prefills). Record-once decode replay is gated
+  off for qwen35 (the tape isn't audited for recurrent-state bindings; static
+  per-token decode matches the old seam).
+- The old hand-written seam (`qwen35::SeamModel`) remains reachable via
+  `INFR_QWEN35_OLD=1` until unified qwen35 is validated on Metal hardware; after
+  that it gets deleted (phase 4b).
+- **CPU reference: DONE & correct** (`crates/infr-llama/src/qwen35.rs`). The one
+  real bug was the attention q/gate split: `attn_q` packs query+gate INTERLEAVED
+  PER HEAD `[h0 q | h0 gate | h1 q | h1 gate | …]`, not two contiguous blocks.
 
 ## GPU situation (corrected)
 
