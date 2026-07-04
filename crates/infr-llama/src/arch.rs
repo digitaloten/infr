@@ -32,6 +32,11 @@ pub const GEMMA4: &str = "gemma4";
 /// V-broadcast pattern) and not `qwen35moe` — both are rejected on purpose.
 pub const QWEN35: &str = "qwen35";
 
-/// What `Config::from_gguf` (the dense/MoE transformer path) accepts. `QWEN35` is deliberately
-/// absent — the runners route it to `crate::qwen35::SeamModel` before Config is ever built.
-pub const DENSE: &[&str] = &[LLAMA, QWEN2, QWEN3, QWEN3_MOE, GEMMA3, GEMMA4];
+/// What `Config::from_gguf` — the shared TRANSFORMER-skeleton path — accepts. The split is by
+/// code path, not FFN sparsity: this list includes the routed-MoE `qwen3moe` (same attention/KV
+/// machinery, an expert FFN swapped in), and excludes `QWEN35` only because the runners route the
+/// DeltaNet hybrid to `crate::qwen35::SeamModel` before Config is ever built.
+pub const TRANSFORMER: &[&str] = &[LLAMA, QWEN2, QWEN3, QWEN3_MOE, GEMMA3, GEMMA4];
+
+/// Every architecture infr runs, across both paths.
+pub const ALL: &[&str] = &[LLAMA, QWEN2, QWEN3, QWEN3_MOE, GEMMA3, GEMMA4, QWEN35];

@@ -172,10 +172,12 @@ impl Config {
             | crate::arch::GEMMA3
             | crate::arch::GEMMA4 => true,
             // (qwen35 — Qwen3.5's DeltaNet hybrid — never reaches this Config: the runners route
-            // it to `qwen35::SeamModel` first. Every name here is llama.cpp-canonical.)
+            // it to `qwen35::SeamModel` first. The message renders from `arch::TRANSFORMER` so
+            // the supported list can't drift from the match arms above.)
             other => bail!(
-                "infr-llama supports architecture=llama|qwen2|qwen3|qwen3moe|gemma3|gemma4 \
-                 (plus qwen35 via its own seam), got {other:?}"
+                "infr-llama supports architecture={} (plus {} via its own seam), got {other:?}",
+                crate::arch::TRANSFORMER.join("|"),
+                crate::arch::QWEN35,
             ),
         };
         // Qwen2/2.5 bias their q/k/v projections (Qwen3 removed them); every other supported arch is
