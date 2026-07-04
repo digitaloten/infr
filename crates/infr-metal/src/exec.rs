@@ -258,11 +258,17 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
             } => {
                 has_attn = true;
                 let (kdt, vdt) = (g.desc(*k_cache).dtype, g.desc(*v_cache).dtype);
-                // f16/q8 are coupled by the runner's clamp; q4_0/iq4_nl compose per-side in
-                // general but only the COUPLED shape has a native-read dyn kernel — a mixed
-                // pair keeps the static prepass path.
-                let native = matches!(kdt, DType::F16 | DType::Q8_0)
-                    || (kdt == vdt && matches!(kdt, DType::Q4_0 | DType::Iq4Nl));
+                // Only a COUPLED pair has a native-read dyn kernel, so require k == v for EVERY
+                // format (q8/f32 are coupled by the runner's clamp anyway; f16/f16 is the
+                // default). Checking K alone admitted the reachable MIXED K=f16 + V=q4_0/iq4_nl
+                // pair (prepass formats compose per-side — the recommended high-K + quant-V
+                // shape), and the tape's f16 dyn kernel would read the quantized V cache as
+                // half — corrupt decode under replay. Mixed pairs keep the static prepass path.
+                let native = kdt == vdt
+                    && matches!(
+                        kdt,
+                        DType::F16 | DType::Q8_0 | DType::Q4_0 | DType::Iq4Nl
+                    );
                 if *rows != 1 || !matches!(*head_dim, 64 | 128 | 256) || !native {
                     return false;
                 }
