@@ -119,3 +119,110 @@ fn gemv_bandwidth() {
         "quik4-ffn",
     );
 }
+
+fn synth_q5_0(n_elem: usize, seed: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    for blk_i in 0..(n_elem / 32) {
+        let mut blk = vec![0u8; 22];
+        blk[0..2].copy_from_slice(&half::f16::from_f32(0.04).to_le_bytes());
+        blk[2..22].copy_from_slice(&lcg_bytes(seed ^ blk_i as u32, 20));
+        out.extend_from_slice(&blk);
+    }
+    out
+}
+
+fn quantize_q8_0(w: &[f32]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for blk in w.chunks(32) {
+        let amax = blk.iter().fold(0f32, |m, &v| m.max(v.abs()));
+        let d = if amax > 0.0 { amax / 127.0 } else { 0.0 };
+        out.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+        for &v in blk {
+            let q = if d > 0.0 {
+                (v / d).round().clamp(-127.0, 127.0) as i8
+            } else {
+                0
+            };
+            out.push(q as u8);
+        }
+    }
+    out
+}
+
+// Chained bench: K identical GEMVs over K DISTINCT weight copies in ONE graph (one command
+// buffer) — the per-cb commit+wait overhead amortizes away and the number reflects the
+// in-decode-chain cost. Distinct weights so the stream is not cache-resident.
+fn bench_chained(dtype: DType, wbytes: &[u8], in_f: usize, out_f: usize, bpw: f64, label: &str) {
+    let be = MetalBackend::new().unwrap();
+    let k = 8usize;
+    let xs: Vec<f32> = (0..in_f).map(|i| (i % 7) as f32 * 0.01).collect();
+
+    let mut g = Graph::new();
+    let x = g.input(TensorDesc::new(vec![1, in_f], DType::F32));
+    let ws: Vec<_> = (0..k)
+        .map(|_| g.weight(TensorDesc::new(vec![out_f, in_f], dtype)))
+        .collect();
+    let dst = g.output(TensorDesc::new(vec![1, out_f], DType::F32));
+    for w in &ws {
+        g.push(Op::Linear {
+            x,
+            weight: *w,
+            dst,
+            m: 1,
+            in_f: in_f as u32,
+            out_f: out_f as u32,
+            w_off: 0,
+        });
+    }
+
+    let xb = be.alloc(in_f * 4, BufferUsage::Activations).unwrap();
+    be.upload(xb.as_ref(), bytemuck::cast_slice(&xs)).unwrap();
+    let mut wbs = Vec::new();
+    for _ in 0..k {
+        let wb = be.alloc(wbytes.len(), BufferUsage::Weights).unwrap();
+        be.upload(wb.as_ref(), wbytes).unwrap();
+        wbs.push(wb);
+    }
+    let ob = be.alloc(out_f * 4, BufferUsage::Activations).unwrap();
+
+    let mut binds = Bindings::new();
+    binds.bind(x, xb.as_ref());
+    for (w, wb) in ws.iter().zip(&wbs) {
+        binds.bind(*w, wb.as_ref());
+    }
+    binds.bind(dst, ob.as_ref());
+    let plan = be.compile(&g).unwrap();
+    be.execute(plan.as_ref(), &binds).unwrap();
+    let reps = 20;
+    let t0 = std::time::Instant::now();
+    for _ in 0..reps {
+        be.execute(plan.as_ref(), &binds).unwrap();
+    }
+    let dt = t0.elapsed().as_secs_f64() / (reps * k) as f64;
+    let bytes = (out_f * in_f) as f64 * bpw / 8.0;
+    println!(
+        "{label}: {out_f}x{in_f} chained -> {:.3} ms/gemv, {:.1} GB/s (stream {:.1} MB)",
+        dt * 1e3,
+        bytes / dt / 1e9,
+        bytes / 1e6
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU; evidence probe, not a correctness test"]
+fn gemv_bandwidth_gemma_shapes() {
+    // gemma3-1b decode shapes, chained (in-decode-chain cost, cb overhead amortized)
+    let wq5 = synth_q5_0(6912 * 1152, 11);
+    bench_chained(DType::Q5_0, &wq5, 1152, 6912, 5.5, "q5_0 gate/up");
+    let wq6 = synth_q6k(6912 * 1152, 12);
+    bench_chained(DType::Q6K, &wq6, 1152, 6912, 6.5625, "q6k down");
+    let wq4 = synth_q4k(1024 * 1152, 13);
+    bench_chained(DType::Q4K, &wq4, 1024, 1152, 4.5, "q4k o");
+    let wq5q = synth_q5_0(1152 * 1024, 14);
+    bench_chained(DType::Q5_0, &wq5q, 1152, 1024, 5.5, "q5_0 q");
+    let wf: Vec<f32> = (0..(65536usize * 1152))
+        .map(|i| (i % 13) as f32 * 0.01)
+        .collect();
+    let w8 = quantize_q8_0(&wf);
+    bench_chained(DType::Q8_0, &w8, 1152, 65536, 8.5, "q8_0 head/4");
+}

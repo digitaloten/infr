@@ -8,6 +8,7 @@ use infr_core::graph::{Op, TensorKind};
 use infr_core::tensor::{DType, TensorId};
 use infr_core::Result;
 use infr_gguf::dequant::dequant_block;
+use metal::foreign_types::ForeignType;
 use metal::{
     Buffer as MtlBuffer, CommandBuffer, ComputeCommandEncoder, ComputePipelineState,
     MTLResourceOptions, MTLSize,
@@ -56,6 +57,13 @@ struct Resident {
     /// tensor, final dst); the absorbed Adds are in `skip`.
     fused: std::collections::HashMap<usize, (TensorId, TensorId)>,
     skip: std::collections::HashSet<usize>,
+    /// GPU-counter sampling state (`INFR_METAL_PROFILE=3`): the timestamp sample buffer, the
+    /// next free sample slot, the (op name, start-sample) log for this batch, and the op the
+    /// walk is currently encoding (sub-dispatches attribute to their parent op).
+    csb: Option<metal::CounterSampleBuffer>,
+    csb_idx: u64,
+    op_samples: Vec<(&'static str, u64)>,
+    cur_op: &'static str,
     /// Host-read override of the graph's baked position (see `run_graph`): the seam's replay
     /// loop re-executes one compiled decode graph (baked pos=0) and only rewrites the bound
     /// positions buffer, so on any decode-shaped graph the position-consuming ops (Attention,
@@ -88,7 +96,10 @@ fn linear_add_peephole(
         if !matches!(g.tensors[dst.0 as usize].kind, TensorKind::Internal) {
             continue;
         }
-        if !matches!(g.desc(*weight).dtype, DType::Q4K | DType::Q6K | DType::Q8_0) {
+        if !matches!(
+            g.desc(*weight).dtype,
+            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q5_0 | DType::Q4_0
+        ) {
             continue;
         }
         if let Some(Op::Add {
@@ -118,6 +129,10 @@ pub(crate) struct TapeEntry {
     /// Per-buffer byte offset for `set_buffer` (parallel to `bufs`; all zero except the
     /// fused-QKV weight slices — see the Linear arm's `w_off`).
     offs: Vec<u64>,
+    /// Bitmask over `bufs`: which buffers this dispatch WRITES. Replay runs a CONCURRENT
+    /// encoder and derives the exact barrier placement from these (see `replay_tape`); sites
+    /// that don't annotate record `u32::MAX` — treated as writing everything, i.e. serialized.
+    wmask: u32,
     params: Vec<u8>,
     threads: usize,
     tg: usize,
@@ -174,7 +189,30 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
             | Op::GatedAct { .. }
             | Op::GatedActFused { .. }
             | Op::Add { .. } => {}
-            Op::QkNormRope { .. } => has_rope = true,
+            Op::QkNormRope { .. } | Op::Rope { .. } => has_rope = true,
+            // MoE decode tapes only when the arm takes the fully-on-device path (the same gate
+            // as the MoeFfn arm's `device_ok`): dtypes with expert kernels, in-bounds shapes,
+            // escape hatch off. The host fallback computes on the CPU per token — a tape can't
+            // represent it.
+            Op::MoeFfn {
+                gate_exps,
+                up_exps,
+                down_exps,
+                ne,
+                n_ff_exp,
+                n_used,
+                ..
+            } => {
+                let kq = |t: &TensorId| matches!(g.desc(*t).dtype, DType::Q4K | DType::Q6K);
+                if !(kq(gate_exps) && kq(up_exps) && kq(down_exps))
+                    || *n_used > 16
+                    || *ne % 256 != 0
+                    || *n_ff_exp % 256 != 0
+                    || std::env::var("INFR_METAL_NOMOE").is_ok()
+                {
+                    return false;
+                }
+            }
             Op::WriteKv { cache, .. } => {
                 if !matches!(g.desc(*cache).dtype, DType::F16 | DType::Q8_0) {
                     return false;
@@ -383,6 +421,19 @@ impl MetalBackend {
         self.encode_tg(r, pso, bufs, params, threads, 0);
     }
 
+    /// `encode` with a write mask — see `encode_tg_w`.
+    fn encode_w(
+        &self,
+        r: &mut Resident,
+        pso: &ComputePipelineState,
+        bufs: &[&MtlBuffer],
+        wmask: u32,
+        params: &[u8],
+        threads: usize,
+    ) {
+        self.encode_tg_w(r, pso, bufs, wmask, params, threads, 0);
+    }
+
     /// As `encode`, but with an explicit threadgroup width (`tg`; 0 = auto). The simdgroup-GEMV
     /// kernels pass 32 (one simdgroup per threadgroup) so a matvec launches `out_f` threadgroups
     /// instead of a handful of wide ones — far more threadgroups for the GPU's cores to interleave,
@@ -396,17 +447,37 @@ impl MetalBackend {
         threads: usize,
         tg: usize,
     ) {
-        let with_offs: Vec<(&MtlBuffer, u64)> = bufs.iter().map(|b| (*b, 0)).collect();
-        self.encode_tg_off(r, pso, &with_offs, params, threads, tg);
+        // No write annotation: recorded as writes-everything, so replay serializes around it.
+        self.encode_tg_w(r, pso, bufs, u32::MAX, params, threads, tg);
     }
 
-    /// As `encode_tg`, but each buffer binds at a byte offset — the fused-QKV Linear slices
+    /// `encode_tg` with an explicit WRITE mask (bit i = `bufs[i]` is written by the dispatch).
+    /// The mask only matters on the decode replay tape, where it drives exact barrier placement
+    /// under the concurrent encoder — un-annotated dispatches replay serialized.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_tg_w(
+        &self,
+        r: &mut Resident,
+        pso: &ComputePipelineState,
+        bufs: &[&MtlBuffer],
+        wmask: u32,
+        params: &[u8],
+        threads: usize,
+        tg: usize,
+    ) {
+        let with_offs: Vec<(&MtlBuffer, u64)> = bufs.iter().map(|b| (*b, 0)).collect();
+        self.encode_tg_off(r, pso, &with_offs, wmask, params, threads, tg);
+    }
+
+    /// As `encode_tg_w`, but each buffer binds at a byte offset — the fused-QKV Linear slices
     /// bind the shared concatenated weight at each projection's row offset (`Op::Linear.w_off`).
+    #[allow(clippy::too_many_arguments)]
     fn encode_tg_off(
         &self,
         r: &mut Resident,
         pso: &ComputePipelineState,
         bufs: &[(&MtlBuffer, u64)],
+        wmask: u32,
         params: &[u8],
         threads: usize,
         tg: usize,
@@ -415,10 +486,41 @@ impl MetalBackend {
             return;
         }
         if r.enc.is_none() {
-            let cb = self.queue.new_command_buffer().to_owned();
-            let enc = cb.new_compute_command_encoder().to_owned();
-            r.cb = Some(cb);
-            r.enc = Some(enc);
+            if r.cb.is_none() {
+                r.cb = Some(self.queue.new_command_buffer().to_owned());
+            }
+            let cb = r.cb.as_ref().unwrap();
+            // Counter profiling: every encoder carries a stage-boundary timestamp pair, so each
+            // op's GPU time is measured IN CONTEXT (the batch still commits once). The walk ends
+            // the encoder between ops; everything an op encodes lands in its encoder(s).
+            r.enc = Some(if let Some(set) = self.counter_set.as_ref() {
+                const CSB_CAP: u64 = 4096;
+                if r.csb.is_none() {
+                    let d = metal::CounterSampleBufferDescriptor::new();
+                    d.set_counter_set(set);
+                    d.set_sample_count(CSB_CAP);
+                    d.set_storage_mode(metal::MTLStorageMode::Shared);
+                    r.csb = self
+                        .device
+                        .new_counter_sample_buffer_with_descriptor(&d)
+                        .ok();
+                }
+                match r.csb.as_ref() {
+                    Some(csb) if r.csb_idx + 2 <= CSB_CAP => {
+                        let desc = metal::ComputePassDescriptor::new();
+                        let att = desc.sample_buffer_attachments().object_at(0).unwrap();
+                        att.set_sample_buffer(csb);
+                        att.set_start_of_encoder_sample_index(r.csb_idx);
+                        att.set_end_of_encoder_sample_index(r.csb_idx + 1);
+                        r.op_samples.push((r.cur_op, r.csb_idx));
+                        r.csb_idx += 2;
+                        cb.compute_command_encoder_with_descriptor(desc).to_owned()
+                    }
+                    _ => cb.new_compute_command_encoder().to_owned(),
+                }
+            } else {
+                cb.new_compute_command_encoder().to_owned()
+            });
         }
         let enc = r.enc.as_ref().unwrap();
         enc.set_compute_pipeline_state(pso);
@@ -440,6 +542,7 @@ impl MetalBackend {
                 pso: pso.clone(),
                 bufs: bufs.iter().map(|(b, _)| (*b).clone()).collect(),
                 offs: bufs.iter().map(|(_, off)| *off).collect(),
+                wmask,
                 params: params.to_vec(),
                 threads,
                 tg,
@@ -453,8 +556,49 @@ impl MetalBackend {
     fn replay_tape(&self, tape: &Tape) {
         objc::rc::autoreleasepool(|| {
             let cb = self.queue.new_command_buffer();
-            let enc = cb.new_compute_command_encoder();
+            // CONCURRENT dispatch: with the serial type every dispatch implicitly orders after
+            // the previous one, which costs ~1 µs of pipeline drain per dispatch on runs of
+            // INDEPENDENT work (decode's q/k/v GEMVs, the two KV writes). Ordering here comes
+            // from explicit barriers, placed exactly where the recorded write masks show a
+            // hazard: this dispatch reads or writes a buffer someone wrote since the last
+            // barrier (RAW/WAW), or writes one someone read (WAR). Un-annotated entries
+            // (wmask = MAX) count every buffer as written — serialized, never under-fenced.
+            let enc =
+                cb.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent);
+            let mut written: Vec<*const c_void> = Vec::with_capacity(8);
+            let mut read: Vec<*const c_void> = Vec::with_capacity(24);
+            // Every buffer touched since the last barrier (owned refs into the tape entries) —
+            // the resource list the barrier fences.
+            let mut touched: Vec<&MtlBuffer> = Vec::with_capacity(32);
             for e in &tape.entries {
+                let is_w = |i: usize| e.wmask & (1u32 << i.min(31)) != 0;
+                let hazard = e.bufs.iter().enumerate().any(|(i, b)| {
+                    let p = b.as_ptr() as *const c_void;
+                    written.contains(&p) || (is_w(i) && read.contains(&p))
+                });
+                if hazard {
+                    // Barrier over every buffer touched since the last one: prior dispatches'
+                    // accesses to those resources complete before anything encoded after.
+                    let refs: Vec<&metal::ResourceRef> = touched
+                        .iter()
+                        .map(|b| b.as_ref() as &metal::ResourceRef)
+                        .collect();
+                    enc.memory_barrier_with_resources(&refs);
+                    written.clear();
+                    read.clear();
+                    touched.clear();
+                }
+                for (i, b) in e.bufs.iter().enumerate() {
+                    let p = b.as_ptr() as *const c_void;
+                    if is_w(i) {
+                        written.push(p);
+                    } else {
+                        read.push(p);
+                    }
+                    if !touched.iter().any(|t| t.as_ptr() as *const c_void == p) {
+                        touched.push(b);
+                    }
+                }
                 enc.set_compute_pipeline_state(&e.pso);
                 for (i, b) in e.bufs.iter().enumerate() {
                     enc.set_buffer(i as u64, Some(b), e.offs[i]);
@@ -486,12 +630,52 @@ impl MetalBackend {
     fn flush(&self, r: &mut Resident) {
         if let Some(enc) = r.enc.take() {
             enc.end_encoding();
-            let cb = r.cb.take().expect("metal: enc without command buffer");
+        }
+        if let Some(cb) = r.cb.take() {
             let t0 = self.profiling.then(std::time::Instant::now);
             cb.commit();
             cb.wait_until_completed();
             if let Some(t0) = t0 {
                 self.prof.lock().unwrap().add_dispatch(t0.elapsed());
+            }
+            // Counter mode: the batch is done — resolve this batch's stage-boundary timestamp
+            // pairs and attribute per op. The samples are GPU-clock ticks, not wall time:
+            // calibrate ticks→ns by bracketing the wait with two CPU/GPU timestamp
+            // correlations (sampleTimestamps) and using their ratio.
+            if r.csb_idx > 0 {
+                if let Some(csb) = r.csb.as_ref() {
+                    let (mut cpu1, mut gpu1) = (0u64, 0u64);
+                    self.device.sample_timestamps(&mut cpu1, &mut gpu1);
+                    let ns_per_tick = {
+                        // one correlation before this resolve and the one cached from init
+                        let (c0, g0) = self.ts_base;
+                        if gpu1 > g0 && cpu1 > c0 {
+                            (cpu1 - c0) as f64 / (gpu1 - g0) as f64
+                        } else {
+                            1.0
+                        }
+                    };
+                    let ts = Self::resolve_counters(csb, r.csb_idx);
+                    if std::env::var("INFR_METAL_PROF_DEBUG").is_ok() {
+                        eprintln!(
+                            "ns_per_tick={ns_per_tick:.4} first samples: {:?}",
+                            &ts[..8.min(ts.len())]
+                        );
+                    }
+                    let mut pr = self.prof.lock().unwrap();
+                    for &(name, i) in &r.op_samples {
+                        if i as usize + 1 >= ts.len() {
+                            break;
+                        }
+                        let (a, b) = (ts[i as usize], ts[i as usize + 1]);
+                        if b > a && a != u64::MAX && b != u64::MAX {
+                            let ns = ((b - a) as f64 * ns_per_tick) as u64;
+                            pr.add_op_gpu(name, std::time::Duration::from_nanos(ns));
+                        }
+                    }
+                }
+                r.csb_idx = 0;
+                r.op_samples.clear();
             }
         }
     }
@@ -569,7 +753,10 @@ impl MetalBackend {
                     .unwrap_or(false)
             })
         };
-        if replay_shape(g, bindings) && dyn_cap_ok() {
+        // Counter profiling is per-op analysis: the tape would replay decode tokens without
+        // walking ops (only the RECORDED token would ever be attributed — every per-token op
+        // reading would silently be a sample of one), so it is disabled under PROFILE=3.
+        if self.counter_set.is_none() && replay_shape(g, bindings) && dyn_cap_ok() {
             let fp = replay_fp(g, bindings);
             if let Some(tape) = self.replay.lock().unwrap().as_ref() {
                 if tape.fp == fp {
@@ -610,6 +797,10 @@ impl MetalBackend {
             posbuf: None,
             fused: std::collections::HashMap::new(),
             skip: std::collections::HashSet::new(),
+            csb: None,
+            csb_idx: 0,
+            op_samples: Vec::new(),
+            cur_op: "",
             dynpos: None,
         };
         // Decode-shaped graph (a rows==1 Attention) with a bound positions buffer: read the
@@ -670,10 +861,12 @@ impl MetalBackend {
                 .ops
                 .iter()
                 .find_map(|op| match op {
-                    Op::QkNormRope { positions, .. } => Some(*positions),
+                    Op::QkNormRope { positions, .. } | Op::Rope { positions, .. } => {
+                        Some(*positions)
+                    }
                     _ => None,
                 })
-                .expect("replay_shape checked QkNormRope");
+                .expect("replay_shape checked QkNormRope/Rope");
             r.posbuf = Some(metal_buf(bindings.get(positions).unwrap()).raw.clone());
         }
         for (i, decl) in g.tensors.iter().enumerate() {
@@ -702,7 +895,15 @@ impl MetalBackend {
                     continue;
                 }
                 let t0 = std::time::Instant::now();
+                r.cur_op = op_name(op);
                 self.run_op(op, idx, g, bindings, &mut r)?;
+                // Counter mode: seal this op's encoder (the command buffer stays open) so the
+                // next op's dispatches land in their own sampled encoder.
+                if self.counter_set.is_some() {
+                    if let Some(e) = r.enc.take() {
+                        e.end_encoding();
+                    }
+                }
                 let enc = t0.elapsed();
                 // Per-op mode: flush now so this op's GPU wall is isolable (breaks batching).
                 let gpu = if self.prof_ops {
@@ -817,6 +1018,8 @@ impl MetalBackend {
             DType::Q4K => Some("linear_q4k"),
             DType::Q6K => Some("linear_q6k"),
             DType::Q8_0 => Some("linear_q8_0"),
+            DType::Q5_0 => Some("linear_q5_0"),
+            DType::Q4_0 => Some("linear_q4_0"),
             _ => None,
         };
         if let Some(kern) = native_kern {
@@ -882,6 +1085,30 @@ impl MetalBackend {
         v
     }
 
+    /// Resolve a counter-sample range to raw u64 timestamps. metal-rs 0.33's
+    /// `resolve_counter_range` computes its copy size from an EMPTY vec (0 bytes) and then
+    /// `set_len`s over uninitialized memory — this reads the returned NSData directly.
+    #[allow(unexpected_cfgs)]
+    fn resolve_counters(csb: &metal::CounterSampleBufferRef, len: u64) -> Vec<u64> {
+        use objc::{msg_send, sel, sel_impl};
+        unsafe {
+            let range = metal::NSRange {
+                location: 0,
+                length: len,
+            };
+            let data: *mut objc::runtime::Object = msg_send![csb, resolveCounterRange: range];
+            if data.is_null() {
+                return Vec::new();
+            }
+            let bytes: *const u8 = msg_send![data, bytes];
+            let nbytes: usize = msg_send![data, length];
+            let n = (nbytes / 8).min(len as usize);
+            let mut out = vec![0u64; n];
+            std::ptr::copy_nonoverlapping(bytes, out.as_mut_ptr() as *mut u8, n * 8);
+            out
+        }
+    }
+
     /// Read `len` bytes at `off` from a buffer's (unified-memory) contents.
     fn read_bytes_range(buf: &crate::MetalBuffer, off: usize, len: usize) -> Vec<u8> {
         let mut v = vec![0u8; len];
@@ -940,18 +1167,32 @@ impl MetalBackend {
                 let bx = self.ensure_device(r, x);
                 let bw = self.weight_buf(weight, g, bindings);
                 let bd = self.dev_dst(r, dst, rows * dim);
-                let pso = self.pipelines.get("rmsnorm_f32")?;
+                // Decode (few rows): the WIDE kernel — 8 simdgroups per row; the 32-lane form
+                // is latency-bound on dim/32 serial loads (~20 us/launch at dim 1152). Prefill
+                // keeps one simdgroup per row (the rows themselves fill the GPU).
+                let wide = rows <= 4
+                    && self
+                        .pipelines
+                        .get("rmsnorm_wide_f32")
+                        .map(|pl| pl.max_total_threads_per_threadgroup() >= 256)
+                        .unwrap_or(false);
+                let pso = self.pipelines.get(if wide {
+                    "rmsnorm_wide_f32"
+                } else {
+                    "rmsnorm_f32"
+                })?;
                 let mut p = (rows as u32).to_ne_bytes().to_vec();
                 p.extend_from_slice(&(dim as u32).to_ne_bytes());
                 p.extend_from_slice(&eps.to_ne_bytes());
-                // One simdgroup (32 lanes) per row — see `rmsnorm_f32`.
-                self.encode_tg(
+                let tgw = if wide { 256 } else { 32 };
+                self.encode_tg_w(
                     r,
                     &pso,
                     &[bx.as_ref(), bw.as_ref(), bd.as_ref()],
+                    1 << 2,
                     &p,
-                    rows * 32,
-                    32,
+                    rows * tgw,
+                    tgw,
                 );
                 r.loc[dst.0 as usize] = Loc::Device;
             }
@@ -1022,6 +1263,8 @@ impl MetalBackend {
                         "linear_q4k" => (e / 256 * 144, 0, 0),
                         "linear_q6k" => (e / 256 * 210, 0, 0),
                         "linear_q8_0" => (e / 32 * 34, 0, 0),
+                        "linear_q5_0" => (e / 32 * 22, 0, 0),
+                        "linear_q4_0" => (e / 32 * 18, 0, 0),
                         "linear_quik4" => (e / 2, e / 4, dd_off),
                         "linear_quik6" => (e / 4 * 3, e / 4, dd_off),
                         _ => (e, e / 4, dd_off),
@@ -1046,6 +1289,8 @@ impl MetalBackend {
                         "linear_q4k" => "linear_q4k_hmm",
                         "linear_q6k" => "linear_q6k_hmm",
                         "linear_q8_0" => "linear_q8_0_hmm",
+                        "linear_q5_0" => "linear_q5_0_hmm",
+                        "linear_q4_0" => "linear_q4_0_hmm",
                         _ => "linear_quik8_hmm",
                     };
                     let cmm_kern = match qw.kern {
@@ -1054,6 +1299,8 @@ impl MetalBackend {
                         "linear_q4k" => "linear_q4k_cmm",
                         "linear_q6k" => "linear_q6k_cmm",
                         "linear_q8_0" => "linear_q8_0_cmm",
+                        "linear_q5_0" => "linear_q5_0_cmm",
+                        "linear_q4_0" => "linear_q4_0_cmm",
                         _ => "linear_quik8_cmm",
                     };
                     // Prefer the cooperative 32x64 threadgroup tile; per-simdgroup HGEMM covers
@@ -1086,6 +1333,7 @@ impl MetalBackend {
                                 (&qw.dd, dd_off),
                                 (bd.as_ref(), 0),
                             ],
+                            1 << 4,
                             &p,
                             m.div_ceil(32) * (out_f / 64) * 128,
                             128,
@@ -1099,7 +1347,14 @@ impl MetalBackend {
                         ));
                         let cast = self.pipelines.get("cast_f32_f16")?;
                         let n = (m * in_f) as u32;
-                        self.encode(r, &cast, &[bx.as_ref(), &xh], &n.to_ne_bytes(), m * in_f);
+                        self.encode_w(
+                            r,
+                            &cast,
+                            &[bx.as_ref(), &xh],
+                            1 << 1,
+                            &n.to_ne_bytes(),
+                            m * in_f,
+                        );
                         let pso = self.pipelines.get(hmm_kern)?;
                         self.encode_tg_off(
                             r,
@@ -1111,30 +1366,62 @@ impl MetalBackend {
                                 (&qw.dd, dd_off),
                                 (bd.as_ref(), 0),
                             ],
+                            1 << 4,
                             &p,
                             m.div_ceil(32) * (out_f / 16) * 32,
                             128,
                         );
                     } else {
-                        let (kern, sgs): (&'static str, usize) = if m > 1 {
+                        let (kern, threads, tgw): (&'static str, usize, usize) = if m > 1 {
                             let rt = match qw.kern {
                                 "linear_quik4" => "linear_quik4_rt",
                                 "linear_quik6" => "linear_quik6_rt",
                                 "linear_q4k" => "linear_q4k_rt",
                                 "linear_q6k" => "linear_q6k_rt",
                                 "linear_q8_0" => "linear_q8_0_rt",
+                                "linear_q5_0" => "linear_q5_0_rt",
+                                "linear_q4_0" => "linear_q4_0_rt",
                                 _ => "linear_quik8_rt",
                             };
-                            (rt, m.div_ceil(8) * out_f)
+                            (rt, m.div_ceil(8) * out_f * 32, 32)
                         } else {
                             // The native mul_mv-shape GEMVs cover TWO output rows per simdgroup
-                            // (FOUR for Q8_0 — llama.cpp's N_R0_Q8_0).
-                            let sgs = match qw.kern {
-                                "linear_q4k" | "linear_q6k" => out_f.div_ceil(2),
-                                "linear_q8_0" => out_f.div_ceil(4),
-                                _ => out_f,
+                            // (FOUR for Q8_0/Q5_0). Small/mid row counts underfill the GPU with
+                            // one simdgroup per row group AND serialize the whole k-dim, so they
+                            // take the k-SPLIT variant: 4 cooperating simdgroups per row group
+                            // (needs the full 128-thread threadgroup — cap-gated with a fall
+                            // back to the single-simdgroup form). Big row counts (the LM head)
+                            // already saturate and keep NSG=1.
+                            let rpg = match qw.kern {
+                                "linear_q4k" | "linear_q6k" => 2usize,
+                                "linear_q8_0" | "linear_q5_0" | "linear_q4_0" => 4,
+                                _ => 1,
                             };
-                            (qw.kern, sgs)
+                            let groups = out_f.div_ceil(rpg);
+                            // The k-dim must be deep enough that each of the 4 simdgroups gets
+                            // at least two of the body's blocks-in-flight passes — a shallow k
+                            // (0.6B's in_f=1024 is FOUR Q4_K superblocks) leaves simdgroups
+                            // idle and pays the reduce for nothing (measured -8% there).
+                            let ks_kern = match qw.kern {
+                                "linear_q4k" if in_f >= 8192 => Some("linear_q4k_ks"),
+                                "linear_q6k" if in_f >= 4096 => Some("linear_q6k_ks"),
+                                "linear_q8_0" if in_f >= 2048 => Some("linear_q8_0_ks"),
+                                "linear_q5_0" if in_f >= 2048 => Some("linear_q5_0_ks"),
+                                "linear_q4_0" if in_f >= 2048 => Some("linear_q4_0_ks"),
+                                _ => None,
+                            };
+                            let ks = groups <= 4096
+                                && ks_kern.is_some_and(|kn| {
+                                    self.pipelines
+                                        .get(kn)
+                                        .map(|pl| pl.max_total_threads_per_threadgroup() >= 128)
+                                        .unwrap_or(false)
+                                });
+                            if ks {
+                                (ks_kern.unwrap(), groups * 128, 128)
+                            } else {
+                                (qw.kern, groups * 32, 32)
+                            }
                         };
                         // Residual peephole: this Linear absorbed the following Add — take the
                         // fused-residual variant and write the Add's dst directly.
@@ -1142,6 +1429,13 @@ impl MetalBackend {
                             let fk = match kern {
                                 "linear_q4k" => "linear_q4k_add",
                                 "linear_q8_0" => "linear_q8_0_add",
+                                "linear_q5_0" => "linear_q5_0_add",
+                                "linear_q4_0" => "linear_q4_0_add",
+                                "linear_q4k_ks" => "linear_q4k_ks_add",
+                                "linear_q6k_ks" => "linear_q6k_ks_add",
+                                "linear_q8_0_ks" => "linear_q8_0_ks_add",
+                                "linear_q5_0_ks" => "linear_q5_0_ks_add",
+                                "linear_q4_0_ks" => "linear_q4_0_ks_add",
                                 _ => "linear_q6k_add",
                             };
                             let bres = self.ensure_device(r, res);
@@ -1158,9 +1452,10 @@ impl MetalBackend {
                                     (bfd.as_ref(), 0),
                                     (bres.as_ref(), 0),
                                 ],
+                                1 << 4,
                                 &p,
-                                sgs * 32,
-                                32,
+                                threads,
+                                tgw,
                             );
                             r.loc[fdst.0 as usize] = Loc::Device;
                             return Ok(());
@@ -1176,9 +1471,10 @@ impl MetalBackend {
                                 (&qw.dd, dd_off),
                                 (bd.as_ref(), 0),
                             ],
+                            1 << 4,
                             &p,
-                            sgs * 32,
-                            32,
+                            threads,
+                            tgw,
                         );
                     }
                 } else {
@@ -1193,6 +1489,7 @@ impl MetalBackend {
                             (bw.as_ref(), w_off as u64 * 4),
                             (bd.as_ref(), 0),
                         ],
+                        1 << 2,
                         &p,
                         m * out_f * 32,
                         32,
@@ -1226,12 +1523,15 @@ impl MetalBackend {
                 p.extend_from_slice(&(rope_dim).to_ne_bytes());
                 p.extend_from_slice(&theta.to_ne_bytes());
                 p.extend_from_slice(&(freq_factors.is_some() as u32).to_ne_bytes());
-                self.encode(
+                // One thread per (row, head, pair) + pass-through dims — see `rope_f32`.
+                let per = (rope_dim as usize / 2) + (hd - rope_dim as usize);
+                self.encode_w(
                     r,
                     &pso,
                     &[bx.as_ref(), bpos.as_ref(), bff.as_ref(), bd.as_ref()],
+                    1 << 3,
                     &p,
-                    rows * nh,
+                    rows * nh * per,
                 );
                 r.loc[dst.0 as usize] = Loc::Device;
             }
@@ -1268,7 +1568,19 @@ impl MetalBackend {
                     None => Arc::new(self.zeros_buf(1)),
                 };
                 let bd = self.dev_dst(r, dst, rows * nh * hd);
-                let pso = self.pipelines.get("qknormrope_f32")?;
+                // Decode: the WIDE kernel — see `rmsnorm_wide_f32` (a decode row launches only
+                // n_head simdgroups on the 32-lane form and serializes head_dim/32 loads).
+                let wide = rows <= 4
+                    && self
+                        .pipelines
+                        .get("qknormrope_wide_f32")
+                        .map(|pl| pl.max_total_threads_per_threadgroup() >= 256)
+                        .unwrap_or(false);
+                let pso = self.pipelines.get(if wide {
+                    "qknormrope_wide_f32"
+                } else {
+                    "qknormrope_f32"
+                })?;
                 let mut p = (rows as u32).to_ne_bytes().to_vec();
                 p.extend_from_slice(&(nh as u32).to_ne_bytes());
                 p.extend_from_slice(&(hd as u32).to_ne_bytes());
@@ -1276,8 +1588,9 @@ impl MetalBackend {
                 p.extend_from_slice(&theta.to_ne_bytes());
                 p.extend_from_slice(&eps.to_ne_bytes());
                 p.extend_from_slice(&(freq_factors.is_some() as u32).to_ne_bytes());
-                // One simdgroup per (row, head) — see `qknormrope_f32`.
-                self.encode_tg(
+                // One simdgroup per (row, head) — 8 on the wide decode form.
+                let tgw = if wide { 256 } else { 32 };
+                self.encode_tg_w(
                     r,
                     &pso,
                     &[
@@ -1287,9 +1600,10 @@ impl MetalBackend {
                         bff.as_ref(),
                         bd.as_ref(),
                     ],
+                    1 << 4,
                     &p,
-                    rows * nh * 32,
-                    32,
+                    rows * nh * tgw,
+                    tgw,
                 );
                 r.loc[dst.0 as usize] = Loc::Device;
             }
@@ -1299,10 +1613,11 @@ impl MetalBackend {
                 let bb = self.ensure_device(r, b);
                 let bd = self.dev_dst(r, dst, n);
                 let pso = self.pipelines.get("add_f32")?;
-                self.encode(
+                self.encode_w(
                     r,
                     &pso,
                     &[ba.as_ref(), bb.as_ref(), bd.as_ref()],
+                    1 << 2,
                     &(n as u32).to_ne_bytes(),
                     n,
                 );
@@ -1351,10 +1666,11 @@ impl MetalBackend {
                 p.extend_from_slice(&(nff as u32).to_ne_bytes());
                 p.extend_from_slice(&act_code.to_ne_bytes());
                 p.extend_from_slice(&up_off.to_ne_bytes());
-                self.encode(
+                self.encode_w(
                     r,
                     &pso,
                     &[bg.as_ref(), bu.as_ref(), bd.as_ref()],
+                    1 << 2,
                     &p,
                     rows * nff,
                 );
@@ -1382,7 +1698,7 @@ impl MetalBackend {
                 p.extend_from_slice(&(nff as u32).to_ne_bytes());
                 p.extend_from_slice(&act_code.to_ne_bytes());
                 p.extend_from_slice(&0u32.to_ne_bytes()); // pad to GatedParams
-                self.encode(r, &pso, &[bg.as_ref(), bd.as_ref()], &p, rows * nff);
+                self.encode_w(r, &pso, &[bg.as_ref(), bd.as_ref()], 1 << 1, &p, rows * nff);
                 r.loc[dst.0 as usize] = Loc::Device;
             }
             Op::WriteKv {
@@ -1419,7 +1735,14 @@ impl MetalBackend {
                     let mut p = (n as u32).to_ne_bytes().to_vec();
                     p.extend_from_slice(&(rs as u32).to_ne_bytes());
                     let threads = if q8 { n / 32 } else { n };
-                    self.encode(r, &pso, &[bsrc.as_ref(), &cbuf.raw, &posbuf], &p, threads);
+                    self.encode_w(
+                        r,
+                        &pso,
+                        &[bsrc.as_ref(), &cbuf.raw, &posbuf],
+                        1 << 1,
+                        &p,
+                        threads,
+                    );
                 } else {
                     // Static per-token write. The decoupled quant formats (block quants, bf16,
                     // turbo) force static decode (the replay gate rejects them), so their WriteKv
@@ -1444,6 +1767,9 @@ impl MetalBackend {
                     let pso = self.pipelines.get(kern)?;
                     let mut p = (n as u32).to_ne_bytes().to_vec();
                     p.extend_from_slice(&(base as u32).to_ne_bytes());
+                    // Per-format thread counts (block quants n/32, turbo n/128, dense n) — from
+                    // the KV-quant work on main; `encode_w` with write-mask 1<<1 (WriteKv writes
+                    // only the cache at binding index 1) — from #15's concurrent-replay barriers.
                     let threads = match dt {
                         DType::Q8_0
                         | DType::Q4_0
@@ -1454,7 +1780,7 @@ impl MetalBackend {
                         DType::Turbo2 | DType::Turbo3 | DType::Turbo4 => n / 128,
                         _ => n,
                     };
-                    self.encode(r, &pso, &[bsrc.as_ref(), &cbuf.raw], &p, threads);
+                    self.encode_w(r, &pso, &[bsrc.as_ref(), &cbuf.raw], 1 << 1, &p, threads);
                 }
             }
             Op::Attention {
@@ -1525,10 +1851,11 @@ impl MetalBackend {
                     p.extend_from_slice(&scale.to_ne_bytes());
                     p.extend_from_slice(&window.to_ne_bytes());
                     p.extend_from_slice(&pos.to_ne_bytes());
-                    self.encode_tg(
+                    self.encode_tg_w(
                         r,
                         &pso,
                         &[bq.as_ref(), &kbuf.raw, &vbuf.raw, bd.as_ref(), &posbuf],
+                        1 << 3,
                         &p,
                         rows * nh * nsg * 32,
                         nsg * 32,
@@ -1909,10 +2236,11 @@ impl MetalBackend {
                     let mut p = (rows as u32).to_ne_bytes().to_vec();
                     p.extend_from_slice(&(ne as u32).to_ne_bytes());
                     p.extend_from_slice(&(n_expert as u32).to_ne_bytes());
-                    self.encode_tg(
+                    self.encode_tg_w(
                         r,
                         &pso,
                         &[bx.as_ref(), rw.as_ref(), logits.as_ref()],
+                        1 << 2,
                         &p,
                         rows * n_expert * 32,
                         32,
@@ -1922,7 +2250,15 @@ impl MetalBackend {
                     let mut p = (n_expert as u32).to_ne_bytes().to_vec();
                     p.extend_from_slice(&(n_used as u32).to_ne_bytes());
                     p.extend_from_slice(&scale.to_ne_bytes());
-                    self.encode_tg(r, &pso, &[logits.as_ref(), tbl.as_ref()], &p, rows * 32, 32);
+                    self.encode_tg_w(
+                        r,
+                        &pso,
+                        &[logits.as_ref(), tbl.as_ref()],
+                        1 << 1,
+                        &p,
+                        rows * 32,
+                        32,
+                    );
                     // Expert FFN, batched over (chunk rows x selected experts) — one dispatch per
                     // stage per chunk; chunking bounds the expert scratch (a full 8k-row prefill
                     // would need ~0.5 GB of it).
@@ -2085,7 +2421,7 @@ impl MetalBackend {
                             continue;
                         }
                         let pso = self.pipelines.get(moe_kern(gdt2).unwrap().0)?;
-                        self.encode_tg(
+                        self.encode_tg_w(
                             r,
                             &pso,
                             &[
@@ -2096,12 +2432,13 @@ impl MetalBackend {
                                 gate_t.as_ref(),
                                 tbl.as_ref(),
                             ],
+                            1 << 4,
                             &pack(ne, nffx, row0),
                             cr * n_used * (nffx / 2) * 32,
                             32,
                         );
                         let pso = self.pipelines.get(moe_kern(udt2).unwrap().0)?;
-                        self.encode_tg(
+                        self.encode_tg_w(
                             r,
                             &pso,
                             &[
@@ -2112,6 +2449,7 @@ impl MetalBackend {
                                 up_t.as_ref(),
                                 tbl.as_ref(),
                             ],
+                            1 << 4,
                             &pack(ne, nffx, row0),
                             cr * n_used * (nffx / 2) * 32,
                             32,
@@ -2121,15 +2459,16 @@ impl MetalBackend {
                         p.extend_from_slice(&(nffx as u32).to_ne_bytes());
                         p.extend_from_slice(&act_code.to_ne_bytes());
                         p.extend_from_slice(&0u32.to_ne_bytes()); // up_off
-                        self.encode(
+                        self.encode_w(
                             r,
                             &pso,
                             &[gate_t.as_ref(), up_t.as_ref(), act_t.as_ref()],
+                            1 << 2,
                             &p,
                             cr * n_used * nffx,
                         );
                         let pso = self.pipelines.get(moe_kern(ddt2).unwrap().1)?;
-                        self.encode_tg(
+                        self.encode_tg_w(
                             r,
                             &pso,
                             &[
@@ -2140,6 +2479,7 @@ impl MetalBackend {
                                 ydown.as_ref(),
                                 tbl.as_ref(),
                             ],
+                            1 << 4,
                             &pack(nffx, ne, row0),
                             cr * n_used * (ne / 2) * 32,
                             32,
@@ -2149,7 +2489,7 @@ impl MetalBackend {
                         p.extend_from_slice(&(n_used as u32).to_ne_bytes());
                         p.extend_from_slice(&(cr as u32).to_ne_bytes());
                         p.extend_from_slice(&(row0 as u32).to_ne_bytes());
-                        self.encode(r, &pso, &[ydown.as_ref(), bd.as_ref()], &p, cr * ne);
+                        self.encode_w(r, &pso, &[ydown.as_ref(), bd.as_ref()], 1 << 1, &p, cr * ne);
                     }
                     r.loc[dst.0 as usize] = Loc::Device;
                     return Ok(());
@@ -2440,7 +2780,9 @@ impl MetalBackend {
                 r.vals[dst.0 as usize] = out;
                 r.loc[dst.0 as usize] = Loc::Host;
             }
-            // Pure data movement (no arithmetic): done host-side, identical to the CPU reference.
+            // Pure data movement, ON-DEVICE (the rows=1 case of `copy_strided_f32`): the prefill
+            // graph extracts the last row's hidden state for the LM head with a Copy, and a host
+            // copy here forced a readback + a command-buffer break every prefill chunk.
             Op::Copy {
                 src,
                 src_off,
@@ -2448,12 +2790,17 @@ impl MetalBackend {
                 dst_off,
                 n,
             } => {
-                let (so, dof, n) = (src_off as usize, dst_off as usize, n as usize);
-                self.ensure_host(r, g, src);
-                self.ensure_host(r, g, dst);
-                let s = r.vals[src.0 as usize].clone();
-                r.vals[dst.0 as usize][dof..dof + n].copy_from_slice(&s[so..so + n]);
-                r.loc[dst.0 as usize] = Loc::Host;
+                let bs = self.ensure_device(r, src);
+                let bd = self.ensure_device(r, dst);
+                let mut p = src_off.to_ne_bytes().to_vec();
+                p.extend_from_slice(&0u32.to_ne_bytes()); // src_stride (unused at rows=1)
+                p.extend_from_slice(&dst_off.to_ne_bytes());
+                p.extend_from_slice(&0u32.to_ne_bytes()); // dst_stride
+                p.extend_from_slice(&1u32.to_ne_bytes()); // rows
+                p.extend_from_slice(&n.to_ne_bytes());
+                let pso = self.pipelines.get("copy_strided_f32")?;
+                self.encode_w(r, &pso, &[bs.as_ref(), bd.as_ref()], 1 << 1, &p, n as usize);
+                r.loc[dst.0 as usize] = Loc::Device;
             }
             // On-device: the fused-QKV prefill emits one of these per projection right after the
             // wide GEMM — a host copy would round-trip the [m, qkv] activation mid-forward.
