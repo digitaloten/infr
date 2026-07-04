@@ -904,6 +904,57 @@ dyn_spv!(store_q8_spv, "store_q8");
 dyn_spv!(store_q8_dyn_spv, "store_q8_dyn");
 dyn_spv!(store_q8_f16_spv, "store_q8_f16");
 dyn_spv!(store_q8_f16_dyn_spv, "store_q8_f16_dyn");
+// Mainline low-bit KV quants: per-format quantize (f32 V / f16 K) + dequant→f16 prefix expander.
+dyn_spv!(quant_kv_q4_0_spv, "quant_kv_q4_0");
+dyn_spv!(quant_kv_q4_0_f16_spv, "quant_kv_q4_0_f16");
+dyn_spv!(quant_kv_q4_1_spv, "quant_kv_q4_1");
+dyn_spv!(quant_kv_q4_1_f16_spv, "quant_kv_q4_1_f16");
+dyn_spv!(quant_kv_q5_0_spv, "quant_kv_q5_0");
+dyn_spv!(quant_kv_q5_0_f16_spv, "quant_kv_q5_0_f16");
+dyn_spv!(quant_kv_q5_1_spv, "quant_kv_q5_1");
+dyn_spv!(quant_kv_q5_1_f16_spv, "quant_kv_q5_1_f16");
+dyn_spv!(quant_kv_iq4_nl_spv, "quant_kv_iq4_nl");
+dyn_spv!(quant_kv_iq4_nl_f16_spv, "quant_kv_iq4_nl_f16");
+dyn_spv!(dequant_kv_q4_0_spv, "dequant_kv_q4_0");
+dyn_spv!(dequant_kv_q4_1_spv, "dequant_kv_q4_1");
+dyn_spv!(dequant_kv_q5_0_spv, "dequant_kv_q5_0");
+dyn_spv!(dequant_kv_q5_1_spv, "dequant_kv_q5_1");
+dyn_spv!(dequant_kv_iq4_nl_spv, "dequant_kv_iq4_nl");
+
+/// (kernel name, SPIR-V) for the KV quantize kernel of `dt` (`src_f16` = f16 K source, else f32 V).
+/// Distinct names per variant so the recorder's name-keyed pipeline cache never collides.
+pub(crate) fn quant_kv_kernel(
+    dt: infr_core::DType,
+    src_f16: bool,
+) -> (&'static str, &'static [u32]) {
+    use infr_core::DType::*;
+    match (dt, src_f16) {
+        (Q4_0, false) => ("quant_kv_q4_0", quant_kv_q4_0_spv()),
+        (Q4_0, true) => ("quant_kv_q4_0_f16", quant_kv_q4_0_f16_spv()),
+        (Q4_1, false) => ("quant_kv_q4_1", quant_kv_q4_1_spv()),
+        (Q4_1, true) => ("quant_kv_q4_1_f16", quant_kv_q4_1_f16_spv()),
+        (Q5_0, false) => ("quant_kv_q5_0", quant_kv_q5_0_spv()),
+        (Q5_0, true) => ("quant_kv_q5_0_f16", quant_kv_q5_0_f16_spv()),
+        (Q5_1, false) => ("quant_kv_q5_1", quant_kv_q5_1_spv()),
+        (Q5_1, true) => ("quant_kv_q5_1_f16", quant_kv_q5_1_f16_spv()),
+        (Iq4Nl, false) => ("quant_kv_iq4_nl", quant_kv_iq4_nl_spv()),
+        (Iq4Nl, true) => ("quant_kv_iq4_nl_f16", quant_kv_iq4_nl_f16_spv()),
+        _ => unreachable!("quant_kv_kernel for non-KV-quant dtype {dt:?}"),
+    }
+}
+
+/// (kernel name, SPIR-V) for the KV dequant→f16 prefix expander of `dt`.
+pub(crate) fn dequant_kv_kernel(dt: infr_core::DType) -> (&'static str, &'static [u32]) {
+    use infr_core::DType::*;
+    match dt {
+        Q4_0 => ("dequant_kv_q4_0", dequant_kv_q4_0_spv()),
+        Q4_1 => ("dequant_kv_q4_1", dequant_kv_q4_1_spv()),
+        Q5_0 => ("dequant_kv_q5_0", dequant_kv_q5_0_spv()),
+        Q5_1 => ("dequant_kv_q5_1", dequant_kv_q5_1_spv()),
+        Iq4Nl => ("dequant_kv_iq4_nl", dequant_kv_iq4_nl_spv()),
+        _ => unreachable!("dequant_kv_kernel for non-KV-quant dtype {dt:?}"),
+    }
+}
 // Coupled Q8_0 KV: coalesced split-K decode partials reading Q8 blocks (static / dyn / self-chunk).
 dyn_spv!(attn_partial_q8_spv, "attn_partial_q8");
 dyn_spv!(attn_partial_kq8_spv, "attn_partial_kq8");

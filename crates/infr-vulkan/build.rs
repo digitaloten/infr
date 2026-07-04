@@ -95,6 +95,44 @@ fn main() {
             "store_q8_f16_dyn",
             &["-DSRC_F16", "-DUSE_PARAMS"],
         ),
+        // Mainline low-bit KV quants (standard GGUF blocks): a quantize kernel per format (f32 V +
+        // f16 K sources) and a dequant→f16 prefix expander per format (reuses native_decode `dq()`).
+        // Static only — a quantized KV cache forces per-execute static decode (see decode_eligible).
+        ("quant_kv", "quant_kv_q4_0", &["-DFMT_Q4_0"]),
+        (
+            "quant_kv",
+            "quant_kv_q4_0_f16",
+            &["-DFMT_Q4_0", "-DSRC_F16"],
+        ),
+        ("quant_kv", "quant_kv_q4_1", &["-DFMT_Q4_1"]),
+        (
+            "quant_kv",
+            "quant_kv_q4_1_f16",
+            &["-DFMT_Q4_1", "-DSRC_F16"],
+        ),
+        ("quant_kv", "quant_kv_q5_0", &["-DFMT_Q5_0"]),
+        (
+            "quant_kv",
+            "quant_kv_q5_0_f16",
+            &["-DFMT_Q5_0", "-DSRC_F16"],
+        ),
+        ("quant_kv", "quant_kv_q5_1", &["-DFMT_Q5_1"]),
+        (
+            "quant_kv",
+            "quant_kv_q5_1_f16",
+            &["-DFMT_Q5_1", "-DSRC_F16"],
+        ),
+        ("quant_kv", "quant_kv_iq4_nl", &["-DFMT_IQ4NL"]),
+        (
+            "quant_kv",
+            "quant_kv_iq4_nl_f16",
+            &["-DFMT_IQ4NL", "-DSRC_F16"],
+        ),
+        ("dequant_kv_f16", "dequant_kv_q4_0", &["-DFMT_Q4_0"]),
+        ("dequant_kv_f16", "dequant_kv_q4_1", &["-DFMT_Q4_1"]),
+        ("dequant_kv_f16", "dequant_kv_q5_0", &["-DFMT_Q5_0"]),
+        ("dequant_kv_f16", "dequant_kv_q5_1", &["-DFMT_Q5_1"]),
+        ("dequant_kv_f16", "dequant_kv_iq4_nl", &["-DFMT_IQ4NL"]),
         ("rope", "rope", &[]),
         ("rope", "rope_f16", &["-DOUT_F16"]),
         ("rope", "rope_f16_dyn", &["-DOUT_F16", "-DUSE_PARAMS"]),

@@ -364,6 +364,23 @@ type BindWeight<'a> = dyn Fn(&str, WBytes, DType, usize) -> AResult<(Box<dyn Buf
 /// (a 2-byte f16 scale + 32 int8), F16 = 2 bytes, else raw f32. K and V pick their dtype
 /// independently, so this is called per-side. Q8_0 is rounded up to a u32 multiple so the Vulkan
 /// backend can bind the buffer as a `uint` array (its planar Q8 layout reads codes/scales as words).
+/// A quantized KV cache dtype that forces per-execute static decode on the GPU (record-once replay
+/// is disabled for it). Must match the adapter's `decode_eligible` rejection.
+fn kv_forces_static(dt: DType) -> bool {
+    matches!(
+        dt,
+        DType::Q8_0
+            | DType::Q4_0
+            | DType::Q4_1
+            | DType::Q5_0
+            | DType::Q5_1
+            | DType::Iq4Nl
+            | DType::Turbo2
+            | DType::Turbo3
+            | DType::Turbo4
+    )
+}
+
 pub(crate) fn kv_fmt_bytes(dt: DType, elems: usize) -> usize {
     match dt {
         DType::Q8_0 => (elems / 32 * 34).next_multiple_of(4),
@@ -675,7 +692,9 @@ pub(crate) fn generate_dense_backend(
     let kv_q8_backend = matches!(be.name(), "metal" | "cpu" | "vulkan");
     let cpu = be.name() == "cpu";
     let kv_turbo_ok = cpu && (0..c.n_layer).all(|l| c.layer_head_dim(l).is_multiple_of(128));
-    let cpu_blk = cpu && kv_align_ok; // CPU-only block quants (need 32-alignment)
+    // Mainline low-bit block quants (q4_0/…/iq4_nl): CPU + Vulkan (Vulkan uses a dequant→f16 prepass);
+    // need 32-block alignment. f32/bf16 KV stay CPU-only (no GPU dense-KV path yet).
+    let blk_ok = matches!(be.name(), "cpu" | "vulkan") && kv_align_ok;
     let parse_kv_fmt = |var: &str| -> DType {
         let side = std::env::var(var).ok();
         match side.as_deref() {
@@ -683,11 +702,11 @@ pub(crate) fn generate_dense_backend(
             Some("turbo3") if kv_turbo_ok => DType::Turbo3,
             Some("turbo4") if kv_turbo_ok => DType::Turbo4,
             Some("q8_0") | Some("q8") | Some("Q8_0") if kv_align_ok && kv_q8_backend => DType::Q8_0,
-            Some("q4_0") if cpu_blk => DType::Q4_0,
-            Some("q4_1") if cpu_blk => DType::Q4_1,
-            Some("q5_0") if cpu_blk => DType::Q5_0,
-            Some("q5_1") if cpu_blk => DType::Q5_1,
-            Some("iq4_nl") if cpu_blk => DType::Iq4Nl,
+            Some("q4_0") if blk_ok => DType::Q4_0,
+            Some("q4_1") if blk_ok => DType::Q4_1,
+            Some("q5_0") if blk_ok => DType::Q5_0,
+            Some("q5_1") if blk_ok => DType::Q5_1,
+            Some("iq4_nl") if blk_ok => DType::Iq4Nl,
             Some("bf16") if cpu => DType::Bf16,
             Some("f32") if cpu => DType::F32,
             Some("f16") | Some("F16") => DType::F16,
@@ -1851,11 +1870,13 @@ pub(crate) fn generate_dense_backend(
     let dyn_replay = be.capabilities().decode_replay
         && std::env::var("INFR_SEAM_NO_REPLAY").is_err()
         && (qk_norm || rope_freqs.is_none())
-        // A Q8_0 KV cache forces the per-execute STATIC decode (see the adapter's `decode_eligible`:
-        // the record-once replay of the un-fused Q8 K-write mis-decodes). Must mirror that rejection
-        // so this gate stays a strict subset — else the loop bakes pos=0 for a static run.
-        && k_fmt != DType::Q8_0
-        && v_fmt != DType::Q8_0
+        // Any quantized KV cache forces the per-execute STATIC decode (see the adapter's
+        // `decode_eligible`: Q8's un-fused K-write mis-decodes under record-once replay; the low-bit
+        // block quants use a dequant→f16 prepass with a standalone quantizing WriteKv). Must mirror
+        // that rejection so this gate stays a strict subset — else the loop bakes pos=0 for a static
+        // run. (turbo forces static too but is CPU-only, where decode_replay is off anyway.)
+        && !kv_forces_static(k_fmt)
+        && !kv_forces_static(v_fmt)
         && (0..c.n_layer)
             .all(|l| c.layer_head_dim(l).is_multiple_of(4) && c.layer_head_dim(l) <= 512);
     let ro = if dyn_replay {

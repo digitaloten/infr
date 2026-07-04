@@ -1856,6 +1856,55 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Quantize `src[0..n]` → the standard GGUF-block KV cache of `dt` at element offset `off` (one
+    /// thread per 32-block). `src_f16` = f16 source (roped K); f32 otherwise (V).
+    pub fn quant_kv(
+        &self,
+        dt: infr_core::DType,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        n: usize,
+        off: usize,
+        src_f16: bool,
+    ) {
+        self.stamp("quant_kv");
+        let (name, spv) = crate::gemm::quant_kv_kernel(dt, src_f16);
+        let k = self.be.kernel(name, spv, 2, 8);
+        let mut push = [0u8; 8];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(src), Self::vkb(dst)],
+            1,
+            &push,
+            ((n / 32) as u32).div_ceil(64),
+        );
+    }
+
+    /// Expand `n` elements of a standard-GGUF-block KV cache of `dt` → an f16 buffer (reuses the
+    /// native_decode `dq()`), so the f16 attention can read a quantized KV prefix. One thread/element.
+    pub fn dequant_kv_f16(
+        &self,
+        dt: infr_core::DType,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        n: usize,
+    ) {
+        self.stamp("dequant_kv_f16");
+        let (name, spv) = crate::gemm::dequant_kv_kernel(dt);
+        let k = self.be.kernel(name, spv, 2, 4);
+        let mut push = [0u8; 4];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(src), Self::vkb(dst)],
+            1,
+            &push,
+            (n as u32).div_ceil(64),
+        );
+    }
+
     /// Qwen3 QK-norm + RoPE over `x[rows, nheads, hd]` → `y` at rows `out_base..`. `nw` is the
     /// per-head [hd] norm weight. (q: out_base=0; k: out_base=pos so it lands in the cache.)
     #[allow(clippy::too_many_arguments)]

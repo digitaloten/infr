@@ -75,6 +75,12 @@ pub(crate) fn compile(graph: &Graph) -> Result<Box<dyn Plan>> {
 /// (no standalone `Rope`, no `freq_factors`); and there is no `Softcap` / sliding window / `MoeFfn` /
 /// `Conv1dSilu` / `DeltaNet` / per-head `QkNorm`. Anything else falls back to the static path — which
 /// matters for correctness: `attention_kv_dyn` is gemma-disabled (full causal, hardcoded 1/√hd).
+/// Standard-GGUF-block low-bit KV quants that ride the dequant→f16 prepass path (not native reads).
+fn is_kv_quant(dt: infr_core::DType) -> bool {
+    use infr_core::DType::*;
+    matches!(dt, Q4_0 | Q4_1 | Q5_0 | Q5_1 | Iq4Nl)
+}
+
 fn decode_eligible(graph: &Graph) -> bool {
     // INFR_SEAM_NO_REPLAY forces the static per-execute path (INFR_PROF2 timestamps work there;
     // the replay path can't report them).
@@ -106,6 +112,8 @@ fn decode_eligible(graph: &Graph) -> bool {
                 // the replay and drop this so Q8 decode gets the record-once speedup too.
                 if matches!(graph.desc(*k_cache).dtype, infr_core::DType::Q8_0)
                     || matches!(graph.desc(*v_cache).dtype, infr_core::DType::Q8_0)
+                    || is_kv_quant(graph.desc(*k_cache).dtype)
+                    || is_kv_quant(graph.desc(*v_cache).dtype)
                 {
                     return false;
                 }
@@ -715,7 +723,8 @@ fn lower_op(
             let (s, c) = (r(*src)?, r(*cache)?);
             // Q8_0 cache: quantize the row(s) into 34 B/32-elem blocks. For a Q8 cache the K-rope
             // peephole is disabled, so the K WriteKv (f16 staging) reaches here alongside the f32 V.
-            let cache_q8 = matches!(graph.desc(*cache).dtype, infr_core::DType::Q8_0);
+            let cache_dt = graph.desc(*cache).dtype;
+            let cache_q8 = matches!(cache_dt, infr_core::DType::Q8_0);
             let src_f16 = matches!(graph.desc(*src).dtype, infr_core::DType::F16);
             // Planar scales region begins at byte `cap` = total cache elements.
             let cap = graph.desc(*cache).numel();
@@ -723,6 +732,11 @@ fn lower_op(
                 RopeMode::Static(_) if cache_q8 => rec.store_q8(s, c, n, pos * rs, cap, src_f16),
                 RopeMode::Dynamic(params) if cache_q8 => {
                     rec.store_q8_dyn(s, *params, c, n, cap, src_f16)
+                }
+                // Mainline low-bit KV quants: quantize into standard GGUF blocks (static only — a
+                // quantized KV cache forces static decode, so a Dynamic WriteKv never reaches here).
+                RopeMode::Static(_) if is_kv_quant(cache_dt) => {
+                    rec.quant_kv(cache_dt, s, c, n, pos * rs, src_f16)
                 }
                 RopeMode::Static(_) => match graph.desc(*src).dtype {
                     infr_core::DType::F16 => rec.copy(s, 0, c, pos * rs * 2, n * 2),
@@ -1007,30 +1021,51 @@ fn lower_op(
                     );
                 }
             } else {
-                // Q8 PREFILL (rows>1): the coalesced f16 flash/non-FA kernels can't read Q8 blocks,
-                // and the scalar fallback is O(kv²) — TDR-slow (GPU hang) at depth. Dequant the Q8 KV
-                // prefix → a transient f16 scratch once (O(kv)) and run the fast f16 prefill on it;
-                // the persistent cache stays Q8 (footprint preserved). DECODE (rows==1) reads Q8
-                // natively via the split / scalar kernels, so it keeps the cache directly.
-                let deq_prefill = (k_q8 || v_q8) && rows > 1;
+                // Dequant a quantized KV side → a transient f16 scratch, then run the f16 attention on
+                // it. Q8 only dequants on PREFILL (rows>1; decode reads Q8 natively via the coalesced
+                // split/scalar kernels — the scalar O(kv²) path TDR-hangs at depth). The mainline
+                // low-bit quants (q4_0/…/iq4_nl) have no native read, so they dequant on EVERY pass
+                // (prefill + decode). The persistent cache stays quantized (footprint preserved).
+                let k_new = is_kv_quant(graph.desc(*k_cache).dtype);
+                let v_new = is_kv_quant(graph.desc(*v_cache).dtype);
+                let deq_k = (k_q8 && rows > 1) || k_new;
+                let deq_v = (v_q8 && rows > 1) || v_new;
                 let ne = kv_len * nkv * hd;
-                let kc_key = if deq_prefill && k_q8 {
-                    let k = pooled(pool, be_, "q8deq_k", ne * 2)?;
-                    rec.dequant_q8_f16(r(*k_cache)?, pool[&k].as_ref(), ne, cap);
+                let kc_key = if deq_k {
+                    let k = pooled(pool, be_, "kvdeq_k", ne * 2)?;
+                    if k_q8 {
+                        rec.dequant_q8_f16(r(*k_cache)?, pool[&k].as_ref(), ne, cap);
+                    } else {
+                        rec.dequant_kv_f16(
+                            graph.desc(*k_cache).dtype,
+                            r(*k_cache)?,
+                            pool[&k].as_ref(),
+                            ne,
+                        );
+                    }
                     Some(k)
                 } else {
                     None
                 };
-                let vc_key = if deq_prefill && v_q8 {
-                    let k = pooled(pool, be_, "q8deq_v", ne * 2)?;
-                    rec.dequant_q8_f16(r(*v_cache)?, pool[&k].as_ref(), ne, cap);
+                let vc_key = if deq_v {
+                    let k = pooled(pool, be_, "kvdeq_v", ne * 2)?;
+                    if v_q8 {
+                        rec.dequant_q8_f16(r(*v_cache)?, pool[&k].as_ref(), ne, cap);
+                    } else {
+                        rec.dequant_kv_f16(
+                            graph.desc(*v_cache).dtype,
+                            r(*v_cache)?,
+                            pool[&k].as_ref(),
+                            ne,
+                        );
+                    }
                     Some(k)
                 } else {
                     None
                 };
-                // Native Q8 read only on the decode path; prefill reads the dequanted f16 scratch.
-                let k_q8_eff = k_q8 && !deq_prefill;
-                let v_q8_eff = v_q8 && !deq_prefill;
+                // A dequanted side reads the f16 scratch; native Q8 read only when not dequanted.
+                let k_q8_eff = k_q8 && !deq_k;
+                let v_q8_eff = v_q8 && !deq_v;
                 // Prefill (rows≥64), causal, hd==128, standard 1/√hd scale: FlashAttention-2 (split-K
                 // online softmax, no materialized [m,kv] scores). The flash kernel hardcodes 1/√hd and
                 // writes ceil(rows/64)*64 output rows, so guard the scale and copy the real rows.

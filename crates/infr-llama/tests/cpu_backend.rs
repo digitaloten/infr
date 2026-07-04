@@ -478,6 +478,37 @@ fn gpu_seam_kv_q8_coherent() {
     std::env::remove_var("INFR_KV_TYPE_V");
 }
 
+/// Mainline low-bit KV quants on the Vulkan seam: q4_0/q4_1/q5_0/q5_1/iq4_nl run via a quantizing
+/// WriteKv (quant_kv) + a dequant→f16 prefix prepass (dequant_kv_f16, reusing native_decode) feeding
+/// the standard f16 flash/split/scalar attention. K=f16 with each quantized V must stay coherent
+/// (K needs higher precision). A broken GPU quantize or dequant would garble even a V-only cache.
+#[test]
+fn gpu_seam_kv_mainline_quants_coherent() {
+    let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
+    need_gpu!();
+    let _tlk = test_serial_lock();
+    std::env::set_var("INFR_TEMP", "0");
+    let head = |s: &str| s.chars().take(64).collect::<String>();
+    // Long enough (>64 tokens) to take the flash prefill on the dequanted scratch, then deep decode.
+    let long =
+        "Explain how a CPU instruction pipeline works and list its common hazards. ".repeat(6);
+    std::env::set_var("INFR_KV_TYPE_K", "f16");
+    for v in ["q4_0", "q4_1", "q5_0", "q5_1", "iq4_nl"] {
+        std::env::set_var("INFR_KV_TYPE_V", v);
+        let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+        let out = model
+            .generate_dense_vulkan(&long, 24)
+            .expect("gpu kv-quant gen");
+        assert!(
+            !is_degenerate(&out),
+            "GPU K=f16 V={v} degenerate: {:?}",
+            head(&out)
+        );
+    }
+    std::env::remove_var("INFR_KV_TYPE_K");
+    std::env::remove_var("INFR_KV_TYPE_V");
+}
+
 /// Multi-slot KV prefix sharing: two INTERLEAVED conversations with a common long prefix (a
 /// "system prompt"). Conversation B must (a) generate exactly what a fresh full prefill does,
 /// (b) prefill only past the shared prefix (its slot was SEEDED by a device-side KV copy from
