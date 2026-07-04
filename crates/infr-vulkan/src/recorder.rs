@@ -2079,6 +2079,7 @@ impl<'a> Recorder<'a> {
     /// compute per-chunk softmax partials in parallel (`pm`/`pl`/`pacc`), then combine into `o`.
     /// Parallelizes attention across `nh*n_chunks` workgroups so it stays fast at long context.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn attention_kv_split(
         &self,
         q: &dyn Buffer,
@@ -2088,6 +2089,12 @@ impl<'a> Recorder<'a> {
         pm: &dyn Buffer,
         pl: &dyn Buffer,
         pacc: &dyn Buffer,
+        // Small-m generalization: `rows` query rows at absolute positions pos..pos+rows-1 (decode
+        // = 1 row at kv_len-1). Row r's causal end is pos+r+1; workgroup y picks the row; the
+        // partial scratch and `o` are [rows*nh, ...] row-major — the combine treats (rows*nh) as
+        // its head count unchanged, and o IS the [rows, nh, hd] dst.
+        rows: usize,
+        pos: usize,
         kv_len: usize,
         nh: usize,
         nkv: usize,
@@ -2110,8 +2117,8 @@ impl<'a> Recorder<'a> {
             (false, true) => ("attn_partial_vq8", crate::gemm::attn_partial_vq8_spv()),
             (true, true) => ("attn_partial_q8", crate::gemm::attn_partial_q8_spv()),
         };
-        let k1 = self.be.kernel_sg(p1name, p1spv, 6, 36, 32);
-        let mut p1 = [0u8; 36];
+        let k1 = self.be.kernel_sg(p1name, p1spv, 6, 44, 32);
+        let mut p1 = [0u8; 44];
         p1[0..4].copy_from_slice(&(kv_len as u32).to_ne_bytes());
         p1[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
         p1[8..12].copy_from_slice(&(nkv as u32).to_ne_bytes());
@@ -2121,7 +2128,9 @@ impl<'a> Recorder<'a> {
         p1[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
         p1[28..32].copy_from_slice(&scale.to_ne_bytes());
         p1[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
-        self.dispatch(
+        p1[36..40].copy_from_slice(&(pos as u32).to_ne_bytes());
+        p1[40..44].copy_from_slice(&(rows as u32).to_ne_bytes());
+        self.dispatch3(
             k1,
             &[
                 Self::vkb(q),
@@ -2134,15 +2143,18 @@ impl<'a> Recorder<'a> {
             3,
             &p1,
             (nh * n_chunks) as u32,
+            rows as u32,
+            1,
         );
-        // pass 2: combine — split each head's hd outputs across `ntile` workgroups for occupancy.
+        // pass 2: combine — split each (row, head)'s hd outputs across `ntile` workgroups for
+        // occupancy. The combine is row-agnostic: rows*nh independent [n_chunks] partial sets.
         self.stamp("attn_combine");
         let k2 = self
             .be
             .kernel("attn_combine", crate::gemm::attn_combine_spv(), 4, 16);
         let ntile = if hd.is_multiple_of(4) { 4u32 } else { 1u32 };
         let mut p2 = [0u8; 16];
-        p2[0..4].copy_from_slice(&(nh as u32).to_ne_bytes());
+        p2[0..4].copy_from_slice(&((rows * nh) as u32).to_ne_bytes());
         p2[4..8].copy_from_slice(&(hd as u32).to_ne_bytes());
         p2[8..12].copy_from_slice(&(n_chunks as u32).to_ne_bytes());
         p2[12..16].copy_from_slice(&ntile.to_ne_bytes());
@@ -2151,7 +2163,7 @@ impl<'a> Recorder<'a> {
             &[Self::vkb(pm), Self::vkb(pl), Self::vkb(pacc), Self::vkb(o)],
             1,
             &p2,
-            nh as u32 * ntile,
+            (rows * nh) as u32 * ntile,
         );
     }
 
@@ -3991,6 +4003,8 @@ mod tests {
             pm.as_ref(),
             pl.as_ref(),
             pacc.as_ref(),
+            1,          // rows (decode shape)
+            kv_len - 1, // pos of the single query row
             kv_len,
             nh,
             nkv,

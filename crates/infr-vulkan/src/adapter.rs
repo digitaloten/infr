@@ -1137,14 +1137,21 @@ fn lower_op(
                     && !(k_q8_eff || v_q8_eff)
                     && matches!(graph.tensors[q.0 as usize].kind, TensorKind::Internal)
                     && matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal);
-                // Decode (rows==1): flash-decoding split-K — each head's KV range splits across
-                // ~32 chunks of workgroups instead of the scalar attention_kv's rows*nh (= nh at
-                // decode, ~16 workgroups on a 96-CU GPU — the decode bottleneck). attn_partial
-                // handles any hd%4==0 ≤ 512 (hd=128 fast path, general path above), any scale
-                // (push constant; gemma4 uses 1.0), and SWA windows (chunks below the window
-                // clamp to empty → zero-weight partials the combine skips).
+                // Decode (rows==1) AND small-m suffix prefill (rows 2..63, below the flash/nonfa
+                // floor): flash-decoding split-K — each (row, head)'s KV range splits across ~32
+                // chunks of workgroups instead of the scalar attention_kv's rows*nh (= nh at
+                // decode, ~16 workgroups on a 96-CU GPU; the SHORT TURN suffix shape measured
+                // ~2.5ms/layer scalar = 97% of the forward at d4096). attn_partial handles any
+                // hd%4==0 ≤ 512 (hd=128 fast path, general path above), any scale (push constant;
+                // gemma4 uses 1.0), SWA windows, and per-row causal ends (row r attends
+                // ≤ pos + r). Native Q8 reads are decode-only (rows>1 already dequanted to the
+                // f16 scratch above, so k/v_q8_eff are false there by construction).
                 let chunk = (kv_len / 32).clamp(64, 512);
-                let split_ok = rows == 1 && kv_len > chunk && hd % 4 == 0 && hd <= 512;
+                let split_ok = rows < 64
+                    && kv_len > chunk
+                    && hd % 4 == 0
+                    && hd <= 512
+                    && (rows == 1 || !(k_q8_eff || v_q8_eff));
                 if flash_ok {
                     let mpad = rows.div_ceil(64) * 64;
                     // Pooled split partials (fully written before the combine reads them) — one
@@ -1218,9 +1225,11 @@ fn lower_op(
                         AttnMask::SlidingWindow(w) => *w,
                     };
                     let n_chunks = kv_len.div_ceil(chunk);
-                    let pm = pooled(pool, be_, "split_pm", nh * n_chunks * 4)?;
-                    let pl = pooled(pool, be_, "split_pl", nh * n_chunks * 4)?;
-                    let pacc = pooled(pool, be_, "split_pacc", nh * n_chunks * hd * 4)?;
+                    // Scratch scales with rows (rows*nh partial planes); rows==1 keeps the old
+                    // decode sizes, so the hot decode pool entries are unchanged.
+                    let pm = pooled(pool, be_, "split_pm", rows * nh * n_chunks * 4)?;
+                    let pl = pooled(pool, be_, "split_pl", rows * nh * n_chunks * 4)?;
+                    let pacc = pooled(pool, be_, "split_pacc", rows * nh * n_chunks * hd * 4)?;
                     let kcb = match &kc_key {
                         Some(k) => pool[k].as_ref(),
                         None => r(*k_cache)?,
@@ -1237,6 +1246,8 @@ fn lower_op(
                         pool[&pm].as_ref(),
                         pool[&pl].as_ref(),
                         pool[&pacc].as_ref(),
+                        rows,
+                        pos as usize,
                         kv_len,
                         nh,
                         nkv,
@@ -2272,6 +2283,129 @@ mod tests {
                 got[i],
                 want[i]
             );
+        }
+    }
+
+    /// Small-m attention through the split-K path (rows 2..63, kv_len > chunk — the SHORT TURN
+    /// suffix-prefill shape): every row's output must match a host oracle with the PER-ROW causal
+    /// bound (row r attends keys 0..=pos+r), full-causal and sliding-window. rows=17 also covers
+    /// the 9..63 band; kv_len=300 > chunk (=64) forces the split route, not the scalar fallback.
+    #[test]
+    fn attention_small_m_split_matches_host() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        let (nh, nkv, hd) = (4usize, 2usize, 64usize);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let group = nh / nkv;
+        let to_f16 = |v: &[f32]| -> Vec<u8> {
+            v.iter()
+                .flat_map(|&x| half::f16::from_f32(x).to_le_bytes())
+                .collect()
+        };
+        let deq = |b: &[u8]| -> Vec<f32> {
+            b.chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect()
+        };
+        for (rows, window) in [(2usize, 0usize), (5, 0), (8, 0), (17, 0), (4, 128)] {
+            let kv_len = 300usize;
+            let pos = kv_len - rows; // the suffix occupies the last `rows` positions
+            let q: Vec<f32> = (0..rows * nh * hd)
+                .map(|i| (i as f32 * 0.03).sin())
+                .collect();
+            let k: Vec<f32> = (0..kv_len * nkv * hd)
+                .map(|i| (i as f32 * 0.011).cos())
+                .collect();
+            let v: Vec<f32> = (0..kv_len * nkv * hd)
+                .map(|i| ((i % 173) as f32) * 0.011 - 0.9)
+                .collect();
+            let (qf, kf, vf) = (to_f16(&q), to_f16(&k), to_f16(&v));
+            let (qd, kd, vd) = (deq(&qf), deq(&kf), deq(&vf));
+            // host oracle: per-row causal end pos+r+1, window lo = max(0, end - window)
+            let mut want = vec![0f32; rows * nh * hd];
+            for r0 in 0..rows {
+                let end = pos + r0 + 1;
+                let lo = if window > 0 && end > window {
+                    end - window
+                } else {
+                    0
+                };
+                for h in 0..nh {
+                    let kvh = h / group;
+                    let mut sc = vec![0f32; end - lo];
+                    let mut mx = f32::NEG_INFINITY;
+                    for (jj, scj) in sc.iter_mut().enumerate() {
+                        let j = lo + jj;
+                        let d: f32 = (0..hd)
+                            .map(|x| qd[(r0 * nh + h) * hd + x] * kd[(j * nkv + kvh) * hd + x])
+                            .sum();
+                        *scj = d * scale;
+                        mx = mx.max(*scj);
+                    }
+                    let l: f32 = sc.iter().map(|s| (s - mx).exp()).sum();
+                    for (jj, &s) in sc.iter().enumerate() {
+                        let j = lo + jj;
+                        let p = (s - mx).exp() / l;
+                        for x in 0..hd {
+                            want[(r0 * nh + h) * hd + x] += p * vd[(j * nkv + kvh) * hd + x];
+                        }
+                    }
+                }
+            }
+            let mut g = Graph::new();
+            let qi = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F16));
+            let ki = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+            let vi = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+            let yi = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+            g.push(Op::Attention {
+                q: qi,
+                k_cache: ki,
+                v_cache: vi,
+                dst: yi,
+                rows: rows as u32,
+                kv_len: kv_len as u32,
+                n_head: nh as u32,
+                n_kv: nkv as u32,
+                head_dim: hd as u32,
+                scale,
+                mask: if window > 0 {
+                    AttnMask::SlidingWindow(window)
+                } else {
+                    AttnMask::Causal
+                },
+                pos: pos as u32,
+            });
+            let qb = be_.alloc(qf.len(), BufferUsage::Activations).unwrap();
+            let kb = be_.alloc(kf.len(), BufferUsage::Activations).unwrap();
+            let vb = be_.alloc(vf.len(), BufferUsage::Activations).unwrap();
+            let yb = be_
+                .alloc(rows * nh * hd * 4, BufferUsage::Activations)
+                .unwrap();
+            be_.upload(qb.as_ref(), &qf).unwrap();
+            be_.upload(kb.as_ref(), &kf).unwrap();
+            be_.upload(vb.as_ref(), &vf).unwrap();
+            let plan = be_.compile(&g).unwrap();
+            let mut bind = Bindings::new();
+            bind.bind(qi, qb.as_ref());
+            bind.bind(ki, kb.as_ref());
+            bind.bind(vi, vb.as_ref());
+            bind.bind(yi, yb.as_ref());
+            be_.execute(plan.as_ref(), &bind).unwrap();
+            let mut got = vec![0f32; rows * nh * hd];
+            be_.download(yb.as_ref(), bytemuck::cast_slice_mut(&mut got))
+                .unwrap();
+            for i in 0..rows * nh * hd {
+                assert!(
+                    (got[i] - want[i]).abs() < 2e-2,
+                    "small-m attention mismatch rows={rows} window={window} at {i} \
+                     (row {} head {}): got {} want {}",
+                    i / (nh * hd),
+                    (i / hd) % nh,
+                    got[i],
+                    want[i]
+                );
+            }
         }
     }
 

@@ -560,6 +560,8 @@ fn decode_attn_variants_bench() {
             pm.as_ref(),
             pl.as_ref(),
             pacc.as_ref(),
+            1,          // rows (decode shape)
+            kv_len - 1, // pos of the single query row
             kv_len,
             nh,
             nkv,

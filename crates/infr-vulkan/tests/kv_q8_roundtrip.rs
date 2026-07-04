@@ -162,6 +162,8 @@ fn planar_q8_attn_partial_matches_f16() {
         pm.as_ref(),
         pl.as_ref(),
         pacc.as_ref(),
+        1,          // rows (decode shape)
+        kv_len - 1, // pos of the single query row
         kv_len,
         nh,
         nkv,
@@ -199,6 +201,8 @@ fn planar_q8_attn_partial_matches_f16() {
         pm2.as_ref(),
         pl2.as_ref(),
         pacc2.as_ref(),
+        1,          // rows (decode shape)
+        kv_len - 1, // pos of the single query row
         kv_len,
         nh,
         nkv,
@@ -285,6 +289,8 @@ fn planar_q8_attn_partial_mixed_kv() {
             pm.as_ref(),
             pl.as_ref(),
             pacc.as_ref(),
+            1,          // rows (decode shape)
+            kv_len - 1, // pos of the single query row
             kv_len,
             nh,
             nkv,

@@ -15,8 +15,13 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 layout(push_constant) uniform PC {
     uint kv_len; uint nh; uint nkv; uint hd; uint chunk; uint n_chunks; uint window; float scale;
     uint cap;   // KVQ8: total cache elements — the planar scales region begins at word cap/4
+    // Small-m rows (STATIC path only; the dyn/replay variants stay rows==1, dispatch 1D, and never
+    // read these — their push stays short, like `cap` for the f16 dyn variant): `rows` query rows
+    // at absolute positions pos..pos+rows-1. gl_WorkGroupID.y picks the row; each row's causal end
+    // is pos+row+1. A 1D dispatch with rows=1, pos=kv_len-1 is EXACTLY the old decode behavior.
+    uint pos; uint rows;
 } pc;
-layout(binding = 0) readonly buffer QB { f16vec4 q4[]; };    // [nh, hd] as vec4
+layout(binding = 0) readonly buffer QB { f16vec4 q4[]; };    // [rows, nh, hd] as vec4
 // PLANAR Q8_0 KV cache (per-side): codes int8[cap] then scales f16[cap/32] (see store_q8), read as
 // `uint` words — each `f16vec4` load becomes ONE aligned u32 (4 codes) + one scale word shared by the
 // 8 vec4s of a block. K and V pick their dtype INDEPENDENTLY (-DKQ8 / -DVQ8), so the four f16/q8
@@ -80,13 +85,22 @@ void main() {
     float scale = pc.scale > 0.0 ? pc.scale : 1.0 / sqrt(float(hd));
 #ifdef USE_PARAMS
     uint kv_len = p_kvlen;
+#endif
+#ifdef USE_PARAMS
+    // Replay decode: always a single row, the query IS position kv_len-1.
+    uint row = 0u;
+    uint qpos1 = kv_len;
 #else
     uint kv_len = pc.kv_len;
+    // Small-m static path: workgroup y picks the query row (1D dispatch → row 0 = old decode);
+    // this row's causal END is its absolute position + 1 (mirrors attention_kv's per-row bound).
+    uint row = gl_WorkGroupID.y;
+    uint qpos1 = pc.pos + row + 1u;
 #endif
-    // Sliding-window attention (decode: the query is position kv_len-1): attend only keys
-    // j >= lo. 0 = full causal. Chunks below `lo` never dispatch work — SELF_CHUNK offsets its
-    // chunk grid by `lo`; the static path clamps each chunk's range (empty → zero-weight partial).
-    uint lo = (pc.window > 0u && kv_len > pc.window) ? kv_len - pc.window : 0u;
+    // Sliding-window attention: THIS ROW attends only keys j >= lo (0 = full causal). Chunks below
+    // `lo` never dispatch work — SELF_CHUNK offsets its chunk grid by `lo`; the static path clamps
+    // each chunk's range (empty → zero-weight partial).
+    uint lo = (pc.window > 0u && qpos1 > pc.window) ? qpos1 - pc.window : 0u;
 #ifdef SELF_CHUNK
     // Record-once replay with a growing kv_len: chunk/n_chunks are baked at record, but ONE baked
     // chunk can't serve every depth (small chunks drown in per-workgroup overhead at deep kv; big
@@ -113,10 +127,10 @@ void main() {
     uint c = rest % pc.n_chunks;
     uint kvh = rest / pc.n_chunks;
     uint h = kvh * g + hh;
-    // Clamp to the window: a chunk fully below `lo` gets an empty range → zero-weight partial
-    // (m = -3e38, l = 0) the combine's `wexp != 0` test skips.
+    // Clamp to the window AND this row's causal end: a chunk fully outside either gets an empty
+    // range → zero-weight partial (m = -3e38, l = 0) the combine's `wexp != 0` test skips.
     uint j0 = max(c * pc.chunk, lo);
-    uint j1 = min(c * pc.chunk + pc.chunk, kv_len);
+    uint j1 = min(c * pc.chunk + pc.chunk, qpos1);
 #endif
 
     // QK via subgroup reduction (one key per subgroup-iteration; vec4 coalesced K reads). Each lane's
@@ -126,7 +140,7 @@ void main() {
     uint nsg = gl_NumSubgroups;          // 2
     vec4 qreg[4];
     uint nq = 0u;
-    for (uint r = lane; r < hd4; r += 32u) { qreg[nq] = vec4(q4[h * hd4 + r]); nq++; }
+    for (uint r = lane; r < hd4; r += 32u) { qreg[nq] = vec4(q4[(row * pc.nh + h) * hd4 + r]); nq++; }
     float lmax = -3.0e38;
     uint j = j0 + sg;
     if (hd4 == 32u) {
@@ -190,7 +204,7 @@ void main() {
     float l = red[0];
 
     // V: thread owns a vec4 of output dims; one wide coalesced load per key.
-    uint pbase = (h * pc.n_chunks + c) * hd;
+    uint pbase = ((row * pc.nh + h) * pc.n_chunks + c) * hd;
     if (hd4 <= 32u) {
         // Full-occupancy V: each lane owns dim `lane`, and the TWO subgroups split the key range
         // (sg reads keys j0+sg, j0+sg+nsg, …). Both subgroups now issue V loads — the old loop ran V
@@ -233,5 +247,8 @@ void main() {
             pacc[pbase + 4u * g + 3u] = acc.w;
         }
     }
-    if (t == 0u) { pm[h * pc.n_chunks + c] = m; pl[h * pc.n_chunks + c] = l; }
+    if (t == 0u) {
+        pm[(row * pc.nh + h) * pc.n_chunks + c] = m;
+        pl[(row * pc.nh + h) * pc.n_chunks + c] = l;
+    }
 }
