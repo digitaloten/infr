@@ -211,7 +211,8 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
                 ..
             } => {
                 if *head_k > 256
-                    || !(head_v.is_multiple_of(32) && *head_v <= 1024)
+                    || !head_k.is_multiple_of(32)
+                    || !(head_v.is_multiple_of(4) && *head_v <= 1024)
                     || std::env::var("INFR_METAL_NODELTA").is_ok()
                     || bindings.get(*state).is_none()
                 {
@@ -2933,20 +2934,32 @@ impl MetalBackend {
                     head_k as usize,
                     head_v as usize,
                 );
-                // Device path: one threadgroup per value head, one lane per value dim — each
-                // lane owns state column S[:, d] (the delta-rule update touches only that
-                // column, so the row scan needs no state synchronization). State updates the
-                // BOUND buffer in place. Gates match the kernel's shared/thread budgets.
+                // Device path: one SIMDGROUP per (value-dim, head) — 32 lanes split the k-dim
+                // (kd/32 state entries per lane, register-resident for the whole chunk), so the
+                // row scan needs only simd_sums; 4 simdgroups share a threadgroup for occupancy
+                // (grid = nv * vd/4 threadgroups vs the old nv). State updates the BOUND buffer
+                // in place. Gates match the kernel's register/split budgets (kd % 32 for the
+                // per-lane split, kd <= 256 for the ls[] register cap, vd % 4 for the
+                // simdgroup packing).
                 if kd <= 256
-                    && vd.is_multiple_of(32)
+                    && kd.is_multiple_of(32)
+                    && vd.is_multiple_of(4)
                     && vd <= 1024
                     && std::env::var("INFR_METAL_NODELTA").is_err()
                 {
                     if let Some(sb) = bindings.get(state) {
+                        // KPL = kd/32 is a compile-time template parameter (register
+                        // promotion needs the fixed bound) — pick the instantiation.
+                        let dn_kern: &'static str = match kd / 32 {
+                            1 => "deltanet_f32_k1",
+                            2 => "deltanet_f32_k2",
+                            4 => "deltanet_f32_k4",
+                            _ => "deltanet_f32_k8",
+                        };
                         let fits = self
                             .pipelines
-                            .get("deltanet_f32")
-                            .map(|pl| pl.max_total_threads_per_threadgroup() >= vd as u64)
+                            .get(dn_kern)
+                            .map(|pl| pl.max_total_threads_per_threadgroup() >= 128)
                             .unwrap_or(false);
                         if fits {
                             let bq = self.ensure_device(r, q);
@@ -2961,7 +2974,7 @@ impl MetalBackend {
                             let i = state.0 as usize;
                             r.dev[i] = Some(Arc::new(sbuf.raw.clone()));
                             r.loc[i] = Loc::Device;
-                            let pso = self.pipelines.get("deltanet_f32")?;
+                            let pso = self.pipelines.get(dn_kern)?;
                             let mut p = (rr as u32).to_ne_bytes().to_vec();
                             p.extend_from_slice(&(nv as u32).to_ne_bytes());
                             p.extend_from_slice(&(nk as u32).to_ne_bytes());
@@ -2984,8 +2997,8 @@ impl MetalBackend {
                                 ],
                                 (1 << 7) | (1 << 8),
                                 &p,
-                                nv * vd,
-                                vd,
+                                nv * (vd / 4) * 128,
+                                128,
                             );
                             r.loc[dst.0 as usize] = Loc::Device;
                             return Ok(());
