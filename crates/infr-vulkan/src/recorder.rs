@@ -3569,6 +3569,31 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Broadcast bias add: `y[i] = x[i] + bias[i % n]` over `rows*n` elements (Qwen2 q/k/v `Wx+b`).
+    pub fn add_bias(
+        &self,
+        x: &dyn Buffer,
+        bias: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        n: usize,
+    ) {
+        self.stamp("add_bias");
+        let total = (rows * n) as u32;
+        let k = self
+            .be
+            .kernel("add_bias", crate::gemm::add_bias_spv(), 3, 8);
+        let mut pc = (n as u32).to_ne_bytes().to_vec();
+        pc.extend_from_slice(&total.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(bias), Self::vkb(y)],
+            1,
+            &pc,
+            total.div_ceil(64),
+        );
+    }
+
     /// End recording, submit once, wait, and release transient objects.
     pub fn finish(self) -> Result<()> {
         let device = &self.be.shared.device;

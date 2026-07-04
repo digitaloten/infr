@@ -188,7 +188,9 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
             | Op::Linear { .. }
             | Op::GatedAct { .. }
             | Op::GatedActFused { .. }
-            | Op::Add { .. } => {}
+            | Op::Add { .. }
+            // Qwen2 q/k/v bias: pos-independent elementwise over a bound weight — replay-safe.
+            | Op::AddBias { .. } => {}
             Op::QkNormRope { .. } | Op::Rope { .. } => has_rope = true,
             // qwen35 (Qwen3-Next) decode ops: all pos-independent, on-device, recurrent state
             // updated in the BOUND buffer — tape-safe when the arm's device gate holds (the
@@ -327,6 +329,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::GatedAct { .. } => "GatedAct",
         Op::GatedActFused { .. } => "GatedActFused",
         Op::Add { .. } => "Add",
+        Op::AddBias { .. } => "AddBias",
         Op::Scale { .. } => "Scale",
         Op::Softcap { .. } => "Softcap",
         Op::Copy { .. } => "Copy",
@@ -1812,6 +1815,33 @@ impl MetalBackend {
                     1 << 2,
                     &(n as u32).to_ne_bytes(),
                     n,
+                );
+                r.loc[dst.0 as usize] = Loc::Device;
+            }
+            // Broadcast bias add (Qwen2 q/k/v `Wx + b`): `dst[i] = x[i] + bias[i % n]` over rows*n
+            // elements. `bias` is a bound weight (f32); dst-write-mask 1<<2 for the replay barriers.
+            Op::AddBias {
+                x,
+                bias,
+                dst,
+                rows,
+                n,
+            } => {
+                let (rows, n) = (rows as usize, n as usize);
+                let total = rows * n;
+                let bx = self.ensure_device(r, x);
+                let bb = self.weight_buf(bias, g, bindings);
+                let bd = self.dev_dst(r, dst, total);
+                let pso = self.pipelines.get("add_bias_f32")?;
+                let mut p = (n as u32).to_ne_bytes().to_vec();
+                p.extend_from_slice(&(total as u32).to_ne_bytes());
+                self.encode_w(
+                    r,
+                    &pso,
+                    &[bx.as_ref(), bb.as_ref(), bd.as_ref()],
+                    1 << 2,
+                    &p,
+                    total,
                 );
                 r.loc[dst.0 as usize] = Loc::Device;
             }

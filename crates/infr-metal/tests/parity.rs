@@ -185,6 +185,31 @@ fn add_parity() {
     assert_parity(&g, &bound, dst, n, 0.0);
 }
 
+// Broadcast bias add (Qwen2/2.5 q/k/v `Wx + b`): `dst[r*n+c] = x[r*n+c] + bias[c]`. `bias` is a
+// bound weight; `n=7` (not a 64-wide-workgroup multiple) exercises the `% n` broadcast + the tail.
+// Exact (both backends do f32 x + f32 bias), so tol 0.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn add_bias_parity() {
+    let (rows, n) = (5usize, 7usize);
+    let mut g = Graph::new();
+    let x = g.input(TensorDesc::new(vec![rows, n], DType::F32));
+    let bias = g.weight(TensorDesc::new(vec![n], DType::F32));
+    let dst = g.output(TensorDesc::new(vec![rows, n], DType::F32));
+    g.push(Op::AddBias {
+        x,
+        bias,
+        dst,
+        rows: rows as u32,
+        n: n as u32,
+    });
+    let bound = vec![
+        (x, f32_bytes(&rand_f32(rows * n, 71))),
+        (bias, f32_bytes(&rand_f32(n, 72))),
+    ];
+    assert_parity(&g, &bound, dst, rows * n, 0.0);
+}
+
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn scale_parity() {

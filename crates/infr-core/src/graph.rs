@@ -196,6 +196,17 @@ pub enum Op {
         dst: TensorId,
         n: u32,
     },
+    /// Broadcast bias add: `dst[r*n + c] = x[r*n + c] + bias[c]` for `r` in `0..rows`, `c` in
+    /// `0..n`. `bias` is a length-`n` vector added to every one of the `rows` rows (a projection's
+    /// `Wx + b`). Qwen2/2.5 bias their q/k/v projections; the seam has no bias otherwise. In place
+    /// when `dst == x`.
+    AddBias {
+        x: TensorId,
+        bias: TensorId,
+        dst: TensorId,
+        rows: u32,
+        n: u32,
+    },
     /// `dst[i] = x[i] * s` (Gemma per-layer output scale, embedding scale).
     Scale {
         x: TensorId,
@@ -312,6 +323,7 @@ impl Op {
             Op::GatedAct { .. } => "GatedAct",
             Op::GatedActFused { .. } => "GatedActFused",
             Op::Add { .. } => "Add",
+            Op::AddBias { .. } => "AddBias",
             Op::Scale { .. } => "Scale",
             Op::Softcap { .. } => "Softcap",
             Op::Copy { .. } => "Copy",

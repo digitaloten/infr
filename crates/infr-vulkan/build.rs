@@ -74,6 +74,7 @@ fn main() {
         ("copy_strided", "copy_strided", &[]),
         ("mul_sigmoid", "mul_sigmoid", &[]),
         ("add", "add", &[]),
+        ("add_bias", "add_bias", &[]),
         ("add_scaled", "add_scaled", &[]),
         ("scale", "scale", &[]),
         ("softcap", "softcap", &[]),

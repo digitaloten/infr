@@ -45,6 +45,10 @@ struct LayerW {
     wq: TensorId,
     wk: TensorId,
     wv: Option<TensorId>,
+    // Qwen2/2.5 q/k/v projection biases (`Config::qkv_bias`); `None` on every bias-free arch.
+    qb: Option<TensorId>,
+    kb: Option<TensorId>,
+    vb: Option<TensorId>,
     q_norm: Option<TensorId>,
     k_norm: Option<TensorId>,
     wo: TensorId,
@@ -801,6 +805,46 @@ pub(crate) fn generate_dense_backend(
         // one owned buffer (the combined gate+up upload; same dtype, row-major concat of [nff, ne]
         // tensors = a valid [k*nff, ne] tensor). Records the native dtype + element count so
         // `build` declares the handle to match.
+        // NEOX→NORM row permute (qwen2, `Config::permute_qk_neox`): qwen2's GGUF keeps attn_q/attn_k
+        // in the HF rotate-half order (the converter only permutes llama-arch), but the no-qknorm
+        // path's `Op::Rope` is the INTERLEAVED rotation. Reordering each head's rows at load —
+        // new[2p] = old[p], new[2p+1] = old[p + rd/2], dims past rope_dim pass through — makes NORM
+        // rope over the permuted projections equal NEOX over the originals (llama.cpp's convert-time
+        // permute), with no kernel variant on any backend. Row reorder is quant-block-safe (blocks
+        // run along the input dim, whole rows move). Returns the head count for a q/k tensor, or
+        // None (no permute).
+        let qk_perm_heads = |name: &str| -> Option<usize> {
+            if !c.permute_qk_neox {
+                return None;
+            }
+            if name.ends_with("attn_q.weight") || name.ends_with("attn_q.bias") {
+                Some(c.n_head)
+            } else if name.ends_with("attn_k.weight") || name.ends_with("attn_k.bias") {
+                Some(c.n_kv)
+            } else {
+                None
+            }
+        };
+        let permute_rows = |src: &[u8], heads: usize, row_b: usize| -> Vec<u8> {
+            let (hd, rd) = (c.head_dim, c.rope_dim);
+            let mut out = vec![0u8; src.len()];
+            for h in 0..heads {
+                for j in 0..hd {
+                    let sj = if j < rd {
+                        if j % 2 == 0 {
+                            j / 2
+                        } else {
+                            j / 2 + rd / 2
+                        }
+                    } else {
+                        j
+                    };
+                    let (d, s) = ((h * hd + j) * row_b, (h * hd + sj) * row_b);
+                    out[d..d + row_b].copy_from_slice(&src[s..s + row_b]);
+                }
+            }
+            out
+        };
         let mut wload = |names: &[&str]| -> AResult<()> {
             let info = |name: &str| {
                 g.tensors()
@@ -809,10 +853,26 @@ pub(crate) fn generate_dense_backend(
                     .cloned()
                     .ok_or_else(|| anyhow!("tensor not found: {name}"))
             };
+            // Bytes-per-row for the permute: a weight row is `n_embd` elements of the tensor's
+            // dtype (block-aligned); a bias "row" is one f32.
+            let row_bytes = |name: &str, dt: DType| -> usize {
+                if name.ends_with(".bias") {
+                    4
+                } else {
+                    infr_gguf::nbytes(dt, c.n_embd)
+                }
+            };
             let (bytes, dt, numel) = if let [name] = names {
                 let i = info(name)?;
                 let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
-                (WBytes::Mmap(tb), i.dtype, i.shape.iter().product())
+                let numel = i.shape.iter().product();
+                match qk_perm_heads(name) {
+                    Some(heads) => {
+                        let rb = row_bytes(name, i.dtype);
+                        (WBytes::Owned(permute_rows(&tb, heads, rb)), i.dtype, numel)
+                    }
+                    None => (WBytes::Mmap(tb), i.dtype, numel),
+                }
             } else {
                 let mut cat = Vec::new();
                 let mut numel = 0usize;
@@ -823,7 +883,13 @@ pub(crate) fn generate_dense_backend(
                         return Err(anyhow!("wload concat dtype mismatch: {names:?}"));
                     }
                     numel += i.shape.iter().product::<usize>();
-                    cat.extend_from_slice(&g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?);
+                    let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
+                    match qk_perm_heads(name) {
+                        Some(heads) => {
+                            cat.extend_from_slice(&permute_rows(&tb, heads, row_bytes(name, dt)))
+                        }
+                        None => cat.extend_from_slice(&tb),
+                    }
                 }
                 (WBytes::Owned(cat), dt, numel)
             };
@@ -849,6 +915,13 @@ pub(crate) fn generate_dense_backend(
                 if has_wv[l] {
                     wload(&[&p("attn_v.weight")])?;
                 }
+            }
+            // Qwen2/2.5 q/k/v projection biases (small f32 [out_f] vectors). Loaded AFTER the q/k/v
+            // weights so the upload order matches the `wpush` order below.
+            if c.qkv_bias {
+                wload(&[&p("attn_q.bias")])?;
+                wload(&[&p("attn_k.bias")])?;
+                wload(&[&p("attn_v.bias")])?;
             }
             if qk_norm {
                 wload(&[&p("attn_q_norm.weight")])?;
@@ -1086,6 +1159,18 @@ pub(crate) fn generate_dense_backend(
                 };
                 (wq, wk, wv)
             };
+            // Qwen2 q/k/v biases — pushed here to match the `wload` order (after the q/k/v weights,
+            // before qk_norm). Always three separate handles (they add to the SPLIT q/k/v buffers,
+            // independent of whether the weights were fused).
+            let (qb, kb, vb) = if c.qkv_bias {
+                (
+                    Some(wpush(&mut g, &mut weights)),
+                    Some(wpush(&mut g, &mut weights)),
+                    Some(wpush(&mut g, &mut weights)),
+                )
+            } else {
+                (None, None, None)
+            };
             let (q_norm, k_norm) = if qk_norm {
                 (
                     Some(wpush(&mut g, &mut weights)),
@@ -1139,6 +1224,9 @@ pub(crate) fn generate_dense_backend(
                 wq,
                 wk,
                 wv,
+                qb,
+                kb,
+                vb,
                 q_norm,
                 k_norm,
                 wo,
@@ -1352,6 +1440,17 @@ pub(crate) fn generate_dense_backend(
                     w_off: 0,
                 });
             }
+            // Qwen2 q-bias: `q += qb` after the projection (all three projection paths converge on
+            // `q` here), before RoPE. `Wx + b`.
+            if let Some(qb) = lw.qb {
+                g.push(Op::AddBias {
+                    x: q,
+                    bias: qb,
+                    dst: q,
+                    rows: batch as u32,
+                    n: qrow as u32,
+                });
+            }
             if own_kv {
                 if !fuse_qkv {
                     g.push(Op::Linear {
@@ -1383,6 +1482,28 @@ pub(crate) fn generate_dense_backend(
                             n: (batch * kvrow) as u32,
                         }),
                     }
+                }
+                // Qwen2 k/v-bias: `k += kb`, `v += vb` after the projections (here q/k/v are all
+                // materialized in every path — fused prefill/decode projected k/v above, the split
+                // form just did), BEFORE the K RoPE and the V-norm/WriteKv. Emitted before the K
+                // QkNormRope so that op stays adjacent to its WriteKv (see below).
+                if let Some(kb) = lw.kb {
+                    g.push(Op::AddBias {
+                        x: k,
+                        bias: kb,
+                        dst: k,
+                        rows: batch as u32,
+                        n: kvrow as u32,
+                    });
+                }
+                if let Some(vb) = lw.vb {
+                    g.push(Op::AddBias {
+                        x: v,
+                        bias: vb,
+                        dst: v,
+                        rows: batch as u32,
+                        n: kvrow as u32,
+                    });
                 }
                 // gemma4 weightless per-head RMSNorm on V (= x/rms) before caching. Emitted BEFORE
                 // the K QkNormRope so that op stays ADJACENT to its WriteKv — the Vulkan adapter's

@@ -597,6 +597,13 @@ fn lower_op(
             }
         }
         Op::Add { a, b, dst, n } => rec.add(r(*a)?, r(*b)?, r(*dst)?, *n as usize),
+        Op::AddBias {
+            x,
+            bias,
+            dst,
+            rows,
+            n,
+        } => rec.add_bias(r(*x)?, r(*bias)?, r(*dst)?, *rows as usize, *n as usize),
         Op::Scale { x, dst, s, n } => {
             let n = *n as usize;
             // recorder `scale` is in place on its buffer; copy x→dst first if they differ.

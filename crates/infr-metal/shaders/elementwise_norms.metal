@@ -7,6 +7,17 @@ kernel void add_f32(device const float* a   [[buffer(0)]],
     if (gid < n) dst[gid] = a[gid] + b[gid];
 }
 
+// Broadcast bias add (Qwen2/2.5 q/k/v `Wx + b`): dst[i] = x[i] + bias[i % n] over `total = rows*n`
+// elements. Params: n = bias length / row width, total = rows*n.
+struct AddBiasParams { uint n; uint total; };
+kernel void add_bias_f32(device const float* x    [[buffer(0)]],
+                         device const float* bias [[buffer(1)]],
+                         device float*       dst  [[buffer(2)]],
+                         constant AddBiasParams& p [[buffer(3)]],
+                         uint gid [[thread_position_in_grid]]) {
+    if (gid < p.total) dst[gid] = x[gid] + bias[gid % p.n];
+}
+
 struct ScaleParams { float s; uint n; };
 kernel void scale_f32(device const float* x   [[buffer(0)]],
                       device float*       dst [[buffer(1)]],

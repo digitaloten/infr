@@ -35,6 +35,17 @@ pub struct Config {
     pub eos_ids: Vec<u32>,
     /// Qwen3-style per-head RMSNorm on Q and K before RoPE.
     pub qk_norm: bool,
+    /// Qwen2/2.5 add a learned bias to the q/k/v projections (`Wx + b`); Qwen3 dropped them. o-proj
+    /// and FFN stay bias-free. `true` only for `arch == "qwen2"`.
+    pub qkv_bias: bool,
+    /// qwen2 needs the NEOX (rotate-half) RoPE but rides the no-qknorm path, whose `Op::Rope` is the
+    /// INTERLEAVED (NORM) rotation — llama-arch GGUFs get that layout from the converter's q/k row
+    /// permute, qwen2's GGUF stays in HF order. Rather than a NEOX kernel variant on every backend,
+    /// the loader applies the same permute (new\[2p\]=old\[p\], new\[2p+1\]=old\[p+rd/2\] per head) to
+    /// attn_q/attn_k rows + biases: NORM rope over permuted rows == NEOX over the originals, and q·k
+    /// dots are permutation-invariant (K cached permuted, Q permuted identically; V untouched).
+    /// qwen3/gemma rotate NEOX inside QkNormRope directly — no permute.
+    pub permute_qk_neox: bool,
     /// gemma family: scale input embeddings by √n_embd, sandwich norms (post-attn / post-ffw RMSNorm
     /// before the residual add), and a GeGLU (GELU) FFN instead of SwiGLU.
     pub gemma: bool,
@@ -155,12 +166,17 @@ impl Config {
             .unwrap_or("")
             .to_string();
         let qk_norm = match arch.as_str() {
-            "llama" => false,
+            "llama" | "qwen2" => false,
             "qwen3" | "qwen3moe" | "gemma3" | "gemma4" => true,
             other => bail!(
-                "infr-llama supports architecture=llama|qwen3|qwen3moe|gemma3|gemma4, got {other:?}"
+                "infr-llama supports architecture=llama|qwen2|qwen3|qwen3moe|gemma3|gemma4, got {other:?}"
             ),
         };
+        // Qwen2/2.5 bias their q/k/v projections (Qwen3 removed them); every other supported arch is
+        // bias-free on attention. They also keep the HF rotate-half q/k row order (see the
+        // `permute_qk_neox` field doc).
+        let qkv_bias = arch == "qwen2";
+        let permute_qk_neox = arch == "qwen2";
         let gemma4 = arch == "gemma4";
         let gemma = arch == "gemma3" || gemma4;
         let mk = |k: &str| format!("{arch}.{k}");
@@ -326,6 +342,8 @@ impl Config {
             eos,
             eos_ids: vec![eos],
             qk_norm,
+            qkv_bias,
+            permute_qk_neox,
             gemma,
             gemma4,
             head_dim_swa,

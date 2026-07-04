@@ -2955,6 +2955,25 @@ impl Backend for CpuBackend {
                     }
                     vals[dst.0 as usize] = out;
                 }
+                // Broadcast bias: add the length-`n` `bias` to each of `rows` rows (Qwen2 q/k/v).
+                Op::AddBias {
+                    x,
+                    bias,
+                    dst,
+                    rows,
+                    n,
+                } => {
+                    let (rows, n) = (rows as usize, n as usize);
+                    let xs = vals[x.0 as usize].clone();
+                    let bv = weight(bias); // bias is a bound weight, not an activation
+                    let mut out = vec![0f32; rows * n];
+                    for r in 0..rows {
+                        for c in 0..n {
+                            out[r * n + c] = xs[r * n + c] + bv[c];
+                        }
+                    }
+                    vals[dst.0 as usize] = out;
+                }
                 Op::Scale { x, dst, s, n } => {
                     let n = n as usize;
                     let xs = vals[x.0 as usize].clone();

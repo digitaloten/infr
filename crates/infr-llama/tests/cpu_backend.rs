@@ -141,6 +141,30 @@ fn qwen3_quant(quant: &str) -> Option<PathBuf> {
     )
 }
 
+// ─── Qwen2.5-0.5B (dense, BIASED q/k/v) ───────────────────────────────────────────
+// Qwen2/2.5 add a learned bias to the q/k/v projections (Qwen3 dropped them) — the new `AddBias`
+// seam op. The 0.5B-Instruct also ties its output embedding, so this exercises the tied lm-head
+// path too. Gated: needs a Qwen2.5 GGUF in the HF cache, or `INFR_TEST_QWEN2=/path/to.gguf`.
+fn qwen2_05b() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("INFR_TEST_QWEN2") {
+        return Some(PathBuf::from(p));
+    }
+    find_gguf(
+        "unsloth--Qwen2.5-0.5B-Instruct-GGUF",
+        "Qwen2.5-0.5B-Instruct-Q4_K_M.gguf",
+    )
+}
+
+/// Qwen2.5 through the Vulkan seam must match the CPU oracle token-for-token — validates the QKV
+/// bias (`AddBias`) end to end on prefill + decode + record-once replay, plus tied embeddings.
+#[test]
+fn gpu_seam_matches_cpu_qwen2() {
+    let path = need_model!(qwen2_05b(), "Qwen2.5-0.5B-Instruct");
+    need_gpu!();
+    let _tlk = test_serial_lock();
+    seam_vulkan_matches_cpu(&path, "What is the capital of France? Answer briefly.", 16);
+}
+
 // Captured + verified coherent (chat-templated, Qwen3 thinks then answers): "…France's capital is
 // Paris", a simple-terms computer explanation, an ocean paragraph.
 const QWEN3_GOLDEN: &[(&str, usize, u64)] = &[
