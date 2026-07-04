@@ -912,8 +912,7 @@ fn cmd_bench_qwen35(
     let sentence = "The quick brown fox jumps over the lazy dog. "; // ~10 tokens
                                                                     // Depth rides the PROMPT: `GenStats` splits prompt_secs from decode_secs, so decoding at
                                                                     // depth d = a ~d-token prompt whose (untimed-for-tg) prefill fills the state, then the
-                                                                    // timed decode runs at that depth. pp is only reported at depth 0 (a deeper prompt can't
-                                                                    // split its prefill time into "depth warm" vs "measured n_prompt").
+                                                                    // timed decode runs at that depth.
     let prompt_toks = n_prompt + depth;
     let prompt = if prompt_toks > 0 {
         sentence.repeat(prompt_toks.div_ceil(10))
@@ -925,11 +924,34 @@ fn cmd_bench_qwen35(
     m.generate(sentence, 1, &mut |_| {})?;
     let (mut pps, mut tgs) = (Vec::new(), Vec::new());
     let (mut np, mut ng) = (0usize, 0usize);
-    for _ in 0..reps.max(1) {
-        let st = m.generate(&prompt, n, &mut |_| {})?;
-        pps.push(st.n_prompt as f64 / st.prompt_secs.max(1e-9));
-        tgs.push(st.n_gen as f64 / st.decode_secs.max(1e-9));
-        (np, ng) = (st.n_prompt, st.n_gen);
+    if n_gen == 0 && depth > 0 {
+        // pp@depth (the SHORT TURN / suffix shape, llama-bench `-p N -d D`): the session reuses
+        // an exactly-EXTENDED cached sequence, so fill the state to ~depth (untimed), then time
+        // the suffix-only prefill of the extension. Without this split, a single deep prompt
+        // reported BULK prefill throughput labeled as the suffix — pp4@d4096 read 13.9k t/s
+        // (≈ this model's pp512 rate) against llama-bench's true 793. Reps re-fill the depth
+        // each round (a shorter re-prompt zero-resets the recurrent state by contract).
+        // Trim the trailing space: "…dog. " + more text BPE-merges the space into the next word,
+        // changing the depth prompt's LAST token when extended — the session sees a non-extension
+        // and zero-resets (recurrent state can't rewind), silently re-prefilling the whole depth.
+        // Ending on "…dog." keeps tokenize(dprompt) a strict prefix of tokenize(full). The suffix
+        // is N repetitions of a single-token word so the measured suffix is ~N tokens (the label
+        // reports the exact prefilled count).
+        let dprompt = sentence.repeat(depth.div_ceil(10)).trim_end().to_string();
+        let full = format!("{dprompt}{}", " fox".repeat(n_prompt.max(1)));
+        for _ in 0..reps.max(1) {
+            m.generate(&dprompt, 1, &mut |_| {})?; // untimed: state to ~depth
+            let st = m.generate(&full, 1, &mut |_| {})?; // timed part: the suffix prefill
+            pps.push(st.n_prompt as f64 / st.prompt_secs.max(1e-9));
+            np = st.n_prompt;
+        }
+    } else {
+        for _ in 0..reps.max(1) {
+            let st = m.generate(&prompt, n, &mut |_| {})?;
+            pps.push(st.n_prompt as f64 / st.prompt_secs.max(1e-9));
+            tgs.push(st.n_gen as f64 / st.decode_secs.max(1e-9));
+            (np, ng) = (st.n_prompt, st.n_gen);
+        }
     }
     let avg = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
     if json {
