@@ -1244,3 +1244,192 @@ fn gpu_seam_matches_cpu_diffusion_gemma() {
         "CPU/Vulkan last-row logits diverged too far: cosine={cos}"
     );
 }
+
+// ─── DiffusionGemma Phase 2: canvas denoise ─────────────────────────────────────────
+//
+// One bidirectional forward over the C canvas rows, reusing the prompt KV Phase 1's causal
+// prefill already wrote (encoder scalars, rows 0..P) — decoder scalars, the `AttnMask::Canvas`
+// bidirectional mask, and (optionally) self-conditioning. See docs/DIFFUSIONGEMMA.md.
+
+/// CPU-only: prefill a short prompt, then ONE denoise forward over an all-mask canvas
+/// (`sc_logits=None`, matching the reference's step-0 zero-SC gate). Also proves the WriteKv
+/// overwrite (a second denoise call with a DIFFERENT canvas must produce different, still-finite
+/// logits — the next denoise step re-overwrites the same KV rows) and a self-conditioning smoke
+/// test (feeding the first call's raw logits back in must differ from the no-SC call).
+#[test]
+fn cpu_diffusion_gemma_denoise_step() {
+    let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
+    let _tlk = test_serial_lock();
+    std::env::set_var("INFR_TEMP", "0");
+    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let vocab = model.config().vocab;
+    let canvas_len = model.config().canvas_length;
+    let mask_id = model.config().mask_token_id;
+    let tokens = model
+        .encode("What is the capital of France?")
+        .expect("encode");
+    assert!(!tokens.is_empty(), "empty prompt");
+
+    let mut session = model.diffusion_gemma_cpu_session(tokens.len() + canvas_len + 8);
+    let t0 = std::time::Instant::now();
+    session.prefill(&tokens).expect("cpu prefill");
+    eprintln!(
+        "cpu_diffusion_gemma_denoise_step: prefill {} tokens in {:.1}s",
+        tokens.len(),
+        t0.elapsed().as_secs_f64()
+    );
+
+    let canvas: Vec<u32> = vec![mask_id; canvas_len];
+    let t1 = std::time::Instant::now();
+    let logits1 = session
+        .denoise(&canvas, None, 1.0)
+        .expect("cpu denoise step 1 (no SC)");
+    eprintln!(
+        "cpu_diffusion_gemma_denoise_step: denoise (no SC) {:.1}s",
+        t1.elapsed().as_secs_f64()
+    );
+    assert_eq!(logits1.len(), canvas_len * vocab, "denoise logits shape");
+    assert!(
+        logits1.iter().all(|v| v.is_finite()),
+        "non-finite logit in the no-SC denoise output"
+    );
+    for row in 0..canvas_len.min(8) {
+        let row_logits = &logits1[row * vocab..(row + 1) * vocab];
+        let top = top_k(row_logits, 1)[0];
+        println!("row {row} argmax: token {} logit {:.3}", top.0, top.1);
+    }
+
+    // WriteKv overwrite: a second denoise call with a DIFFERENT canvas (row 0 unmasked to the
+    // previous argmax) must produce different, still-finite logits — proving the cache actually
+    // gets re-written each step (not stale-row reuse). Row 0's own argmax over an all-mask canvas
+    // is often the mask token itself (the model's "not enough context yet" answer) — that would
+    // leave canvas2 identical to canvas, so pick the first top-5 candidate that ACTUALLY differs
+    // from mask_id (falling back to a fixed different token if somehow all 5 are the mask token).
+    let mut canvas2 = canvas.clone();
+    canvas2[0] = top_k(&logits1[..vocab], 5)
+        .into_iter()
+        .map(|(id, _)| id as u32)
+        .find(|&id| id != mask_id)
+        .unwrap_or((mask_id + 1) % vocab as u32);
+    assert_ne!(
+        canvas2[0], canvas[0],
+        "test bug: canvas2 didn't actually change row 0"
+    );
+    let t2 = std::time::Instant::now();
+    let logits2 = session
+        .denoise(&canvas2, None, 1.0)
+        .expect("cpu denoise step 2 (different canvas)");
+    eprintln!(
+        "cpu_diffusion_gemma_denoise_step: denoise (overwrite check) {:.1}s",
+        t2.elapsed().as_secs_f64()
+    );
+    assert_eq!(logits2.len(), canvas_len * vocab, "denoise2 logits shape");
+    assert!(
+        logits2.iter().all(|v| v.is_finite()),
+        "non-finite logit after the second (overwrite) denoise call"
+    );
+    assert!(
+        logits1 != logits2,
+        "second denoise call (different canvas) produced IDENTICAL logits — WriteKv didn't \
+         overwrite the canvas KV rows"
+    );
+
+    // Self-conditioning smoke test: feed the first call's raw logits back as sc_logits.
+    let t3 = std::time::Instant::now();
+    let logits_sc = session
+        .denoise(&canvas, Some(&logits1), 1.0)
+        .expect("cpu denoise with self-conditioning");
+    eprintln!(
+        "cpu_diffusion_gemma_denoise_step: denoise (self-cond) {:.1}s",
+        t3.elapsed().as_secs_f64()
+    );
+    assert_eq!(
+        logits_sc.len(),
+        canvas_len * vocab,
+        "SC denoise logits shape"
+    );
+    assert!(
+        logits_sc.iter().all(|v| v.is_finite()),
+        "non-finite logit in the self-conditioned denoise output"
+    );
+    assert!(
+        logits_sc != logits1,
+        "self-conditioned denoise produced IDENTICAL logits to the no-SC call"
+    );
+    println!("cpu_diffusion_gemma_denoise_step: all sub-checks passed");
+}
+
+/// DiffusionGemma canvas denoise: CPU vs Vulkan on separate sessions given the SAME prompt +
+/// all-mask canvas, no self-conditioning. Calibrated like `gpu_seam_matches_cpu_diffusion_gemma`
+/// (Phase 1): a 128-expert top-8 MoE model's near-tie router logits can flip expert selection
+/// between f32 CPU and f16-native-quant Vulkan, diverging the downstream FFN output for that
+/// token — assert per-row cosine + top-5 overlap on a handful of rows rather than a tight
+/// tolerance across all 256.
+#[test]
+fn gpu_seam_matches_cpu_diffusion_gemma_denoise() {
+    let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
+    need_gpu!();
+    let _tlk = test_serial_lock();
+    std::env::set_var("INFR_TEMP", "0");
+    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let vocab = model.config().vocab;
+    let canvas_len = model.config().canvas_length;
+    let mask_id = model.config().mask_token_id;
+    let tokens = model
+        .encode("What is the capital of France?")
+        .expect("encode");
+
+    let mut cpu_session = model.diffusion_gemma_cpu_session(tokens.len() + canvas_len + 8);
+    cpu_session.prefill(&tokens).expect("cpu prefill");
+    let canvas: Vec<u32> = vec![mask_id; canvas_len];
+    let t0 = std::time::Instant::now();
+    let cpu_logits = cpu_session
+        .denoise(&canvas, None, 1.0)
+        .expect("cpu denoise");
+    let cpu_secs = t0.elapsed().as_secs_f64();
+
+    let mut vk_session = model
+        .diffusion_gemma_vulkan_session(tokens.len() + canvas_len + 8)
+        .expect("vulkan session");
+    vk_session.prefill(&tokens).expect("vulkan prefill");
+    let t1 = std::time::Instant::now();
+    let gpu_logits = vk_session
+        .denoise(&canvas, None, 1.0)
+        .expect("vulkan denoise");
+    let gpu_secs = t1.elapsed().as_secs_f64();
+    eprintln!(
+        "gpu_seam_matches_cpu_diffusion_gemma_denoise: cpu {cpu_secs:.1}s vulkan {gpu_secs:.1}s"
+    );
+
+    assert_eq!(cpu_logits.len(), canvas_len * vocab, "cpu logits shape");
+    assert_eq!(gpu_logits.len(), canvas_len * vocab, "gpu logits shape");
+    assert!(
+        gpu_logits.iter().all(|v| v.is_finite()),
+        "non-finite logit in the Vulkan denoise output"
+    );
+
+    let mut min_cos = f64::INFINITY;
+    for row in 0..canvas_len.min(8) {
+        let c = &cpu_logits[row * vocab..(row + 1) * vocab];
+        let v = &gpu_logits[row * vocab..(row + 1) * vocab];
+        let cos = cosine(c, v);
+        min_cos = min_cos.min(cos);
+        let (ctop, vtop) = (top_k(c, 5), top_k(v, 5));
+        println!(
+            "row {row}: cosine={cos:.3} cpu_top1={:?} vulkan_top1={:?}",
+            ctop[0], vtop[0]
+        );
+        assert!(
+            ctop.iter().any(|&(id, _)| id == vtop[0].0)
+                || vtop.iter().any(|&(id, _)| id == ctop[0].0),
+            "row {row}: CPU/Vulkan top tokens don't overlap in each other's top-5: \
+             cpu={:?} vulkan={:?}",
+            ctop[0],
+            vtop[0]
+        );
+        assert!(cos > 0.7, "row {row}: cosine too low: {cos}");
+    }
+    println!(
+        "gpu_seam_matches_cpu_diffusion_gemma_denoise: min row cosine over checked rows = {min_cos:.3}"
+    );
+}

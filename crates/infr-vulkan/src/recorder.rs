@@ -2107,6 +2107,14 @@ impl<'a> Recorder<'a> {
         n_chunks: usize,
         scale: f32,
         window: usize,
+        // DiffusionGemma canvas denoise (docs/DIFFUSIONGEMMA.md, `AttnMask::Canvas`): every row
+        // attends the SAME fixed bidirectional `[lo, kv_len)`, overriding BOTH the per-row causal
+        // end (`qpos1 = pos+row+1` → `kv_len`) and the sliding-window `lo` formula. Rides the
+        // shader's otherwise-dead `rows` push-constant slot (see `attn_partial.comp`: the
+        // dispatch grid already encodes the row via `gl_WorkGroupID.y`, so the field was never
+        // read) as `lo+1` (0 = disabled) — no push-constant layout change, no effect on any
+        // existing (non-canvas) caller.
+        canvas_lo: Option<usize>,
         // Per-side planar Q8_0 KV read (K and V independent). Planar `cap` = total cache elements
         // (the scales-region base), unused when both are f16.
         k_q8: bool,
@@ -2114,6 +2122,7 @@ impl<'a> Recorder<'a> {
         cap: usize,
         // Rows-batched pass 1 (attn_partial_mrows_c256, K/V once per 4-row group): the caller
         // gates on rows/kv_len/hd (see the adapter's `batched_attn`) and MUST pass chunk <= 256.
+        // Mutually exclusive with `canvas_lo` (the adapter's `batched_attn` gate excludes Canvas).
         batched: bool,
     ) {
         // pass 1: per-chunk partials (subgroup-reduction QK; needs requiredSubgroupSize=32)
@@ -2156,7 +2165,18 @@ impl<'a> Recorder<'a> {
         p1[28..32].copy_from_slice(&scale.to_ne_bytes());
         p1[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
         p1[36..40].copy_from_slice(&(pos as u32).to_ne_bytes());
-        p1[40..44].copy_from_slice(&(rows as u32).to_ne_bytes());
+        // `rows` is dead in `attn_partial.comp` (this slot carries `canvas_lo+1`, 0 = disabled,
+        // instead — see `canvas_lo`'s doc above) but `attn_partial_mrows.comp` (the `batched`
+        // kernel) genuinely reads it (`rb = min(RB, pc.rows - row0)`, the short-last-row-group
+        // clamp) — canvas is never batched (the adapter's `batched_attn` gate excludes Canvas),
+        // so keep sending the real row count there.
+        debug_assert!(!batched || canvas_lo.is_none());
+        let rows_field = if batched {
+            rows as u32
+        } else {
+            canvas_lo.map(|lo| lo as u32 + 1).unwrap_or(0)
+        };
+        p1[40..44].copy_from_slice(&rows_field.to_ne_bytes());
         // Batched: workgroup y = 4-row group; per-row: y = row.
         let gy = if batched { rows.div_ceil(4) } else { rows };
         self.dispatch3(
@@ -4098,6 +4118,7 @@ mod tests {
             n_chunks,
             scale,
             win,
+            None,  // canvas_lo: causal decode, not DiffusionGemma canvas
             false, // k f16
             false, // v f16
             0,     // cap (unused for f16)

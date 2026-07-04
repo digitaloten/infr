@@ -993,6 +993,10 @@ fn lower_op(
                 let window = match mask {
                     AttnMask::Causal => 0usize,
                     AttnMask::SlidingWindow(w) => *w,
+                    // Record-once decode replay is rows==1 causal-only (DiffusionGemma canvas
+                    // denoise is a rows=C static forward, never eligible for this path) — never
+                    // actually reached with Canvas; 0 is an arbitrary but harmless placeholder.
+                    AttnMask::Canvas { .. } => 0usize,
                 };
                 let def_scale = (*scale - 1.0 / (hd as f32).sqrt()).abs() < 1e-6;
                 let pscale = if def_scale { 0.0 } else { *scale };
@@ -1149,7 +1153,18 @@ fn lower_op(
                 // (attn_qk → softmax → attn_pv) is hd-general and ~an order faster than the scalar
                 // attention_kv. Needs 64-row-padded q/dst (Internal buffers are row-padded), so
                 // require both to be Internal.
+                // DiffusionGemma canvas denoise (docs/DIFFUSIONGEMMA.md): bidirectional, fixed
+                // `[lo, kv_len)` reach per row — neither the flash kernel (Causal-only, already
+                // excluded above) nor `attention_prefill_nonfa`'s per-row causal-end window
+                // understand that shape, so gate BOTH off it and force the split-K path below
+                // (which DOES carry a `lo` override) even though rows=C(=256) would otherwise
+                // pick one of these tiers. Perf pass deferred (Phase 4).
+                let canvas_lo = match mask {
+                    AttnMask::Canvas { lo } => Some(*lo),
+                    _ => None,
+                };
                 let nonfa_ok = !flash_ok
+                    && canvas_lo.is_none()
                     && rows >= 64
                     && hd % 64 == 0
                     && hd <= 512
@@ -1175,6 +1190,7 @@ fn lower_op(
                 // A/B), INFR_NO_MROWS_ATTN forces it off.
                 let batched_attn = rows >= 2
                     && hd <= 128
+                    && canvas_lo.is_none()
                     && !(k_q8_eff || v_q8_eff)
                     && std::env::var("INFR_NO_MROWS_ATTN").is_err()
                     && ((rows >= 12 && kv_len >= 8192) || std::env::var("INFR_MROWS_ATTN").is_ok());
@@ -1185,7 +1201,9 @@ fn lower_op(
                 } else {
                     (kv_len / 32).clamp(64, 512)
                 };
-                let split_ok = rows < 64
+                // Canvas forces the split-K tier regardless of row count (see `canvas_lo` above) —
+                // `attn_partial` carries the fixed `lo` override this mask needs; flash/nonfa don't.
+                let split_ok = (rows < 64 || canvas_lo.is_some())
                     && kv_len > chunk
                     && hd % 4 == 0
                     && hd <= 512
@@ -1224,6 +1242,7 @@ fn lower_op(
                     let window = match mask {
                         AttnMask::Causal => 0,
                         AttnMask::SlidingWindow(w) => *w,
+                        AttnMask::Canvas { .. } => unreachable!("nonfa_ok excludes Canvas"),
                     };
                     let mpad = rows.div_ceil(64) * 64;
                     let kv_pad = kv_len.div_ceil(256) * 256;
@@ -1258,9 +1277,13 @@ fn lower_op(
                         *scale,
                     );
                 } else if split_ok {
+                    // `canvas_lo` (computed above) rides a SEPARATE param into
+                    // `attention_kv_split` — `window` stays the ordinary causal/SWA value (0 for
+                    // Canvas; unused by the shader when `canvas_lo` is set).
                     let window = match mask {
                         AttnMask::Causal => 0,
                         AttnMask::SlidingWindow(w) => *w,
+                        AttnMask::Canvas { .. } => 0,
                     };
                     let n_chunks = kv_len.div_ceil(chunk);
                     // Scratch scales with rows (rows*nh partial planes); rows==1 keeps the old
@@ -1294,6 +1317,7 @@ fn lower_op(
                         n_chunks,
                         *scale,
                         window,
+                        canvas_lo,
                         k_q8_eff,
                         v_q8_eff,
                         cap,
@@ -1303,6 +1327,13 @@ fn lower_op(
                     let window = match mask {
                         AttnMask::Causal => 0,
                         AttnMask::SlidingWindow(w) => *w,
+                        AttnMask::Canvas { .. } => {
+                            return Err(be(
+                                "vulkan adapter: AttnMask::Canvas requires the split-K attention \
+                                 path (split_ok) — the scalar attention_kv fallback doesn't carry \
+                                 a bidirectional `lo` override",
+                            ));
+                        }
                     };
                     let kcb = match &kc_key {
                         Some(k) => pool[k].as_ref(),
@@ -1530,15 +1561,118 @@ fn lower_op(
                     "vulkan adapter: MoeFfn expert banks need an id-native quant format",
                 ));
             }
-            // The batched (rows>1) path below assumes separate gate_exps/up_exps banks of width
-            // `nff` each (its own dtype/shape gate) — diffusion-gemma's fused tensor never reaches
-            // it in Phase 1 (its dtype/name never matches the runner's `moe_batched_ok` gate), but
-            // fail loudly rather than silently misread a fused tensor as split banks if that ever
-            // changes.
-            if *fused_gate_up && graph.desc(*x).numel() / ne > 1 {
-                return Err(be(
-                    "vulkan adapter: batched (rows>1) MoeFfn doesn't support fused_gate_up yet",
-                ));
+            let rows = graph.desc(*x).numel() / ne;
+            let rdt = graph.desc(*router).dtype;
+            let rw = r(*router)?;
+            // The Q4_K/Q6_K+SiLU batched (rows>1) path below assumes separate gate_exps/up_exps
+            // banks of width `nff` each — diffusion-gemma's fused `ffn_gate_up_exps` (GELU, not
+            // SiLU) never fits it. DiffusionGemma canvas denoise (rows=C=256, see
+            // docs/DIFFUSIONGEMMA.md's Phase 2) is the only fused+rows>1 caller today: no batched
+            // GPU kernel exists for the fused layout yet, so loop the proven per-row (single-
+            // token) path below `rows` times over small per-row scratch, recorded into the SAME
+            // command buffer (no extra submits/syncs — just more of them). Correct, not fast; a
+            // perf pass (single-dispatch-per-stage, like the Q4_K/Q6_K tier) is Phase 4 work.
+            if *fused_gate_up && rows > 1 {
+                let xb_all = r(*x)?;
+                let rxb_all = r(*router_x)?;
+                let dstb_all = r(*dst)?;
+                let alu = |n: usize| be_.alloc_uninit((n * 4).max(4), BufferUsage::Activations);
+                let x_row = alu(ne)?;
+                let rx_row = alu(ne)?;
+                let y_row = alu(ne)?;
+                let logits = alu(n_expert)?;
+                let ids = alu(n_used)?;
+                let wts = alu(n_used)?;
+                let gubuf = alu(n_used * 2 * nff)?;
+                let abuf = alu(n_used * nff)?;
+                let ybuf = alu(n_used * ne)?;
+                for row in 0..rows {
+                    rec.copy(xb_all, row * ne * 4, x_row.as_ref(), 0, ne * 4);
+                    rec.copy(rxb_all, row * ne * 4, rx_row.as_ref(), 0, ne * 4);
+                    if native_dense_supported(rdt) {
+                        rec.linear_native(
+                            rdt,
+                            rw,
+                            rx_row.as_ref(),
+                            logits.as_ref(),
+                            1,
+                            ne,
+                            n_expert,
+                        );
+                    } else if matches!(rdt, infr_core::DType::F32) {
+                        rec.linear_f32(rw, rx_row.as_ref(), logits.as_ref(), 1, ne, n_expert);
+                    } else {
+                        rec.linear(rw, rx_row.as_ref(), logits.as_ref(), 1, ne, n_expert);
+                    }
+                    rec.moe_topk(
+                        logits.as_ref(),
+                        ids.as_ref(),
+                        wts.as_ref(),
+                        1,
+                        n_expert,
+                        n_used,
+                        *scale,
+                    );
+                    rec.linear_native_id_multi(
+                        gdt,
+                        r(*gate_exps)?,
+                        ids.as_ref(),
+                        n_used,
+                        stride,
+                        x_row.as_ref(),
+                        false,
+                        gubuf.as_ref(),
+                        ne,
+                        2 * nff,
+                    );
+                    match act {
+                        Activation::Silu => {
+                            rec.silu_mul_fused(gubuf.as_ref(), abuf.as_ref(), n_used, nff)
+                        }
+                        Activation::Gelu => {
+                            rec.gelu_mul_fused(gubuf.as_ref(), abuf.as_ref(), n_used, nff)
+                        }
+                        Activation::Sigmoid => {
+                            return Err(be(
+                                "vulkan adapter: fused_gate_up MoeFfn Sigmoid unsupported",
+                            ))
+                        }
+                    }
+                    rec.linear_native_id_multi(
+                        ddt,
+                        r(*down_exps)?,
+                        ids.as_ref(),
+                        n_used,
+                        down_stride,
+                        abuf.as_ref(),
+                        true,
+                        ybuf.as_ref(),
+                        nff,
+                        ne,
+                    );
+                    rec.zero(y_row.as_ref(), ne);
+                    match down_scale {
+                        Some(ds) => rec.moe_accumulate_scaled(
+                            ybuf.as_ref(),
+                            wts.as_ref(),
+                            ids.as_ref(),
+                            r(*ds)?,
+                            y_row.as_ref(),
+                            ne,
+                            n_used,
+                        ),
+                        None => rec.moe_accumulate(
+                            ybuf.as_ref(),
+                            wts.as_ref(),
+                            y_row.as_ref(),
+                            ne,
+                            n_used,
+                        ),
+                    }
+                    rec.copy(y_row.as_ref(), 0, dstb_all, row * ne * 4, ne * 4);
+                }
+                transient.extend([x_row, rx_row, y_row, logits, ids, wts, gubuf, abuf, ybuf]);
+                return Ok(());
             }
             // ── BATCHED MoE FFN (rows > 1, the seam's prefill chunks): GPU-resident expert
             // routing (top-k → bucket count/scan/scatter, all on-GPU) + a prologue that writes
@@ -1546,7 +1680,7 @@ fn lower_op(
             // records with NO host readback (the bespoke path downloads counts mid-graph to size
             // its GEMMs; indirect dispatch replaces that). Q4_K gate/up + Q6_K down only (what
             // qwen3moe ships) — the runner routes other formats through the per-token path.
-            let rows = graph.desc(*x).numel() / ne;
+            // (`rows` computed once above, shared with the fused-loop branch.)
             if rows > 1 {
                 use infr_core::DType::{Q4K, Q6K};
                 let down_q6 = matches!(ddt, Q6K);

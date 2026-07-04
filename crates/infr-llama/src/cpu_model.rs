@@ -3,6 +3,8 @@
 use crate::*;
 use anyhow::{anyhow, Result};
 use infr_chat::{render_chat_jinja, render_chat_user};
+use infr_core::backend::{Backend, BufferUsage};
+use infr_cpu::CpuBackend;
 use infr_gguf::Gguf;
 use std::path::Path;
 use tokenizers::Tokenizer;
@@ -312,6 +314,38 @@ impl CpuModel {
             self.per_layer_embd.as_ref(),
             tokens,
         )
+    }
+
+    /// Open a Phase-2 DiffusionGemma denoise session on the CPU reference backend (see
+    /// `docs/DIFFUSIONGEMMA.md`): [`prefill`](DiffusionGemmaCpuSession::prefill) causally
+    /// prefills the prompt ONCE (encoder scalars, KV rows `0..P`), then repeated
+    /// [`denoise`](DiffusionGemmaCpuSession::denoise) calls forward the C-row canvas (decoder
+    /// scalars, the bidirectional `Canvas` mask) against the SAME session — each call OVERWRITES
+    /// KV rows `P..P+C`, so a caller can denoise the same block with a different partially-
+    /// unmasked canvas over and over (the loop Phase 3 drives). `max_ctx` sizes the session's KV
+    /// cache (must fit the whole prompt + canvas_length + any headroom for later blocks).
+    pub fn diffusion_gemma_cpu_session(&self, max_ctx: usize) -> DiffusionGemmaCpuSession<'_> {
+        DiffusionGemmaCpuSession {
+            model: self,
+            be: CpuBackend::new(),
+            state: None,
+            max_ctx,
+        }
+    }
+
+    /// [`diffusion_gemma_cpu_session`](Self::diffusion_gemma_cpu_session)'s Vulkan twin, for the
+    /// CPU/Vulkan cross-backend parity check.
+    pub fn diffusion_gemma_vulkan_session(
+        &self,
+        max_ctx: usize,
+    ) -> Result<DiffusionGemmaVulkanSession<'_>> {
+        let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
+        Ok(DiffusionGemmaVulkanSession {
+            model: self,
+            be: vk,
+            state: None,
+            max_ctx,
+        })
     }
 
     /// Token-level bench on the CPU reference backend (no GPU): prefill `n_prompt` dummy tokens, then
@@ -787,6 +821,191 @@ impl CpuModel {
             |id| stream_token(&self.tokenizer, &mut acc, &mut printed, id, &mut on_piece),
         )?;
         Ok(stats)
+    }
+}
+
+/// A persistent CPU-reference session for DiffusionGemma's two-pass forward (Phase 2 — see
+/// docs/DIFFUSIONGEMMA.md and [`CpuModel::diffusion_gemma_cpu_session`]).
+pub struct DiffusionGemmaCpuSession<'m> {
+    model: &'m CpuModel,
+    be: CpuBackend,
+    state: Option<crate::cpu_backend::SeamKv>,
+    max_ctx: usize,
+}
+
+/// [`DiffusionGemmaCpuSession`]'s Vulkan twin (see [`CpuModel::diffusion_gemma_vulkan_session`]).
+pub struct DiffusionGemmaVulkanSession<'m> {
+    model: &'m CpuModel,
+    be: infr_vulkan::VulkanBackend,
+    state: Option<crate::cpu_backend::SeamKv>,
+    max_ctx: usize,
+}
+
+impl DiffusionGemmaCpuSession<'_> {
+    /// Causal prefill of `tokens` (encoder scalars, chunked/per-token like every other dense
+    /// prefill on this seam) — writes KV rows `0..tokens.len()`. Call once per block before
+    /// [`denoise`](Self::denoise); a second call with a prompt that EXTENDS the previous one
+    /// continues the session (ChatSession-style prefix reuse), matching every other session on
+    /// this seam.
+    pub fn prefill(&mut self, tokens: &[u32]) -> Result<()> {
+        crate::cpu_backend::generate_dense_backend(
+            &self.be,
+            &|_name, tb, dt, _n| match tb {
+                crate::cpu_backend::WBytes::Mmap(tb) => Ok((self.be.map_weight(tb), dt)),
+                crate::cpu_backend::WBytes::Owned(v) => {
+                    let buf = self
+                        .be
+                        .alloc(v.len().max(1), BufferUsage::Weights)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    self.be
+                        .upload(buf.as_ref(), &v)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    Ok((buf, dt))
+                }
+            },
+            &self.model.gguf,
+            &self.model.cfg,
+            &self.model.token_embd,
+            self.model.per_layer_embd.as_ref(),
+            tokens,
+            1, // rides the ordinary per-token causal-prefill loop (see `verify_dense_cpu`'s doc)
+            |_| {},
+            &mut self.state,
+            self.max_ctx,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        Ok(())
+    }
+
+    /// ONE canvas denoise forward over the session's already-prefilled prompt (see
+    /// `DenoiseReq`'s doc): `canvas_tokens.len()` MUST match every call on this session (the
+    /// model's `canvas_length`). Returns `[canvas_tokens.len() * vocab]` raw logits. `sc_logits`
+    /// is the PREVIOUS step's raw canvas logits for self-conditioning (`None` = off, matching the
+    /// reference's step-0 gate); `temp_inv` is the self-conditioning softmax temperature divisor
+    /// (unused when `sc_logits` is `None`). Panics-free even before [`prefill`](Self::prefill) is
+    /// ever called — errors instead (an empty prompt, P=0).
+    pub fn denoise(
+        &mut self,
+        canvas_tokens: &[u32],
+        sc_logits: Option<&[f32]>,
+        temp_inv: f32,
+    ) -> Result<Vec<f32>> {
+        let mut out_logits = Vec::new();
+        crate::cpu_backend::generate_dense_backend(
+            &self.be,
+            &|_name, tb, dt, _n| match tb {
+                crate::cpu_backend::WBytes::Mmap(tb) => Ok((self.be.map_weight(tb), dt)),
+                crate::cpu_backend::WBytes::Owned(v) => {
+                    let buf = self
+                        .be
+                        .alloc(v.len().max(1), BufferUsage::Weights)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    self.be
+                        .upload(buf.as_ref(), &v)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    Ok((buf, dt))
+                }
+            },
+            &self.model.gguf,
+            &self.model.cfg,
+            &self.model.token_embd,
+            self.model.per_layer_embd.as_ref(),
+            &[], // denoise never touches the prompt/generation token stream — see `DenoiseReq`
+            0,
+            |_| {},
+            &mut self.state,
+            self.max_ctx,
+            None,
+            None,
+            None,
+            Some(crate::cpu_backend::DenoiseReq {
+                canvas_tokens,
+                sc_logits,
+                temp_inv,
+                out_logits: &mut out_logits,
+            }),
+        )?;
+        Ok(out_logits)
+    }
+}
+
+impl DiffusionGemmaVulkanSession<'_> {
+    /// [`DiffusionGemmaCpuSession::prefill`]'s Vulkan twin.
+    pub fn prefill(&mut self, tokens: &[u32]) -> Result<()> {
+        crate::cpu_backend::generate_dense_backend(
+            &self.be,
+            &|_name, tb, dt, _n| {
+                let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
+                let buf = self
+                    .be
+                    .alloc(padded.len(), BufferUsage::Weights)
+                    .map_err(|e| anyhow!("{e}"))?;
+                self.be
+                    .upload(buf.as_ref(), &padded)
+                    .map_err(|e| anyhow!("{e}"))?;
+                Ok((buf, dt))
+            },
+            &self.model.gguf,
+            &self.model.cfg,
+            &self.model.token_embd,
+            self.model.per_layer_embd.as_ref(),
+            tokens,
+            1,
+            |_| {},
+            &mut self.state,
+            self.max_ctx,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        Ok(())
+    }
+
+    /// [`DiffusionGemmaCpuSession::denoise`]'s Vulkan twin.
+    pub fn denoise(
+        &mut self,
+        canvas_tokens: &[u32],
+        sc_logits: Option<&[f32]>,
+        temp_inv: f32,
+    ) -> Result<Vec<f32>> {
+        let mut out_logits = Vec::new();
+        crate::cpu_backend::generate_dense_backend(
+            &self.be,
+            &|_name, tb, dt, _n| {
+                let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
+                let buf = self
+                    .be
+                    .alloc(padded.len(), BufferUsage::Weights)
+                    .map_err(|e| anyhow!("{e}"))?;
+                self.be
+                    .upload(buf.as_ref(), &padded)
+                    .map_err(|e| anyhow!("{e}"))?;
+                Ok((buf, dt))
+            },
+            &self.model.gguf,
+            &self.model.cfg,
+            &self.model.token_embd,
+            self.model.per_layer_embd.as_ref(),
+            &[],
+            0,
+            |_| {},
+            &mut self.state,
+            self.max_ctx,
+            None,
+            None,
+            None,
+            Some(crate::cpu_backend::DenoiseReq {
+                canvas_tokens,
+                sc_logits,
+                temp_inv,
+                out_logits: &mut out_logits,
+            }),
+        )?;
+        Ok(out_logits)
     }
 }
 

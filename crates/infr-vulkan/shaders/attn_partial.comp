@@ -85,22 +85,30 @@ void main() {
     float scale = pc.scale > 0.0 ? pc.scale : 1.0 / sqrt(float(hd));
 #ifdef USE_PARAMS
     uint kv_len = p_kvlen;
-#endif
-#ifdef USE_PARAMS
     // Replay decode: always a single row, the query IS position kv_len-1.
     uint row = 0u;
     uint qpos1 = kv_len;
+    // Sliding-window attention: THIS ROW attends only keys j >= lo (0 = full causal). Chunks below
+    // `lo` never dispatch work — SELF_CHUNK offsets its chunk grid by `lo`; the static path clamps
+    // each chunk's range (empty → zero-weight partial).
+    uint lo = (pc.window > 0u && qpos1 > pc.window) ? qpos1 - pc.window : 0u;
 #else
     uint kv_len = pc.kv_len;
     // Small-m static path: workgroup y picks the query row (1D dispatch → row 0 = old decode);
     // this row's causal END is its absolute position + 1 (mirrors attention_kv's per-row bound).
     uint row = gl_WorkGroupID.y;
-    uint qpos1 = pc.pos + row + 1u;
+    // DiffusionGemma canvas denoise (docs/DIFFUSIONGEMMA.md): `pc.rows` is otherwise DEAD in this
+    // shader (the dispatch grid already encodes the row via gl_WorkGroupID.y, so nothing here
+    // ever needed the row COUNT) — repurposed as `canvas_lo+1` (0 = disabled) by
+    // `attention_kv_split`. When set, EVERY row attends the SAME fixed bidirectional range
+    // `[lo, kv_len)` — `qpos1` becomes `kv_len` (not this row's causal end) and `lo` is the
+    // caller's value directly, ignoring the sliding-window formula entirely (the canvas mask
+    // isn't a window relative to the query's own position — see `AttnMask::Canvas`'s doc).
+    bool canvas = pc.rows > 0u;
+    uint qpos1 = canvas ? kv_len : (pc.pos + row + 1u);
+    uint lo = canvas ? (pc.rows - 1u)
+                     : ((pc.window > 0u && qpos1 > pc.window) ? qpos1 - pc.window : 0u);
 #endif
-    // Sliding-window attention: THIS ROW attends only keys j >= lo (0 = full causal). Chunks below
-    // `lo` never dispatch work — SELF_CHUNK offsets its chunk grid by `lo`; the static path clamps
-    // each chunk's range (empty → zero-weight partial).
-    uint lo = (pc.window > 0u && qpos1 > pc.window) ? qpos1 - pc.window : 0u;
 #ifdef SELF_CHUNK
     // Record-once replay with a growing kv_len: chunk/n_chunks are baked at record, but ONE baked
     // chunk can't serve every depth (small chunks drown in per-workgroup overhead at deep kv; big

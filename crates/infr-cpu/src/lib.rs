@@ -2856,9 +2856,14 @@ impl Backend for CpuBackend {
                     let ks = deq(&kguard, g.desc(k_cache).dtype);
                     let vs = deq(&vguard, g.desc(v_cache).dtype);
                     let group = nh / nkv;
-                    let window = match mask {
-                        AttnMask::Causal => 0usize,
-                        AttnMask::SlidingWindow(w) => w,
+                    // `Causal`/`SlidingWindow` clip the causal END at `abs+1` (per-row, from
+                    // `pos`); `Canvas` (DiffusionGemma denoise — see `AttnMask::Canvas`'s doc)
+                    // ignores `pos` entirely and gives every row the SAME fixed bidirectional
+                    // range `[lo, kv_len)`.
+                    let (window, canvas_lo) = match mask {
+                        AttnMask::Causal => (0usize, None),
+                        AttnMask::SlidingWindow(w) => (w, None),
+                        AttnMask::Canvas { lo } => (0usize, Some(lo)),
                     };
                     let mut out = vec![0f32; rows * nh * hd];
                     // Each (ti, h) pair writes exactly one hd-sized output slice with no
@@ -2871,13 +2876,20 @@ impl Backend for CpuBackend {
                             let kvh = h / group;
                             let qb = (ti * nh + h) * hd;
                             let abs = pos as usize + ti; // absolute position of this query
-                                                         // visible keys: [lo, abs] (causal); SWA clips lo to abs-window+1.
-                            let lo = if window > 0 && abs + 1 > window {
-                                abs + 1 - window
-                            } else {
-                                0
+                            let (lo, hi) = match canvas_lo {
+                                // bidirectional: every row attends the same fixed [lo, kv_len).
+                                Some(clo) => (clo, kv_len),
+                                // causal (± SWA): [lo, abs] — SWA clips lo to abs-window+1.
+                                None => {
+                                    let lo = if window > 0 && abs + 1 > window {
+                                        abs + 1 - window
+                                    } else {
+                                        0
+                                    };
+                                    (lo, abs + 1)
+                                }
                             };
-                            let n_keys = abs + 1 - lo;
+                            let n_keys = hi - lo;
                             let mut sc = vec![0f32; n_keys];
                             let mut mx = f32::NEG_INFINITY;
                             for (jj, scj) in sc.iter_mut().enumerate() {

@@ -570,6 +570,7 @@ fn decode_attn_variants_bench() {
             n_chunks,
             0.0,
             0,
+            None,  // canvas_lo
             false, // k f16
             false, // v f16
             0,     // cap (unused for f16)

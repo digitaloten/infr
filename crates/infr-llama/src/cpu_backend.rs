@@ -178,6 +178,7 @@ pub(crate) fn generate_dense_cpu(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -318,6 +319,7 @@ pub(crate) fn generate_dense_gpu_session(
         constraint,
         None,
         None,
+        None,
     )
 }
 
@@ -390,6 +392,7 @@ pub(crate) fn generate_dense_metal_session(
         constraint,
         None,
         None,
+        None,
     )
 }
 
@@ -431,6 +434,7 @@ pub(crate) fn verify_dense_metal2(
         want_ctx,
         None,
         Some(&mut logits),
+        None,
         None,
     )?;
     Ok((logits, stats.prompt_secs))
@@ -476,6 +480,7 @@ pub(crate) fn verify_dense_cpu(
         None,
         None,
         Some(&mut logits),
+        None,
     )?;
     Ok(logits)
 }
@@ -515,6 +520,7 @@ pub(crate) fn verify_dense_vulkan(
         None,
         None,
         Some(&mut logits),
+        None,
     )?;
     Ok(logits)
 }
@@ -794,6 +800,113 @@ fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
+/// DiffusionGemma self-conditioning block (Phase 2 — see docs/DIFFUSIONGEMMA.md's "Self-
+/// conditioning is ON by default" and the reference's `dg_canvas_embed`): given the PREVIOUS
+/// step's raw canvas logits `[cc, vocab]`, returns the additive signal `sc_sig` (`[cc, ne]`) the
+/// caller adds to the scaled canvas embedding before the weightless rms-norm.
+/// `sc_sig[row] = sc_down @ (gelu_tanh(sc_gate @ n) * (sc_up @ n))`, `n = rmsnorm(soft,
+/// sc_pre_norm)`, `soft = softmax(logits·temp_inv) @ token_embd · √n_embd`.
+///
+/// Runs entirely on the HOST: `soft` is a `[vocab]`-wide weighted sum of embedding rows, computed
+/// directly against the CPU runner's already-dequantized `token_embd` table (a plain threaded
+/// matvec) rather than materializing the reference's second on-device transposed-embedding
+/// weight (`sc_embT`, ~1.4 GB) — see the Phase-2 report's "deviation from spec" note. The Vulkan
+/// denoise path reuses this SAME host routine (identical math, so CPU/Vulkan self-cond agree
+/// bit-for-bit modulo the usual f32 rounding-order noise) rather than a GPU-resident soft-embed.
+fn diffusion_self_cond(
+    g: &Gguf,
+    c: &Config,
+    token_embd: &[f32],
+    sc_logits: &[f32],
+    temp_inv: f32,
+    cc: usize,
+) -> AResult<Vec<f32>> {
+    use rayon::prelude::*;
+    let ne = c.n_embd;
+    let vocab = c.vocab;
+    debug_assert_eq!(sc_logits.len(), cc * vocab);
+    let (pre_norm, _) = crate::load_tensor_dequant(g, "self_cond_pre_norm.weight")?;
+    let (gate_w, _) = crate::load_tensor_dequant(g, "self_cond_gate.weight")?; // [nff, ne]
+    let (up_w, _) = crate::load_tensor_dequant(g, "self_cond_up.weight")?; // [nff, ne]
+    let (down_w, _) = crate::load_tensor_dequant(g, "self_cond_down.weight")?; // [ne, nff]
+    let nff = gate_w.len() / ne;
+    let sqrt_ne = (ne as f32).sqrt();
+    let eps = c.rms_eps;
+    let mut sig = vec![0f32; cc * ne];
+    sig.par_chunks_mut(ne).enumerate().for_each(|(row, out)| {
+        let logits_row = &sc_logits[row * vocab..(row + 1) * vocab];
+        // probs = softmax(logits * temp_inv) over the FULL vocab.
+        let mx = logits_row
+            .iter()
+            .fold(f32::NEG_INFINITY, |m, &v| m.max(v * temp_inv));
+        let mut probs = vec![0f32; vocab];
+        let mut denom = 0f32;
+        for (p, &v) in probs.iter_mut().zip(logits_row) {
+            *p = (v * temp_inv - mx).exp();
+            denom += *p;
+        }
+        for p in probs.iter_mut() {
+            *p /= denom;
+        }
+        // soft = (probs @ token_embd) * sqrt(ne) — a [ne] weighted sum over ALL vocab rows
+        // (token_embd is row-major [vocab, ne], already fully dequantized in host memory).
+        let mut soft = vec![0f32; ne];
+        for (v, &p) in probs.iter().enumerate() {
+            if p == 0.0 {
+                continue;
+            }
+            let row_e = &token_embd[v * ne..v * ne + ne];
+            for (s, &e) in soft.iter_mut().zip(row_e) {
+                *s += p * e;
+            }
+        }
+        for s in soft.iter_mut() {
+            *s *= sqrt_ne;
+        }
+        // sc_pre_norm: a NORMAL (weighted) rmsnorm — unlike the canvas embedding's weightless one.
+        let ms: f32 = soft.iter().map(|&x| x * x).sum::<f32>() / ne as f32;
+        let inv = 1.0 / (ms + eps).sqrt();
+        let normed: Vec<f32> = soft
+            .iter()
+            .zip(&pre_norm)
+            .map(|(&x, &w)| x * inv * w)
+            .collect();
+        // Gated-GELU MLP: down(gelu_tanh(gate·normed) * (up·normed)).
+        let mut act = vec![0f32; nff];
+        for (f, a) in act.iter_mut().enumerate() {
+            let grow = &gate_w[f * ne..f * ne + ne];
+            let urow = &up_w[f * ne..f * ne + ne];
+            let gd: f32 = grow.iter().zip(&normed).map(|(&w, &x)| w * x).sum();
+            let ud: f32 = urow.iter().zip(&normed).map(|(&w, &x)| w * x).sum();
+            // gelu_pytorch_tanh, matching `infr_cpu::act_fn(Activation::Gelu, ..)` exactly.
+            let gelu = 0.5 * gd * (1.0 + (0.797_884_6 * (gd + 0.044715 * gd * gd * gd)).tanh());
+            *a = gelu * ud;
+        }
+        for (e, out_e) in out.iter_mut().enumerate() {
+            let drow = &down_w[e * nff..e * nff + nff];
+            *out_e = drow.iter().zip(&act).map(|(&w, &a)| w * a).sum();
+        }
+    });
+    Ok(sig)
+}
+
+/// Phase-2 DiffusionGemma canvas-denoise request (see docs/DIFFUSIONGEMMA.md): short-circuits
+/// `generate_dense_backend` into ONE forward over the `canvas_tokens.len()` canvas rows, reusing
+/// the session's already-prefilled prompt KV (rows `0..P`, `P = state.cached.len()` — the prior
+/// causal prefill call's materialized prompt). Mirrors the `verify` early-return below (same
+/// short-circuit style) but for the bidirectional canvas mask + decoder scalars + self-cond.
+pub(crate) struct DenoiseReq<'a> {
+    pub canvas_tokens: &'a [u32],
+    /// Previous step's raw (pre-softmax, post-softcap) canvas logits `[C * vocab]`, for self-
+    /// conditioning. `None` = SC off (`sc_use = 0`, matching the reference's step-0 gate).
+    pub sc_logits: Option<&'a [f32]>,
+    /// Self-conditioning softmax temperature divisor (`probs = softmax(sc_logits · temp_inv)`).
+    /// Unused when `sc_logits` is `None`.
+    pub temp_inv: f32,
+    /// Filled with `[C * vocab]` raw logits (pre-softmax, post-softcap) on success.
+    pub out_logits: &'a mut Vec<f32>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_dense_backend(
     be: &dyn Backend,
@@ -815,6 +928,8 @@ pub(crate) fn generate_dense_backend(
     // MoE-incompatible — see its guard below) this rides the existing rows==1 per-token loop, so
     // it works for MoE/diffusion-gemma models too.
     mut logits_out: Option<&mut Vec<f32>>,
+    // Phase-2 DiffusionGemma canvas denoise (see `DenoiseReq`'s doc). `None` everywhere else.
+    denoise_req: Option<DenoiseReq>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     let c = cfg;
     let (ne, nh) = (c.n_embd, c.n_head);
@@ -857,6 +972,23 @@ pub(crate) fn generate_dense_backend(
     let out_scale: Vec<Option<f32>> = (0..c.n_layer)
         .map(|l| {
             let name = format!("blk.{l}.{out_scale_name}.weight");
+            if g.tensors().iter().any(|t| t.name == name) {
+                crate::load_tensor_dequant(g, &name)
+                    .ok()
+                    .and_then(|(v, _)| v.first().copied())
+            } else {
+                None
+            }
+        })
+        .collect();
+    // diffusion-gemma's DECODER per-layer scalar (`layer_output_scale`, the canvas-denoise twin
+    // of `out_scale`'s encoder-named array above) — read unconditionally alongside it (both are
+    // tiny [1]-tensors, negligible host cost) so the denoise graph (`build`'s `denoise` flag) can
+    // select it without re-deriving the name. `None`/empty for every non-diffusion-gemma model
+    // (never read there).
+    let dec_out_scale: Vec<Option<f32>> = (0..c.n_layer)
+        .map(|l| {
+            let name = format!("blk.{l}.layer_output_scale.weight");
             if g.tensors().iter().any(|t| t.name == name) {
                 crate::load_tensor_dequant(g, &name)
                     .ok()
@@ -1349,6 +1481,11 @@ pub(crate) fn generate_dense_backend(
             max_new
         ));
     }
+    // Phase-2 DiffusionGemma denoise: capture the prompt length BEFORE the ordinary prefix-diff
+    // logic below runs (a denoise call's `prompt`/`max_new` are empty/0 — see `DenoiseReq`'s
+    // caller — so `start`/`cached` are left untouched: the `if denoise_req.is_some()` guard just
+    // below makes both a no-op). `P` for the denoise graph is this, NOT `start`.
+    let denoise_p = cached.len();
     // ChatSession-style prefix reuse: KV rows 0..start are already materialized for `cached`'s
     // shared prefix — prefill only the suffix. Always leave ≥1 prompt token to process so the
     // first generated token samples from fresh logits.
@@ -1359,7 +1496,11 @@ pub(crate) fn generate_dense_backend(
     // else (divergent prompt, identical resend, first-ever call) zero-resets every DeltaNet layer's
     // conv/S state and re-prefills from scratch. Dense/attention models keep the generic
     // longest-common-prefix diff.
-    let start = if c.qwen35 {
+    let start = if denoise_req.is_some() {
+        // No-op: a denoise call never touches `cached` (it isn't part of the prompt/generation
+        // token stream) — `cached.truncate(start)` below is then a truncate-to-current-length.
+        cached.len()
+    } else if c.qwen35 {
         let pfx = common_prefix_len(cached, prompt);
         if pfx == cached.len() && pfx < prompt.len() {
             pfx
@@ -1395,7 +1536,17 @@ pub(crate) fn generate_dense_backend(
     // Scratch tensors scale by `batch`; the LM head runs on the last `logits_rows` tokens —
     // 1 everywhere except speculative VERIFY, which needs the distribution after every
     // candidate (logits output = [logits_rows, vocab], logits_rows ∈ {1, batch}).
-    let build = |batch: usize, start_pos: usize, logits_rows: usize| -> (Graph, DecodeHandles) {
+    // `denoise`: build the DiffusionGemma canvas-denoise variant of this layer stack instead of
+    // the ordinary causal forward — see docs/DIFFUSIONGEMMA.md's "Seam extensions". `batch` is the
+    // canvas length C, `start_pos` the prompt length P (unchanged meaning: WriteKv still lands at
+    // row P, Attention's kv_len is still `start_pos+batch` = P+C, positions are still bound
+    // per-row P..P+C-1 by the caller) — ONLY the attention mask and the per-layer output scalar
+    // change. Never true for any existing caller (all pass `false`).
+    let build = |batch: usize,
+                 start_pos: usize,
+                 logits_rows: usize,
+                 denoise: bool|
+     -> (Graph, DecodeHandles) {
         let mut g = Graph::new();
         let f32d = |n: usize| TensorDesc::new(vec![n], DType::F32);
         // KV cache dtype: f16 by default (halves memory vs f32, tightens CPU↔GPU parity); Q8_0
@@ -1761,7 +1912,20 @@ pub(crate) fn generate_dense_backend(
             let theta = c.layer_rope_theta(l); // gemma dual-rope (SWA 1e4 / full 1e6); uniform else
             let rope_dim = c.layer_rope_dim(l);
             let swa = gemma && c.is_swa_layer(l);
-            let mask = if swa {
+            // DiffusionGemma canvas denoise (docs/DIFFUSIONGEMMA.md): every canvas query attends
+            // the SAME fixed bidirectional range `[lo, kv_len)` — `lo = 0` on full-attention
+            // layers (every prompt + canvas key visible), `lo = max(0, P-(n_swa-1))` on SWA
+            // layers (only the last `n_swa-1` prompt positions, but every canvas key — canvas
+            // keys live in `[P, kv_len)` ⊆ `[lo, kv_len)` on both layer types since `lo <= P`).
+            // `start_pos` IS `P` here (the denoise batch starts right after the cached prompt).
+            let mask = if denoise {
+                let lo = if swa {
+                    start_pos.saturating_sub(c.swa_window.saturating_sub(1))
+                } else {
+                    0
+                };
+                AttnMask::Canvas { lo }
+            } else if swa {
                 AttnMask::SlidingWindow(c.swa_window)
             } else {
                 AttnMask::Causal
@@ -2545,7 +2709,15 @@ pub(crate) fn generate_dense_backend(
                 });
             }
             // gemma4: scale the whole layer output by the per-layer scalar before the next layer.
-            if let Some(s) = out_scale[l] {
+            // DiffusionGemma denoise reads the DECODER scalar (`layer_output_scale`) instead of
+            // the encoder one baked into `out_scale` for every other diffusion-gemma phase (the
+            // causal prompt prefill) — see docs/DIFFUSIONGEMMA.md.
+            let layer_scale = if denoise {
+                dec_out_scale[l]
+            } else {
+                out_scale[l]
+            };
+            if let Some(s) = layer_scale {
                 g.push(Op::Scale {
                     x: hidden,
                     dst: hidden,
@@ -2611,6 +2783,111 @@ pub(crate) fn generate_dense_backend(
         )
     };
 
+    // ── Phase-2 DiffusionGemma canvas denoise (see `DenoiseReq`'s doc) ───────────────────────
+    // ONE forward over the C canvas rows, reusing the session's already-prefilled prompt KV
+    // (rows 0..P, P = `denoise_p`). Mirrors the VERIFY early-return below (batched multi-row
+    // forward, LM head on every row) but with the canvas embedding/mask/decoder-scalar wiring.
+    if let Some(req) = denoise_req {
+        if !c.diffusion_gemma {
+            return Err(anyhow!(
+                "canvas denoise forward: diffusion-gemma models only"
+            ));
+        }
+        let canvas = req.canvas_tokens;
+        let cc = canvas.len();
+        let p = denoise_p;
+        if p + cc > max_ctx {
+            return Err(anyhow!(
+                "denoise: prompt {p} + canvas {cc} exceeds the session KV capacity {max_ctx}"
+            ));
+        }
+        // 1. Canvas embedding: e = embed(tok)·√n_embd [+ self-cond], then weightless rms-norm
+        // (no scale weight — matches `dg_canvas_embed` in the reference exactly). diffusion-gemma
+        // is always gemma-family, so `embed_scale` is always √n_embd — computed locally (the
+        // "── drive ──" section below defines its own copy for the ordinary decode loop, unreached
+        // by this early return).
+        let embed_scale = if gemma { (ne as f32).sqrt() } else { 1.0 };
+        let mut hidden_host: Vec<f32> = Vec::with_capacity(cc * ne);
+        for &tok in canvas {
+            let base = tok as usize * ne;
+            hidden_host.extend(token_embd[base..base + ne].iter().map(|&x| x * embed_scale));
+        }
+        if let Some(sc_logits) = req.sc_logits {
+            if sc_logits.len() != cc * c.vocab {
+                return Err(anyhow!(
+                    "denoise: sc_logits length {} != {cc}*{} (canvas rows * vocab)",
+                    sc_logits.len(),
+                    c.vocab
+                ));
+            }
+            let sc_sig = diffusion_self_cond(g, c, token_embd, sc_logits, req.temp_inv, cc)?;
+            for (h, s) in hidden_host.iter_mut().zip(sc_sig.iter()) {
+                *h += s;
+            }
+        }
+        for row in hidden_host.chunks_mut(ne) {
+            let ms: f32 = row.iter().map(|&x| x * x).sum::<f32>() / ne as f32;
+            let inv = 1.0 / (ms + c.rms_eps).sqrt();
+            for v in row.iter_mut() {
+                *v *= inv;
+            }
+        }
+        let dn_positions: Vec<i32> = (p as i32..(p + cc) as i32).collect();
+        let dn_hidden_buf = be
+            .alloc(cc * ne * 4, BufferUsage::Staging)
+            .map_err(|e| anyhow!("{e}"))?;
+        let dn_pos_buf = be
+            .alloc(cc * 4, BufferUsage::Staging)
+            .map_err(|e| anyhow!("{e}"))?;
+        let dn_logits_buf = be
+            .alloc(cc * c.vocab * 4, BufferUsage::Staging)
+            .map_err(|e| anyhow!("{e}"))?;
+        be.upload(dn_hidden_buf.as_ref(), bytemuck::cast_slice(&hidden_host))
+            .map_err(|e| anyhow!("{e}"))?;
+        be.upload(dn_pos_buf.as_ref(), bytemuck::cast_slice(&dn_positions))
+            .map_err(|e| anyhow!("{e}"))?;
+        // 2/3/4. Per-layer forward: the decoder-scalar / Canvas-mask denoise variant of `build`;
+        // 5. logits over ALL C rows (logits_rows = cc).
+        let (dg, dh) = build(cc, p, cc, true);
+        let dplan = be.compile(&dg).map_err(|e| anyhow!("{e}"))?;
+        let mut db = Bindings::new();
+        db.bind(dh.hidden, dn_hidden_buf.as_ref());
+        db.bind(dh.positions, dn_pos_buf.as_ref());
+        if let (Some(rid), Some((rb, _))) = (dh.rope_freqs, &rf_buf) {
+            db.bind(rid, rb.as_ref());
+        }
+        for l in 0..c.n_layer {
+            db.bind(dh.k_cache[l], kbufs[l].as_ref());
+            db.bind(dh.v_cache[l], vbufs[l].as_ref());
+        }
+        for (i, wid) in dh.weights.iter().enumerate() {
+            db.bind(*wid, wbufs[i].as_ref());
+        }
+        db.bind(dh.logits, dn_logits_buf.as_ref());
+        let t0 = std::time::Instant::now();
+        be.execute(dplan.as_ref(), &db)
+            .map_err(|e| anyhow!("{e}"))?;
+        req.out_logits.resize(cc * c.vocab, 0.0);
+        be.download(
+            dn_logits_buf.as_ref(),
+            bytemuck::cast_slice_mut(req.out_logits),
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+        // `cached`/`start` were left untouched above (the canvas isn't part of the prompt/gen
+        // token stream) — the prompt-KV rows 0..P stay exactly as the prior prefill call left
+        // them, so the NEXT denoise call (same or different canvas) re-overwrites rows P..P+C
+        // again, and a later real prefill still resumes from P.
+        return Ok((
+            Vec::new(),
+            GenStats {
+                n_prompt: 0,
+                prompt_secs: t0.elapsed().as_secs_f64(),
+                n_gen: 0,
+                decode_secs: 0.0,
+            },
+        ));
+    }
+
     // ── speculative VERIFY ──────────────────────────────────────────────────────────
     // One batched forward over the un-cached suffix with the LM head on EVERY row: returns
     // [m, vocab] logits (the distribution after each suffix token) and generates nothing.
@@ -2642,7 +2919,7 @@ pub(crate) fn generate_dense_backend(
             .map_err(|e| anyhow!("{e}"))?;
         be.upload(vf_pos_buf.as_ref(), bytemuck::cast_slice(&vf_positions))
             .map_err(|e| anyhow!("{e}"))?;
-        let (vg, vh) = build(m, start, m);
+        let (vg, vh) = build(m, start, m, false);
         let vplan = be.compile(&vg).map_err(|e| anyhow!("{e}"))?;
         let mut vb = Bindings::new();
         vb.bind(vh.hidden, vf_hidden_buf.as_ref());
@@ -2768,7 +3045,7 @@ pub(crate) fn generate_dense_backend(
                 None
             };
             let pf_t0 = std::time::Instant::now();
-            let (pf_g, pf_h) = build(pf_m, cstart, 1);
+            let (pf_g, pf_h) = build(pf_m, cstart, 1, false);
             let t_build = pf_t0.elapsed();
             let pf_plan = be.compile(&pf_g).map_err(|e| anyhow!("{e}"))?;
             let t_compile = pf_t0.elapsed();
@@ -2853,7 +3130,7 @@ pub(crate) fn generate_dense_backend(
         // Force the static path for qwen35 until that's audited; every other arch is unaffected.
         && !c.qwen35;
     let ro = if dyn_replay {
-        let (g, h) = build(1, 0, 1);
+        let (g, h) = build(1, 0, 1, false);
         let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
         let mut b = Bindings::new();
         b.bind(h.hidden, hidden_buf.as_ref());
@@ -2914,7 +3191,7 @@ pub(crate) fn generate_dense_backend(
             be.execute(plan.as_ref(), b).map_err(|e| anyhow!("{e}"))?;
             exec_el = t_exec.elapsed();
         } else {
-            let (g, h) = build(1, pos, 1);
+            let (g, h) = build(1, pos, 1, false);
             let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
             let mut b = Bindings::new();
             b.bind(h.hidden, hidden_buf.as_ref());

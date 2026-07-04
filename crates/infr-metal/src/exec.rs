@@ -2089,6 +2089,19 @@ impl MetalBackend {
                 let window: u32 = match mask {
                     infr_core::graph::AttnMask::Causal => 0,
                     infr_core::graph::AttnMask::SlidingWindow(w) => w as u32,
+                    // DiffusionGemma canvas denoise (docs/DIFFUSIONGEMMA.md): every row attends
+                    // the SAME fixed bidirectional `[lo, kv_len)`, not a per-row causal/SWA
+                    // window — none of the kernel tiers below (all built around a per-row causal
+                    // END) implement that reach yet. Fail loudly rather than silently run a
+                    // causal-shaped kernel over a bidirectional mask (Metal is Phase 2's
+                    // blind/unverified backend — CPU + Vulkan are the validated ones).
+                    infr_core::graph::AttnMask::Canvas { .. } => {
+                        return Err(Error::Unsupported(
+                            "metal attention: AttnMask::Canvas (DiffusionGemma denoise) has no \
+                             Metal kernel yet — CPU/Vulkan only so far"
+                                .into(),
+                        ));
+                    }
                 };
                 if let Some(posbuf) = r.posbuf.clone() {
                     // Recording a replay tape (rows==1, f16/q8/coupled-q4_0/iq4_nl cache, hd

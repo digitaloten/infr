@@ -29,6 +29,17 @@ pub enum AttnMask {
     Causal,
     /// Causal sliding-window attention with the given window size (in tokens).
     SlidingWindow(usize),
+    /// DiffusionGemma canvas denoise mask (bidirectional, NOT causal — see
+    /// `docs/DIFFUSIONGEMMA.md`'s "Seam extensions" and the reference
+    /// `llm_graph_input_attn_diffusion_decode::set_input` in `diffusion-gemma.cpp`): EVERY query
+    /// row attends the SAME fixed range `[lo, kv_len)` regardless of its own row index — `pos`/
+    /// per-row causal bounds are ignored entirely. `lo = 0` on full-attention layers (every
+    /// prompt + canvas key visible); `lo = max(0, P - (n_swa-1))` on SWA layers (only the last
+    /// `n_swa-1` prompt positions, but EVERY canvas key: canvas keys live in `[P, kv_len)` ⊆
+    /// `[lo, kv_len)` on both layer types, since `lo <= P`). The caller (graph builder) computes
+    /// `lo` from the prompt length `P` and the layer's SWA window; this variant only carries the
+    /// already-resolved value.
+    Canvas { lo: usize },
 }
 
 /// Activation used by the gated FFN (`act(gate) * up`).

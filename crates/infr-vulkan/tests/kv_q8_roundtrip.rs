@@ -172,6 +172,7 @@ fn planar_q8_attn_partial_matches_f16() {
         n_chunks,
         0.0,
         0,
+        None, // canvas_lo
         false,
         false,
         0,
@@ -212,6 +213,7 @@ fn planar_q8_attn_partial_matches_f16() {
         n_chunks,
         0.0,
         0,
+        None, // canvas_lo
         true,
         true,
         cap,
@@ -301,6 +303,7 @@ fn planar_q8_attn_partial_mixed_kv() {
             n_chunks,
             0.0,
             0,
+            None, // canvas_lo
             k_q8,
             v_q8,
             c,
