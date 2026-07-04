@@ -18,8 +18,8 @@ use infr_gguf::{Gguf, TensorBytes};
 // prompt ingestion (looped) and generation — so no GEMM/flash prefill kernels are needed on CPU.
 // The KV cache grows one row per step. Validates the agnostic seam end-to-end against the GPU path.
 
-/// FFN weight handles: a dense gated FFN, or a qwen3moe routed-expert bank (router + stacked
-/// per-expert gate/up/down).
+/// FFN weight handles: a dense gated FFN, a qwen3moe routed-expert bank (router + stacked
+/// per-expert gate/up/down), or diffusion-gemma's dual FFN (dense ∥ MoE, summed).
 enum FfnW {
     Dense {
         wgate: TensorId,
@@ -33,6 +33,34 @@ enum FfnW {
         gate_exps: TensorId,
         up_exps: TensorId,
         down_exps: TensorId,
+    },
+    /// diffusion-gemma's per-layer dual FFN: a dense GeGLU branch (the "shared expert") ∥ a
+    /// 128-expert MoE branch (fused `gate_up_exps` + per-expert `down_exps` scale), summed and
+    /// sandwich-normed. See the FFN wiring in `docs/DIFFUSIONGEMMA.md`. `LayerW::ffn_norm` is the
+    /// dense branch's INPUT norm and `LayerW::post_ffw` the shared FINAL norm (both reused as-is —
+    /// every gemma model already carries them); the fields below are the pieces unique to the
+    /// dual-FFN block.
+    DiffusionMoe {
+        d_gate: TensorId,
+        d_up: TensorId,
+        d_down: TensorId,
+        /// `post_ffw_norm_1`: dense branch output norm (before summing with the MoE branch).
+        d_post_norm: TensorId,
+        /// `pre_ffw_norm_2`: MoE branch's own input norm, applied to `attn_out` (the UNNORMED
+        /// post-attention residual — a separate parallel read from the dense branch's `ffn_norm`).
+        m_pre_norm: TensorId,
+        /// `ffn_gate_inp.weight`: router logits projection.
+        router: TensorId,
+        /// `ffn_gate_inp.scale` `[ne]`: elementwise scale on the router's OWN input (the weightless
+        /// rmsnorm of `attn_out`, further scaled by `1/√ne` — see the graph-build wiring).
+        router_scale: TensorId,
+        /// `ffn_gate_up_exps.weight`, fused `[ne, 2*n_ff_exp, n_expert]`.
+        gate_up_exps: TensorId,
+        down_exps: TensorId,
+        /// `ffn_down_exps.scale` `[n_expert]`: per-expert scale on the down-projection output.
+        down_scale: TensorId,
+        /// `post_ffw_norm_2`: MoE branch output norm (before summing with the dense branch).
+        m_post_norm: TensorId,
     },
 }
 
@@ -147,6 +175,7 @@ pub(crate) fn generate_dense_cpu(
         on_token,
         &mut None,
         prompt.len() + max_new + 1,
+        None,
         None,
         None,
     )
@@ -288,6 +317,7 @@ pub(crate) fn generate_dense_gpu_session(
         want_ctx,
         constraint,
         None,
+        None,
     )
 }
 
@@ -359,6 +389,7 @@ pub(crate) fn generate_dense_metal_session(
         want_ctx,
         constraint,
         None,
+        None,
     )
 }
 
@@ -400,8 +431,92 @@ pub(crate) fn verify_dense_metal2(
         want_ctx,
         None,
         Some(&mut logits),
+        None,
     )?;
     Ok((logits, stats.prompt_secs))
+}
+
+/// DiffusionGemma Phase-1 validation: a causal prefill of `tokens` (a fresh one-shot forward, no
+/// session) through the CPU reference backend, returning the LAST token's raw (pre-softmax, post-
+/// softcap) logits. Rides the ordinary per-token decode loop (`max_new = 1`, the one generated
+/// token discarded) — MoE-compatible, unlike the batched `verify` path.
+pub(crate) fn verify_dense_cpu(
+    g: &Gguf,
+    cfg: &Config,
+    token_embd: &[f32],
+    ple: Option<&PerLayerEmbd>,
+    tokens: &[u32],
+) -> AResult<Vec<f32>> {
+    let cpu_be = CpuBackend::new();
+    let mut logits = Vec::new();
+    let mut state = None;
+    generate_dense_backend(
+        &cpu_be,
+        &|_name, tb, dt, _n| match tb {
+            WBytes::Mmap(tb) => Ok((cpu_be.map_weight(tb), dt)),
+            WBytes::Owned(v) => {
+                let buf = cpu_be
+                    .alloc(v.len().max(1), BufferUsage::Weights)
+                    .map_err(|e| anyhow!("{e}"))?;
+                cpu_be
+                    .upload(buf.as_ref(), &v)
+                    .map_err(|e| anyhow!("{e}"))?;
+                Ok((buf, dt))
+            }
+        },
+        g,
+        cfg,
+        token_embd,
+        ple,
+        tokens,
+        1,
+        |_| {},
+        &mut state,
+        tokens.len() + 2,
+        None,
+        None,
+        Some(&mut logits),
+    )?;
+    Ok(logits)
+}
+
+/// [`verify_dense_cpu`]'s Vulkan twin — the same one-shot causal prefill through the production
+/// Vulkan seam, for the CPU/Vulkan cross-backend parity check.
+pub(crate) fn verify_dense_vulkan(
+    vk: &infr_vulkan::VulkanBackend,
+    g: &Gguf,
+    cfg: &Config,
+    token_embd: &[f32],
+    ple: Option<&PerLayerEmbd>,
+    tokens: &[u32],
+) -> AResult<Vec<f32>> {
+    let mut logits = Vec::new();
+    let mut state = None;
+    generate_dense_backend(
+        vk,
+        &|_name, tb, dt, _n| {
+            let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
+            let buf = vk
+                .alloc(padded.len(), BufferUsage::Weights)
+                .map_err(|e| anyhow!("{e}"))?;
+            vk.upload(buf.as_ref(), &padded)
+                .map_err(|e| anyhow!("{e}"))?;
+            Ok((buf, dt))
+        },
+        g,
+        cfg,
+        token_embd,
+        ple,
+        tokens,
+        1,
+        |_| {},
+        &mut state,
+        tokens.len() + 2,
+        None,
+        None,
+        Some(&mut logits),
+    )?;
+    Ok(logits)
 }
 
 /// Backend-generic dense decode runner. Builds the agnostic decode [`Graph`] per token and runs it
@@ -694,6 +809,12 @@ pub(crate) fn generate_dense_backend(
     want_ctx: usize,
     mut constraint: Option<&mut crate::grammar::Constraint>,
     verify: Option<&mut Vec<f32>>,
+    // Phase-1 DiffusionGemma validation hook: captures the LAST prompt token's raw logits (the
+    // per-token loop's first `is_decode` row, i.e. the causal-prefill result) without disturbing
+    // the sampled continuation. `None` everywhere else. Unlike `verify` (a batched m-row forward,
+    // MoE-incompatible — see its guard below) this rides the existing rows==1 per-token loop, so
+    // it works for MoE/diffusion-gemma models too.
+    mut logits_out: Option<&mut Vec<f32>>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     let c = cfg;
     let (ne, nh) = (c.n_embd, c.n_head);
@@ -724,10 +845,18 @@ pub(crate) fn generate_dense_backend(
         })
         .collect();
     // gemma4 per-layer output scale (`layer_output_scale.weight`, a single scalar multiplying the
-    // layer output before the next layer). Read host-side; applied as an `Op::Scale`.
+    // layer output before the next layer). Read host-side; applied as an `Op::Scale`. diffusion-
+    // gemma ships TWO per-layer scalars (encoder for the prompt, decoder for the canvas); Phase 1
+    // is the encoder-only causal prefill, so it reads `enc_layer_output_scale` — the decoder
+    // scalar is unused until the canvas denoise graph (Phase 2+).
+    let out_scale_name = if c.diffusion_gemma {
+        "enc_layer_output_scale"
+    } else {
+        "layer_output_scale"
+    };
     let out_scale: Vec<Option<f32>> = (0..c.n_layer)
         .map(|l| {
-            let name = format!("blk.{l}.layer_output_scale.weight");
+            let name = format!("blk.{l}.{out_scale_name}.weight");
             if g.tensors().iter().any(|t| t.name == name) {
                 crate::load_tensor_dequant(g, &name)
                     .ok()
@@ -1008,7 +1137,21 @@ pub(crate) fn generate_dense_backend(
                 "ffn_norm.weight"
             };
             wload(&[&p(ffn_norm_name)])?;
-            if c.moe.is_some() {
+            if c.diffusion_gemma {
+                // Dual FFN: dense GeGLU (n_ff=2112) ∥ 128-expert MoE (fused gate_up_exps + a
+                // per-expert down scale), summed — see docs/DIFFUSIONGEMMA.md's FFN wiring.
+                wload(&[&p("ffn_gate.weight")])?;
+                wload(&[&p("ffn_up.weight")])?;
+                wload(&[&p("ffn_down.weight")])?;
+                wload(&[&p("post_ffw_norm_1.weight")])?;
+                wload(&[&p("pre_ffw_norm_2.weight")])?;
+                wload(&[&p("ffn_gate_inp.weight")])?;
+                wload(&[&p("ffn_gate_inp.scale")])?;
+                wload(&[&p("ffn_gate_up_exps.weight")])?;
+                wload(&[&p("ffn_down_exps.weight")])?;
+                wload(&[&p("ffn_down_exps.scale")])?;
+                wload(&[&p("post_ffw_norm_2.weight")])?;
+            } else if c.moe.is_some() {
                 // qwen3moe: router + stacked per-expert gate/up/down banks.
                 wload(&[&p("ffn_gate_inp.weight")])?;
                 wload(&[&p("ffn_gate_exps.weight")])?;
@@ -1041,6 +1184,19 @@ pub(crate) fn generate_dense_backend(
         } else {
             wload(&["token_embd.weight"])?;
         }
+        // diffusion-gemma: top-level self-conditioning gated MLP. LOADED (occupies a weight-buffer
+        // slot like any other tensor) but NOT READ by any Op this phase — Phase 1 is the
+        // encoder-only causal prefill, which runs with self-conditioning permanently off (see
+        // docs/DIFFUSIONGEMMA.md); the canvas denoise graph (Phase 2+) is the first reader.
+        // Loaded BEFORE the e2b block (mutually exclusive with it — no model is both) so the
+        // `debug_assert_eq!` below, which indexes `wspecs` directly, isn't straddled by a later
+        // `wload` call (the closure's mutable borrow of `wspecs` would conflict with that read).
+        if c.diffusion_gemma {
+            wload(&["self_cond_pre_norm.weight"])?;
+            wload(&["self_cond_gate.weight"])?;
+            wload(&["self_cond_up.weight"])?;
+            wload(&["self_cond_down.weight"])?;
+        }
         // gemma4 E2B: the per-layer input-embedding projection weights, native-uploaded like any
         // other weight (model_proj stays bf16 — the seam's native bf16 GEMV/GEMM reads it directly;
         // proj_norm is f32). The GPU graph prologue (in `build`, below) runs the GEMV + RMSNorm that
@@ -1065,6 +1221,19 @@ pub(crate) fn generate_dense_backend(
                 .map_err(|e| anyhow!("{e}"))?;
             wbufs.push(b);
             wspecs.push((DType::F32, max_hd));
+        }
+        // diffusion-gemma: weightless FULL-WIDTH (ne-wide) RMSNorm for the MoE router's own input
+        // (`rmsnorm_noscale(attn_out)`, see the graph-build wiring) — a SEPARATE ones-vector from
+        // `v_ones` above (that one's per-HEAD width `max_hd`; this is the whole residual width).
+        if c.diffusion_gemma {
+            let ones = vec![1.0f32; ne];
+            let b = be
+                .alloc(ones.len() * 4, BufferUsage::Weights)
+                .map_err(|e| anyhow!("{e}"))?;
+            be.upload(b.as_ref(), bytemuck::cast_slice(&ones))
+                .map_err(|e| anyhow!("{e}"))?;
+            wbufs.push(b);
+            wspecs.push((DType::F32, ne));
         }
 
         // ── persistent KV cache buffers, sized per-layer (gemma4 SWA layers are narrower) and
@@ -1361,7 +1530,21 @@ pub(crate) fn generate_dense_backend(
                 None
             };
             let ffn_norm = wpush(&mut g, &mut weights);
-            let ffn = if c.moe.is_some() {
+            let ffn = if c.diffusion_gemma {
+                FfnW::DiffusionMoe {
+                    d_gate: wpush(&mut g, &mut weights),
+                    d_up: wpush(&mut g, &mut weights),
+                    d_down: wpush(&mut g, &mut weights),
+                    d_post_norm: wpush(&mut g, &mut weights),
+                    m_pre_norm: wpush(&mut g, &mut weights),
+                    router: wpush(&mut g, &mut weights),
+                    router_scale: wpush(&mut g, &mut weights),
+                    gate_up_exps: wpush(&mut g, &mut weights),
+                    down_exps: wpush(&mut g, &mut weights),
+                    down_scale: wpush(&mut g, &mut weights),
+                    m_post_norm: wpush(&mut g, &mut weights),
+                }
+            } else if c.moe.is_some() {
                 FfnW::Moe {
                     router: wpush(&mut g, &mut weights),
                     gate_exps: wpush(&mut g, &mut weights),
@@ -1408,8 +1591,17 @@ pub(crate) fn generate_dense_backend(
         }
         let w_out_norm = wpush(&mut g, &mut weights);
         let w_lm = wpush(&mut g, &mut weights);
+        // diffusion-gemma: self-conditioning MLP handles — declared to match `wload`'s upload
+        // order (right after lm_head, before the e2b projection weights), discarded (Phase 1
+        // never emits an Op reading them; Phase 2 names them).
+        if c.diffusion_gemma {
+            let _sc_pre_norm = wpush(&mut g, &mut weights);
+            let _sc_gate = wpush(&mut g, &mut weights);
+            let _sc_up = wpush(&mut g, &mut weights);
+            let _sc_down = wpush(&mut g, &mut weights);
+        }
         // gemma4 E2B per-layer input-embedding projection weights — declared here to match the
-        // `wload` upload order (right after lm_head, before the gemma4 V-norm ones-vector).
+        // `wload` upload order (right after lm_head/self_cond, before the gemma4 V-norm ones-vector).
         let (mp_w, pn_w) = if e2b {
             (
                 Some(wpush(&mut g, &mut weights)),
@@ -1419,6 +1611,13 @@ pub(crate) fn generate_dense_backend(
             (None, None)
         };
         let v_ones = if gemma4 {
+            Some(wpush(&mut g, &mut weights))
+        } else {
+            None
+        };
+        // diffusion-gemma: weightless full-width (ne) RMSNorm ones-vector for the MoE router's own
+        // input — see the matching upload in `generate_dense_backend`'s init block.
+        let router_ones = if c.diffusion_gemma {
             Some(wpush(&mut g, &mut weights))
         } else {
             None
@@ -1458,6 +1657,16 @@ pub(crate) fn generate_dense_backend(
         // E2B per-layer embed scratch: gate `[npl]` and projected `[ne]`.
         let plg = g.internal(f32d(batch * npl.max(1)));
         let plp = g.internal(f32d(batch * ne));
+
+        // diffusion-gemma dual-FFN scratch (see docs/DIFFUSIONGEMMA.md's FFN wiring): the dense
+        // branch's own output (`d_out`, before summing with the MoE branch), the router's own
+        // input row (`router_tmp` — a DIFFERENT normalization of `attn_out` than either FFN
+        // branch reads), the MoE branch's input (`moe_in`) and raw output (`moe_out`). Harmlessly
+        // allocated (but unused) on every other arch, like the E2B/qwen35 scratch above.
+        let d_out = g.internal(f32d(batch * ne));
+        let router_tmp = g.internal(f32d(batch * ne));
+        let moe_in = g.internal(f32d(batch * ne));
+        let moe_out = g.internal(f32d(batch * ne));
 
         // qwen35 attention out-gate scratch (the interleaved q+gate trap — see docs/QWEN35.md):
         // `qg` holds the RAW `attn_q` projection (`[batch, nh*2*hd]`, q and gate interleaved per
@@ -2107,10 +2316,13 @@ pub(crate) fn generate_dense_backend(
                     let mc = c.moe.expect("moe layer without MoeConfig");
                     g.push(Op::MoeFfn {
                         x: hn,
+                        router_x: hn, // qwen3moe: router reads the SAME normed input as the experts
                         router,
                         gate_exps,
                         up_exps,
                         down_exps,
+                        down_scale: None,
+                        fused_gate_up: false,
                         dst: sub,
                         ne: ne as u32,
                         n_expert: mc.n_expert as u32,
@@ -2118,6 +2330,138 @@ pub(crate) fn generate_dense_backend(
                         n_ff_exp: mc.n_ff_exp as u32,
                         scale: mc.scale,
                         act, // qwen3moe: SwiGLU (act == Silu)
+                    });
+                }
+                FfnW::DiffusionMoe {
+                    d_gate,
+                    d_up,
+                    d_down,
+                    d_post_norm,
+                    m_pre_norm,
+                    router,
+                    router_scale,
+                    gate_up_exps,
+                    down_exps,
+                    down_scale,
+                    m_post_norm,
+                } => {
+                    let mc = c.moe.expect("diffusion-gemma layer without MoeConfig");
+                    // Dense branch (the "shared expert"): GELU-par gate/up/down on `hn` (already
+                    // ffn_norm(attn_out) from above), then its own post-norm. `act` is Gelu here —
+                    // gemma implies it (see the `act` computation above).
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: d_gate,
+                        dst: gbuf,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: nff_l as u32,
+                        w_off: 0,
+                    });
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: d_up,
+                        dst: ubuf,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: nff_l as u32,
+                        w_off: 0,
+                    });
+                    g.push(Op::GatedAct {
+                        gate: gbuf,
+                        up: ubuf,
+                        dst: actbuf,
+                        rows: batch as u32,
+                        nff: nff_l as u32,
+                        act,
+                        up_off: 0,
+                    });
+                    g.push(Op::Linear {
+                        x: actbuf,
+                        weight: d_down,
+                        dst: d_out,
+                        m: batch as u32,
+                        in_f: nff_l as u32,
+                        out_f: ne as u32,
+                        w_off: 0,
+                    });
+                    g.push(Op::RmsNorm {
+                        x: d_out,
+                        weight: d_post_norm,
+                        dst: d_out,
+                        rows: batch as u32,
+                        dim: ne as u32,
+                        eps,
+                    });
+                    // Router's OWN input: rmsnorm_noscale(attn_out) · 1/√ne · ffn_gate_inp.scale —
+                    // reads the UNNORMED post-attention residual `hidden`, NOT `hn` (neither FFN
+                    // branch's normed input). `router_ones` is the weightless full-width RMSNorm
+                    // (see its upload next to `v_ones`).
+                    let ones = router_ones.expect("diffusion-gemma layer without router_ones");
+                    g.push(Op::RmsNorm {
+                        x: hidden,
+                        weight: ones,
+                        dst: router_tmp,
+                        rows: batch as u32,
+                        dim: ne as u32,
+                        eps,
+                    });
+                    g.push(Op::Scale {
+                        x: router_tmp,
+                        dst: router_tmp,
+                        s: 1.0 / (ne as f32).sqrt(),
+                        n: (batch * ne) as u32,
+                    });
+                    g.push(Op::MulVec {
+                        x: router_tmp,
+                        vec: router_scale,
+                        dst: router_tmp,
+                        rows: batch as u32,
+                        n: ne as u32,
+                    });
+                    // MoE branch input: pre_ffw_norm_2(attn_out) — also reads `hidden`, a THIRD
+                    // independent normalization of the same residual.
+                    g.push(Op::RmsNorm {
+                        x: hidden,
+                        weight: m_pre_norm,
+                        dst: moe_in,
+                        rows: batch as u32,
+                        dim: ne as u32,
+                        eps,
+                    });
+                    g.push(Op::MoeFfn {
+                        x: moe_in,
+                        router_x: router_tmp,
+                        router,
+                        gate_exps: gate_up_exps,
+                        up_exps: gate_up_exps, // fused: same handle as gate_exps, never read
+                        down_exps,
+                        down_scale: Some(down_scale),
+                        fused_gate_up: true,
+                        dst: moe_out,
+                        ne: ne as u32,
+                        n_expert: mc.n_expert as u32,
+                        n_used: mc.n_used as u32,
+                        n_ff_exp: mc.n_ff_exp as u32,
+                        scale: mc.scale,
+                        act,
+                    });
+                    g.push(Op::RmsNorm {
+                        x: moe_out,
+                        weight: m_post_norm,
+                        dst: moe_out,
+                        rows: batch as u32,
+                        dim: ne as u32,
+                        eps,
+                    });
+                    // out = post_ffw_norm(dense + moe) + attn_out — the sum lands in `sub`; the
+                    // shared `post_ffw_norm` (`lw.post_ffw`, generic below) and residual add are
+                    // the SAME code every gemma layer already runs.
+                    g.push(Op::Add {
+                        a: d_out,
+                        b: moe_out,
+                        dst: sub,
+                        n: (batch * ne) as u32,
                     });
                 }
             }
@@ -2608,6 +2952,12 @@ pub(crate) fn generate_dense_backend(
         if is_decode && at_frontier {
             be.download(logits_buf.as_ref(), bytemuck::cast_slice_mut(&mut logits))
                 .map_err(|e| anyhow!("{e}"))?;
+            // Phase-1 DiffusionGemma validation hook (see the param doc): this is the FIRST
+            // is_decode row — the causal prefill's last-token logits — captured before sampling
+            // touches `logits` (grammar-constrained steps overwrite it in place below).
+            if let Some(out) = logits_out.take() {
+                *out = logits.clone();
+            }
             if let Some(cst) = constraint.as_deref_mut() {
                 // Grammar-forced span (serve's tool_choice "required"/named): the shared
                 // llguidance step. Empty step ⇒ the constrained span ended.

@@ -338,6 +338,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::Add { .. } => "Add",
         Op::AddBias { .. } => "AddBias",
         Op::Scale { .. } => "Scale",
+        Op::MulVec { .. } => "MulVec",
         Op::Softcap { .. } => "Softcap",
         Op::Copy { .. } => "Copy",
         Op::CopyStrided { .. } => "CopyStrided",
@@ -1862,6 +1863,33 @@ impl MetalBackend {
                 self.encode_w(r, &pso, &[bx.as_ref(), bd.as_ref()], 1 << 1, &p, n);
                 r.loc[dst.0 as usize] = Loc::Device;
             }
+            // Broadcast multiply: the length-`n` `vec` scales every one of `rows` rows
+            // (diffusion-gemma's router input scale — the multiplicative twin of `AddBias`).
+            Op::MulVec {
+                x,
+                vec,
+                dst,
+                rows,
+                n,
+            } => {
+                let (rows, n) = (rows as usize, n as usize);
+                let total = rows * n;
+                let bx = self.ensure_device(r, x);
+                let bv = self.weight_buf(vec, g, bindings)?;
+                let bd = self.dev_dst(r, dst, total);
+                let pso = self.pipelines.get("mul_vec_f32")?;
+                let mut p = (n as u32).to_ne_bytes().to_vec();
+                p.extend_from_slice(&(total as u32).to_ne_bytes());
+                self.encode_w(
+                    r,
+                    &pso,
+                    &[bx.as_ref(), bv.as_ref(), bd.as_ref()],
+                    1 << 2,
+                    &p,
+                    total,
+                );
+                r.loc[dst.0 as usize] = Loc::Device;
+            }
             Op::Softcap { x, dst, cap, n } => {
                 let n = n as usize;
                 let bx = self.ensure_device(r, x);
@@ -2461,10 +2489,13 @@ impl MetalBackend {
             }
             Op::MoeFfn {
                 x,
+                router_x,
                 router,
                 gate_exps,
                 up_exps,
                 down_exps,
+                down_scale,
+                fused_gate_up,
                 dst,
                 ne,
                 n_expert,
@@ -2499,9 +2530,15 @@ impl MetalBackend {
                     g.desc(up_exps).dtype,
                     g.desc(down_exps).dtype,
                 );
+                // The device path assumes SEPARATE full-width gate/up expert banks and no per-
+                // expert down scale (qwen3moe's shape); diffusion-gemma's fused `gate_up_exps` +
+                // `ffn_down_exps.scale` always falls to the host path below instead of teaching
+                // the device kernels a layout they don't expect.
                 let device_ok = n_used <= 16
                     && ne % 256 == 0
                     && nffx % 256 == 0
+                    && !fused_gate_up
+                    && down_scale.is_none()
                     && std::env::var("INFR_METAL_NOMOE").is_err()
                     && moe_kern(gdt2).is_some()
                     && moe_kern(udt2).is_some()
@@ -2777,7 +2814,11 @@ impl MetalBackend {
                     return Ok(());
                 }
                 self.ensure_host(r, g, x);
+                self.ensure_host(r, g, router_x);
                 let xs = r.vals[x.0 as usize].clone();
+                // diffusion-gemma's router reads a DIFFERENTLY normalized/scaled row than the
+                // experts (see the `Op::MoeFfn` doc); qwen3moe binds the same handle as `x`.
+                let rxs = r.vals[router_x.0 as usize].clone();
                 // `x` may hold several rows (the seam's batched prefill) — route + run per row,
                 // mirroring the CPU reference's row loop.
                 let rows = xs.len() / ne;
@@ -2785,25 +2826,30 @@ impl MetalBackend {
                 // but the logits use a naive f32 sum here vs the CPU's 8-accumulator dot, so the
                 // summation order differs — top-k can pick differently on a near-tie logit.
                 let rw = self.weight_host(router, g, bindings);
-                // Per-expert stacked-weight byte-slice sizes (each expert = an equal slice).
+                // Per-expert stacked-weight byte-slice sizes (each expert = an equal slice). Fused:
+                // `gate_exps` holds BOTH roles ([ne, 2*nffx, n_expert]); `up_exps` is the SAME
+                // handle (unused below).
                 let gbuf = metal_buf(bindings.get(gate_exps).expect("metal: unbound gate_exps"));
-                let ubuf = metal_buf(bindings.get(up_exps).expect("metal: unbound up_exps"));
                 let dbuf = metal_buf(bindings.get(down_exps).expect("metal: unbound down_exps"));
-                let (gst, ust, dsz) = (
-                    gbuf.len / n_expert,
-                    ubuf.len / n_expert,
-                    dbuf.len / n_expert,
-                );
-                let (gdt, udt, ddt) = (
-                    g.desc(gate_exps).dtype,
-                    g.desc(up_exps).dtype,
-                    g.desc(down_exps).dtype,
-                );
+                let gdt = g.desc(gate_exps).dtype;
+                let ddt = g.desc(down_exps).dtype;
+                let gst = gbuf.len / n_expert;
+                let dsz = dbuf.len / n_expert;
+                let (ubuf, udt, ust) = if fused_gate_up {
+                    (None, gdt, 0)
+                } else {
+                    let b = metal_buf(bindings.get(up_exps).expect("metal: unbound up_exps"));
+                    let dt = g.desc(up_exps).dtype;
+                    let s = b.len / n_expert;
+                    (Some(b), dt, s)
+                };
+                let dscale = down_scale.map(|id| self.weight_host(id, g, bindings));
                 let mut out = vec![0f32; rows * ne];
                 for (row, orow) in out.chunks_mut(ne).enumerate() {
                     let xr = &xs[row * ne..row * ne + ne];
+                    let xrr = &rxs[row * ne..row * ne + ne];
                     let logits: Vec<f32> = (0..n_expert)
-                        .map(|e| (0..ne).map(|i| rw[e * ne + i] * xr[i]).sum::<f32>())
+                        .map(|e| (0..ne).map(|i| rw[e * ne + i] * xrr[i]).sum::<f32>())
                         .collect();
                     let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                     let mut probs: Vec<f32> = logits.iter().map(|&v| (v - maxl).exp()).collect();
@@ -2821,14 +2867,30 @@ impl MetalBackend {
                     let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
                     for &e in &idx {
                         // Dequant only this expert's slices, then matvec on the GPU.
-                        let gw = bytes_to_f32(&Self::read_bytes_range(gbuf, e * gst, gst), gdt);
-                        let uw = bytes_to_f32(&Self::read_bytes_range(ubuf, e * ust, ust), udt);
-                        let dw = bytes_to_f32(&Self::read_bytes_range(dbuf, e * dsz, dsz), ddt);
-                        let gate = self.gpu_matvec(xr, &gw, ne, nffx)?;
-                        let up = self.gpu_matvec(xr, &uw, ne, nffx)?;
+                        let (gate, up) = if fused_gate_up {
+                            let full =
+                                bytes_to_f32(&Self::read_bytes_range(gbuf, e * gst, gst), gdt);
+                            let full = self.gpu_matvec(xr, &full, ne, 2 * nffx)?;
+                            (full[..nffx].to_vec(), full[nffx..].to_vec())
+                        } else {
+                            let ubuf = ubuf.as_ref().expect("split gate/up: up_exps missing");
+                            let gw = bytes_to_f32(&Self::read_bytes_range(gbuf, e * gst, gst), gdt);
+                            let uw = bytes_to_f32(&Self::read_bytes_range(ubuf, e * ust, ust), udt);
+                            (
+                                self.gpu_matvec(xr, &gw, ne, nffx)?,
+                                self.gpu_matvec(xr, &uw, ne, nffx)?,
+                            )
+                        };
                         let actv: Vec<f32> =
                             (0..nffx).map(|i| act_fn(act, gate[i]) * up[i]).collect();
-                        let y = self.gpu_matvec(&actv, &dw, nffx, ne)?;
+                        let dw = bytes_to_f32(&Self::read_bytes_range(dbuf, e * dsz, dsz), ddt);
+                        let mut y = self.gpu_matvec(&actv, &dw, nffx, ne)?;
+                        if let Some(ds) = &dscale {
+                            let s = ds[e];
+                            for v in y.iter_mut() {
+                                *v *= s;
+                            }
+                        }
                         let w_e = probs[e] / wsum * scale;
                         for i in 0..ne {
                             orow[i] += w_e * y[i];

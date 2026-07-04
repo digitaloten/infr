@@ -2009,10 +2009,13 @@ fn moe_ffn_parity() {
     let dst = g.output(TensorDesc::new(vec![ne], DType::F32));
     g.push(Op::MoeFfn {
         x,
+        router_x: x,
         router,
         gate_exps: gate,
         up_exps: up,
         down_exps: down,
+        down_scale: None,
+        fused_gate_up: false,
         dst,
         ne: ne as u32,
         n_expert: n_expert as u32,
@@ -2045,10 +2048,13 @@ fn moe_quant_test(dtype: DType, synth: fn(usize, u32) -> Vec<u8>, seed: u32) {
     let dst = g.output(TensorDesc::new(vec![ne], DType::F32));
     g.push(Op::MoeFfn {
         x,
+        router_x: x,
         router,
         gate_exps: gate,
         up_exps: up,
         down_exps: down,
+        down_scale: None,
+        fused_gate_up: false,
         dst,
         ne: ne as u32,
         n_expert: n_expert as u32,
@@ -2094,10 +2100,13 @@ fn moe_ffn_batched_rows_parity() {
     let dst = g.output(TensorDesc::new(vec![rows, ne], DType::F32));
     g.push(Op::MoeFfn {
         x,
+        router_x: x,
         router,
         gate_exps: gate,
         up_exps: up,
         down_exps: down,
+        down_scale: None,
+        fused_gate_up: false,
         dst,
         ne: ne as u32,
         n_expert: n_expert as u32,

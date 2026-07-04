@@ -274,6 +274,46 @@ impl CpuModel {
         &self.cfg
     }
 
+    /// Tokenize raw text with the model's own tokenizer (no chat template) — for callers that
+    /// need token ids directly (e.g. a raw-forward validation harness), as opposed to
+    /// [`render_chat`](Self::render_chat) + the generation loop.
+    pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
+        Ok(self
+            .tokenizer
+            .encode(text, false)
+            .map_err(|e| anyhow!("encode: {e}"))?
+            .get_ids()
+            .to_vec())
+    }
+
+    /// DiffusionGemma Phase-1 validation: a causal prefill of `tokens` on the CPU reference
+    /// backend, returning the LAST token's raw logits (`[vocab]`, pre-softmax, post-softcap). Not
+    /// specific to diffusion-gemma — works for any arch on this seam — but this is its only
+    /// caller today (see `docs/DIFFUSIONGEMMA.md`).
+    pub fn prefill_logits_cpu(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        crate::cpu_backend::verify_dense_cpu(
+            &self.gguf,
+            &self.cfg,
+            &self.token_embd,
+            self.per_layer_embd.as_ref(),
+            tokens,
+        )
+    }
+
+    /// [`prefill_logits_cpu`](Self::prefill_logits_cpu)'s Vulkan twin, for the CPU/Vulkan
+    /// cross-backend parity check.
+    pub fn prefill_logits_vulkan(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
+        crate::cpu_backend::verify_dense_vulkan(
+            &vk,
+            &self.gguf,
+            &self.cfg,
+            &self.token_embd,
+            self.per_layer_embd.as_ref(),
+            tokens,
+        )
+    }
+
     /// Token-level bench on the CPU reference backend (no GPU): prefill `n_prompt` dummy tokens, then
     /// decode `n_gen`, returning the timing ([`crate::GenStats`] has `prompt_secs`/`decode_secs`). Lets
     /// `infr bench -ngl 0` measure prefill (pp = n_prompt/prompt_secs) and decode (tg = n_gen/decode_secs)

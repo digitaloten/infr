@@ -56,10 +56,13 @@ fn moe_layer_wall() {
         };
         g.push(Op::MoeFfn {
             x: cur,
+            router_x: cur,
             router,
             gate_exps: gate,
             up_exps: up,
             down_exps: down,
+            down_scale: None,
+            fused_gate_up: false,
             dst,
             ne: ne as u32,
             n_expert: n_expert as u32,

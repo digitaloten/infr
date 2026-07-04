@@ -214,6 +214,17 @@ pub enum Op {
         s: f32,
         n: u32,
     },
+    /// Broadcast elementwise multiply: `dst[r*n+c] = x[r*n+c] * vec[c]` for `r` in `0..rows`, `c`
+    /// in `0..n` — the multiplicative twin of [`Op::AddBias`]. `vec` is a length-`n` weight
+    /// (diffusion-gemma's router input scale `ffn_gate_inp.scale`, applied to the router's
+    /// rmsnorm-noscale'd input before the router `Linear`; see `docs/DIFFUSIONGEMMA.md`).
+    MulVec {
+        x: TensorId,
+        vec: TensorId,
+        dst: TensorId,
+        rows: u32,
+        n: u32,
+    },
     /// `dst[i] = cap * tanh(x[i] / cap)` (Gemma final-logit softcap).
     Softcap {
         x: TensorId,
@@ -243,18 +254,37 @@ pub enum Op {
         rows: u32,
         n: u32,
     },
-    /// Mixture-of-experts FFN for a single token row (qwen3moe). The router (`Linear` of `x[ne] →
-    /// n_expert`) is softmaxed, the top-`n_used` experts selected, their softmax weights renormalized,
-    /// and each runs a gated FFN (`act(gate·x) * (up·x)`, then `down·`); the outputs are summed
-    /// weighted by the renormalized weights × `scale` into `dst[ne]` (the residual contribution).
+    /// Mixture-of-experts FFN for a single token row (qwen3moe; diffusion-gemma's MoE branch — see
+    /// `docs/DIFFUSIONGEMMA.md`). The router (`Linear` of `router_x[ne] → n_expert`) is softmaxed,
+    /// the top-`n_used` experts selected, their softmax weights renormalized, and each runs a gated
+    /// FFN on `x` (`act(gate·x) * (up·x)`, then `down·`); the outputs are summed weighted by the
+    /// renormalized weights × `scale` into `dst[ne]` (the residual contribution).
     /// `gate_exps`/`up_exps`/`down_exps` are the stacked per-expert weights — expert `e` is the `e`-th
     /// equal byte slice (gate/up are `[n_ff_exp, ne]`, down is `[ne, n_ff_exp]` row-major).
     MoeFfn {
         x: TensorId,
+        /// The router's own input row — usually the SAME tensor as `x` (qwen3moe: the router reads
+        /// whatever normed input feeds the experts). diffusion-gemma's router reads a DIFFERENTLY
+        /// normalized/scaled row of the same residual (`rmsnorm_noscale(attn_out)/√ne ·
+        /// ffn_gate_inp.scale`, built with `Op::RmsNorm` + `Op::Scale` + `Op::MulVec` upstream), so
+        /// it's a separate handle rather than reusing `x`.
+        router_x: TensorId,
         router: TensorId,
         gate_exps: TensorId,
+        /// Ignored when `fused_gate_up` is set (the call site passes the same handle as
+        /// `gate_exps` — never read).
         up_exps: TensorId,
         down_exps: TensorId,
+        /// Per-expert scale on the selected expert's DOWN-projection output BEFORE the weighted
+        /// sum (diffusion-gemma `ffn_down_exps.scale[n_expert]`, one f32 per expert). `None` = no
+        /// scale (qwen3moe).
+        down_scale: Option<TensorId>,
+        /// `gate_exps` holds gate AND up FUSED into one `[ne, 2*n_ff_exp, n_expert]` tensor (gate
+        /// rows first, up rows second — the same "gate half, up half" per-expert-slice convention
+        /// as `Op::GatedActFused`'s combined `gu` buffer). `up_exps` is unused when `true`
+        /// (diffusion-gemma's `ffn_gate_up_exps`); `false` = separate `gate_exps`/`up_exps` tensors
+        /// (qwen3moe).
+        fused_gate_up: bool,
         dst: TensorId,
         ne: u32,
         n_expert: u32,
@@ -325,6 +355,7 @@ impl Op {
             Op::Add { .. } => "Add",
             Op::AddBias { .. } => "AddBias",
             Op::Scale { .. } => "Scale",
+            Op::MulVec { .. } => "MulVec",
             Op::Softcap { .. } => "Softcap",
             Op::Copy { .. } => "Copy",
             Op::CopyStrided { .. } => "CopyStrided",

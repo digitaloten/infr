@@ -3672,6 +3672,62 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Broadcast multiply: `dst[i] = x[i] * vec[i % n]` over `total = rows*n` elements
+    /// (diffusion-gemma's router input scale — the multiplicative twin of `add_bias`).
+    pub fn mul_vec(&self, x: &dyn Buffer, vec: &dyn Buffer, y: &dyn Buffer, rows: usize, n: usize) {
+        self.stamp("mul_vec");
+        let total = (rows * n) as u32;
+        let k = self.be.kernel("mul_vec", crate::gemm::mul_vec_spv(), 3, 8);
+        let mut pc = (n as u32).to_ne_bytes().to_vec();
+        pc.extend_from_slice(&total.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(vec), Self::vkb(y)],
+            1,
+            &pc,
+            total.div_ceil(64),
+        );
+    }
+
+    /// Like [`Self::moe_accumulate`], but scales each selected expert's down output by a per-expert
+    /// weight BEFORE the weighted sum: `hidden[i] += sum_slot wts[slot] * dscale[ids[slot]] *
+    /// down[slot*ne+i]` (diffusion-gemma `ffn_down_exps.scale`). `ids` is the same expert-id buffer
+    /// `moe_topk` filled.
+    pub fn moe_accumulate_scaled(
+        &self,
+        down: &dyn Buffer,
+        wts: &dyn Buffer,
+        ids: &dyn Buffer,
+        dscale: &dyn Buffer,
+        hidden: &dyn Buffer,
+        ne: usize,
+        n_used: usize,
+    ) {
+        self.stamp("moe_accumulate_scaled");
+        let k = self.be.kernel(
+            "moe_accumulate_scaled",
+            crate::gemm::moe_accumulate_scaled_spv(),
+            5,
+            8,
+        );
+        let mut push = [0u8; 8];
+        push[0..4].copy_from_slice(&(ne as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n_used as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[
+                Self::vkb(down),
+                Self::vkb(wts),
+                Self::vkb(ids),
+                Self::vkb(dscale),
+                Self::vkb(hidden),
+            ],
+            1,
+            &push,
+            (ne as u32).div_ceil(64),
+        );
+    }
+
     /// End recording, submit once, wait, and release transient objects.
     pub fn finish(self) -> Result<()> {
         let device = &self.be.shared.device;

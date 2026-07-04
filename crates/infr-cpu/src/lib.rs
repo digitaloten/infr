@@ -2983,6 +2983,26 @@ impl Backend for CpuBackend {
                     }
                     vals[dst.0 as usize] = out;
                 }
+                // Broadcast multiply: the length-`n` `vec` scales every one of `rows` rows
+                // (diffusion-gemma's router input scale — the multiplicative twin of `AddBias`).
+                Op::MulVec {
+                    x,
+                    vec: vecid,
+                    dst,
+                    rows,
+                    n,
+                } => {
+                    let (rows, n) = (rows as usize, n as usize);
+                    let xs = vals[x.0 as usize].clone();
+                    let vv = weight(vecid); // vec is a bound weight, not an activation
+                    let mut out = vec![0f32; rows * n];
+                    for r in 0..rows {
+                        for c in 0..n {
+                            out[r * n + c] = xs[r * n + c] * vv[c];
+                        }
+                    }
+                    vals[dst.0 as usize] = out;
+                }
                 Op::Softcap { x, dst, cap, n } => {
                     let n = n as usize;
                     let xs = vals[x.0 as usize].clone();
@@ -3029,10 +3049,13 @@ impl Backend for CpuBackend {
                 }
                 Op::MoeFfn {
                     x,
+                    router_x,
                     router,
                     gate_exps,
                     up_exps,
                     down_exps,
+                    down_scale,
+                    fused_gate_up,
                     dst,
                     ne,
                     n_expert,
@@ -3048,6 +3071,10 @@ impl Backend for CpuBackend {
                         n_ff_exp as usize,
                     );
                     let xs = vals[x.0 as usize].clone();
+                    // `router_x` is usually the SAME tensor as `x` (qwen3moe); diffusion-gemma binds
+                    // a differently-normalized row (see the `Op::MoeFfn` doc). Clone independently —
+                    // it may legitimately be a different handle with its own row layout.
+                    let rxs = vals[router_x.0 as usize].clone();
                     // `x` may hold several rows (the seam's batched prefill): route + run the
                     // expert FFN independently per row — the reference semantics for the GPU
                     // adapter's GPU-routed batched form.
@@ -3068,29 +3095,32 @@ impl Backend for CpuBackend {
                     let gbuf = bindings
                         .get(gate_exps)
                         .expect("cpu backend: unbound gate_exps");
-                    let ubuf = bindings.get(up_exps).expect("cpu backend: unbound up_exps");
                     let dbuf = bindings
                         .get(down_exps)
                         .expect("cpu backend: unbound down_exps");
                     let rbytes = cpu_buf(rbuf).read();
                     let gb = cpu_buf(gbuf).read();
-                    let ub = cpu_buf(ubuf).read();
                     let db = cpu_buf(dbuf).read();
-                    let (gdt, udt, ddt) = (
-                        g.desc(gate_exps).dtype,
-                        g.desc(up_exps).dtype,
-                        g.desc(down_exps).dtype,
-                    );
-                    let (gst, ust, dst_) = (
-                        gb.len() / n_expert,
-                        ub.len() / n_expert,
-                        db.len() / n_expert,
-                    );
+                    let gdt = g.desc(gate_exps).dtype;
+                    let ddt = g.desc(down_exps).dtype;
+                    // Fused: `gate_exps` holds BOTH roles ([ne, 2*n_ff_exp, n_expert], gate rows
+                    // first); split gets its own separate up_exps/up buffer.
+                    let (ub, udt) = if fused_gate_up {
+                        (None, gdt)
+                    } else {
+                        let ubuf = bindings.get(up_exps).expect("cpu backend: unbound up_exps");
+                        (Some(cpu_buf(ubuf).read()), g.desc(up_exps).dtype)
+                    };
+                    let gst = gb.len() / n_expert;
+                    let ust = ub.as_ref().map(|b| b.len() / n_expert);
+                    let dst_ = db.len() / n_expert;
+                    let dscale = down_scale.map(&weight); // per-expert scale [n_expert], if any
                     let mut out = vec![0f32; rows * ne];
                     for (r, orow) in out.chunks_mut(ne).enumerate() {
                         let xr = &xs[r * ne..r * ne + ne];
-                        // Router softmax over all experts.
-                        let logits = matvec(&rbytes, g.desc(router).dtype, xr, ne, n_expert);
+                        let xrr = &rxs[r * ne..r * ne + ne];
+                        // Router softmax over all experts (reads router_x, NOT the expert input).
+                        let logits = matvec(&rbytes, g.desc(router).dtype, xrr, ne, n_expert);
                         let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                         let mut probs: Vec<f32> =
                             logits.iter().map(|&v| (v - maxl).exp()).collect();
@@ -3104,11 +3134,29 @@ impl Backend for CpuBackend {
                         idx.truncate(n_used);
                         let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
                         for &e in &idx {
-                            let gate = matvec(&gb[e * gst..(e + 1) * gst], gdt, xr, ne, nffx);
-                            let up = matvec(&ub[e * ust..(e + 1) * ust], udt, xr, ne, nffx);
+                            let (gate, up) = if fused_gate_up {
+                                // One matvec over the fused [2*nffx, ne] expert slice; first nffx
+                                // rows are gate, next nffx are up (Op::GatedActFused's convention).
+                                let full =
+                                    matvec(&gb[e * gst..(e + 1) * gst], gdt, xr, ne, 2 * nffx);
+                                (full[..nffx].to_vec(), full[nffx..].to_vec())
+                            } else {
+                                let ub = ub.as_ref().expect("split gate/up: up_exps missing");
+                                let ust = ust.expect("split gate/up: up stride missing");
+                                (
+                                    matvec(&gb[e * gst..(e + 1) * gst], gdt, xr, ne, nffx),
+                                    matvec(&ub[e * ust..(e + 1) * ust], udt, xr, ne, nffx),
+                                )
+                            };
                             let actv: Vec<f32> =
                                 (0..nffx).map(|i| act_fn(act, gate[i]) * up[i]).collect();
-                            let y = matvec(&db[e * dst_..(e + 1) * dst_], ddt, &actv, nffx, ne);
+                            let mut y = matvec(&db[e * dst_..(e + 1) * dst_], ddt, &actv, nffx, ne);
+                            if let Some(ds) = &dscale {
+                                let s = ds[e];
+                                for v in y.iter_mut() {
+                                    *v *= s;
+                                }
+                            }
                             let w_e = probs[e] / wsum * scale;
                             for i in 0..ne {
                                 orow[i] += w_e * y[i];

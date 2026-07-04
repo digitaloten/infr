@@ -31,12 +31,34 @@ pub const GEMMA4: &str = "gemma4";
 /// `Config::from_gguf`. NOT llama.cpp's `qwen3next` (a sibling arch with a different DeltaNet
 /// V-broadcast pattern) and not `qwen35moe` — both are rejected on purpose.
 pub const QWEN35: &str = "qwen35";
+/// DiffusionGemma: block text-diffusion MoE on a Gemma-4 backbone (shares gemma4's heterogeneous
+/// per-layer dims, V-norm, freq_factors, softcap, sandwich norms), plus a per-layer DUAL FFN
+/// (dense GeGLU ∥ 128-expert MoE, summed) and encoder/decoder per-layer output scalars. See
+/// `docs/DIFFUSIONGEMMA.md`.
+pub const DIFFUSION_GEMMA: &str = "diffusion-gemma";
 
 /// What `Config::from_gguf` — the shared TRANSFORMER-skeleton path — accepts. The split is by
 /// code path, not FFN sparsity: this list includes the routed-MoE `qwen3moe` (same attention/KV
 /// machinery, an expert FFN swapped in), and excludes `QWEN35` only because the runners route the
 /// DeltaNet hybrid to `crate::qwen35::SeamModel` before Config is ever built.
-pub const TRANSFORMER: &[&str] = &[LLAMA, QWEN2, QWEN3, QWEN3_MOE, GEMMA3, GEMMA4];
+pub const TRANSFORMER: &[&str] = &[
+    LLAMA,
+    QWEN2,
+    QWEN3,
+    QWEN3_MOE,
+    GEMMA3,
+    GEMMA4,
+    DIFFUSION_GEMMA,
+];
 
 /// Every architecture infr runs, across both paths.
-pub const ALL: &[&str] = &[LLAMA, QWEN2, QWEN3, QWEN3_MOE, GEMMA3, GEMMA4, QWEN35];
+pub const ALL: &[&str] = &[
+    LLAMA,
+    QWEN2,
+    QWEN3,
+    QWEN3_MOE,
+    GEMMA3,
+    GEMMA4,
+    DIFFUSION_GEMMA,
+    QWEN35,
+];

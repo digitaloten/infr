@@ -51,8 +51,23 @@ pub struct Config {
     pub gemma: bool,
     /// gemma4: adds per-layer heterogeneous head dims (the `*_swa` fields), a weightless RMSNorm on V,
     /// attention scale 1.0 (no 1/√d — QK-norm handles magnitude), a final logit softcap, and
-    /// proportional RoPE (freq_factors) on the full-attention layers.
+    /// proportional RoPE (freq_factors) on the full-attention layers. `true` for gemma4 AND
+    /// diffusion-gemma (its backbone is gemma4's, verbatim — see `docs/DIFFUSIONGEMMA.md`); use
+    /// `diffusion_gemma` below to gate the DIFFERENCES (dual FFN, encoder/decoder output scalars).
     pub gemma4: bool,
+    /// diffusion-gemma (block text-diffusion MoE on the gemma4 backbone): `true` only for
+    /// `arch == "diffusion-gemma"`. Gates the dual per-layer FFN (dense GeGLU ∥ 128-expert MoE,
+    /// summed) and the encoder-scalar tensor name (`enc_layer_output_scale` vs gemma4's
+    /// `layer_output_scale`); everything else reuses the `gemma4` backbone gate above.
+    pub diffusion_gemma: bool,
+    /// diffusion-gemma: the canvas (denoise-target) length — `[prompt | canvas]` splits at
+    /// `n_tokens - canvas_length`. Phase 1 (prompt-only causal prefill) doesn't slice the canvas
+    /// off, but the field is parsed now so later phases don't need to touch `Config` again. `0`
+    /// for every non-diffusion-gemma model.
+    pub canvas_length: usize,
+    /// diffusion-gemma: the vocab id used to pad an unfinished canvas block (`tokenizer.ggml.
+    /// mask_token_id`). Unused until the denoise decode loop (Phase 3). `0` for every other model.
+    pub mask_token_id: u32,
     /// Per-layer dims for the SWA (local) layers when they differ from the full (global) layers
     /// (gemma4). Equal to `head_dim` / `n_kv` / `rope_dim` for uniform-dim models.
     pub head_dim_swa: usize,
@@ -219,7 +234,8 @@ impl Config {
             crate::arch::QWEN3
             | crate::arch::QWEN3_MOE
             | crate::arch::GEMMA3
-            | crate::arch::GEMMA4 => true,
+            | crate::arch::GEMMA4
+            | crate::arch::DIFFUSION_GEMMA => true,
             // qwen35's full-attention layers are qk-normed like qwen3/gemma. In PRODUCTION this
             // Config is never built for a qwen35 GGUF (the runners route it to `qwen35::SeamModel`
             // first via `is_qwen35`) — accepting it here only lets tests drive the shared skeleton
@@ -237,7 +253,12 @@ impl Config {
         // `permute_qk_neox` field doc).
         let qkv_bias = arch == crate::arch::QWEN2;
         let permute_qk_neox = arch == crate::arch::QWEN2;
-        let gemma4 = arch == crate::arch::GEMMA4;
+        let diffusion_gemma = arch == crate::arch::DIFFUSION_GEMMA;
+        // diffusion-gemma's backbone IS gemma4's (heterogeneous per-layer dims, V-norm,
+        // freq_factors, softcap) verbatim — see docs/DIFFUSIONGEMMA.md — so it folds into the same
+        // gate as every other gemma4-shared parse below. `diffusion_gemma` gates only what's
+        // actually different (dual FFN, canvas/mask fields, encoder-scalar tensor name).
+        let gemma4 = arch == crate::arch::GEMMA4 || diffusion_gemma;
         let gemma = arch == crate::arch::GEMMA3 || gemma4;
         let qwen35 = arch == crate::arch::QWEN35;
         let mk = |k: &str| format!("{arch}.{k}");
@@ -260,7 +281,10 @@ impl Config {
             vec![ff; n_layer]
         };
         let n_ff = n_ff_layers.iter().copied().max().unwrap_or(0);
-        let moe = if arch == crate::arch::QWEN3_MOE {
+        // diffusion-gemma's MoE shape (128 experts / 8 used, softmax gating, no extra routed-weight
+        // scale) is parsed identically to qwen3moe's — only the FFN it feeds differs (dual FFN:
+        // dense ∥ MoE, summed, vs qwen3moe's MoE-only), which is a `cpu_backend` graph-build detail.
+        let moe = if arch == crate::arch::QWEN3_MOE || diffusion_gemma {
             let n_expert = meta_u64(g, &mk("expert_count")).context("expert_count")? as usize;
             let n_used =
                 meta_u64(g, &mk("expert_used_count")).context("expert_used_count")? as usize;
@@ -424,6 +448,24 @@ impl Config {
             [0u32; 4]
         };
         let attn_out_gate = qwen35;
+        // diffusion-gemma's canvas/mask keys sit at the TOP level (`diffusion.*` /
+        // `tokenizer.ggml.*`), not namespaced under `{arch}.*` like everything else above —
+        // matches the reference loader (`diffusion-gemma.cpp: load_arch_hparams`) verbatim.
+        let canvas_length = if diffusion_gemma {
+            let cl =
+                meta_u64(g, "diffusion.canvas_length").context("diffusion.canvas_length")? as usize;
+            if cl == 0 {
+                bail!("DiffusionGemma requires a positive diffusion.canvas_length");
+            }
+            cl
+        } else {
+            0
+        };
+        let mask_token_id = if diffusion_gemma {
+            meta_u64(g, "tokenizer.ggml.mask_token_id").unwrap_or(4) as u32
+        } else {
+            0
+        };
         Ok(Config {
             n_layer,
             n_head,
@@ -445,6 +487,9 @@ impl Config {
             permute_qk_neox,
             gemma,
             gemma4,
+            diffusion_gemma,
+            canvas_length,
+            mask_token_id,
             head_dim_swa,
             n_kv_swa,
             rope_dim_swa,

@@ -18,6 +18,17 @@ kernel void add_bias_f32(device const float* x    [[buffer(0)]],
     if (gid < p.total) dst[gid] = x[gid] + bias[gid % p.n];
 }
 
+// Broadcast multiply (diffusion-gemma router input scale): dst[i] = x[i] * vec[i % n] over
+// `total = rows*n` elements. The multiplicative twin of `add_bias_f32`.
+struct MulVecParams { uint n; uint total; };
+kernel void mul_vec_f32(device const float* x    [[buffer(0)]],
+                        device const float* vec_ [[buffer(1)]],
+                        device float*       dst  [[buffer(2)]],
+                        constant MulVecParams& p [[buffer(3)]],
+                        uint gid [[thread_position_in_grid]]) {
+    if (gid < p.total) dst[gid] = x[gid] * vec_[gid % p.n];
+}
+
 struct ScaleParams { float s; uint n; };
 kernel void scale_f32(device const float* x   [[buffer(0)]],
                       device float*       dst [[buffer(1)]],

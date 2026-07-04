@@ -214,6 +214,13 @@ pub(crate) fn moe_accumulate_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// SPIR-V for the MoE weighted-accumulate with a per-expert down-output scale (diffusion-gemma
+/// `ffn_down_exps.scale`).
+pub(crate) fn moe_accumulate_scaled_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_accumulate_scaled.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for the GPU MoE router top-k.
 pub(crate) fn moe_topk_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_topk.spv"));
@@ -749,6 +756,13 @@ pub(crate) fn add_scaled_spv() -> &'static [u32] {
 /// SPIR-V for the broadcast bias add (`dst[i] = x[i] + bias[i % n]`; Qwen2 q/k/v projections).
 pub(crate) fn add_bias_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/add_bias.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+/// SPIR-V for the broadcast vector multiply (`dst[i] = x[i] * vec[i % n]`; diffusion-gemma's
+/// router input scale — the multiplicative twin of `add_bias`).
+pub(crate) fn mul_vec_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_vec.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
