@@ -83,6 +83,16 @@ impl SlotPool {
 
     /// Pick (and prepare) the slot for `prompt`; returns its index. See the struct doc for the
     /// policy. A freshly created slot is `None` — the runner's first call uploads the weights.
+    ///
+    /// This best-prefix choice is prefix-OPTIMAL for a real per-position KV cache (dense/
+    /// attention arches): the picked slot always has the longest reusable prefix. For qwen35
+    /// (gated-DeltaNet: an append-only recurrent summary, not a per-position cache — see the
+    /// no-rewind rule in `cpu_backend::generate_dense_backend`) a `prefix_score` match is only
+    /// scored on shared TOKENS, not on whether the state can actually rewind to it — so the pick
+    /// here is merely CORRECT, not necessarily optimal: the runner independently re-checks EXACT
+    /// extension (`prompt` extends `cached` verbatim) before reusing the slot's state, and
+    /// zero-resets it otherwise. A suboptimal pick for qwen35 just costs an extra full
+    /// re-prefill; it can never reuse a wrong recurrent state.
     fn pick(
         &mut self,
         be: &dyn infr_core::backend::Backend,

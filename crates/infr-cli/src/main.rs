@@ -416,13 +416,21 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     // qwen3moe, dense Qwen3/Llama/Gemma. Every backend now does history-based multi-turn — no
     // per-arch one-shot special-case. The CLI owns the Llama; the boxed trait object borrows it (so
     // the borrow-based dense `ChatSession` needs no ownership change).
+    // Phase 3 cutover: qwen35 (Qwen3.5) now runs through the SAME standard `ChatModel` structs as
+    // every other arch below — `CpuModel::load` + the CPU/Vulkan/Metal sessions drive any
+    // `Config` arch (including `MixerW::DeltaNet`) since Phase 1+2, so there is no more
+    // qwen35-only branch. Escape hatch: `INFR_QWEN35_OLD=1` still reaches the old hand-written
+    // seam (`Qwen35Chat` / `qwen35::SeamModel`) for one release — Metal hardware validation
+    // happens on another machine, so the hatch is cheap insurance. TEMPORARY: phase 4 removes
+    // this + the old seam entirely.
     let is_q35 = infr_llama::qwen35::is_qwen35(&gguf);
+    let use_old_seam = is_q35 && std::env::var("INFR_QWEN35_OLD").is_ok();
     // Chat-default sampling for every backend (the bespoke branch reads the same envs below).
     set_default_sampling_env();
     let model: Box<dyn infr_llama::model::ChatModel + '_> = if std::env::var("INFR_METAL").is_ok() {
-        if is_q35 {
+        if use_old_seam {
             eprintln!(
-                "[metal backend — qwen35 (Qwen3.5) on the agnostic seam, Apple GPU (reference)]"
+                "[metal backend — qwen35 (Qwen3.5) on the OLD seam (INFR_QWEN35_OLD=1), Apple GPU (reference)]"
             );
             Box::new(infr_llama::model::Qwen35Chat::new_metal(gguf.clone()))
         } else {
@@ -441,8 +449,10 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
             }
         }
     } else if std::env::var("INFR_CPU").is_ok() {
-        if is_q35 {
-            eprintln!("[cpu backend — qwen35 (Qwen3.5) on the agnostic seam, no GPU]");
+        if use_old_seam {
+            eprintln!(
+                "[cpu backend — qwen35 (Qwen3.5) on the OLD seam (INFR_QWEN35_OLD=1), no GPU]"
+            );
             Box::new(infr_llama::model::Qwen35Chat::new_cpu(gguf.clone()))
         } else {
             eprintln!(
@@ -452,12 +462,14 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
                 infr_llama::CpuModel::load(&gguf, tok.as_deref())?,
             ))
         }
-    } else if is_q35 {
-        eprintln!("[qwen35 (Qwen3.5) — Vulkan agnostic seam]");
+    } else if use_old_seam {
+        eprintln!("[qwen35 (Qwen3.5) — OLD Vulkan agnostic seam (INFR_QWEN35_OLD=1)]");
         Box::new(infr_llama::model::Qwen35Chat::new(gguf.clone()))
     } else {
         // The default: dense/MoE on the VULKAN agnostic seam — persistent multi-slot KV sessions
-        // (per-turn suffix-only prefill), record-once decode replay, MoE expert auto-fit.
+        // (per-turn suffix-only prefill), record-once decode replay, MoE expert auto-fit. qwen35
+        // (Qwen3.5) lands here too since Phase 3 — same seam, same `Config::from_gguf` +
+        // `MixerW::DeltaNet` unified runner (see `unified_qwen35_*` tests).
         eprintln!("[vulkan seam — dense/MoE on the agnostic compute graph, persistent KV session]");
         Box::new(infr_llama::model::DenseSeamChat::new(
             infr_llama::CpuModel::load(&gguf, tok.as_deref())?,
@@ -700,11 +712,14 @@ fn cmd_bench(
         })
         .transpose()?;
     let (gguf, tok) = resolve(model)?;
-    // qwen35 (Qwen3.5): a hybrid gated-DeltaNet + GQA model on its own agnostic-seam graph — it
-    // is NOT a `Llama` (dense/MoE), so `load_opt` below can't load or run it. Route it through the
-    // seam's own `ChatModel` (`cmd_bench_qwen35`), reusing the same pp/tg warmup-then-time
-    // methodology.
-    if infr_llama::qwen35::is_qwen35(&gguf) {
+    // Phase 3 cutover: qwen35 (Qwen3.5) now benches through the STANDARD arms below
+    // (`cmd_bench_cpu` / the seam's `bench_vulkan` / `cmd_bench_metal`) — `CpuModel::load` drives
+    // it through the unified runner (`Config::from_gguf` + `MixerW::DeltaNet`, Phase 1+2), reusing
+    // the exact same pp/tg/depth methodology every other arch gets. This permanently kills the
+    // class of depth-accounting artifacts the old qwen35-only bench arm (`cmd_bench_qwen35`) had.
+    // Escape hatch: `INFR_QWEN35_OLD=1` still reaches that old hand-written seam bench for one
+    // release. TEMPORARY: phase 4 removes this + `cmd_bench_qwen35`/the old seam entirely.
+    if infr_llama::qwen35::is_qwen35(&gguf) && std::env::var("INFR_QWEN35_OLD").is_ok() {
         return cmd_bench_qwen35(&gguf, n_prompt, n_gen, depth, pg, reps, ngl == 0, json);
     }
     // -ngl 0: run on the CPU reference backend (no GPU), comparable to `llama-bench -ngl 0`.
@@ -1337,8 +1352,13 @@ fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
     // Seam-backed serve — the ONE engine: the SAME ChatModel + multi-slot session `infr run`
     // uses, so serve gets per-request suffix-only prefill and cross-conversation prefix seeding
     // for free. INFR_CPU / INFR_METAL select the reference backends; Vulkan is the default.
+    // Phase 3 cutover: qwen35 shares the SAME selection funnel as every other arch below (no more
+    // standalone `Qwen35Chat` branch) — see the matching comment in `cmd_run`. Escape hatch:
+    // `INFR_QWEN35_OLD=1` still reaches the old seam for one release. TEMPORARY: phase 4 removes
+    // this + the old seam entirely.
     let is_q35 = infr_llama::qwen35::is_qwen35(&gguf);
-    let mut m: Box<dyn infr_llama::model::ChatModel + Send> = if is_q35 {
+    let use_old_seam = is_q35 && std::env::var("INFR_QWEN35_OLD").is_ok();
+    let mut m: Box<dyn infr_llama::model::ChatModel + Send> = if use_old_seam {
         Box::new(if std::env::var("INFR_METAL").is_ok() {
             infr_llama::model::Qwen35Chat::new_metal(gguf.clone())
         } else if std::env::var("INFR_CPU").is_ok() {

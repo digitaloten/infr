@@ -963,8 +963,10 @@ fn cpu_golden_qwen35() {
 // `Config::from_gguf` now accepts `arch == "qwen35"` and `cpu_backend`'s layer loop has a
 // `MixerW::DeltaNet` branch (see `docs/QWEN35.md`) — so `CpuModel::load` on a qwen35 GGUF drives
 // the SAME shared runner every other arch uses, in parallel with the old hand-written seam above.
-// Production routing is UNCHANGED (the CLI's `is_qwen35` gate still sends qwen35 to
-// `qwen35::SeamModel` first) — these tests are the only callers of the unified path for this arch.
+// Phase 3: production routing (`infr run`/`serve`/`bench` in infr-cli) now sends qwen35 through
+// this SAME unified path by default too — the old `qwen35::SeamModel` seam is reachable only via
+// the temporary `INFR_QWEN35_OLD=1` escape hatch. These tests remain the token-identical proof
+// that the two paths agree.
 
 /// The unified CPU path (`CpuModel::generate_cpu`, i.e. `cpu_backend::generate_dense_cpu`) must
 /// produce IDENTICAL output to the old hand-written seam (`qwen35::generate_cpu`) for the same
