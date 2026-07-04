@@ -36,12 +36,12 @@ enum FfnW {
     },
 }
 
-/// Per-layer weight handles captured while building one decode graph (q/k-norm + the gemma
-/// sandwich norms are optional; `wv` is absent on gemma4 full-attention layers, which reuse the raw
-/// K projection as V). The order they're declared in MUST match the upload order so `weights[i]`
-/// binds to `wbufs[i]`.
-struct LayerW {
-    attn_norm: TensorId,
+/// Attention-mixer weights (the classic transformer token mixer: QKV projections + output;
+/// q/k-norm optional, `wv` absent on gemma4 full-attention layers which reuse the raw K
+/// projection as V). A future phase adds a DeltaNet variant (qwen35's linear-attention mixer),
+/// so everything attention-specific lives here and everything layer-generic (norms, FFN,
+/// per-layer embeddings) stays on [`LayerW`].
+struct AttnW {
     wq: TensorId,
     wk: TensorId,
     wv: Option<TensorId>,
@@ -52,6 +52,19 @@ struct LayerW {
     q_norm: Option<TensorId>,
     k_norm: Option<TensorId>,
     wo: TensorId,
+}
+
+/// The layer's token mixer. Only attention exists today; qwen35's gated-DeltaNet mixer lands in
+/// a later phase.
+enum MixerW {
+    Attn(AttnW),
+}
+
+/// Per-layer weight handles captured while building one decode graph (sandwich norms optional).
+/// The order they're declared in MUST match the upload order so `weights[i]` binds to `wbufs[i]`.
+struct LayerW {
+    attn_norm: TensorId, // the mixer INPUT norm (applies to any mixer type)
+    mixer: MixerW,
     post_attn: Option<TensorId>,
     ffn_norm: TensorId,
     ffn: FfnW,
@@ -1221,15 +1234,17 @@ pub(crate) fn generate_dense_backend(
             };
             lw.push(LayerW {
                 attn_norm,
-                wq,
-                wk,
-                wv,
-                qb,
-                kb,
-                vb,
-                q_norm,
-                k_norm,
-                wo,
+                mixer: MixerW::Attn(AttnW {
+                    wq,
+                    wk,
+                    wv,
+                    qb,
+                    kb,
+                    vb,
+                    q_norm,
+                    k_norm,
+                    wo,
+                }),
                 post_attn,
                 ffn_norm,
                 ffn,
@@ -1347,6 +1362,7 @@ pub(crate) fn generate_dense_backend(
             };
 
         for (l, lw) in lw.iter().enumerate() {
+            let MixerW::Attn(aw) = &lw.mixer;
             // Per-layer dims (gemma4 SWA vs full; uniform for every other model).
             let hd = c.layer_head_dim(l);
             let nkv = c.layer_n_kv(l);
@@ -1388,7 +1404,7 @@ pub(crate) fn generate_dense_backend(
                 let stride = (qrow + 2 * kvrow) as u32;
                 g.push(Op::Linear {
                     x: hn,
-                    weight: lw.wq,
+                    weight: aw.wq,
                     dst: qkv,
                     m: batch as u32,
                     in_f: ne as u32,
@@ -1421,7 +1437,7 @@ pub(crate) fn generate_dense_backend(
                 ] {
                     g.push(Op::Linear {
                         x: hn,
-                        weight: lw.wq,
+                        weight: aw.wq,
                         dst,
                         m: batch as u32,
                         in_f: ne as u32,
@@ -1432,7 +1448,7 @@ pub(crate) fn generate_dense_backend(
             } else {
                 g.push(Op::Linear {
                     x: hn,
-                    weight: lw.wq,
+                    weight: aw.wq,
                     dst: q,
                     m: batch as u32,
                     in_f: ne as u32,
@@ -1442,7 +1458,7 @@ pub(crate) fn generate_dense_backend(
             }
             // Qwen2 q-bias: `q += qb` after the projection (all three projection paths converge on
             // `q` here), before RoPE. `Wx + b`.
-            if let Some(qb) = lw.qb {
+            if let Some(qb) = aw.qb {
                 g.push(Op::AddBias {
                     x: q,
                     bias: qb,
@@ -1455,7 +1471,7 @@ pub(crate) fn generate_dense_backend(
                 if !fuse_qkv {
                     g.push(Op::Linear {
                         x: hn,
-                        weight: lw.wk,
+                        weight: aw.wk,
                         dst: k,
                         m: batch as u32,
                         in_f: ne as u32,
@@ -1464,7 +1480,7 @@ pub(crate) fn generate_dense_backend(
                     });
                     // V projection, or (gemma4 full layers) V = the raw K projection, copied BEFORE
                     // K is QK-normed + RoPE'd.
-                    match lw.wv {
+                    match aw.wv {
                         Some(wv) => g.push(Op::Linear {
                             x: hn,
                             weight: wv,
@@ -1487,7 +1503,7 @@ pub(crate) fn generate_dense_backend(
                 // materialized in every path — fused prefill/decode projected k/v above, the split
                 // form just did), BEFORE the K RoPE and the V-norm/WriteKv. Emitted before the K
                 // QkNormRope so that op stays adjacent to its WriteKv (see below).
-                if let Some(kb) = lw.kb {
+                if let Some(kb) = aw.kb {
                     g.push(Op::AddBias {
                         x: k,
                         bias: kb,
@@ -1496,7 +1512,7 @@ pub(crate) fn generate_dense_backend(
                         n: kvrow as u32,
                     });
                 }
-                if let Some(vb) = lw.vb {
+                if let Some(vb) = aw.vb {
                     g.push(Op::AddBias {
                         x: v,
                         bias: vb,
@@ -1522,7 +1538,7 @@ pub(crate) fn generate_dense_backend(
                     });
                 }
                 // K: fused QkNorm+RoPE (qwen3/gemma) → f16 `k16`, else RoPE alone (llama) in-place f32.
-                let k_write = match lw.k_norm {
+                let k_write = match aw.k_norm {
                     Some(kn) => {
                         g.push(Op::QkNormRope {
                             x: k,
@@ -1573,7 +1589,7 @@ pub(crate) fn generate_dense_backend(
                 });
             }
             // Q: fused QkNorm+RoPE (qwen3/gemma) → f16 `q16`, else RoPE alone (llama) in-place f32.
-            let q_attn = match lw.q_norm {
+            let q_attn = match aw.q_norm {
                 Some(qn) => {
                     g.push(Op::QkNormRope {
                         x: q,
@@ -1622,7 +1638,7 @@ pub(crate) fn generate_dense_backend(
             });
             g.push(Op::Linear {
                 x: attn,
-                weight: lw.wo,
+                weight: aw.wo,
                 dst: sub,
                 m: batch as u32,
                 in_f: qrow as u32,
