@@ -835,8 +835,105 @@ fn cmd_bench(
     } else {
         format!("pp{n_prompt}")
     };
-    print_bench_avg(&samples, &label, depth, "", reps, json);
+    // MTP arm (issue #33, phase 4 — perf-bottleneck visibility): a model that ships an MTP head
+    // gets its self-speculative decode measured ADDITIONALLY alongside the baseline tg above (not
+    // instead — `36 t/s vs 100 t/s baseline` is the whole point of this pass being visible in one
+    // run). Only when there's a decode length to measure (`-n > 0`) and no `--pg` (that's a
+    // combined ingest+reply shape the MTP arm doesn't have an equivalent for). Models without a
+    // head take the exact path above unchanged — `mtp` stays `None`, `print_bench_avg_mtp` falls
+    // straight through to the pre-existing `print_bench_avg` line.
+    let mtp = if pg.is_none() && n_gen > 0 && model.config().n_layer_nextn > 0 {
+        Some(bench_mtp_tg(&model, n_prompt, depth, n_gen, reps)?)
+    } else {
+        None
+    };
+    print_bench_avg_mtp(&samples, &label, depth, reps, json, mtp.as_ref());
     Ok(())
+}
+
+/// The MTP-spec-decode measurement `infr bench` reports alongside the baseline tg rate (issue #33,
+/// phase 4) — for models whose GGUF ships an MTP head. Runs
+/// [`infr_llama::mtp::generate_mtp_spec_vulkan_timed`] on a synthetic text prompt sized to match
+/// `-p`/`-d` (the same "repeat a fixed sentence to ~N tokens" convention `cmd_bench_qwen35` uses —
+/// the MTP driver takes a rendered PROMPT, not raw token ids, unlike `bench_vulkan`'s dummy-id
+/// arm), once per rep (no persistent MTP session yet — `docs/MTP.md`'s Phase 3 doc on
+/// `generate_mtp_spec_vulkan`'s per-call fresh trunk+head — so each rep re-pays the full weight
+/// upload; keep `-r` small for this arm), and aggregates the per-cycle draft/verify/catchup wall
+/// time into phase shares + the accept rate (alpha) via [`infr_llama::mtp::MtpTiming`].
+struct MtpBenchStats {
+    n_gen: usize,
+    ts: f64,
+    alpha: f64,
+    draft_pct: f64,
+    verify_pct: f64,
+    catchup_pct: f64,
+}
+
+fn bench_mtp_tg(
+    model: &infr_llama::CpuModel,
+    n_prompt: usize,
+    depth: usize,
+    n_gen: usize,
+    reps: usize,
+) -> anyhow::Result<MtpBenchStats> {
+    let head = infr_llama::mtp::load_mtp_head(model.gguf(), model.config())?;
+    let sentence = "The quick brown fox jumps over the lazy dog. "; // ~10 tokens/rep, cmd_bench_qwen35's convention
+    let want = (n_prompt + depth).max(1);
+    let prompt = sentence.repeat(want.div_ceil(10));
+    let mut samples = Vec::with_capacity(reps.max(1));
+    let mut timing = infr_llama::mtp::MtpTiming::default();
+    for _ in 0..reps.max(1) {
+        let (stats, t) =
+            infr_llama::mtp::generate_mtp_spec_vulkan_timed(model, &head, &prompt, n_gen, |_| {})?;
+        samples.push(stats.n_gen as f64 / stats.decode_secs.max(1e-9));
+        timing.add(&t);
+    }
+    let ts = samples.iter().sum::<f64>() / samples.len().max(1) as f64;
+    let (draft_pct, verify_pct, catchup_pct) = timing.phase_shares();
+    Ok(MtpBenchStats {
+        n_gen,
+        ts,
+        alpha: timing.alpha(),
+        draft_pct,
+        verify_pct,
+        catchup_pct,
+    })
+}
+
+/// [`print_bench_avg`] plus the optional MTP segment: `mtp` is `None` for every model without a
+/// head (or `-pg`/`-n 0` bench calls), in which case this is BYTE-IDENTICAL to the pre-MTP output
+/// (falls straight through to `print_bench_avg`) — the "no new flags, unchanged output" guarantee
+/// for non-MTP models.
+fn print_bench_avg_mtp(
+    samples: &[f64],
+    label: &str,
+    depth: usize,
+    reps: usize,
+    json: bool,
+    mtp: Option<&MtpBenchStats>,
+) {
+    let Some(m) = mtp else {
+        print_bench_avg(samples, label, depth, "", reps, json);
+        return;
+    };
+    let avg = samples.iter().sum::<f64>() / samples.len().max(1) as f64;
+    let ratio = m.ts / avg.max(1e-9);
+    if json {
+        println!(
+            "[{{\"avg_ts\": {avg:.2}, \"mtp_ts\": {:.2}, \"mtp_ratio\": {ratio:.4}, \"alpha\": {:.4}, \"draft_pct\": {:.1}, \"verify_pct\": {:.1}, \"catchup_pct\": {:.1}}}]",
+            m.ts, m.alpha, m.draft_pct, m.verify_pct, m.catchup_pct
+        );
+        return;
+    }
+    let d = if depth > 0 {
+        format!(" @ d{depth}")
+    } else {
+        String::new()
+    };
+    println!(
+        "{label}{d}: {avg:.1} t/s | mtp{}: {:.1} t/s ({ratio:.2}x, alpha={:.2}, draft {:.0}% verify {:.0}% catchup {:.0}%)  ({reps} reps)",
+        m.n_gen, m.ts, m.alpha, m.draft_pct, m.verify_pct, m.catchup_pct
+    );
 }
 
 /// Shared bench-result reporter: average the per-rep t/s samples and print either the JSON shape
@@ -1328,6 +1425,33 @@ fn cmd_compare_sweep(
             };
             println!("{short:<22} {metric_label:<10} | {is:>9} | {ls:>9} | {ratio:>10}");
         }
+        // mtp column (issue #33, phase 4): infr-vs-llama at the SAME tg128 shape above, but with
+        // both tools' MTP spec decode on — MTP-capable models only (the cell costs one llama-cli
+        // run + one infr mtp run; every other model prints a blank row instantly, keeping the
+        // sweep's runtime dominated by the 4 metrics above, not this column).
+        let metric_label = "mtp128".to_string();
+        if mb.has_mtp_head() {
+            let iv = mb.infr_mtp(&["-p", "0", "-n", "128"]);
+            let lv = mb.llama_cli_mtp(128);
+            let is = iv.as_ref().map(|v| format!("{v:.0}")).unwrap_or_else(|e| {
+                eprintln!("infr mtp bench failed ({short}): {e:#}");
+                "ERR".into()
+            });
+            let ls = lv.map(|v| format!("{v:.0}")).unwrap_or_else(|| "NA".into());
+            let ratio = match (iv.as_ref().ok(), lv) {
+                (Some(&i), Some(l)) if l > 0.0 => {
+                    rows.push((short.to_string(), metric_label.clone(), i, l));
+                    format!("{:.2}x", i / l)
+                }
+                _ => "-".into(),
+            };
+            println!("{short:<22} {metric_label:<10} | {is:>9} | {ls:>9} | {ratio:>10}");
+        } else {
+            println!(
+                "{short:<22} {metric_label:<10} | {:>9} | {:>9} | {:>10}",
+                "-", "-", "-"
+            );
+        }
     }
     // Worst-first: the top of this list is the next perf target.
     rows.sort_by(|a, b| (a.2 / a.3).partial_cmp(&(b.2 / b.3)).unwrap());
@@ -1338,6 +1462,27 @@ fn cmd_compare_sweep(
     Ok(())
 }
 
+/// `llama-cli`'s MTP arm has no JSON output (unlike `llama-bench -o json`) — it prints
+/// `[ Prompt: X t/s | Generation: Y t/s ]` at exit, so pull the LAST `Generation: <float> t/s`
+/// occurrence out of its combined stdout+stderr by hand (no regex dependency for one float). The
+/// LAST match matters: some llama.cpp builds print an interim perf line before the final summary.
+fn parse_llama_cli_gen_rate(output: &str) -> Option<f64> {
+    const NEEDLE: &str = "Generation:";
+    let mut last = None;
+    let mut rest = output;
+    while let Some(idx) = rest.find(NEEDLE) {
+        let after = rest[idx + NEEDLE.len()..].trim_start();
+        let end = after
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(after.len());
+        if let Ok(v) = after[..end].parse::<f64>() {
+            last = Some(v);
+        }
+        rest = &rest[idx + NEEDLE.len()..];
+    }
+    last
+}
+
 /// One model's infr-vs-llama.cpp bench harness: resolves the shared model ref once and shells
 /// out to `infr bench --json` / `llama-bench -o json` with MATCHED flags. Both the deep
 /// coding-agent scenarios (`cmd_compare`) and the multi-model survey (`cmd_compare_sweep`) run
@@ -1345,6 +1490,10 @@ fn cmd_compare_sweep(
 struct ModelBench {
     exe: PathBuf,
     model: String,
+    /// The resolved local GGUF path — `llama-cli`'s MTP arm (issue #33, phase 4) shells the
+    /// binary directly (no `llama-bench` JSON plumbing for spec decode: `llama-bench` doesn't run
+    /// spec at all), so it needs a real `-m <path>` regardless of whether `model` was an `-hf` ref.
+    gguf_path: PathBuf,
     llama_model_args: Vec<String>,
     llama_bench: String,
     dev: String,
@@ -1399,6 +1548,7 @@ impl ModelBench {
         Ok(Self {
             exe,
             model: model.to_string(),
+            gguf_path: resolved,
             llama_model_args,
             llama_bench: llama_bench.to_string(),
             dev: dev.to_string(),
@@ -1409,8 +1559,17 @@ impl ModelBench {
         })
     }
 
-    /// Run `infr bench` (this binary) and read its single-row [{"avg_ts":X}].
-    fn infr(&self, args: &[&str]) -> anyhow::Result<f64> {
+    /// Whether this model's GGUF ships an MTP head (issue #33, phase 4) — gates the extra
+    /// `mtp`/`MTP DECODE` measurements in `cmd_compare`/`cmd_compare_sweep` so non-MTP models pay
+    /// nothing extra.
+    fn has_mtp_head(&self) -> bool {
+        infr_llama::mtp::has_mtp_head(&self.gguf_path)
+    }
+
+    /// Run `infr bench --json` and return the parsed row object (`[{"avg_ts": .., ..}]`'s first
+    /// element) — shared by [`infr`](Self::infr) (`avg_ts`) and [`infr_mtp`](Self::infr_mtp)
+    /// (`mtp_ts`), so both read one shelled-out call's worth of plumbing.
+    fn infr_json(&self, args: &[&str]) -> anyhow::Result<serde_json::Value> {
         use std::process::Command;
         let mut c = Command::new(&self.exe);
         c.arg("bench")
@@ -1425,15 +1584,28 @@ impl ModelBench {
         }
         c.args(args).arg("--json");
         let out = c.output().context("running `infr bench`")?;
-        let v: serde_json::Value = serde_json::from_slice(&out.stdout).with_context(|| {
+        serde_json::from_slice(&out.stdout).with_context(|| {
             format!(
                 "parsing infr bench output: {}",
                 String::from_utf8_lossy(&out.stdout)
             )
-        })?;
-        v[0]["avg_ts"]
+        })
+    }
+
+    /// Run `infr bench` (this binary) and read its single-row [{"avg_ts":X}].
+    fn infr(&self, args: &[&str]) -> anyhow::Result<f64> {
+        self.infr_json(args)?[0]["avg_ts"]
             .as_f64()
             .context("infr bench: missing avg_ts")
+    }
+
+    /// Run `infr bench` and read the `mtp_ts` field `bench_mtp_tg`'s JSON output adds for
+    /// MTP-capable models (issue #33, phase 4) — `args` should include `-n <N>` matching the
+    /// baseline `infr` call this is compared against (the sweep's/compare's tg128 shape).
+    fn infr_mtp(&self, args: &[&str]) -> anyhow::Result<f64> {
+        self.infr_json(args)?[0]["mtp_ts"]
+            .as_f64()
+            .context("infr bench: missing mtp_ts (model has no MTP head, or -n was 0)")
     }
 
     /// Run `llama-bench -o json` and pick the row matching (n_prompt, n_gen): -pg adds extra rows.
@@ -1476,6 +1648,61 @@ impl ModelBench {
             let g = r["n_gen"].as_u64()? as usize;
             (p == np && g == ng).then(|| r["avg_ts"].as_f64())?
         })
+    }
+
+    /// The fixed prompt both tools' MTP arm decodes from — `docs/MTP.md`'s own oracle prompt, so
+    /// this number is directly comparable to the numbers already captured there.
+    const MTP_PROMPT: &str = "What is the capital of France?";
+
+    /// `llama-cli` sits alongside `llama-bench` in the same install (`/usr/sbin` on this box) —
+    /// derive its path from `--llama-bench` instead of adding a second CLI flag: replace the
+    /// binary name when `llama_bench` names it explicitly, else assume it's on `PATH` like the
+    /// `llama-bench` default is.
+    fn llama_cli_path(&self) -> String {
+        if self.llama_bench.contains("llama-bench") {
+            self.llama_bench.replace("llama-bench", "llama-cli")
+        } else {
+            "llama-cli".to_string()
+        }
+    }
+
+    /// Shell `llama-cli` directly with MTP spec decode on (`llama-bench` has no spec-decode mode
+    /// at all — issue #33's phase 4 context) and parse the LAST `Generation: X t/s` line from its
+    /// combined stdout+stderr (robust to which stream a given llama.cpp build writes the perf
+    /// summary to). `-r` reps average, matching every other measurement this tool prints.
+    fn llama_cli_mtp(&self, n_gen: usize) -> Option<f64> {
+        use std::process::Command;
+        let cli = self.llama_cli_path();
+        let gguf = self.gguf_path.to_string_lossy().into_owned();
+        let n = n_gen.to_string();
+        let mut samples = Vec::with_capacity(self.reps.max(1));
+        for _ in 0..self.reps.max(1) {
+            let out = Command::new(&cli)
+                .args(["-m", &gguf])
+                .args(["-ngl", "99"])
+                .args(["-p", Self::MTP_PROMPT])
+                .args(["-n", &n])
+                .args(["--temp", "0", "--single-turn"])
+                .args(["--spec-type", "draft-mtp", "--spec-draft-n-max", "6"])
+                .output()
+                .ok()?;
+            let combined = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            match parse_llama_cli_gen_rate(&combined) {
+                Some(v) => samples.push(v),
+                None => {
+                    eprintln!(
+                        "llama-cli MTP run produced no parseable `Generation: X t/s` line: {}",
+                        combined.trim()
+                    );
+                    return None;
+                }
+            }
+        }
+        Some(samples.iter().sum::<f64>() / samples.len().max(1) as f64)
     }
 }
 
@@ -1551,6 +1778,39 @@ fn cmd_compare(
             format!("tg{gen}@{d}"),
             infr_b(&["-p", "0", "-n", &g, "-d", &ds]),
             llama_b(0, gen, &["-p", "0", "-n", &g, "-d", &ds]),
+        );
+    }
+
+    // MTP DECODE (issue #33, phase 4 — perf-bottleneck visibility for the self-speculative decode
+    // path, currently NET NEGATIVE at 36 t/s vs a ~100 t/s baseline): four numbers — infr/llama at
+    // baseline tg, infr/llama with MTP on — plus each tool's own mtp/base speedup, so the gap AND
+    // its shape (is infr's speculation slower to begin with, or is its baseline just slower) are
+    // both visible in one section. Absent entirely for a GGUF with no `nextn.*` head.
+    if mb.has_mtp_head() {
+        hdr("MTP DECODE"); // self-speculative decode: baseline tg vs MTP-spec tg, both tools
+        const N: usize = 128;
+        let ns = N.to_string();
+        let infr_base = infr_b(&["-p", "0", "-n", &ns]);
+        let infr_mtp = mb.infr_mtp(&["-p", "0", "-n", &ns]);
+        let llama_base = llama_b(0, N, &["-p", "0", "-n", &ns]);
+        let llama_mtp = mb.llama_cli_mtp(N);
+        // Each tool's own speedup (mtp/base) — NOT an infr-vs-llama ratio, so computed here rather
+        // than through `row`'s ratio column (which is always infr/llama at one shape).
+        let infr_speedup = match (infr_base.as_ref(), infr_mtp.as_ref()) {
+            (Ok(&b), Ok(&m)) if b > 0.0 => Some(m / b),
+            _ => None,
+        };
+        let llama_speedup = match (llama_base, llama_mtp) {
+            (Some(b), Some(m)) if b > 0.0 => Some(m / b),
+            _ => None,
+        };
+        row(format!("tg{N}"), infr_base, llama_base); // infr-vs-llama @ baseline
+        row(format!("mtp{N}"), infr_mtp, llama_mtp); // infr-vs-llama @ MTP
+        let fmt_x = |v: Option<f64>| v.map(|v| format!("{v:.2}x")).unwrap_or_else(|| "-".into());
+        println!(
+            "  own-tool speedup (mtp/base): infr {}   llama {}",
+            fmt_x(infr_speedup),
+            fmt_x(llama_speedup),
         );
     }
 

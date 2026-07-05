@@ -65,6 +65,23 @@ pub struct MtpHeadWeights {
     pub shared_head_norm: Option<MtpTensor>,
 }
 
+/// Cheap arch/head check from a resolved GGUF path — no `Config`/tensor validation, just the
+/// metadata flag (mirrors `qwen35::is_qwen35`/`diffusion::is_diffusion_gemma`'s "peek without a
+/// full load" convention). `infr compare`'s MTP DECODE section and the `--sweep` `mtp` column
+/// (issue #33, phase 4 — perf-bottleneck visibility) use this to decide whether a model needs the
+/// extra measurement at all, cheaper than `Config::from_gguf` (which validates every other field
+/// too) for a check this narrow.
+pub fn has_mtp_head(path: &std::path::Path) -> bool {
+    let Ok(g) = Gguf::open(path) else {
+        return false;
+    };
+    let arch = g.metadata().str("general.architecture").unwrap_or("");
+    g.metadata()
+        .u64(&format!("{arch}.nextn_predict_layers"))
+        .unwrap_or(0)
+        > 0
+}
+
 fn find<'a>(g: &'a Gguf, name: &str) -> Option<&'a TensorInfo> {
     g.tensors().iter().find(|t| t.name == name)
 }
@@ -1025,6 +1042,53 @@ fn run_verify(
     Ok((logits, h))
 }
 
+/// Cumulative per-phase wall time + accept-rate counters over one [`generate_mtp_spec_vulkan_timed`]
+/// run (issue #33, phase 4 — `infr bench`/`infr compare`'s perf-bottleneck visibility pass: this is
+/// the struct return `docs/MTP.md`'s `INFR_MTP_TIME` per-cycle `eprintln!`s are refactored to feed,
+/// instead of the caller scraping stderr). `draft_secs`/`verify_secs`/`catchup_secs` sum every
+/// cycle's three timed sections (the SAME three the `[mtp cycle N]` debug line prints); the one-time
+/// prompt-prime VERIFY forward is deliberately excluded — it's already `GenStats::prompt_secs`, not
+/// part of the steady-state decode this breakdown characterizes.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MtpTiming {
+    pub draft_secs: f64,
+    pub verify_secs: f64,
+    pub catchup_secs: f64,
+    pub total_drafted: usize,
+    pub total_accepted: usize,
+}
+
+impl MtpTiming {
+    /// Fold another run's counters in (bench averages several reps — see `infr-cli`'s
+    /// `bench_mtp_tg`).
+    pub fn add(&mut self, other: &MtpTiming) {
+        self.draft_secs += other.draft_secs;
+        self.verify_secs += other.verify_secs;
+        self.catchup_secs += other.catchup_secs;
+        self.total_drafted += other.total_drafted;
+        self.total_accepted += other.total_accepted;
+    }
+
+    /// Draft acceptance rate (`accepted / drafted`) — llama.cpp's `alpha`.
+    pub fn alpha(&self) -> f64 {
+        self.total_accepted as f64 / self.total_drafted.max(1) as f64
+    }
+
+    /// `(draft%, verify%, catchup%)` of the three phases' summed wall time — the breakdown that
+    /// tells the next perf pass where the net-negative time actually goes.
+    pub fn phase_shares(&self) -> (f64, f64, f64) {
+        let total = self.draft_secs + self.verify_secs + self.catchup_secs;
+        if total <= 0.0 {
+            return (0.0, 0.0, 0.0);
+        }
+        (
+            100.0 * self.draft_secs / total,
+            100.0 * self.verify_secs / total,
+            100.0 * self.catchup_secs / total,
+        )
+    }
+}
+
 /// Greedy argmax over one `[vocab]` logits row (unlike [`top1_softmax`], no probability needed —
 /// `spec_accept`/the verify-round check only reads the winning id).
 fn argmax_row(row: &[f32]) -> u32 {
@@ -1101,14 +1165,33 @@ fn argmax_row(row: &[f32]) -> u32 {
 /// and the `build`/`exec` split `MtpHeadSession` accumulates internally — Phase 2's doc already
 /// flags the head graph as rebuilding + recompiling from scratch every `forward` call, since
 /// `Op::Attention::kv_len`/`Op::WriteKv::pos` are baked into the graph rather than bound inputs;
-/// this is the number that quantifies that cost) plus a final aggregate-`alpha` summary.
+/// this is the number that quantifies that cost) plus a final aggregate-`alpha` summary. Phase 4
+/// (issue #33, perf-bottleneck visibility) plumbs the SAME per-cycle sums out programmatically as
+/// [`MtpTiming`] — see [`generate_mtp_spec_vulkan_timed`] — rather than adding a second stderr
+/// scraper: this function is now a thin wrapper that drops the timing half of that return, so
+/// `run`/`serve` (which only want [`crate::GenStats`]) and `bench`/`compare` (which want both)
+/// share one implementation.
 pub fn generate_mtp_spec_vulkan(
     model: &crate::CpuModel,
     head: &MtpHeadWeights,
     prompt: &str,
     max_new: usize,
-    mut on_piece: impl FnMut(&str),
+    on_piece: impl FnMut(&str),
 ) -> Result<crate::GenStats> {
+    generate_mtp_spec_vulkan_timed(model, head, prompt, max_new, on_piece).map(|(stats, _)| stats)
+}
+
+/// [`generate_mtp_spec_vulkan`] plus the [`MtpTiming`] breakdown `INFR_MTP_TIME=1`'s per-cycle
+/// `eprintln!`s already compute — this is that same accounting, returned instead of only printed,
+/// so `infr bench`'s `mtp` segment and `infr compare`'s MTP DECODE section can report the
+/// draft/verify/catchup phase split and alpha without scraping stderr.
+pub fn generate_mtp_spec_vulkan_timed(
+    model: &crate::CpuModel,
+    head: &MtpHeadWeights,
+    prompt: &str,
+    max_new: usize,
+    mut on_piece: impl FnMut(&str),
+) -> Result<(crate::GenStats, MtpTiming)> {
     let cfg = model.config();
     let ne = cfg.n_embd;
     let vocab = cfg.vocab;
@@ -1169,6 +1252,11 @@ pub fn generate_mtp_spec_vulkan(
     let mut cycle = 0usize;
     let mut total_drafted = 0usize;
     let mut total_accepted = 0usize;
+    // Phase 4 (issue #33): the SAME per-cycle sections `INFR_MTP_TIME`'s `eprintln!` below already
+    // times, summed across the whole run — this is what `MtpTiming`'s return threads out.
+    let mut sum_draft_secs = 0.0f64;
+    let mut sum_verify_secs = 0.0f64;
+    let mut sum_catchup_secs = 0.0f64;
     let t_decode = std::time::Instant::now();
 
     'cycles: while out.len() < max_new {
@@ -1241,6 +1329,9 @@ pub fn generate_mtp_spec_vulkan(
         catch_up(&mut head_sess, &catchup_tokens, catchup_h, n_past + 1)?;
         let catchup_secs = t_catchup.elapsed().as_secs_f64();
         pending_h = catchup_h[accepted * ne..].to_vec();
+        sum_draft_secs += draft_secs;
+        sum_verify_secs += verify_secs;
+        sum_catchup_secs += catchup_secs;
 
         let (build_secs, exec_secs) = head_sess.take_timing();
         if time_mtp {
@@ -1294,18 +1385,29 @@ pub fn generate_mtp_spec_vulkan(
         n_past = committed.len();
     }
 
+    let timing = MtpTiming {
+        draft_secs: sum_draft_secs,
+        verify_secs: sum_verify_secs,
+        catchup_secs: sum_catchup_secs,
+        total_drafted,
+        total_accepted,
+    };
     if time_mtp {
-        let alpha = total_accepted as f64 / total_drafted.max(1) as f64;
+        let (dp, vp, cp) = timing.phase_shares();
         eprintln!(
-            "[mtp summary] {cycle} cycles, {total_accepted}/{total_drafted} accepted (alpha={alpha:.3}), {} tokens generated",
+            "[mtp summary] {cycle} cycles, {total_accepted}/{total_drafted} accepted (alpha={:.3}), {} tokens generated, phase share: draft {dp:.0}% verify {vp:.0}% catchup {cp:.0}%",
+            timing.alpha(),
             out.len()
         );
     }
 
-    Ok(crate::GenStats {
-        n_prompt: p,
-        prompt_secs: prime_verify_secs,
-        n_gen: out.len(),
-        decode_secs: t_decode.elapsed().as_secs_f64(),
-    })
+    Ok((
+        crate::GenStats {
+            n_prompt: p,
+            prompt_secs: prime_verify_secs,
+            n_gen: out.len(),
+            decode_secs: t_decode.elapsed().as_secs_f64(),
+        },
+        timing,
+    ))
 }
