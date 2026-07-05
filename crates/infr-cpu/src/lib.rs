@@ -4100,13 +4100,19 @@ impl Backend for CpuBackend {
                                 let row = &wbytes[o * bpr..o * bpr + bpr];
                                 vec_dot_q4k_batch(row, &q8s, in_f, odd_t);
                             }
-                        } else if dt == DType::Q6K
-                            && out_f >= 8
-                            && in_f.is_multiple_of(256)
-                            && cfg!(target_arch = "x86_64")
-                            && is_x86_feature_detected!("avx512bw")
-                            && is_x86_feature_detected!("avx512vnni")
-                        {
+                        } else if dt == DType::Q6K && out_f >= 8 && in_f.is_multiple_of(256) && {
+                            // `is_x86_feature_detected!` fails to COMPILE on aarch64 even behind
+                            // a runtime `cfg!` — it needs a real #[cfg] block (macOS CI trap).
+                            #[cfg(target_arch = "x86_64")]
+                            {
+                                is_x86_feature_detected!("avx512bw")
+                                    && is_x86_feature_detected!("avx512vnni")
+                            }
+                            #[cfg(not(target_arch = "x86_64"))]
+                            {
+                                false
+                            }
+                        } {
                             // Q6_K on the interleaved-x8 pack (the tied Q6_K lm_head is a 189
                             // GMAC GEMM every DG denoise step): 8 weight rows per activation
                             // pass instead of 1 — same activation-reuse trick Q4_K got.
