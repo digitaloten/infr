@@ -3467,8 +3467,20 @@ pub(crate) fn generate_dense_backend(
         // exactly the rows the MTP catch-up driver needs `h` for (docs/MTP.md's `process()`).
         // `h_tap` piggybacks on the SAME graph/execute, just an extra Output + download.
         let want_h = h_out.is_some();
+        // Phase-4 MTP profiling (issue #33, INFR_MTP_TIME=1): split VERIFY's own wall time into
+        // graph-build / plan-compile / execute / download, and report `m` (the rows actually
+        // reprocessed) + whether this call is a FULL reprefill (`start == 0` with a nonempty
+        // history behind it, i.e. the qwen35 no-rewind fallback fired) vs the cheap incremental
+        // suffix-only path. This is the number the MTP perf pass profiles before touching any
+        // code — see mtp.rs's `generate_mtp_spec_vulkan_timed` doc on the no-rewind cost.
+        let time_verify = std::env::var("INFR_MTP_TIME").is_ok();
+        let full_reprefill = start == 0 && m > 1;
+        let t_vbuild0 = std::time::Instant::now();
         let (vg, vh) = build(m, start, m, false, None, want_h);
+        let vbuild_secs = t_vbuild0.elapsed().as_secs_f64();
+        let t_vcompile0 = std::time::Instant::now();
         let vplan = be.compile(&vg).map_err(|e| anyhow!("{e}"))?;
+        let vcompile_secs = t_vcompile0.elapsed().as_secs_f64();
         let vf_h_buf = if want_h {
             Some(
                 be.alloc(m * ne * 4, BufferUsage::Staging)
@@ -3497,6 +3509,8 @@ pub(crate) fn generate_dense_backend(
         let t0 = std::time::Instant::now();
         be.execute(vplan.as_ref(), &vb)
             .map_err(|e| anyhow!("{e}"))?;
+        let vexec_secs = t0.elapsed().as_secs_f64();
+        let t_vdl0 = std::time::Instant::now();
         out_logits.resize(m * c.vocab, 0.0);
         be.download(vf_logits_buf.as_ref(), bytemuck::cast_slice_mut(out_logits))
             .map_err(|e| anyhow!("{e}"))?;
@@ -3504,6 +3518,18 @@ pub(crate) fn generate_dense_backend(
             out.resize(m * ne, 0.0);
             be.download(hb.as_ref(), bytemuck::cast_slice_mut(out))
                 .map_err(|e| anyhow!("{e}"))?;
+        }
+        let vdl_secs = t_vdl0.elapsed().as_secs_f64();
+        if time_verify {
+            eprintln!(
+                "[mtp verify] m={m} start={start} full_reprefill={full_reprefill} \
+                 build={:.1}ms compile={:.1}ms exec={:.1}ms dl={:.1}ms total={:.1}ms",
+                vbuild_secs * 1e3,
+                vcompile_secs * 1e3,
+                vexec_secs * 1e3,
+                vdl_secs * 1e3,
+                (vbuild_secs + vcompile_secs + vexec_secs + vdl_secs) * 1e3,
+            );
         }
         cached.extend_from_slice(&prompt[start..]);
         return Ok((
