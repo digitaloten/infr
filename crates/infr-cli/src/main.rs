@@ -508,6 +508,11 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
             infr_llama::CpuModel::load(&gguf, tok.as_deref())?,
         ))
     };
+    let mut model = model;
+    // Compile the lazily-built pipelines NOW (like `serve` does before its first request) so the
+    // first turn's reported prefill rate measures prefill, not one-time pipeline builds — a cold
+    // diffusion-gemma prefill measured 26 t/s vs 1424 t/s warm, all compile.
+    model.warmup()?;
     let mut chat = infr_llama::model::Chat::new(model);
 
     // One-shot (a message) or an interactive multi-turn REPL (every backend now supports it).
@@ -1138,11 +1143,21 @@ fn cmd_bench_diffusion_gemma(
     let mut steps_v = Vec::with_capacity(reps.max(1));
     let mut parallel_v = Vec::with_capacity(reps.max(1));
     let (mut last_np, mut last_ng) = (0usize, 0usize);
+    // Untimed pipeline-warmup tokens: NOT a prefix of the timed sequence (reversed), so the
+    // timed prefill still re-prefills from scratch after the prefix-diff — the warmup only
+    // pre-compiles the lazily-built pipelines, exactly like the AR bench arms' untimed warmup
+    // (a cold DG prefill measured 26 t/s vs 1424 t/s warm — all one-time compile).
+    let warm_ids: Vec<u32> = full_ids[..8.min(full_ids.len())]
+        .iter()
+        .rev()
+        .copied()
+        .collect();
 
     for _ in 0..reps.max(1) {
         macro_rules! one_rep {
             ($sess:expr) => {{
                 let mut sess = $sess;
+                sess.prefill(&model, &warm_ids)?; // untimed pipeline warmup (see warm_ids)
                 if depth > 0 {
                     sess.prefill(&model, &dummy(depth))?; // untimed depth warm
                 }

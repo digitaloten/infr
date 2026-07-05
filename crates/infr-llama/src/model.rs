@@ -707,9 +707,75 @@ impl DiffusionGemmaChat {
     }
 }
 
+impl DiffusionGemmaChat {
+    /// Open (or grow) the session for a turn needing `needed` KV rows — see the sizing comment at
+    /// the call site in [`generate`](ChatModel::generate).
+    fn ensure_sess(&mut self, needed: usize) -> Result<()> {
+        if self.sess.is_some() && needed <= self.max_ctx {
+            return Ok(());
+        }
+        let cfg = self.model.config();
+        let max_ctx = std::env::var("INFR_MAX_CTX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| cfg.n_ctx_train.min(8192))
+            .max(needed);
+        self.max_ctx = max_ctx;
+        self.sess = Some(match self.backend {
+            DgBackend::Cpu => DiffusionSess::Cpu(self.model.diffusion_gemma_cpu_session(max_ctx)),
+            DgBackend::Vulkan => {
+                DiffusionSess::Vulkan(self.model.diffusion_gemma_vulkan_session(max_ctx)?)
+            }
+            DgBackend::Metal => {
+                #[cfg(target_os = "macos")]
+                {
+                    DiffusionSess::Metal(self.model.diffusion_gemma_metal_session(max_ctx)?)
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    return Err(anyhow::anyhow!(
+                        "the Metal backend is only available on macOS"
+                    ));
+                }
+            }
+        });
+        Ok(())
+    }
+}
+
 impl ChatModel for DiffusionGemmaChat {
     fn render(&self, messages: &[(&str, &str)]) -> Result<String> {
         self.model.render_chat_messages(messages)
+    }
+
+    fn warmup(&mut self) -> Result<()> {
+        use crate::diffusion::DiffusionSession;
+        let prof2 = std::env::var_os("INFR_PROF2");
+        if prof2.is_some() {
+            std::env::remove_var("INFR_PROF2");
+        }
+        // A tiny PREFILL-only forward compiles the lazily-built pipelines (GEMM/attention/batched
+        // MoE — a cold DG prefill was measured at 26 t/s vs 1424 t/s warm, ~5s of one-time compile
+        // otherwise billed to the first request). No denoise: the canvas plans build per (cc, p)
+        // anyway, and their couple of extra pipelines (canvas attention, softmax) are cheap next
+        // to the shared set warmed here. The throwaway tokens pollute the session's cached prefix
+        // harmlessly — a real prompt prefix-diffs to 0 and re-prefills from scratch.
+        let r = (|| -> Result<()> {
+            self.ensure_sess(64)?;
+            let enc = self
+                .model
+                .tokenizer()
+                .encode("Hi", false)
+                .map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+            self.sess
+                .as_mut()
+                .unwrap()
+                .prefill(&self.model, enc.get_ids())
+        })();
+        if let Some(v) = prof2 {
+            std::env::set_var("INFR_PROF2", v);
+        }
+        r
     }
 
     fn generate(
@@ -747,34 +813,7 @@ impl ChatModel for DiffusionGemmaChat {
         // rebuilt by a from-scratch prefill; correct, just slower for that one turn).
         let blocks = max_new.div_ceil(canvas_len.max(1)).max(1);
         let needed = prompt_tokens.len() + blocks * canvas_len + 64;
-        if self.sess.is_none() || needed > self.max_ctx {
-            let max_ctx = std::env::var("INFR_MAX_CTX")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or_else(|| cfg.n_ctx_train.min(8192))
-                .max(needed);
-            self.max_ctx = max_ctx;
-            self.sess = Some(match self.backend {
-                DgBackend::Cpu => {
-                    DiffusionSess::Cpu(self.model.diffusion_gemma_cpu_session(max_ctx))
-                }
-                DgBackend::Vulkan => {
-                    DiffusionSess::Vulkan(self.model.diffusion_gemma_vulkan_session(max_ctx)?)
-                }
-                DgBackend::Metal => {
-                    #[cfg(target_os = "macos")]
-                    {
-                        DiffusionSess::Metal(self.model.diffusion_gemma_metal_session(max_ctx)?)
-                    }
-                    #[cfg(not(target_os = "macos"))]
-                    {
-                        return Err(anyhow::anyhow!(
-                            "the Metal backend is only available on macOS"
-                        ));
-                    }
-                }
-            });
-        }
+        self.ensure_sess(needed)?;
 
         let result = crate::diffusion::diffusion_generate(
             self.sess.as_mut().unwrap(),
