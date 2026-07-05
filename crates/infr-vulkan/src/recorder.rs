@@ -3241,7 +3241,12 @@ impl<'a> Recorder<'a> {
     }
 
     /// MoE bucketing pass 3 (scatter): group token rows + weights by expert into `bucket_rows` /
-    /// `bucket_wts` (each expert's run starts at `offsets[e]`).
+    /// `bucket_wts` (each expert's run starts at `offsets[e]`). `dscale`, when given, is a
+    /// per-expert weight (diffusion-gemma's `ffn_down_exps.scale`) baked into `bucket_wts` at
+    /// scatter time — the scatter already has the expert id (`e`) in hand to index it, so this
+    /// is a free multiply here vs. a separate post-GEMM pass, and `moe_scatter_reduce` needs no
+    /// changes at all (it just sums already-scaled weights). Equivalent to the per-token path's
+    /// `moe_accumulate_scaled` since the scale is linear in the down output.
     #[allow(clippy::too_many_arguments)]
     pub fn moe_bucket_scatter(
         &self,
@@ -3252,34 +3257,34 @@ impl<'a> Recorder<'a> {
         bucket_rows: &dyn Buffer,
         bucket_wts: &dyn Buffer,
         inv_pos: &dyn Buffer,
+        dscale: Option<&dyn Buffer>,
         n_pairs: usize,
         n_used: usize,
     ) {
         self.stamp("moe_bucket");
-        let k = self.be.kernel(
-            "moe_bucket_scatter",
-            crate::gemm::moe_bucket_scatter_spv(),
-            7,
-            8,
-        );
+        let (name, spv): (_, _) = match dscale {
+            Some(_) => (
+                "moe_bucket_scatter_scaled",
+                crate::gemm::moe_bucket_scatter_scaled_spv(),
+            ),
+            None => ("moe_bucket_scatter", crate::gemm::moe_bucket_scatter_spv()),
+        };
+        let nb = if dscale.is_some() { 8 } else { 7 };
+        let k = self.be.kernel(name, spv, nb, 8);
         let mut push = [0u8; 8];
         push[0..4].copy_from_slice(&(n_pairs as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n_used as u32).to_ne_bytes());
-        self.dispatch(
-            k,
-            &[
-                Self::vkb(tok_ids),
-                Self::vkb(tok_wts),
-                Self::vkb(offsets),
-                Self::vkb(fill),
-                Self::vkb(bucket_rows),
-                Self::vkb(bucket_wts),
-                Self::vkb(inv_pos),
-            ],
-            4,
-            &push,
-            (n_pairs as u32).div_ceil(64),
-        );
+        let mut bufs = vec![Self::vkb(tok_ids), Self::vkb(tok_wts), Self::vkb(offsets)];
+        if let Some(ds) = dscale {
+            bufs.push(Self::vkb(ds));
+        }
+        bufs.extend_from_slice(&[
+            Self::vkb(fill),
+            Self::vkb(bucket_rows),
+            Self::vkb(bucket_wts),
+            Self::vkb(inv_pos),
+        ]);
+        self.dispatch(k, &bufs, 4, &push, (n_pairs as u32).div_ceil(64));
     }
 
     /// Fused gather+quant for the batched MoE pipeline: quantize `n_slots` BUCKET rows (each
@@ -3328,7 +3333,7 @@ impl<'a> Recorder<'a> {
     /// indexed `w_base + e·stride`. Grid x covers the worst-case row tiles (`ceil(rows/64)` — the
     /// whole chunk landing on one expert); tiles past a segment exit immediately, so the empty
     /// launches cost ~nothing while the dispatch count drops from ~n_expert·stages per layer to
-    /// stages. `sact` is Q4_K's min-term row sums (None for Q6_K, which has no min).
+    /// stages. `sact` is Q4_K's min-term row sums (None for Q6_K/Q8_0/Q5_0, which have no min).
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_mmq_experts(
         &self,
@@ -3362,7 +3367,17 @@ impl<'a> Recorder<'a> {
                 crate::gemm::native_gemm_mmq_q6k_xp_spv(),
                 6,
             ),
-            _ => unreachable!("batched MoE expert GEMM: Q4_K/Q6_K only"),
+            infr_core::DType::Q8_0 => (
+                "native_gemm_mmq_q8_0_xp",
+                crate::gemm::native_gemm_mmq_q8_0_xp_spv(),
+                6,
+            ),
+            infr_core::DType::Q5_0 => (
+                "native_gemm_mmq_q5_0_xp",
+                crate::gemm::native_gemm_mmq_q5_0_xp_spv(),
+                6,
+            ),
+            _ => unreachable!("batched MoE expert GEMM: Q4_K/Q6_K/Q8_0/Q5_0 only"),
         };
         let kern = self.be.kernel(name, spv, nb, 16);
         let mut push = [0u8; 16];

@@ -407,6 +407,16 @@ fn main() {
             "native_gemm_mmq_q6k_xp",
             &["-DEXPERT_GRID"],
         ),
+        (
+            "native_gemm_mmq_q8_0",
+            "native_gemm_mmq_q8_0_xp",
+            &["-DEXPERT_GRID"],
+        ),
+        (
+            "native_gemm_mmq_q5_0",
+            "native_gemm_mmq_q5_0_xp",
+            &["-DEXPERT_GRID"],
+        ),
         ("quant_q8", "quant_q8_gather", &["-DGATHER"]),
         ("moe_scatter_reduce", "moe_scatter_reduce", &[]),
         ("moe_topk", "moe_topk", &[]),
@@ -415,6 +425,11 @@ fn main() {
         ("moe_bucket_count", "moe_bucket_count", &[]),
         ("moe_bucket_scan", "moe_bucket_scan", &[]),
         ("moe_bucket_scatter", "moe_bucket_scatter", &[]),
+        (
+            "moe_bucket_scatter",
+            "moe_bucket_scatter_scaled",
+            &["-DDSCALE"],
+        ),
         ("add_scaled_id", "add_scaled_id", &[]),
         // Native-block prefill GEMMs: one .spv per quant format (coopmat tiled, no residual).
         ("native_gemm_warp", "native_gemm_warp_q4k", &["-DFMT_Q4K"]),

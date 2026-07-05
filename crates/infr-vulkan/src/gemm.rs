@@ -257,6 +257,12 @@ pub(crate) fn moe_bucket_scatter_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// SPIR-V for `moe_bucket_scatter`'s per-expert-`dscale`-baking variant (diffusion-gemma).
+pub(crate) fn moe_bucket_scatter_scaled_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_bucket_scatter_scaled.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for the indexed axpy (`acc += wts[slot]*x`).
 pub(crate) fn add_scaled_id_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/add_scaled_id.spv"));
@@ -793,6 +799,22 @@ pub(crate) fn native_gemm_mmq_q4k_xp_spv() -> &'static [u32] {
 
 pub(crate) fn native_gemm_mmq_q6k_xp_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q6k_xp.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+
+/// SPIR-V for the tiled Q8_0 dp4a (mmq) GEMM, expert-grid variant (a diffusion-gemma MoE down
+/// projection quant option).
+pub(crate) fn native_gemm_mmq_q8_0_xp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q8_0_xp.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+
+/// SPIR-V for the tiled Q5_0 dp4a (mmq) GEMM, expert-grid variant (the shipped
+/// diffusiongemma-26B-A4B-it-GGUF quantizes its MoE down projection as Q5_0).
+pub(crate) fn native_gemm_mmq_q5_0_xp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q5_0_xp.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
