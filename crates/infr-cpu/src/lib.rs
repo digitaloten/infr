@@ -1531,8 +1531,12 @@ type RepackCacheState = (HashMap<(usize, usize), Arc<Q4kPack>>, usize);
 // the types appear in cross-target signatures like `expert_matvec_batch`).
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 struct Q4kPackGroup {
-    ilv: Vec<u8>,   // [nb * 2048]
-    sc: Vec<i32>,   // [nb * 8 subs * 8 lanes], PERM order
+    ilv: Vec<u8>, // [nb * 2048]
+    // Pair-duplicated sub-block scales in dpbusd lane order (lanes 2i, 2i+1 = row i): the GEMM
+    // scales each sub-block's 16-lane accumulator with ONE 512-bit mullo and adds vertically,
+    // deferring the pair-merge to once per SUPER-block (the hadd then lands in PERM order
+    // exactly as before). [nb * 8 subs * 16 lanes].
+    sc16: Vec<i32>,
     msc: Vec<i32>,  // [nb * 8 subs * 8 lanes], PERM order
     d: Vec<f32>,    // [nb * 8 lanes], PERM order
     dmin: Vec<f32>, // [nb * 8 lanes], PERM order
@@ -1551,7 +1555,9 @@ impl Q4kPack {
     fn bytes(&self) -> usize {
         self.groups
             .iter()
-            .map(|g| g.ilv.len() + (g.sc.len() + g.msc.len()) * 4 + (g.d.len() + g.dmin.len()) * 4)
+            .map(|g| {
+                g.ilv.len() + (g.sc16.len() + g.msc.len()) * 4 + (g.d.len() + g.dmin.len()) * 4
+            })
             .sum()
     }
 }
@@ -1575,7 +1581,7 @@ unsafe fn q4k_pack(wbytes: &[u8], in_f: usize, out_f: usize) -> Q4kPack {
     for g in 0..n_groups {
         let mut pg = Q4kPackGroup {
             ilv: vec![0u8; nb * 2048],
-            sc: vec![0i32; nb * 64],
+            sc16: vec![0i32; nb * 128],
             msc: vec![0i32; nb * 64],
             d: vec![0f32; nb * 8],
             dmin: vec![0f32; nb * 8],
@@ -1607,8 +1613,11 @@ unsafe fn q4k_pack(wbytes: &[u8], in_f: usize, out_f: usize) -> Q4kPack {
             }
             for st in 0..8usize {
                 for (j, &row) in PERM.iter().enumerate() {
-                    pg.sc[b * 64 + st * 8 + j] = sc_rows[row][st] as i32;
                     pg.msc[b * 64 + st * 8 + j] = m_rows[row][st] as i32;
+                }
+                for i in 0..8usize {
+                    pg.sc16[b * 128 + st * 16 + 2 * i] = sc_rows[i][st] as i32;
+                    pg.sc16[b * 128 + st * 16 + 2 * i + 1] = sc_rows[i][st] as i32;
                 }
                 for gg in 0..4usize {
                     let dst = &mut pg.ilv
@@ -1637,7 +1646,11 @@ unsafe fn q4k_gemm_group(pg: &Q4kPackGroup, nb: usize, q8s: &[Q8], cols: &mut [f
         let q8 = &q8s[r];
         let mut sumf_v = _mm256_setzero_ps();
         for b in 0..nb {
-            let mut sd_ymm = _mm256_setzero_si256();
+            // Vertical accumulation: each sub-block's 16-lane sums are scaled with ONE 512-bit
+            // mullo (pair-duplicated scales, see `sc16`) and added vertically; the pair-merge
+            // hadd runs ONCE per super-block instead of per sub-block. Integer-exact
+            // (Σ_s sc·(a+b) = Σ_s (sc·a + sc·b)) — still bit-identical to the scalar oracle.
+            let mut sd_zmm = _mm512_setzero_si512();
             let mut sm_ymm = _mm256_setzero_si256();
             let q8b = &q8.qs[b * 256..b * 256 + 256];
             for st in 0..8usize {
@@ -1651,15 +1664,16 @@ unsafe fn q4k_gemm_group(pg: &Q4kPackGroup, nb: usize, q8s: &[Q8], cols: &mut [f
                     );
                     acc = _mm512_dpbusd_epi32(acc, w, a);
                 }
-                let lo = _mm512_castsi512_si256(acc);
-                let hi = _mm512_extracti64x4_epi64::<1>(acc);
-                let sums_perm = _mm256_hadd_epi32(lo, hi);
-                let sc_v = _mm256_loadu_si256(pg.sc[b * 64 + st * 8..].as_ptr() as *const __m256i);
+                let sc16 =
+                    _mm512_loadu_si512(pg.sc16[b * 128 + st * 16..].as_ptr() as *const __m512i);
+                sd_zmm = _mm512_add_epi32(sd_zmm, _mm512_mullo_epi32(acc, sc16));
                 let m_v = _mm256_loadu_si256(pg.msc[b * 64 + st * 8..].as_ptr() as *const __m256i);
-                sd_ymm = _mm256_add_epi32(sd_ymm, _mm256_mullo_epi32(sums_perm, sc_v));
                 let isum = _mm256_set1_epi32(q8.bsums[b * 8 + st]);
                 sm_ymm = _mm256_add_epi32(sm_ymm, _mm256_mullo_epi32(m_v, isum));
             }
+            let sd_lo = _mm512_castsi512_si256(sd_zmm);
+            let sd_hi = _mm512_extracti64x4_epi64::<1>(sd_zmm);
+            let sd_ymm = _mm256_hadd_epi32(sd_lo, sd_hi); // pair-merge -> PERM order, once per block
             let sd_f = _mm256_cvtepi32_ps(sd_ymm);
             let sm_f = _mm256_cvtepi32_ps(sm_ymm);
             let d_v = _mm256_loadu_ps(pg.d[b * 8..].as_ptr());
@@ -1708,8 +1722,9 @@ unsafe fn vec_dot_q4k_batch8_ilv_vnni(
     let mut d_arr: [Vec<f32>; 8] = std::array::from_fn(|_| vec![0f32; nb]);
     let mut dmin_arr: [Vec<f32>; 8] = std::array::from_fn(|_| vec![0f32; nb]);
     let mut m_arr: [Vec<[u32; 8]>; 8] = std::array::from_fn(|_| vec![[0u32; 8]; nb]);
-    // per-(b, s) scale vector with rows pre-permuted into hadd order.
-    let mut sc_vec = vec![[_mm256_setzero_si256(); 8]; nb];
+    // per-(b, s) PAIR-DUPLICATED scale vector in dpbusd lane order (lanes 2i, 2i+1 = row i) —
+    // consumed by the vertical 512-bit mullo; see q4k_gemm_group's sc16.
+    let mut sc16_vec = vec![[_mm512_setzero_si512(); 8]; nb];
     // PERM-ordered per-(b,s) m-scales and per-b f32 d/dmin vectors: lets the sm accumulation and
     // the final `q8.d*(d*sd - dmin*sm)` run 8-rows-wide in lane space (un-permuted only at the
     // very end). No FMA anywhere — each mul/sub/add rounds separately, matching the scalar order.
@@ -1761,15 +1776,23 @@ unsafe fn vec_dot_q4k_batch8_ilv_vnni(
                 dmin_arr[PERM[7]][b],
             );
             for s in 0..8usize {
-                sc_vec[b][s] = _mm256_setr_epi32(
-                    sc_rows[PERM[0]][s] as i32,
-                    sc_rows[PERM[1]][s] as i32,
-                    sc_rows[PERM[2]][s] as i32,
-                    sc_rows[PERM[3]][s] as i32,
-                    sc_rows[PERM[4]][s] as i32,
-                    sc_rows[PERM[5]][s] as i32,
-                    sc_rows[PERM[6]][s] as i32,
-                    sc_rows[PERM[7]][s] as i32,
+                sc16_vec[b][s] = _mm512_setr_epi32(
+                    sc_rows[0][s] as i32,
+                    sc_rows[0][s] as i32,
+                    sc_rows[1][s] as i32,
+                    sc_rows[1][s] as i32,
+                    sc_rows[2][s] as i32,
+                    sc_rows[2][s] as i32,
+                    sc_rows[3][s] as i32,
+                    sc_rows[3][s] as i32,
+                    sc_rows[4][s] as i32,
+                    sc_rows[4][s] as i32,
+                    sc_rows[5][s] as i32,
+                    sc_rows[5][s] as i32,
+                    sc_rows[6][s] as i32,
+                    sc_rows[6][s] as i32,
+                    sc_rows[7][s] as i32,
+                    sc_rows[7][s] as i32,
                 );
                 m_vec[b][s] = _mm256_setr_epi32(
                     m_arr[PERM[0]][b][s] as i32,
@@ -1801,8 +1824,8 @@ unsafe fn vec_dot_q4k_batch8_ilv_vnni(
         // sequence to the scalar per-row expression.
         let mut sumf_v = _mm256_setzero_ps();
         for b in 0..nb {
-            // sd/sm per row, accumulated across the 8 sub-blocks in hadd-permuted lane order.
-            let mut sd_ymm = _mm256_setzero_si256();
+            // sd/sm per row: sd vertical in 512-bit pair-lane space, sm in PERM lane order.
+            let mut sd_zmm = _mm512_setzero_si512();
             let mut sm_ymm = _mm256_setzero_si256();
             let q8b = &q8.qs[b * 256..b * 256 + 256];
             for s in 0..8usize {
@@ -1817,16 +1840,17 @@ unsafe fn vec_dot_q4k_batch8_ilv_vnni(
                     );
                     acc = _mm512_dpbusd_epi32(acc, w, a);
                 }
-                // acc lane pair (2i, 2i+1) = row i; hadd merges pairs into PERM order.
-                let lo = _mm512_castsi512_si256(acc);
-                let hi = _mm512_extracti64x4_epi64::<1>(acc);
-                let sums_perm = _mm256_hadd_epi32(lo, hi);
-                sd_ymm = _mm256_add_epi32(sd_ymm, _mm256_mullo_epi32(sums_perm, sc_vec[b][s]));
+                // Vertical: scale pair lanes in 512-bit space; pair-merge deferred to once per
+                // super-block (integer-exact — see q4k_gemm_group's note).
+                sd_zmm = _mm512_add_epi32(sd_zmm, _mm512_mullo_epi32(acc, sc16_vec[b][s]));
                 let isum = _mm256_set1_epi32(q8.bsums[b * 8 + s]);
                 sm_ymm = _mm256_add_epi32(sm_ymm, _mm256_mullo_epi32(m_vec[b][s], isum));
             }
-            // q8.d[b] * (d*sd - dmin*sm), 8 rows at once (cvtepi32→f32 is exact for these
-            // magnitudes; mul/sub/mul/add sequence matches the scalar expression's rounding).
+            let sd_lo = _mm512_castsi512_si256(sd_zmm);
+            let sd_hi = _mm512_extracti64x4_epi64::<1>(sd_zmm);
+            let sd_ymm = _mm256_hadd_epi32(sd_lo, sd_hi); // pair-merge -> PERM order
+                                                          // q8.d[b] * (d*sd - dmin*sm), 8 rows at once (cvtepi32→f32 is exact for these
+                                                          // magnitudes; mul/sub/mul/add sequence matches the scalar expression's rounding).
             let sd_f = _mm256_cvtepi32_ps(sd_ymm);
             let sm_f = _mm256_cvtepi32_ps(sm_ymm);
             let t = _mm256_sub_ps(
@@ -5024,6 +5048,54 @@ mod kernel_tests {
     /// only the final `d_w * d8 * iprod` formula does, which is shared. Runs whichever SIMD tier this
     /// CPU actually has (falls through to the same scalar fn on non-x86 or pre-AVX2 hardware, in which
     /// case the assertion is trivially true).
+    #[test]
+    fn q4k_pack_gemm_bit_identical_to_scalar() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if !(is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni")) {
+                return; // the pack/gemm pair only exists on the VNNI path
+            }
+            let (in_f, out_f, m) = (512usize, 16usize, 5usize);
+            let nb256 = in_f / 256;
+            let mut w = det_bytes(out_f * nb256 * 144, 80);
+            for o in 0..out_f {
+                for b in 0..nb256 {
+                    put_f16(
+                        &mut w[(o * nb256 + b) * 144..(o * nb256 + b) * 144 + 2],
+                        0.02,
+                    );
+                    put_f16(
+                        &mut w[(o * nb256 + b) * 144 + 2..(o * nb256 + b) * 144 + 4],
+                        0.01,
+                    );
+                }
+            }
+            let q8s: Vec<Q8> = (0..m)
+                .map(|r| quantize_q8(&det_x(in_f, 81 + r as u64)))
+                .collect();
+            let pack = unsafe { q4k_pack(&w, in_f, out_f) };
+            let bpr = w.len() / out_f;
+            for (g, pg) in pack.groups.iter().enumerate() {
+                let mut cols = vec![0f32; 8 * m];
+                unsafe { q4k_gemm_group(pg, pack.nb, &q8s, &mut cols) };
+                for i in 0..8 {
+                    let o = g * 8 + i;
+                    let mut want = vec![0f32; m];
+                    vec_dot_q4k_batch_scalar(&w[o * bpr..o * bpr + bpr], &q8s, in_f, &mut want);
+                    for r in 0..m {
+                        assert_eq!(
+                            cols[i * m + r].to_bits(),
+                            want[r].to_bits(),
+                            "pack/gemm g={g} i={i} r={r}: got {}, want {}",
+                            cols[i * m + r],
+                            want[r]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn q32_batch8_bit_identical_to_scalar() {
         for q5 in [false, true] {
