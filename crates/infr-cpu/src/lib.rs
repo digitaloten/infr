@@ -19,7 +19,6 @@ use infr_core::graph::{Activation, AttnMask, Graph, Op, TensorKind};
 use infr_core::tensor::{DType, TensorId};
 use infr_gguf::dequant::{dequant_block, k4, rdf16};
 use infr_gguf::TensorBytes;
-use rayon::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -27,6 +26,7 @@ use std::sync::{Arc, Mutex};
 /// Activation quantized to Q8 over 256-element super-blocks: `qs[i] = round(x[i]/d[blk])` (int8),
 /// `d[blk] = max|x|/127`. Quantize the activation ONCE per matvec, then integer-dot it against the
 /// quantized weight rows (llama.cpp's q8_K path) — no per-row f32 weight expansion.
+#[derive(Clone)]
 struct Q8 {
     qs: Vec<i8>,
     d: Vec<f32>,
@@ -2685,6 +2685,7 @@ fn vec_dot_q5k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
 /// Activation quantized to int8 per NATIVE 32-element block (mirrors [`Q8`] but without the
 /// 256-superblock grouping). `bsum` is `Σqs` per block — Q5_0's constant `-16` offset needs `Σx`,
 /// which `d[b] * bsum[b]` approximates the same way `Q8::bsums` does for the K-quant min term.
+#[derive(Clone)]
 struct Q8x32 {
     qs: Vec<i8>,
     d: Vec<f32>,
@@ -3371,255 +3372,162 @@ fn bytes_to_f32(bytes: &[u8], dtype: DType) -> Vec<f32> {
     }
 }
 
-/// Batched `[count, in_f] @ [out_f, in_f]^T -> [count, out_f]` matvec (row-major throughout) used by
-/// `Op::MoeFfn`'s router/gate/up/down projections: each weight row is read from the mmap and
-/// dequantized to f32 **ONCE**, then dotted against every one of the `count` activation rows —
-/// bit-identical arithmetic to calling a per-row `dequant + dot` `count` times (same bytes, same
-/// `dot`/`dot_f16`/`dot_bf16` reduction), just amortizing the dequant. This is the actual fix for the
-/// MoE FFN's original per-(row, expert) loop: with a top-`n_used`-of-`n_expert` router, an expert's
-/// weight was previously re-streamed from the mmap and re-dequantized independently for EVERY row
-/// that selected it (`rows·n_used/n_expert` ≈ 16x redundant for DiffusionGemma's 256-row/top-8-of-128
-/// shape) — bucketing rows by expert first (see the `Op::MoeFfn` arm) lets this run once per expert.
-/// Not used for `Op::Linear`'s own m>1 path — that already has the same class of int8-activation
-/// batched dot for the 256-superblock-aligned quant types; MoE's `down` projection has
-/// `in_f = n_ff_exp`, which isn't always a multiple of 256 (e.g. DiffusionGemma's 704 — always a
-/// multiple of 32, Q8_0/Q5_0's own native block, so THAT granularity gets its own int8 fast path
-/// below instead of falling all the way back to the plain f32 dequant+dot).
-#[allow(clippy::too_many_arguments)]
-#[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
-fn expert_matvec_batch(
-    wbytes: &[u8],
-    dt: DType,
-    xin: &[f32],
-    count: usize,
-    in_f: usize,
-    out_f: usize,
-    // Prebuilt interleaved pack for this bank (Q4_K + VNNI only; see `CpuBackend::q4k_pack_for`).
-    // `Some` skips the per-call repack inside the 8-row tile entirely.
-    q4k_pack: Option<&Q4kPack>,
-    // int8-activation fast paths allowed? Decided by the CALLER on the WHOLE MoeFfn call's row
-    // count, not this bucket's `count`: a per-bucket gate would mix exact and int8 math inside
-    // one batched forward (1-row buckets exact, big buckets int8), which measurably shuffled
-    // near-tie logits vs the uniform-int8 baseline (the DG CPU/Vulkan parity test caught it).
-    // Single-row CALLS (Metal parity tests, qwen3moe per-token decode) pass false and keep the
-    // exact dequant+f32-dot path byte-for-byte.
-    int8_ok: bool,
-) -> Vec<f32> {
-    let bpr = wbytes.len() / out_f;
-    let mut out = vec![0f32; count * out_f];
-    // Fast path 1: int8-activation batched dot at the 256-element super-block granularity (same
-    // kernels `Op::Linear`'s m>1 path uses) — needs `in_f` to be a whole number of super-blocks;
-    // true for MoE's `gate`/`up` (`in_f = n_embd`), not guaranteed for `down`.
-    // Router/gate/up/down calls come from `Op::MoeFfn`'s PER-EXPERT rayon fan-out (one task per
-    // selected expert; see that arm) — with a top-k router, real inputs route wildly unevenly
-    // (DiffusionGemma's masked-canvas rows collapse onto a handful of experts, e.g. one expert can
-    // draw all 256 rows while dozens draw only a handful), so a single expert's `out_f` loop can
-    // dwarf everyone else's and pin ONE thread while the other 31 sit idle waiting on it. Below a
-    // work threshold, run the `o` loop serially (matches the previous behavior, no rayon overhead
-    // for the common small-bucket case); above it, split `o` across rayon so the straggler expert's
-    // own work gets stolen by idle threads instead of serializing on whichever thread drew it.
-    const PAR_O_WORK_THRESHOLD: usize = 200_000; // count * out_f
-    let par_o = count.saturating_mul(out_f) >= PAR_O_WORK_THRESHOLD;
+/// Activation batch for [`expert_gemm_range`] — the representation the weight dtype dictates
+/// (see [`expert_acts_kind`]). The staged `Op::MoeFfn` pipeline builds these ONCE per stage
+/// (each distinct hidden row quantized a single time, then cloned per routed pair) and every
+/// o-range task borrows a bucket's slice.
+enum ExpertActs<'a> {
+    /// 256-super-block int8 (`quantize_q8`): Q4K/Q6K/Q8_0/Q5K weights with `in_f % 256 == 0`.
+    Super(&'a [Q8]),
+    /// 32-block int8 (`quantize_q8_32`): Q8_0/Q5_0 weights at misaligned `in_f % 32 == 0`
+    /// (e.g. DiffusionGemma's down `in_f = 704`).
+    Blk32(&'a [Q8x32]),
+    /// Row-major f32 `[count, in_f]`: f16/bf16/f32 weights, the dequant fallback, and ALL
+    /// single-row (`int8_ok == false`) calls, which stay byte-for-byte exact (Metal parity).
+    Raw(&'a [f32]),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ActsKind {
+    Super,
+    Blk32,
+    Raw,
+}
+
+/// Which activation representation an expert bank of this `(dtype, in_f)` uses — the SAME
+/// dispatch order the old `expert_matvec_batch` fast paths had, so every (weights, activations)
+/// pairing lands on the identical kernel.
+fn expert_acts_kind(dt: DType, in_f: usize, int8_ok: bool) -> ActsKind {
     if int8_ok
         && matches!(dt, DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q5K)
         && in_f.is_multiple_of(256)
     {
-        // Parallel quantize for big buckets (the straggler expert's serial quantize otherwise
-        // extends the whole MoeFfn join); small buckets stay serial — no rayon overhead, and
-        // the per-row values are identical either way.
-        let q8s: Vec<Q8> = if par_o {
-            (0..count)
-                .into_par_iter()
-                .map(|r| quantize_q8(&xin[r * in_f..r * in_f + in_f]))
-                .collect()
-        } else {
-            (0..count)
-                .map(|r| quantize_q8(&xin[r * in_f..r * in_f + in_f]))
-                .collect()
-        };
-        let dot_col = |o: usize, col: &mut [f32]| {
-            let row = &wbytes[o * bpr..o * bpr + bpr];
-            match dt {
-                DType::Q4K => vec_dot_q4k_batch(row, &q8s, in_f, col),
-                DType::Q6K => vec_dot_q6k_batch(row, &q8s, in_f, col),
-                DType::Q8_0 => vec_dot_q8_0_batch(row, &q8s, in_f, col),
-                DType::Q5K => vec_dot_q5k_batch(row, &q8s, in_f, col),
-                _ => unreachable!(),
-            }
-        };
-        // Q4_K rides the 8-row tile (`vec_dot_q4k_batch8`): the q8 activations are loaded once
-        // per (block, pair) and dotted against 8 weight rows — 8x the activation reuse of the
-        // per-row kernel, which is the dominant L2/L3 traffic in a big expert bucket (the same
-        // structural trick the Linear m>1 path already uses). `cols8` is a [8*count] scratch a
-        // whole output-row group owns; the tail (out_f % 8) falls back to the per-row kernel.
-        let q4k_tile = dt == DType::Q4K;
-        let dot_cols8 = |o8: usize, cols: &mut [f32]| {
-            debug_assert_eq!(cols.len(), 8 * count);
-            #[cfg(target_arch = "x86_64")]
-            if let Some(pack) = q4k_pack {
-                // Cached-pack path: repack already done (once per expert per session).
-                // SAFETY: q4k_pack is only handed in when the VNNI dispatch applies.
-                unsafe { q4k_gemm_group(&pack.groups[o8 / 8], pack.nb, &q8s, cols) };
-                return;
-            }
-            let rows: [&[u8]; 8] =
-                std::array::from_fn(|i| &wbytes[(o8 + i) * bpr..(o8 + i) * bpr + bpr]);
-            let mut it = cols.chunks_mut(count);
-            let outs: [&mut [f32]; 8] = std::array::from_fn(|_| it.next().unwrap());
-            vec_dot_q4k_batch8(rows, &q8s, in_f, outs);
-        };
-        let groups = if q4k_tile { out_f / 8 } else { 0 };
-        let tail_start = groups * 8;
-        if par_o {
-            // Transposed scratch (`out_t[o*count+r]`) so each `o` (or 8-row group) owns a
-            // disjoint slice — no shared `col` to serialize on. Un-transposed into `out` once.
-            let mut out_t = vec![0f32; out_f * count];
-            let (tiled, tail) = out_t.split_at_mut(tail_start * count);
-            rayon::join(
-                || {
-                    tiled
-                        .par_chunks_mut(8 * count)
-                        .enumerate()
-                        .for_each(|(g, cols)| dot_cols8(g * 8, cols));
-                },
-                || {
-                    tail.par_chunks_mut(count)
-                        .enumerate()
-                        .for_each(|(i, col)| dot_col(tail_start + i, col));
-                },
-            );
-            // Parallel un-transpose (was serial — ~1 ms tacked onto the straggler expert).
-            out.par_chunks_mut(out_f).enumerate().for_each(|(r, orow)| {
-                for (o, dst) in orow.iter_mut().enumerate() {
-                    *dst = out_t[o * count + r];
+        ActsKind::Super
+    } else if int8_ok && matches!(dt, DType::Q8_0 | DType::Q5_0) && in_f.is_multiple_of(32) {
+        ActsKind::Blk32
+    } else {
+        ActsKind::Raw
+    }
+}
+
+/// Compute output rows `[o0, o1)` of ONE expert bank into `out_t` — an o-major slice of exactly
+/// `(o1-o0) * count` floats (`out_t[(o - o0) * count + r]`). `o0` MUST be 8-aligned: the
+/// Q4_K / 32-block 8-row tiles are anchored at `o = 0`, so 8-aligned chunking reproduces the
+/// exact tile boundaries (and therefore bit-identical per-element results) of a whole-bank call,
+/// no matter how a task list splits the range. The kernels and their dispatch mirror the old
+/// `expert_matvec_batch` fast paths 1/2 + fallback one-for-one.
+#[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
+fn expert_gemm_range(
+    wbytes: &[u8],
+    dt: DType,
+    in_f: usize,
+    out_f: usize,
+    acts: &ExpertActs,
+    q4k_pack: Option<&Q4kPack>,
+    o0: usize,
+    o1: usize,
+    out_t: &mut [f32],
+) {
+    debug_assert!(o0 % 8 == 0 && o0 <= o1 && o1 <= out_f);
+    let bpr = wbytes.len() / out_f;
+    let count = if o1 > o0 { out_t.len() / (o1 - o0) } else { 0 };
+    match acts {
+        ExpertActs::Super(q8s) => {
+            let dot_col = |o: usize, col: &mut [f32]| {
+                let row = &wbytes[o * bpr..o * bpr + bpr];
+                match dt {
+                    DType::Q4K => vec_dot_q4k_batch(row, q8s, in_f, col),
+                    DType::Q6K => vec_dot_q6k_batch(row, q8s, in_f, col),
+                    DType::Q8_0 => vec_dot_q8_0_batch(row, q8s, in_f, col),
+                    DType::Q5K => vec_dot_q5k_batch(row, q8s, in_f, col),
+                    _ => unreachable!("Super acts imply a 256-super-block quant dtype"),
                 }
-            });
-        } else {
-            let mut cols8 = vec![0f32; 8 * count];
-            for g in 0..groups {
-                dot_cols8(g * 8, &mut cols8);
-                for i in 0..8 {
-                    let o = g * 8 + i;
-                    for r in 0..count {
-                        out[r * out_f + o] = cols8[i * count + r];
+            };
+            // 8-row tiling for Q4_K only (`vec_dot_q4k_batch8` / the cached ilv pack) — the same
+            // gate the old fast path 1 had; Q6K/Q8_0/Q5K run per-row.
+            let tiled_end = if dt == DType::Q4K { out_f / 8 * 8 } else { 0 };
+            let mut o = o0;
+            while o + 8 <= o1.min(tiled_end) {
+                let cols = &mut out_t[(o - o0) * count..(o - o0 + 8) * count];
+                #[cfg(target_arch = "x86_64")]
+                if let Some(pack) = q4k_pack {
+                    // SAFETY: packs are only built when the VNNI ilv dispatch applies.
+                    unsafe { q4k_gemm_group(&pack.groups[o / 8], pack.nb, q8s, cols) };
+                    o += 8;
+                    continue;
+                }
+                let rows: [&[u8]; 8] =
+                    std::array::from_fn(|i| &wbytes[(o + i) * bpr..(o + i) * bpr + bpr]);
+                let mut it = cols.chunks_mut(count);
+                let outs: [&mut [f32]; 8] = std::array::from_fn(|_| it.next().unwrap());
+                vec_dot_q4k_batch8(rows, q8s, in_f, outs);
+                o += 8;
+            }
+            while o < o1 {
+                dot_col(o, &mut out_t[(o - o0) * count..(o - o0 + 1) * count]);
+                o += 1;
+            }
+        }
+        ExpertActs::Blk32(q8s) => {
+            let q5 = dt == DType::Q5_0;
+            let dot_col = |o: usize, col: &mut [f32]| {
+                let row = &wbytes[o * bpr..o * bpr + bpr];
+                match dt {
+                    DType::Q8_0 => vec_dot_q8_0_32_batch(row, q8s, in_f, col),
+                    DType::Q5_0 => vec_dot_q5_0_32_batch(row, q8s, in_f, col),
+                    _ => unreachable!("Blk32 acts imply Q8_0/Q5_0"),
+                }
+            };
+            // Both Q8_0 and Q5_0 ride the interleaved 8-row tile (old fast path 2).
+            let tiled_end = out_f / 8 * 8;
+            let mut o = o0;
+            while o + 8 <= o1.min(tiled_end) {
+                let cols = &mut out_t[(o - o0) * count..(o - o0 + 8) * count];
+                let rows: [&[u8]; 8] =
+                    std::array::from_fn(|i| &wbytes[(o + i) * bpr..(o + i) * bpr + bpr]);
+                let mut it = cols.chunks_mut(count);
+                let outs: [&mut [f32]; 8] = std::array::from_fn(|_| it.next().unwrap());
+                vec_dot_q32_batch8(rows, q8s, in_f, outs, q5);
+                o += 8;
+            }
+            while o < o1 {
+                dot_col(o, &mut out_t[(o - o0) * count..(o - o0 + 1) * count]);
+                o += 1;
+            }
+        }
+        ExpertActs::Raw(xin) => {
+            // f32 dots against raw activation rows: identical math to the old fallback (the
+            // weight row is dequantized ONCE, reused across all rows), o-major placement.
+            for o in o0..o1 {
+                let row = &wbytes[o * bpr..o * bpr + bpr];
+                let col = &mut out_t[(o - o0) * count..(o - o0 + 1) * count];
+                match dt {
+                    DType::F32 => {
+                        let w32: &[f32] = bytemuck::cast_slice(row);
+                        for (r, dst) in col.iter_mut().enumerate() {
+                            *dst = dot(w32, &xin[r * in_f..r * in_f + in_f]);
+                        }
+                    }
+                    DType::F16 => {
+                        for (r, dst) in col.iter_mut().enumerate() {
+                            *dst = dot_f16(row, &xin[r * in_f..r * in_f + in_f]);
+                        }
+                    }
+                    DType::Bf16 => {
+                        for (r, dst) in col.iter_mut().enumerate() {
+                            *dst = dot_bf16(row, &xin[r * in_f..r * in_f + in_f]);
+                        }
+                    }
+                    _ => {
+                        let wf = bytes_to_f32(row, dt);
+                        for (r, dst) in col.iter_mut().enumerate() {
+                            *dst = dot(&wf, &xin[r * in_f..r * in_f + in_f]);
+                        }
                     }
                 }
             }
-            let mut col = vec![0f32; count];
-            for o in tail_start..out_f {
-                dot_col(o, &mut col);
-                for r in 0..count {
-                    out[r * out_f + o] = col[r];
-                }
-            }
-        }
-        return out;
-    }
-    // Fast path 2: Q8_0/Q5_0 at THEIR OWN 32-element native block — covers `down`'s misaligned
-    // `in_f` (e.g. 704) without ever materializing a dequantized f32 row.
-    if int8_ok && matches!(dt, DType::Q8_0 | DType::Q5_0) && in_f.is_multiple_of(32) {
-        let q8s: Vec<Q8x32> = if par_o {
-            (0..count)
-                .into_par_iter()
-                .map(|r| quantize_q8_32(&xin[r * in_f..r * in_f + in_f]))
-                .collect()
-        } else {
-            (0..count)
-                .map(|r| quantize_q8_32(&xin[r * in_f..r * in_f + in_f]))
-                .collect()
-        };
-        let q5 = dt == DType::Q5_0;
-        let dot_col = |o: usize, col: &mut [f32]| {
-            let row = &wbytes[o * bpr..o * bpr + bpr];
-            match dt {
-                DType::Q8_0 => vec_dot_q8_0_32_batch(row, &q8s, in_f, col),
-                DType::Q5_0 => vec_dot_q5_0_32_batch(row, &q8s, in_f, col),
-                _ => unreachable!(),
-            }
-        };
-        // 8-row tile (same structure as fast path 1's Q4_K grouping): the interleaved kernel
-        // loads each activation qword once for all 8 down rows.
-        let dot_cols8 = |o8: usize, cols: &mut [f32]| {
-            debug_assert_eq!(cols.len(), 8 * count);
-            let rows: [&[u8]; 8] =
-                std::array::from_fn(|i| &wbytes[(o8 + i) * bpr..(o8 + i) * bpr + bpr]);
-            let mut it = cols.chunks_mut(count);
-            let outs: [&mut [f32]; 8] = std::array::from_fn(|_| it.next().unwrap());
-            vec_dot_q32_batch8(rows, &q8s, in_f, outs, q5);
-        };
-        let groups = out_f / 8;
-        let tail_start = groups * 8;
-        if par_o {
-            let mut out_t = vec![0f32; out_f * count];
-            let (tiled, tail) = out_t.split_at_mut(tail_start * count);
-            rayon::join(
-                || {
-                    tiled
-                        .par_chunks_mut(8 * count)
-                        .enumerate()
-                        .for_each(|(g, cols)| dot_cols8(g * 8, cols));
-                },
-                || {
-                    tail.par_chunks_mut(count)
-                        .enumerate()
-                        .for_each(|(i, col)| dot_col(tail_start + i, col));
-                },
-            );
-            // Parallel un-transpose (see fast path 1's matching comment).
-            out.par_chunks_mut(out_f).enumerate().for_each(|(r, orow)| {
-                for (o, dst) in orow.iter_mut().enumerate() {
-                    *dst = out_t[o * count + r];
-                }
-            });
-        } else {
-            let mut cols8 = vec![0f32; 8 * count];
-            for g in 0..groups {
-                dot_cols8(g * 8, &mut cols8);
-                for i in 0..8 {
-                    let o = g * 8 + i;
-                    for r in 0..count {
-                        out[r * out_f + o] = cols8[i * count + r];
-                    }
-                }
-            }
-            let mut col = vec![0f32; count];
-            for o in tail_start..out_f {
-                dot_col(o, &mut col);
-                for r in 0..count {
-                    out[r * out_f + o] = col[r];
-                }
-            }
-        }
-        return out;
-    }
-    for o in 0..out_f {
-        let row = &wbytes[o * bpr..o * bpr + bpr];
-        match dt {
-            DType::F32 => {
-                let w32: &[f32] = bytemuck::cast_slice(row);
-                for r in 0..count {
-                    out[r * out_f + o] = dot(w32, &xin[r * in_f..r * in_f + in_f]);
-                }
-            }
-            DType::F16 => {
-                for r in 0..count {
-                    out[r * out_f + o] = dot_f16(row, &xin[r * in_f..r * in_f + in_f]);
-                }
-            }
-            DType::Bf16 => {
-                for r in 0..count {
-                    out[r * out_f + o] = dot_bf16(row, &xin[r * in_f..r * in_f + in_f]);
-                }
-            }
-            _ => {
-                let wf = bytes_to_f32(row, dt);
-                for r in 0..count {
-                    out[r * out_f + o] = dot(&wf, &xin[r * in_f..r * in_f + in_f]);
-                }
-            }
         }
     }
-    out
 }
 
 /// Gated-FFN activation applied to the gate value.
@@ -3756,13 +3664,6 @@ impl Backend for CpuBackend {
         };
 
         let prof_ops = std::env::var("INFR_PROF_OPS").is_ok();
-        // Per-graph spin ceiling: a graph with a rayon section (MoeFfn) needs pool waiters to
-        // park near-immediately or they starve it (qwen3moe pp512 123 -> 97 t/s even with the
-        // arm's `pause`); an all-pool dense graph wants generous spinning (parking between every
-        // op cost qwen3 pp512 404 -> 356 t/s). See `SpinPool::set_budget_cap`.
-        let has_rayon_section = g.ops.iter().any(|o| matches!(o, Op::MoeFfn { .. }));
-        self.pool()
-            .set_budget_cap(if has_rayon_section { 256 } else { 1 << 15 });
         let mut op_times: HashMap<&'static str, f64> = HashMap::new();
         for op in &g.ops {
             let __t0 = if prof_ops {
@@ -4546,11 +4447,6 @@ impl Backend for CpuBackend {
                         n_used as usize,
                         n_ff_exp as usize,
                     );
-                    // This whole arm is a long RAYON section (per-expert fan-out + nested
-                    // straggler splitting) — park the spin-pool's waiters now so 31 spinning
-                    // threads don't fight rayon for the cores (measured: DG exec 2.95 -> 3.18s
-                    // when they do). See `SpinPool::pause`.
-                    self.pool().pause();
                     let xs = vals[x.0 as usize].clone();
                     // `router_x` is usually the SAME tensor as `x` (qwen3moe); diffusion-gemma binds
                     // a differently-normalized row (see the `Op::MoeFfn` doc). Clone independently —
@@ -4591,8 +4487,43 @@ impl Backend for CpuBackend {
                     // then a per-row softmax + top-`n_used` selection (independent per row, so
                     // parallel over rows is safe).
                     let int8_ok = rows >= 2; // whole-call gate — see expert_matvec_batch's param doc
-                    let logits_all =
-                        expert_matvec_batch(&rbytes, rdt, &rxs, rows, ne, n_expert, None, int8_ok);
+                    let pool = self.pool();
+                    // Router GEMM on the pool: serial it was 12-20ms/layer at 512 rows (134M MAC)
+                    // — long enough that spinning pool workers SMT-throttled it, which is where
+                    // qwen3moe's phase-3 prefill regression hid (per-op MoeFfn time had IMPROVED).
+                    let logits_all: Vec<f32> = {
+                        let r_kind = expert_acts_kind(rdt, ne, int8_ok);
+                        let rq8: Vec<Q8> = if r_kind == ActsKind::Super {
+                            pool.collect(rows, &|r| quantize_q8(&rxs[r * ne..r * ne + ne]))
+                        } else {
+                            Vec::new()
+                        };
+                        let rq832: Vec<Q8x32> = if r_kind == ActsKind::Blk32 {
+                            pool.collect(rows, &|r| quantize_q8_32(&rxs[r * ne..r * ne + ne]))
+                        } else {
+                            Vec::new()
+                        };
+                        let racts = match r_kind {
+                            ActsKind::Super => ExpertActs::Super(&rq8),
+                            ActsKind::Blk32 => ExpertActs::Blk32(&rq832),
+                            ActsKind::Raw => ExpertActs::Raw(&rxs),
+                        };
+                        let mut lt = vec![0f32; n_expert * rows]; // o-major
+                        pool.for_chunks_mut(&mut lt, 8 * rows, 1, &|c, dst| {
+                            let o0 = c * 8;
+                            let o1 = (o0 + 8).min(n_expert);
+                            expert_gemm_range(
+                                &rbytes, rdt, ne, n_expert, &racts, None, o0, o1, dst,
+                            );
+                        });
+                        let mut logits = vec![0f32; rows * n_expert];
+                        pool.for_chunks_mut(&mut logits, n_expert, 4, &|r, lrow| {
+                            for (o, dst) in lrow.iter_mut().enumerate() {
+                                *dst = lt[o * rows + r];
+                            }
+                        });
+                        logits
+                    };
                     struct RouteRow {
                         /// Selected experts, sorted by DESCENDING router prob — the same order the
                         /// original per-row loop accumulated in.
@@ -4600,236 +4531,363 @@ impl Backend for CpuBackend {
                         /// Final per-expert weight (renormalized top-k prob × `scale`), aligned to `idx`.
                         w: Vec<f32>,
                     }
-                    let routes: Vec<RouteRow> = (0..rows)
-                        .into_par_iter()
-                        .map(|r| {
-                            let logits = &logits_all[r * n_expert..r * n_expert + n_expert];
-                            let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                            let mut probs: Vec<f32> =
-                                logits.iter().map(|&v| (v - maxl).exp()).collect();
-                            let psum: f32 = probs.iter().sum();
-                            for p in probs.iter_mut() {
-                                *p /= psum;
-                            }
-                            let mut idx: Vec<usize> = (0..n_expert).collect();
-                            idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
-                            idx.truncate(n_used);
-                            let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
-                            let w: Vec<f32> =
-                                idx.iter().map(|&e| probs[e] / wsum * scale).collect();
-                            RouteRow { idx, w }
-                        })
-                        .collect();
+                    let routes: Vec<RouteRow> = pool.collect(rows, &|r| {
+                        let logits = &logits_all[r * n_expert..r * n_expert + n_expert];
+                        let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        let mut probs: Vec<f32> =
+                            logits.iter().map(|&v| (v - maxl).exp()).collect();
+                        let psum: f32 = probs.iter().sum();
+                        for p in probs.iter_mut() {
+                            *p /= psum;
+                        }
+                        let mut idx: Vec<usize> = (0..n_expert).collect();
+                        idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+                        idx.truncate(n_used);
+                        let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
+                        let w: Vec<f32> = idx.iter().map(|&e| probs[e] / wsum * scale).collect();
+                        RouteRow { idx, w }
+                    });
 
-                    // ── Invert the per-row top-k picks into per-EXPERT row buckets: `(row, rank)`
-                    // where `rank` is this row's position in ITS OWN `idx` — carried through so the
-                    // final accumulation below can replay the EXACT original per-row summation order
-                    // (bit-identical output; only the WORK is reordered/batched, not the arithmetic).
-                    let mut expert_tasks: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n_expert];
-                    for (r, rr) in routes.iter().enumerate() {
-                        for (rank, &e) in rr.idx.iter().enumerate() {
-                            expert_tasks[e].push((r, rank));
+                    // ── Phase 3 (threadpool restructure): the per-expert rayon fan-out became a
+                    // STAGED pipeline of flat task lists on the spin-pool — the same design the
+                    // Vulkan backend's single-dispatch-per-stage batched MoE uses. Work is
+                    // reordered, never re-derived: every kernel sees the same bytes in the same
+                    // per-output order as the old per-expert calls, so outputs stay bit-identical
+                    // (the (row, rank) bookkeeping below replays the original per-row summation
+                    // order exactly like the old `row_slots` scatter did).
+                    //
+                    // pair = one (row → expert) routing, grouped contiguously by expert:
+                    let mut buckets: Vec<(usize, usize, usize)> = Vec::new(); // (expert, p0, count)
+                    let mut pair_row: Vec<usize> = Vec::new();
+                    let mut pair_bucket: Vec<u32> = Vec::new();
+                    let mut pair_local: Vec<u32> = Vec::new();
+                    // slot_pair[r][rank] = flat pair index — stage E's replay map.
+                    let mut slot_pair: Vec<Vec<usize>> = routes
+                        .iter()
+                        .map(|rr| vec![usize::MAX; rr.idx.len()])
+                        .collect();
+                    {
+                        let mut expert_tasks: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n_expert];
+                        for (r, rr) in routes.iter().enumerate() {
+                            for (rank, &e) in rr.idx.iter().enumerate() {
+                                expert_tasks[e].push((r, rank));
+                            }
+                        }
+                        for (e, tasks) in expert_tasks.iter().enumerate() {
+                            if tasks.is_empty() {
+                                continue;
+                            }
+                            let p0 = pair_row.len();
+                            for (i, &(r, rank)) in tasks.iter().enumerate() {
+                                slot_pair[r][rank] = pair_row.len();
+                                pair_row.push(r);
+                                pair_bucket.push(buckets.len() as u32);
+                                pair_local.push(i as u32);
+                            }
+                            buckets.push((e, p0, pair_row.len() - p0));
                         }
                     }
+                    let n_pairs = pair_row.len();
+                    let out_gu = if fused_gate_up { 2 * nffx } else { nffx };
+                    // o-major output offsets per bucket for the gate_up / down GEMM stages.
+                    let mut gu_off = vec![0usize; buckets.len() + 1];
+                    let mut d_off = vec![0usize; buckets.len() + 1];
+                    for (b, &(_, _, count)) in buckets.iter().enumerate() {
+                        gu_off[b + 1] = gu_off[b] + out_gu * count;
+                        d_off[b + 1] = d_off[b] + ne * count;
+                    }
+                    // 8-aligned o-chunks (64 rows) per bucket — the flat GEMM task list. Dynamic
+                    // claiming spreads a straggler expert's chunks over every idle thread, which
+                    // replaces both the old per-expert fan-out AND its nested straggler split.
+                    let gemm_tasks = |out_f: usize| -> Vec<(u32, u32, u32)> {
+                        let mut t = Vec::new();
+                        for b in 0..buckets.len() as u32 {
+                            let mut o = 0u32;
+                            while (o as usize) < out_f {
+                                let o1 = (o + 64).min(out_f as u32);
+                                t.push((b, o, o1));
+                                o = o1;
+                            }
+                        }
+                        t
+                    };
 
-                    // ── Per-expert FFN: gather this expert's bucketed rows into one small
-                    // contiguous batch and stream its gate_up/down weight ONCE (see
-                    // `expert_matvec_batch`'s doc) instead of once per selected row. Experts run in
-                    // parallel — a top-`n_used`-of-`n_expert` router already spreads ~`rows·n_used`
-                    // row-expert pairs over `n_expert` buckets, so this fan-out alone is enough
-                    // parallelism without ALSO parallelizing inside each expert.
-                    //
-                    // Diagnostic breakdown (INFR_PROF_OPS=1 only, zero cost otherwise): per-stage
-                    // work-time summed across all experts (they run in parallel, so this is CPU-time,
-                    // not wall-time) plus per-expert bucket-size skew (min/max routed rows) — used to
-                    // tell whether MoeFfn cost is dominated by a specific dot kernel or by imbalance.
-                    let t_gather = std::sync::atomic::AtomicU64::new(0);
-                    let t_gate_up = std::sync::atomic::AtomicU64::new(0);
-                    let t_act = std::sync::atomic::AtomicU64::new(0);
-                    let t_down = std::sync::atomic::AtomicU64::new(0);
-                    let bucket_max = std::sync::atomic::AtomicUsize::new(0);
-                    let bucket_min = std::sync::atomic::AtomicUsize::new(usize::MAX);
-                    let n_active = std::sync::atomic::AtomicUsize::new(0);
-                    let n_single = std::sync::atomic::AtomicUsize::new(0);
-                    let per_expert: Vec<Vec<(usize, usize, Vec<f32>)>> = (0..n_expert)
-                        .into_par_iter()
-                        .filter(|&e| !expert_tasks[e].is_empty())
-                        .map(|e| {
-                            let tasks = &expert_tasks[e];
-                            let count = tasks.len();
-                            if prof_ops {
-                                bucket_max.fetch_max(count, std::sync::atomic::Ordering::Relaxed);
-                                bucket_min.fetch_min(count, std::sync::atomic::Ordering::Relaxed);
-                                n_active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if count == 1 {
-                                    n_single.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                }
+                    // ── Stage A: gate/up activations, quantized ONCE per distinct row (the old
+                    // per-expert gather re-quantized a row for every expert it routed to), then
+                    // cloned per pair so each bucket owns a contiguous slice.
+                    let t_a = std::time::Instant::now();
+                    let g_kind = expert_acts_kind(gdt, ne, int8_ok);
+                    let u_kind = if fused_gate_up {
+                        g_kind
+                    } else {
+                        expert_acts_kind(udt, ne, int8_ok)
+                    };
+                    let need = |k: ActsKind| g_kind == k || u_kind == k;
+                    let q8_pairs: Vec<Q8> = if need(ActsKind::Super) {
+                        let q8_rows: Vec<Q8> =
+                            pool.collect(rows, &|r| quantize_q8(&xs[r * ne..r * ne + ne]));
+                        pool.collect(n_pairs, &|p| q8_rows[pair_row[p]].clone())
+                    } else {
+                        Vec::new()
+                    };
+                    let q832_pairs: Vec<Q8x32> = if need(ActsKind::Blk32) {
+                        let q_rows: Vec<Q8x32> =
+                            pool.collect(rows, &|r| quantize_q8_32(&xs[r * ne..r * ne + ne]));
+                        pool.collect(n_pairs, &|p| q_rows[pair_row[p]].clone())
+                    } else {
+                        Vec::new()
+                    };
+                    let xin_pairs: Vec<f32> = if need(ActsKind::Raw) {
+                        let mut v = vec![0f32; n_pairs * ne];
+                        pool.for_chunks_mut(&mut v, ne, 4, &|p, dstrow| {
+                            dstrow.copy_from_slice(&xs[pair_row[p] * ne..pair_row[p] * ne + ne]);
+                        });
+                        v
+                    } else {
+                        Vec::new()
+                    };
+                    let acts_for = |k: ActsKind, b: usize| -> ExpertActs {
+                        let (_, p0, count) = buckets[b];
+                        match k {
+                            ActsKind::Super => ExpertActs::Super(&q8_pairs[p0..p0 + count]),
+                            ActsKind::Blk32 => ExpertActs::Blk32(&q832_pairs[p0..p0 + count]),
+                            ActsKind::Raw => {
+                                ExpertActs::Raw(&xin_pairs[p0 * ne..(p0 + count) * ne])
                             }
-                            let ts = prof_ops.then(std::time::Instant::now);
-                            let mut xin = vec![0f32; count * ne];
-                            for (i, &(r, _)) in tasks.iter().enumerate() {
-                                xin[i * ne..i * ne + ne].copy_from_slice(&xs[r * ne..r * ne + ne]);
-                            }
-                            if let Some(t) = ts {
-                                t_gather.fetch_add(
-                                    t.elapsed().as_nanos() as u64,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
-                            }
-                            let ts = prof_ops.then(std::time::Instant::now);
-                            let (gate, up) = if fused_gate_up {
-                                // One batched matvec over the fused [2*nffx, ne] expert slice; first
-                                // nffx rows are gate, next nffx are up (Op::GatedActFused's convention).
-                                // Cached interleaved pack for this expert's fused bank (Q4_K +
-                                // VNNI only — `q4k_pack_for` is a hit after the first call, so
-                                // the repack cost is paid once per (expert, session), not per
-                                // step; see `CpuBackend::repack_cache`).
-                                #[cfg(target_arch = "x86_64")]
-                                let pack = (int8_ok
-                                    && gdt == DType::Q4K
-                                    && ne.is_multiple_of(256)
-                                    && (2 * nffx).is_multiple_of(8)
-                                    && is_x86_feature_detected!("avx512bw")
-                                    && is_x86_feature_detected!("avx512vnni"))
-                                .then(|| {
-                                    self.q4k_pack_for(&gb[e * gst..(e + 1) * gst], ne, 2 * nffx)
-                                });
-                                #[cfg(not(target_arch = "x86_64"))]
-                                let pack: Option<
-                                    std::sync::Arc<Q4kPack>,
-                                > = None;
-                                let full = expert_matvec_batch(
-                                    &gb[e * gst..(e + 1) * gst],
-                                    gdt,
-                                    &xin,
-                                    count,
-                                    ne,
-                                    2 * nffx,
-                                    pack.as_deref(),
-                                    int8_ok,
-                                );
-                                let mut gate = vec![0f32; count * nffx];
-                                let mut up = vec![0f32; count * nffx];
-                                for i in 0..count {
-                                    gate[i * nffx..i * nffx + nffx]
-                                        .copy_from_slice(&full[i * 2 * nffx..i * 2 * nffx + nffx]);
-                                    up[i * nffx..i * nffx + nffx].copy_from_slice(
-                                        &full[i * 2 * nffx + nffx..i * 2 * nffx + 2 * nffx],
-                                    );
-                                }
-                                (gate, up)
-                            } else {
-                                let ub = ub.as_ref().expect("split gate/up: up_exps missing");
-                                let ust = ust.expect("split gate/up: up stride missing");
-                                (
-                                    expert_matvec_batch(
-                                        &gb[e * gst..(e + 1) * gst],
-                                        gdt,
-                                        &xin,
-                                        count,
-                                        ne,
-                                        nffx,
-                                        None,
-                                        int8_ok,
-                                    ),
-                                    expert_matvec_batch(
-                                        &ub[e * ust..(e + 1) * ust],
-                                        udt,
-                                        &xin,
-                                        count,
-                                        ne,
-                                        nffx,
-                                        None,
-                                        int8_ok,
-                                    ),
+                        }
+                    };
+                    let t_gather = t_a.elapsed();
+
+                    // ── Stage B: gate_up GEMMs, o-major per bucket. Cached ilv packs (fused Q4_K
+                    // + VNNI only, exactly the old gate) are fetched per bucket up front.
+                    let t_b = std::time::Instant::now();
+                    #[cfg(target_arch = "x86_64")]
+                    let gu_packs: Vec<Option<std::sync::Arc<Q4kPack>>> = {
+                        let packable = int8_ok
+                            && fused_gate_up
+                            && gdt == DType::Q4K
+                            && ne.is_multiple_of(256)
+                            && (2 * nffx).is_multiple_of(8)
+                            && is_x86_feature_detected!("avx512bw")
+                            && is_x86_feature_detected!("avx512vnni");
+                        if packable {
+                            pool.collect(buckets.len(), &|b| {
+                                let e = buckets[b].0;
+                                Some(self.q4k_pack_for(&gb[e * gst..(e + 1) * gst], ne, 2 * nffx))
+                            })
+                        } else {
+                            vec![None; buckets.len()]
+                        }
+                    };
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let gu_packs: Vec<Option<std::sync::Arc<Q4kPack>>> = vec![None; buckets.len()];
+                    let mut gu_all = vec![0f32; gu_off[buckets.len()]];
+                    let mut up_all: Vec<f32> = if fused_gate_up {
+                        Vec::new()
+                    } else {
+                        vec![0f32; gu_off[buckets.len()]]
+                    };
+                    {
+                        let tasks = gemm_tasks(out_gu);
+                        let gu_ptr = pool::SendPtr::new(gu_all.as_mut_ptr());
+                        pool.run(tasks.len(), &|t| {
+                            let (b, o0, o1) = tasks[t];
+                            let (b, o0, o1) = (b as usize, o0 as usize, o1 as usize);
+                            let (e, _, count) = buckets[b];
+                            // SAFETY: (bucket, o-range) slices of gu_all are disjoint per task.
+                            let dst = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    gu_ptr.get().add(gu_off[b] + o0 * count),
+                                    (o1 - o0) * count,
                                 )
                             };
-                            if let Some(t) = ts {
-                                t_gate_up.fetch_add(
-                                    t.elapsed().as_nanos() as u64,
-                                    std::sync::atomic::Ordering::Relaxed,
+                            expert_gemm_range(
+                                &gb[e * gst..(e + 1) * gst],
+                                gdt,
+                                ne,
+                                out_gu,
+                                &acts_for(g_kind, b),
+                                gu_packs[b].as_deref(),
+                                o0,
+                                o1,
+                                dst,
+                            );
+                        });
+                        if !fused_gate_up {
+                            let ub = ub.as_ref().expect("split gate/up: up_exps missing");
+                            let ust = ust.expect("split gate/up: up stride missing");
+                            let up_ptr = pool::SendPtr::new(up_all.as_mut_ptr());
+                            pool.run(tasks.len(), &|t| {
+                                let (b, o0, o1) = tasks[t];
+                                let (b, o0, o1) = (b as usize, o0 as usize, o1 as usize);
+                                let (e, _, count) = buckets[b];
+                                // SAFETY: disjoint (bucket, o-range) slices, as above.
+                                let dst = unsafe {
+                                    std::slice::from_raw_parts_mut(
+                                        up_ptr.get().add(gu_off[b] + o0 * count),
+                                        (o1 - o0) * count,
+                                    )
+                                };
+                                expert_gemm_range(
+                                    &ub[e * ust..(e + 1) * ust],
+                                    udt,
+                                    ne,
+                                    nffx,
+                                    &acts_for(u_kind, b),
+                                    None,
+                                    o0,
+                                    o1,
+                                    dst,
                                 );
+                            });
+                        }
+                    }
+                    let t_gate_up = t_b.elapsed();
+
+                    // ── Stage C: gated activation per pair (strided o-major reads — the same
+                    // values the old un-transpose+split produced), quantized straight into the
+                    // representation the DOWN bank's dtype wants.
+                    let t_c = std::time::Instant::now();
+                    let d_kind = expert_acts_kind(ddt, nffx, int8_ok);
+                    let act_row_of = |p: usize| -> Vec<f32> {
+                        let b = pair_bucket[p] as usize;
+                        let i = pair_local[p] as usize;
+                        let count = buckets[b].2;
+                        let mut row = vec![0f32; nffx];
+                        if fused_gate_up {
+                            let gu = &gu_all[gu_off[b]..gu_off[b] + 2 * nffx * count];
+                            for (f, v) in row.iter_mut().enumerate() {
+                                *v = act_fn(act, gu[f * count + i]) * gu[(nffx + f) * count + i];
                             }
-                            let ts = prof_ops.then(std::time::Instant::now);
-                            let actv: Vec<f32> = (0..count * nffx)
-                                .map(|i| act_fn(act, gate[i]) * up[i])
-                                .collect();
-                            if let Some(t) = ts {
-                                t_act.fetch_add(
-                                    t.elapsed().as_nanos() as u64,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
+                        } else {
+                            let gt = &gu_all[gu_off[b]..gu_off[b] + nffx * count];
+                            let ut = &up_all[gu_off[b]..gu_off[b] + nffx * count];
+                            for (f, v) in row.iter_mut().enumerate() {
+                                *v = act_fn(act, gt[f * count + i]) * ut[f * count + i];
                             }
-                            let ts = prof_ops.then(std::time::Instant::now);
-                            let mut y = expert_matvec_batch(
+                        }
+                        row
+                    };
+                    let (dq8_pairs, dq832_pairs, dact_pairs): (Vec<Q8>, Vec<Q8x32>, Vec<f32>) =
+                        match d_kind {
+                            ActsKind::Super => (
+                                pool.collect(n_pairs, &|p| quantize_q8(&act_row_of(p))),
+                                Vec::new(),
+                                Vec::new(),
+                            ),
+                            ActsKind::Blk32 => (
+                                Vec::new(),
+                                pool.collect(n_pairs, &|p| quantize_q8_32(&act_row_of(p))),
+                                Vec::new(),
+                            ),
+                            ActsKind::Raw => {
+                                let mut v = vec![0f32; n_pairs * nffx];
+                                pool.for_chunks_mut(&mut v, nffx, 1, &|p, dstrow| {
+                                    dstrow.copy_from_slice(&act_row_of(p));
+                                });
+                                (Vec::new(), Vec::new(), v)
+                            }
+                        };
+                    let dacts_for = |b: usize| -> ExpertActs {
+                        let (_, p0, count) = buckets[b];
+                        match d_kind {
+                            ActsKind::Super => ExpertActs::Super(&dq8_pairs[p0..p0 + count]),
+                            ActsKind::Blk32 => ExpertActs::Blk32(&dq832_pairs[p0..p0 + count]),
+                            ActsKind::Raw => {
+                                ExpertActs::Raw(&dact_pairs[p0 * nffx..(p0 + count) * nffx])
+                            }
+                        }
+                    };
+                    let t_act = t_c.elapsed();
+
+                    // ── Stage D: down GEMMs (o-major), then per-pair un-transpose to row-major
+                    // with the per-expert `down_scale` folded in (`y = s * raw`, the same
+                    // scale-then-weight order the old per-expert loop applied).
+                    let t_d = std::time::Instant::now();
+                    let mut down_all = vec![0f32; d_off[buckets.len()]];
+                    {
+                        let tasks = gemm_tasks(ne);
+                        let d_ptr = pool::SendPtr::new(down_all.as_mut_ptr());
+                        pool.run(tasks.len(), &|t| {
+                            let (b, o0, o1) = tasks[t];
+                            let (b, o0, o1) = (b as usize, o0 as usize, o1 as usize);
+                            let (e, _, count) = buckets[b];
+                            // SAFETY: disjoint (bucket, o-range) slices, as above.
+                            let dst = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    d_ptr.get().add(d_off[b] + o0 * count),
+                                    (o1 - o0) * count,
+                                )
+                            };
+                            expert_gemm_range(
                                 &db[e * dst_..(e + 1) * dst_],
                                 ddt,
-                                &actv,
-                                count,
                                 nffx,
                                 ne,
+                                &dacts_for(b),
                                 None,
-                                int8_ok,
+                                o0,
+                                o1,
+                                dst,
                             );
-                            if let Some(ds) = &dscale {
-                                let s = ds[e];
-                                for v in y.iter_mut() {
-                                    *v *= s;
+                        });
+                    }
+                    let mut y_pairs = vec![0f32; n_pairs * ne];
+                    pool.for_chunks_mut(&mut y_pairs, ne, 1, &|p, yrow| {
+                        let b = pair_bucket[p] as usize;
+                        let i = pair_local[p] as usize;
+                        let (e, _, count) = buckets[b];
+                        let dt_slice = &down_all[d_off[b]..d_off[b] + ne * count];
+                        match &dscale {
+                            Some(ds) => {
+                                let s_e = ds[e];
+                                for (d, y) in yrow.iter_mut().enumerate() {
+                                    *y = dt_slice[d * count + i] * s_e;
                                 }
                             }
-                            if let Some(t) = ts {
-                                t_down.fetch_add(
-                                    t.elapsed().as_nanos() as u64,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
+                            None => {
+                                for (d, y) in yrow.iter_mut().enumerate() {
+                                    *y = dt_slice[d * count + i];
+                                }
                             }
-                            tasks
-                                .iter()
-                                .enumerate()
-                                .map(|(i, &(r, rank))| (r, rank, y[i * ne..i * ne + ne].to_vec()))
-                                .collect()
-                        })
-                        .collect();
+                        }
+                    });
+                    let t_down = t_d.elapsed();
                     if prof_ops {
-                        use std::sync::atomic::Ordering::Relaxed;
+                        let (mut bmin, mut bmax, mut single) = (usize::MAX, 0usize, 0usize);
+                        for &(_, _, c) in &buckets {
+                            bmin = bmin.min(c);
+                            bmax = bmax.max(c);
+                            single += (c == 1) as usize;
+                        }
                         eprintln!(
                             "[prof-moe] gather {:.2}ms gate_up {:.2}ms act {:.2}ms down {:.2}ms  bucket[min={},max={}] active={} single={}",
-                            t_gather.load(Relaxed) as f64 / 1e6,
-                            t_gate_up.load(Relaxed) as f64 / 1e6,
-                            t_act.load(Relaxed) as f64 / 1e6,
-                            t_down.load(Relaxed) as f64 / 1e6,
-                            bucket_min.load(Relaxed),
-                            bucket_max.load(Relaxed),
-                            n_active.load(Relaxed),
-                            n_single.load(Relaxed),
+                            t_gather.as_secs_f64() * 1e3,
+                            t_gate_up.as_secs_f64() * 1e3,
+                            t_act.as_secs_f64() * 1e3,
+                            t_down.as_secs_f64() * 1e3,
+                            bmin,
+                            bmax,
+                            buckets.len(),
+                            single,
                         );
                     }
 
-                    // ── Scatter each expert's per-row result into that row's rank slot, then
-                    // accumulate in the SAME order the original per-row loop used (idx sorted by
-                    // descending router prob) — bit-identical to the old per-(row, expert) version.
-                    let mut row_slots: Vec<Vec<Option<Vec<f32>>>> =
-                        routes.iter().map(|rr| vec![None; rr.idx.len()]).collect();
-                    for expert_result in per_expert {
-                        for (r, rank, y) in expert_result {
-                            row_slots[r][rank] = Some(y);
-                        }
-                    }
+                    // ── Stage E: accumulate each row's expert contributions in the SAME order
+                    // the original per-row loop used (rank order = idx sorted by descending
+                    // router prob) — bit-identical to the old row_slots scatter+accumulate.
                     let mut out = vec![0f32; rows * ne];
-                    out.par_chunks_mut(ne)
-                        .zip(routes.par_iter())
-                        .zip(row_slots.par_iter())
-                        .for_each(|((orow, rr), slots)| {
-                            for (rank, y) in slots.iter().enumerate() {
-                                let y = y
-                                    .as_ref()
-                                    .expect("moe: expert result missing for a selected row");
-                                let w_e = rr.w[rank];
-                                for i in 0..ne {
-                                    orow[i] += w_e * y[i];
-                                }
+                    pool.for_chunks_mut(&mut out, ne, 1, &|r, orow| {
+                        let rr = &routes[r];
+                        for (rank, &p) in slot_pair[r].iter().enumerate() {
+                            debug_assert_ne!(p, usize::MAX);
+                            let w_e = rr.w[rank];
+                            let y = &y_pairs[p * ne..p * ne + ne];
+                            for (o, &yv) in orow.iter_mut().zip(y) {
+                                *o += w_e * yv;
                             }
-                        });
+                        }
+                    });
                     vals[dst.0 as usize] = out;
                 }
                 Op::Conv1dSilu {

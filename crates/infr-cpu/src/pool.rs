@@ -36,10 +36,8 @@ struct Shared {
     /// A task panicked (caught per-task so `done` still advances; `run` re-panics).
     panicked: AtomicBool,
     shutdown: AtomicBool,
-    /// [`SpinPool::pause`]: waiting workers park IMMEDIATELY (skip the spin budget). Set by call
-    /// sites about to run a long rayon section (MoeFfn), cleared by the next `run`.
-    pause: AtomicBool,
-    /// Current ceiling for the adaptive spin budget — see [`SpinPool::set_budget_cap`].
+    /// Ceiling for the adaptive spin budget (constant `spin_limit()` since phase 3 removed the
+    /// last rayon section from the interpreter; kept a field for future per-graph tuning).
     budget_cap: AtomicU32,
     /// Per-worker "I am parked" flags — see the park handshake in `worker_loop`.
     sleeping: Vec<AtomicBool>,
@@ -66,7 +64,8 @@ pub(crate) struct SpinPool {
 /// Two measured failure modes bound the budget: too LONG and the spinning workers' SMT siblings
 /// throttle the op loop's SERIAL bookkeeping between pool ops (per-op profile: RmsNorm/Add more
 /// than DOUBLED; DG exec 2.87 → 3.18s at a fixed 32k) — rayon's MoeFfn itself was unharmed once
-/// [`SpinPool::pause`] parked waiters for it. Too SHORT and dense prefill pays a worker wake per
+/// a pause mechanism parked waiters for it (both since removed with the rayon sections
+/// themselves — phase 3 staged MoeFfn onto this pool). Too SHORT and dense prefill pays a worker wake per
 /// op (qwen3 pp512 404 → 356 t/s at a fixed 1k). The adaptive budget collapses after a park and
 /// regrows on jobs arriving mid-spin, so the ceiling can be generous. `INFR_CPU_SPIN` overrides.
 static SPIN_LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -109,9 +108,7 @@ fn worker_loop(me: usize, shared: Arc<Shared>) {
                 return;
             }
             spins += 1;
-            // `pause` skips the remaining spin budget — the dispatcher is telling us the cores
-            // are about to be owned by a rayon section (MoeFfn).
-            if spins < budget && !shared.pause.load(Ordering::Relaxed) {
+            if spins < budget {
                 std::hint::spin_loop();
             } else {
                 // Park handshake: publish the flag, RE-CHECK seq/shutdown (SeqCst on both sides
@@ -172,7 +169,6 @@ impl SpinPool {
             done: AtomicUsize::new(0),
             panicked: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
-            pause: AtomicBool::new(false),
             budget_cap: AtomicU32::new(spin_limit()),
             sleeping: (0..workers).map(|_| AtomicBool::new(false)).collect(),
         });
@@ -222,7 +218,6 @@ impl SpinPool {
             return;
         }
         let sh = &self.shared;
-        sh.pause.store(false, Ordering::Relaxed);
         // SAFETY: lifetime erasure of `f` — sound because this function does not return until
         // every worker has incremented `done`, after which no worker touches the slot again.
         unsafe {
@@ -266,29 +261,6 @@ impl SpinPool {
         if sh.panicked.swap(false, Ordering::AcqRel) {
             panic!("spin-pool: a task panicked (caught per-task; state may be incomplete)");
         }
-    }
-
-    /// Set the ceiling the adaptive per-worker spin budget may grow to. The op interpreter
-    /// calls this per graph: a graph containing a rayon section (MoeFfn) gets a near-zero cap —
-    /// spinning around those sections measurably starves them (qwen3moe pp512 123 -> 97 t/s even
-    /// WITH `pause`) — while an all-pool dense graph gets the full budget (parking between every
-    /// op cost qwen3 pp512 404 -> 356 t/s).
-    pub(crate) fn set_budget_cap(&self, cap: u32) {
-        // An explicit `INFR_CPU_SPIN` wins over the per-graph heuristic (experiment override).
-        let cap = if std::env::var_os("INFR_CPU_SPIN").is_some() {
-            spin_limit()
-        } else {
-            cap
-        };
-        self.shared.budget_cap.store(cap, Ordering::Relaxed);
-    }
-
-    /// Tell waiting workers to park immediately instead of finishing their spin budget — call
-    /// before a long rayon section (MoeFfn) so 31 spinning threads don't starve it at the
-    /// handover. Cleared automatically by the next `run`. Purely a scheduling hint: workers
-    /// mid-job are unaffected, and a `run` racing this simply wakes them again.
-    pub(crate) fn pause(&self) {
-        self.shared.pause.store(true, Ordering::Relaxed);
     }
 
     /// Chunk `data` into `chunk`-sized pieces and run `f(chunk_index, piece)` across the pool,
@@ -343,11 +315,14 @@ impl SpinPool {
 /// Raw base pointer that may cross thread boundaries; safety is argued at each use site
 /// (disjoint index ranges per task). Accessed via [`SendPtr::get`], NOT the field — edition-2021
 /// closures capture individual FIELDS, and a captured bare `*mut T` loses these unsafe impls.
-struct SendPtr<T>(*mut T);
+pub(crate) struct SendPtr<T>(*mut T);
 unsafe impl<T> Send for SendPtr<T> {}
 unsafe impl<T> Sync for SendPtr<T> {}
 impl<T> SendPtr<T> {
-    fn get(&self) -> *mut T {
+    pub(crate) fn new(p: *mut T) -> Self {
+        SendPtr(p)
+    }
+    pub(crate) fn get(&self) -> *mut T {
         self.0
     }
 }
