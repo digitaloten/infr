@@ -1057,34 +1057,60 @@ fn diffusion_self_cond(
             });
     }
     drop(probs);
-    let mut sig = vec![0f32; cc * ne];
-    sig.par_chunks_mut(ne).enumerate().for_each(|(row, out)| {
-        let mut soft = soft_all[row * ne..(row + 1) * ne].to_vec();
-        for s in soft.iter_mut() {
-            *s *= sqrt_ne;
-        }
-        // sc_pre_norm: a NORMAL (weighted) rmsnorm — unlike the canvas embedding's weightless one.
-        let ms: f32 = soft.iter().map(|&x| x * x).sum::<f32>() / ne as f32;
-        let inv = 1.0 / (ms + eps).sqrt();
-        let normed: Vec<f32> = soft
-            .iter()
-            .zip(pre_norm.iter())
-            .map(|(&x, &w)| x * inv * w)
-            .collect();
-        // Gated-GELU MLP: down(gelu_tanh(gate·normed) * (up·normed)).
-        let mut act = vec![0f32; nff];
-        for (f, a) in act.iter_mut().enumerate() {
-            let grow = &gate_w[f * ne..f * ne + ne];
-            let urow = &up_w[f * ne..f * ne + ne];
-            let gd: f32 = grow.iter().zip(&normed).map(|(&w, &x)| w * x).sum();
-            let ud: f32 = urow.iter().zip(&normed).map(|(&w, &x)| w * x).sum();
+    // sc_pre_norm: a NORMAL (weighted) rmsnorm — unlike the canvas embedding's weightless one.
+    let mut normed_all = vec![0f32; cc * ne];
+    normed_all
+        .par_chunks_mut(ne)
+        .enumerate()
+        .for_each(|(row, nr)| {
+            let mut soft = soft_all[row * ne..(row + 1) * ne].to_vec();
+            for s in soft.iter_mut() {
+                *s *= sqrt_ne;
+            }
+            let ms: f32 = soft.iter().map(|&x| x * x).sum::<f32>() / ne as f32;
+            let inv = 1.0 / (ms + eps).sqrt();
+            for ((n, &x), &w) in nr.iter_mut().zip(soft.iter()).zip(pre_norm.iter()) {
+                *n = x * inv * w;
+            }
+        });
+    drop(soft_all);
+    // Gated-GELU MLP: down(gelu_tanh(gate·normed) * (up·normed)) — WEIGHT-row-major loops, same
+    // traffic argument as the soft-embed above: the per-canvas-row version streamed the full
+    // gate/up/down tables (~400 MB f32) once per row. Parallelizing over WEIGHT rows instead
+    // streams each table once per step, with the [cc, ne] activations (2 MB) L3-hot. `act` is
+    // kept TRANSPOSED ([nff, cc]) so both phases read/write contiguously. Bit-identical: every
+    // per-(row, f) / per-(row, e) dot accumulates in the same ascending element order.
+    let mut act_t = vec![0f32; nff * cc];
+    act_t.par_chunks_mut(cc).enumerate().for_each(|(f, ar)| {
+        let grow = &gate_w[f * ne..f * ne + ne];
+        let urow = &up_w[f * ne..f * ne + ne];
+        for (row, a) in ar.iter_mut().enumerate() {
+            let normed = &normed_all[row * ne..(row + 1) * ne];
+            let gd: f32 = grow.iter().zip(normed).map(|(&w, &x)| w * x).sum();
+            let ud: f32 = urow.iter().zip(normed).map(|(&w, &x)| w * x).sum();
             // gelu_pytorch_tanh, matching `infr_cpu::act_fn(Activation::Gelu, ..)` exactly.
             let gelu = 0.5 * gd * (1.0 + (0.797_884_6 * (gd + 0.044715 * gd * gd * gd)).tanh());
             *a = gelu * ud;
         }
-        for (e, out_e) in out.iter_mut().enumerate() {
-            let drow = &down_w[e * nff..e * nff + nff];
-            *out_e = drow.iter().zip(&act).map(|(&w, &a)| w * a).sum();
+    });
+    drop(normed_all);
+    // down phase, also weight-row-major: one [cc]-wide accumulator per output dim `e`, written
+    // TRANSPOSED ([ne, cc]) so every read and write streams contiguously; the final [cc, ne]
+    // un-transpose is a 2 MB copy — noise next to the streaming reads it buys.
+    let mut sig_t = vec![0f32; ne * cc];
+    sig_t.par_chunks_mut(cc).enumerate().for_each(|(e, acc)| {
+        let drow = &down_w[e * nff..e * nff + nff];
+        for (f, &w) in drow.iter().enumerate() {
+            let arow = &act_t[f * cc..(f + 1) * cc];
+            for (a, &x) in acc.iter_mut().zip(arow) {
+                *a += w * x;
+            }
+        }
+    });
+    let mut sig = vec![0f32; cc * ne];
+    sig.par_chunks_mut(ne).enumerate().for_each(|(row, out)| {
+        for (e, o) in out.iter_mut().enumerate() {
+            *o = sig_t[e * cc + row];
         }
     });
     Ok(sig)
