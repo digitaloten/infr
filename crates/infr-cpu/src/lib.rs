@@ -35,6 +35,11 @@ struct Q8 {
     /// `sm` accumulation in `vec_dot_q4k` (Σ m·Σq8) avoids O(rows·256) re-summation.
     /// Mirrors llama.cpp's `block_q8_K.bsums`.
     bsums: Vec<i32>,
+    /// Per-16-element sub-block sums (`bsums16[b*16+s]` = Σ `qs[b*256 + s*16 .. +16]`) — Q6_K's
+    /// `-32` offset correction is per 16-element scale group. Precomputed here for the same
+    /// reason as `bsums`: `vec_dot_q6k_batch` used to re-derive these sums with SIMD for EVERY
+    /// weight row (262k redundant recomputes per lm_head GEMM — ~22% of a DG denoise step).
+    bsums16: Vec<i32>,
 }
 
 fn quantize_q8(x: &[f32]) -> Q8 {
@@ -51,17 +56,23 @@ fn quantize_q8(x: &[f32]) -> Q8 {
             qs[b * 256 + i] = (v * id).round().clamp(-127.0, 127.0) as i8;
         }
     }
-    // Precompute per-32-elem-sub-block sums (used by vec_dot_q4k for the min-scale term).
-    let mut bsums = vec![0i32; nb * 8];
+    // Precompute per-16- and per-32-elem sub-block sums (Q6_K offset term / Q4_K min-scale term).
+    let mut bsums16 = vec![0i32; nb * 16];
     for b in 0..nb {
-        for s in 0..8usize {
-            bsums[b * 8 + s] = qs[b * 256 + s * 32..b * 256 + s * 32 + 32]
+        for s in 0..16usize {
+            bsums16[b * 16 + s] = qs[b * 256 + s * 16..b * 256 + s * 16 + 16]
                 .iter()
                 .map(|&q| q as i32)
                 .sum();
         }
     }
-    Q8 { qs, d, bsums }
+    let bsums = bsums16.chunks_exact(2).map(|p| p[0] + p[1]).collect();
+    Q8 {
+        qs,
+        d,
+        bsums,
+        bsums16,
+    }
 }
 
 /// `Σ weight·x` for one Q4_K row (144 bytes / 256 elems) against the Q8 activation. Weight value is
@@ -2090,7 +2101,6 @@ unsafe fn vec_dot_q6k_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &
     let mask_0f_z = _mm512_set1_epi8(0x0F_u8 as i8);
     let mask_30_z = _mm512_set1_epi8(0x30_u8 as i8);
     let mask_03_z = _mm512_set1_epi8(0x03_u8 as i8);
-    let ones_u8_z = _mm512_set1_epi8(1i8);
     let ones_i16_z = _mm512_set1_epi16(1i16);
 
     // Pre-expand Q6 both halves simultaneously via zmm, store to q6_flat.
@@ -2149,62 +2159,92 @@ unsafe fn vec_dot_q6k_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &
         }
     }
 
-    // Per-token: two halves merged into zmm for 4 columns; split back per scale accumulation.
-    for r in 0..m {
+    // Per-token: `flat` is plain linear element order (see the store above: sub-block s = elems
+    // 16s..16s+16), so each super-block is 4 straight 64-byte chunks. Each chunk's madd yields
+    // 16 i32 lanes = 4 sub-blocks × 4 lanes; collapse in-register (2 permute+add steps per chunk,
+    // 3 cross-chunk permutes) into ONE zmm holding the 16 per-sub-block dots in order — replacing
+    // the 32-extract + 32-hadd storm the old loop paid per (row, super-block). The `-32` offset
+    // correction reads `q8.bsums16` (computed once at quantize time) instead of re-deriving the
+    // activation sums per weight row — the same values, so bit-identity holds, minus 262k
+    // redundant recomputes per lm_head GEMM. The f32 epilogue is UNCHANGED (ascending sub-block
+    // chain, then d·d8·s). Rows go in PAIRS sharing the weight loads so the two sequential f32
+    // chains overlap in the OoO window instead of exposing their latency back to back.
+    let idx_pair = _mm512_set_epi32(14, 15, 12, 13, 10, 11, 8, 9, 6, 7, 4, 5, 2, 3, 0, 1);
+    let idx_half = _mm512_set_epi32(13, 12, 15, 14, 9, 8, 11, 10, 5, 4, 7, 6, 1, 0, 3, 2);
+    let idx_q14 = _mm512_set_epi32(0, 0, 0, 0, 0, 0, 0, 0, 28, 24, 20, 16, 12, 8, 4, 0);
+    let idx_cat = _mm512_set_epi32(23, 22, 21, 20, 19, 18, 17, 16, 7, 6, 5, 4, 3, 2, 1, 0);
+
+    // One row's integer dots for super-block `b` against the four preloaded weight chunks:
+    // sumi16[s] = Σ_{i∈sub-block s} q6[i]·q8[i] (q6 still biased +32 — corrected in the epilogue).
+    macro_rules! q6k_sumi16 {
+        ($q8:expr, $b:expr, $w0:expr, $w1:expr, $w2:expr, $w3:expr, $sumi16:expr) => {{
+            let qs = &$q8.qs[$b * 256..$b * 256 + 256];
+            let a0 = _mm512_loadu_si512(qs.as_ptr() as *const __m512i);
+            let a1 = _mm512_loadu_si512(qs[64..].as_ptr() as *const __m512i);
+            let a2 = _mm512_loadu_si512(qs[128..].as_ptr() as *const __m512i);
+            let a3 = _mm512_loadu_si512(qs[192..].as_ptr() as *const __m512i);
+            let s0 = _mm512_madd_epi16(_mm512_maddubs_epi16($w0, a0), ones_i16_z);
+            let s1 = _mm512_madd_epi16(_mm512_maddubs_epi16($w1, a1), ones_i16_z);
+            let s2 = _mm512_madd_epi16(_mm512_maddubs_epi16($w2, a2), ones_i16_z);
+            let s3 = _mm512_madd_epi16(_mm512_maddubs_epi16($w3, a3), ones_i16_z);
+            let c0 = _mm512_add_epi32(s0, _mm512_permutexvar_epi32(idx_pair, s0));
+            let c0 = _mm512_add_epi32(c0, _mm512_permutexvar_epi32(idx_half, c0));
+            let c1 = _mm512_add_epi32(s1, _mm512_permutexvar_epi32(idx_pair, s1));
+            let c1 = _mm512_add_epi32(c1, _mm512_permutexvar_epi32(idx_half, c1));
+            let c2 = _mm512_add_epi32(s2, _mm512_permutexvar_epi32(idx_pair, s2));
+            let c2 = _mm512_add_epi32(c2, _mm512_permutexvar_epi32(idx_half, c2));
+            let c3 = _mm512_add_epi32(s3, _mm512_permutexvar_epi32(idx_pair, s3));
+            let c3 = _mm512_add_epi32(c3, _mm512_permutexvar_epi32(idx_half, c3));
+            let lo = _mm512_permutex2var_epi32(c0, idx_q14, c1); // subs 0..7 in lanes 0..7
+            let hi = _mm512_permutex2var_epi32(c2, idx_q14, c3); // subs 8..15 in lanes 0..7
+            let all = _mm512_permutex2var_epi32(lo, idx_cat, hi);
+            _mm512_storeu_si512($sumi16.as_mut_ptr() as *mut __m512i, all);
+        }};
+    }
+    // The UNCHANGED f32 epilogue: s accumulated over ascending sub-blocks, then d·d8·s.
+    macro_rules! q6k_epilogue {
+        ($q8:expr, $b:expr, $sumi16:expr, $sumf:expr) => {{
+            let bs = &$q8.bsums16[$b * 16..$b * 16 + 16];
+            let mut s = 0f32;
+            for sub in 0..16 {
+                s += scales_arr[$b * 16 + sub] as f32 * ($sumi16[sub] - 32 * bs[sub]) as f32;
+            }
+            $sumf += d_arr[$b] * $q8.d[$b] * s;
+        }};
+    }
+
+    let mut sumi16_a = [0i32; 16];
+    let mut sumi16_b = [0i32; 16];
+    for rp in 0..m / 2 {
+        let (ra, rb) = (2 * rp, 2 * rp + 1);
+        let (q8a, q8b) = (&q8s[ra], &q8s[rb]);
+        let (mut sumf_a, mut sumf_b) = (0f32, 0f32);
+        for b in 0..nb {
+            let flat = &q6_flat[b * 256..b * 256 + 256];
+            let w0 = _mm512_loadu_si512(flat.as_ptr() as *const __m512i);
+            let w1 = _mm512_loadu_si512(flat[64..].as_ptr() as *const __m512i);
+            let w2 = _mm512_loadu_si512(flat[128..].as_ptr() as *const __m512i);
+            let w3 = _mm512_loadu_si512(flat[192..].as_ptr() as *const __m512i);
+            q6k_sumi16!(q8a, b, w0, w1, w2, w3, sumi16_a);
+            q6k_sumi16!(q8b, b, w0, w1, w2, w3, sumi16_b);
+            q6k_epilogue!(q8a, b, sumi16_a, sumf_a);
+            q6k_epilogue!(q8b, b, sumi16_b, sumf_b);
+        }
+        out[ra] = sumf_a;
+        out[rb] = sumf_b;
+    }
+    if m % 2 == 1 {
+        let r = m - 1;
         let q8 = &q8s[r];
         let mut sumf = 0f32;
         for b in 0..nb {
-            let mut simd_sumi = [0i32; 16];
-            let mut simd_bsum = [0i32; 16];
             let flat = &q6_flat[b * 256..b * 256 + 256];
-            let q8b = &q8.qs[b * 256..b * 256 + 256];
-
-            for ci in 0..4usize {
-                // Load h0 and h1 columns into zmm.
-                let q6_h0 = _mm256_loadu_si256(flat[ci * 32..].as_ptr() as *const __m256i);
-                let q6_h1 = _mm256_loadu_si256(flat[128 + ci * 32..].as_ptr() as *const __m256i);
-                let q6_z = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(q6_h0), q6_h1);
-
-                let q8_h0 = _mm256_loadu_si256(q8b[ci * 32..].as_ptr() as *const __m256i);
-                let q8_h1 = _mm256_loadu_si256(q8b[128 + ci * 32..].as_ptr() as *const __m256i);
-                let q8_z = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(q8_h0), q8_h1);
-
-                let prod = _mm512_maddubs_epi16(q6_z, q8_z);
-                let sum32_z = _mm512_madd_epi16(prod, ones_i16_z);
-                let bsum_i16_z = _mm512_maddubs_epi16(ones_u8_z, q8_z);
-                let bsum_i32_z = _mm512_madd_epi16(bsum_i16_z, ones_i16_z);
-
-                let sum_h0 = _mm512_castsi512_si256(sum32_z);
-                let sum_h1 = _mm512_extracti64x4_epi64::<1>(sum32_z);
-                let bsum_h0 = _mm512_castsi512_si256(bsum_i32_z);
-                let bsum_h1 = _mm512_extracti64x4_epi64::<1>(bsum_i32_z);
-
-                let s_h0_lo = _mm256_castsi256_si128(sum_h0);
-                let s_h0_hi = _mm256_extracti128_si256::<1>(sum_h0);
-                let s_h1_lo = _mm256_castsi256_si128(sum_h1);
-                let s_h1_hi = _mm256_extracti128_si256::<1>(sum_h1);
-                let b_h0_lo = _mm256_castsi256_si128(bsum_h0);
-                let b_h0_hi = _mm256_extracti128_si256::<1>(bsum_h0);
-                let b_h1_lo = _mm256_castsi256_si128(bsum_h1);
-                let b_h1_hi = _mm256_extracti128_si256::<1>(bsum_h1);
-
-                simd_sumi[ci * 2] = hadd_i32_xmm(s_h0_lo);
-                simd_sumi[ci * 2 + 1] = hadd_i32_xmm(s_h0_hi);
-                simd_sumi[8 + ci * 2] = hadd_i32_xmm(s_h1_lo);
-                simd_sumi[8 + ci * 2 + 1] = hadd_i32_xmm(s_h1_hi);
-
-                simd_bsum[ci * 2] = hadd_i32_xmm(b_h0_lo);
-                simd_bsum[ci * 2 + 1] = hadd_i32_xmm(b_h0_hi);
-                simd_bsum[8 + ci * 2] = hadd_i32_xmm(b_h1_lo);
-                simd_bsum[8 + ci * 2 + 1] = hadd_i32_xmm(b_h1_hi);
-            }
-
-            let mut s = 0f32;
-            for sub in 0..16 {
-                s +=
-                    scales_arr[b * 16 + sub] as f32 * (simd_sumi[sub] - 32 * simd_bsum[sub]) as f32;
-            }
-            sumf += d_arr[b] * q8.d[b] * s;
+            let w0 = _mm512_loadu_si512(flat.as_ptr() as *const __m512i);
+            let w1 = _mm512_loadu_si512(flat[64..].as_ptr() as *const __m512i);
+            let w2 = _mm512_loadu_si512(flat[128..].as_ptr() as *const __m512i);
+            let w3 = _mm512_loadu_si512(flat[192..].as_ptr() as *const __m512i);
+            q6k_sumi16!(q8, b, w0, w1, w2, w3, sumi16_a);
+            q6k_epilogue!(q8, b, sumi16_a, sumf);
         }
         out[r] = sumf;
     }
