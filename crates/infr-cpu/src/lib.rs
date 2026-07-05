@@ -2080,6 +2080,103 @@ fn vec_dot_q5k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
     vec_dot_q5k_batch_scalar(row, q8s, in_f, out);
 }
 
+// ─── Native 32-block int8 dot kernels (Q8_0 / Q5_0 at their OWN block size) ──────────────────────
+//
+// The K-quant/Q8_0 batch kernels above all group activations into 256-element super-blocks (`Q8`),
+// which requires `in_f % 256 == 0` — true for most projections but NOT MoE's `down` projection,
+// whose `in_f = n_ff_exp` can be any multiple of 32 (e.g. DiffusionGemma's 704 = 22×32). Q8_0/Q5_0's
+// own native block is 32 elements, so this activation quantizes at THAT granularity instead —
+// scalar only (no SIMD; this path is memory/allocation-bound, not compute-bound, so a plain scalar
+// loop over int8 bytes already beats dequantizing the whole row to f32 first).
+
+/// Activation quantized to int8 per NATIVE 32-element block (mirrors [`Q8`] but without the
+/// 256-superblock grouping). `bsum` is `Σqs` per block — Q5_0's constant `-16` offset needs `Σx`,
+/// which `d[b] * bsum[b]` approximates the same way `Q8::bsums` does for the K-quant min term.
+struct Q8x32 {
+    qs: Vec<i8>,
+    d: Vec<f32>,
+    bsum: Vec<i32>,
+}
+
+fn quantize_q8_32(x: &[f32]) -> Q8x32 {
+    let nb = x.len() / 32;
+    let mut qs = vec![0i8; nb * 32];
+    let mut d = vec![0f32; nb];
+    let mut bsum = vec![0i32; nb];
+    for b in 0..nb {
+        let blk = &x[b * 32..b * 32 + 32];
+        let amax = blk.iter().fold(0f32, |m, &v| m.max(v.abs()));
+        let dd = amax / 127.0;
+        let id = if dd > 0.0 { 1.0 / dd } else { 0.0 };
+        d[b] = dd;
+        let mut s = 0i32;
+        for (i, &v) in blk.iter().enumerate() {
+            let q = (v * id).round().clamp(-127.0, 127.0) as i8;
+            qs[b * 32 + i] = q;
+            s += q as i32;
+        }
+        bsum[b] = s;
+    }
+    Q8x32 { qs, d, bsum }
+}
+
+/// Batched Q8_0 dot at native 32-block granularity: `y = d_w·qw` exactly (no min term — the i8 sign
+/// already encodes it, see `dequant_block`'s Q8_0 case), so `Σy·x = d_w·Σ(qw·x) ≈ d_w·d8·Σ(qw·q8)`.
+/// The weight row's per-block `d_w` is read once, then dotted against every one of the `count` token
+/// activations — same amortization as the other `_batch` kernels, just without an f32 intermediate.
+fn vec_dot_q8_0_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+    let nb = in_f / 32;
+    let bpr = 34usize; // f16 d (2B) + 32 × i8 qs
+    let mut d_arr = vec![0f32; nb];
+    for b in 0..nb {
+        d_arr[b] = rdf16(&row[b * bpr..b * bpr + 2]);
+    }
+    for (r, q8) in q8s.iter().enumerate() {
+        let mut sumf = 0f32;
+        for b in 0..nb {
+            let qw = &row[b * bpr + 2..b * bpr + bpr];
+            let q8b = &q8.qs[b * 32..b * 32 + 32];
+            let mut iprod = 0i32;
+            for i in 0..32 {
+                iprod += qw[i] as i8 as i32 * q8b[i] as i32;
+            }
+            sumf += d_arr[b] * q8.d[b] * iprod as f32;
+        }
+        out[r] = sumf;
+    }
+}
+
+/// Batched Q5_0 dot at native 32-block granularity: `y = d_w·(code−16)`, `code ∈ 0..31` (4 nibble
+/// bits from `qs` + 1 high bit from `qh`, per `dequant_block`'s Q5_0 case) — so
+/// `Σy·x = d_w·(Σcode·x − 16·Σx) ≈ d_w·d8·(Σcode·q8 − 16·bsum)`.
+fn vec_dot_q5_0_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+    let nb = in_f / 32;
+    let bpr = 22usize; // f16 d (2B) + u32 qh (4B) + 16 × packed-nibble qs
+    let mut d_arr = vec![0f32; nb];
+    for b in 0..nb {
+        d_arr[b] = rdf16(&row[b * bpr..b * bpr + 2]);
+    }
+    for (r, q8) in q8s.iter().enumerate() {
+        let mut sumf = 0f32;
+        for b in 0..nb {
+            let blk = &row[b * bpr..b * bpr + bpr];
+            let qh = u32::from_le_bytes(blk[2..6].try_into().unwrap());
+            let qs = &blk[6..22];
+            let q8b = &q8.qs[b * 32..b * 32 + 32];
+            let mut iprod = 0i32;
+            for j in 0..16 {
+                let xh0 = ((qh >> j) << 4) & 0x10;
+                let xh1 = (qh >> (j + 12)) & 0x10;
+                let code0 = ((qs[j] as u32 & 0x0F) | xh0) as i32;
+                let code1 = ((qs[j] as u32 >> 4) | xh1) as i32;
+                iprod += code0 * q8b[j] as i32 + code1 * q8b[j + 16] as i32;
+            }
+            sumf += d_arr[b] * q8.d[b] * (iprod as f32 - 16.0 * q8.bsum[b] as f32);
+        }
+        out[r] = sumf;
+    }
+}
+
 /// `Σ f16_weight·x` (weight is 2 bytes/elem). `target-cpu=native` lowers the f16→f32 to F16C.
 fn dot_f16(w: &[u8], x: &[f32]) -> f32 {
     let mut acc = [0f32; 8];
@@ -2222,6 +2319,104 @@ fn bytes_to_f32(bytes: &[u8], dtype: DType) -> Vec<f32> {
         // F16 / Bf16 / all quant + codebook types go through the shared host dequant.
         other => dequant_block(other, bytes).expect("cpu backend: host dequant"),
     }
+}
+
+/// Batched `[count, in_f] @ [out_f, in_f]^T -> [count, out_f]` matvec (row-major throughout) used by
+/// `Op::MoeFfn`'s router/gate/up/down projections: each weight row is read from the mmap and
+/// dequantized to f32 **ONCE**, then dotted against every one of the `count` activation rows —
+/// bit-identical arithmetic to calling a per-row `dequant + dot` `count` times (same bytes, same
+/// `dot`/`dot_f16`/`dot_bf16` reduction), just amortizing the dequant. This is the actual fix for the
+/// MoE FFN's original per-(row, expert) loop: with a top-`n_used`-of-`n_expert` router, an expert's
+/// weight was previously re-streamed from the mmap and re-dequantized independently for EVERY row
+/// that selected it (`rows·n_used/n_expert` ≈ 16x redundant for DiffusionGemma's 256-row/top-8-of-128
+/// shape) — bucketing rows by expert first (see the `Op::MoeFfn` arm) lets this run once per expert.
+/// Not used for `Op::Linear`'s own m>1 path — that already has the same class of int8-activation
+/// batched dot for the 256-superblock-aligned quant types; MoE's `down` projection has
+/// `in_f = n_ff_exp`, which isn't always a multiple of 256 (e.g. DiffusionGemma's 704 — always a
+/// multiple of 32, Q8_0/Q5_0's own native block, so THAT granularity gets its own int8 fast path
+/// below instead of falling all the way back to the plain f32 dequant+dot).
+fn expert_matvec_batch(
+    wbytes: &[u8],
+    dt: DType,
+    xin: &[f32],
+    count: usize,
+    in_f: usize,
+    out_f: usize,
+) -> Vec<f32> {
+    let bpr = wbytes.len() / out_f;
+    let mut out = vec![0f32; count * out_f];
+    // Fast path 1: int8-activation batched dot at the 256-element super-block granularity (same
+    // kernels `Op::Linear`'s m>1 path uses) — needs `in_f` to be a whole number of super-blocks;
+    // true for MoE's `gate`/`up` (`in_f = n_embd`), not guaranteed for `down`.
+    if matches!(dt, DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q5K) && in_f.is_multiple_of(256)
+    {
+        let q8s: Vec<Q8> = (0..count)
+            .map(|r| quantize_q8(&xin[r * in_f..r * in_f + in_f]))
+            .collect();
+        let mut col = vec![0f32; count];
+        for o in 0..out_f {
+            let row = &wbytes[o * bpr..o * bpr + bpr];
+            match dt {
+                DType::Q4K => vec_dot_q4k_batch(row, &q8s, in_f, &mut col),
+                DType::Q6K => vec_dot_q6k_batch(row, &q8s, in_f, &mut col),
+                DType::Q8_0 => vec_dot_q8_0_batch(row, &q8s, in_f, &mut col),
+                DType::Q5K => vec_dot_q5k_batch(row, &q8s, in_f, &mut col),
+                _ => unreachable!(),
+            }
+            for r in 0..count {
+                out[r * out_f + o] = col[r];
+            }
+        }
+        return out;
+    }
+    // Fast path 2: Q8_0/Q5_0 at THEIR OWN 32-element native block — covers `down`'s misaligned
+    // `in_f` (e.g. 704) without ever materializing a dequantized f32 row.
+    if matches!(dt, DType::Q8_0 | DType::Q5_0) && in_f.is_multiple_of(32) {
+        let q8s: Vec<Q8x32> = (0..count)
+            .map(|r| quantize_q8_32(&xin[r * in_f..r * in_f + in_f]))
+            .collect();
+        let mut col = vec![0f32; count];
+        for o in 0..out_f {
+            let row = &wbytes[o * bpr..o * bpr + bpr];
+            match dt {
+                DType::Q8_0 => vec_dot_q8_0_32_batch(row, &q8s, in_f, &mut col),
+                DType::Q5_0 => vec_dot_q5_0_32_batch(row, &q8s, in_f, &mut col),
+                _ => unreachable!(),
+            }
+            for r in 0..count {
+                out[r * out_f + o] = col[r];
+            }
+        }
+        return out;
+    }
+    for o in 0..out_f {
+        let row = &wbytes[o * bpr..o * bpr + bpr];
+        match dt {
+            DType::F32 => {
+                let w32: &[f32] = bytemuck::cast_slice(row);
+                for r in 0..count {
+                    out[r * out_f + o] = dot(w32, &xin[r * in_f..r * in_f + in_f]);
+                }
+            }
+            DType::F16 => {
+                for r in 0..count {
+                    out[r * out_f + o] = dot_f16(row, &xin[r * in_f..r * in_f + in_f]);
+                }
+            }
+            DType::Bf16 => {
+                for r in 0..count {
+                    out[r * out_f + o] = dot_bf16(row, &xin[r * in_f..r * in_f + in_f]);
+                }
+            }
+            _ => {
+                let wf = bytes_to_f32(row, dt);
+                for r in 0..count {
+                    out[r * out_f + o] = dot(&wf, &xin[r * in_f..r * in_f + in_f]);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Gated-FFN activation applied to the gate value.
@@ -2377,16 +2572,19 @@ impl Backend for CpuBackend {
                     let (rows, dim) = (rows as usize, dim as usize);
                     let xs = &vals[x.0 as usize];
                     let ws = weight(w);
+                    // Rows are independent (no cross-row reduction) — rayon over rows, same
+                    // per-row math and order as before (bit-identical, just distributed).
                     let mut out = vec![0f32; rows * dim];
-                    for r in 0..rows {
-                        let b = r * dim;
-                        let ss: f32 =
-                            (0..dim).map(|i| xs[b + i] * xs[b + i]).sum::<f32>() / dim as f32;
-                        let s = 1.0 / (ss + eps).sqrt();
-                        for i in 0..dim {
-                            out[b + i] = xs[b + i] * s * ws[i];
-                        }
-                    }
+                    out.par_chunks_mut(dim)
+                        .zip(xs.par_chunks(dim))
+                        .for_each(|(orow, xrow)| {
+                            let ss: f32 =
+                                (0..dim).map(|i| xrow[i] * xrow[i]).sum::<f32>() / dim as f32;
+                            let s = 1.0 / (ss + eps).sqrt();
+                            for i in 0..dim {
+                                orow[i] = xrow[i] * s * ws[i];
+                            }
+                        });
                     vals[dst.0 as usize] = out;
                 }
                 Op::Softmax {
@@ -2954,15 +3152,16 @@ impl Backend for CpuBackend {
                     let gs = &vals[gate.0 as usize];
                     let us = &vals[up.0 as usize];
                     // `up` may be a wider layer-major buffer (E2B); the per-row stride stays `nff`
-                    // but the read is shifted by `up_off` (0 for the normal [rows, nff] case).
+                    // but the read is shifted by `up_off` (0 for the normal [rows, nff] case). Rows
+                    // are independent — rayon over rows, bit-identical to the serial version.
                     let mut out = vec![0f32; rows * nff];
-                    for r in 0..rows {
+                    out.par_chunks_mut(nff).enumerate().for_each(|(r, orow)| {
                         let gb = r * nff;
                         let ub = r * nff + up_off;
                         for i in 0..nff {
-                            out[gb + i] = act_fn(act, gs[gb + i]) * us[ub + i];
+                            orow[i] = act_fn(act, gs[gb + i]) * us[ub + i];
                         }
-                    }
+                    });
                     vals[dst.0 as usize] = out;
                 }
                 Op::GatedActFused {
@@ -2972,16 +3171,17 @@ impl Backend for CpuBackend {
                     nff,
                     act,
                 } => {
-                    // Combined [rows, 2*nff] gate|up buffer: gate half first, up half second.
+                    // Combined [rows, 2*nff] gate|up buffer: gate half first, up half second. Rows
+                    // are independent — rayon over rows, bit-identical to the serial version.
                     let (rows, nff) = (rows as usize, nff as usize);
                     let gus = &vals[gu.0 as usize];
                     let mut out = vec![0f32; rows * nff];
-                    for r in 0..rows {
+                    out.par_chunks_mut(nff).enumerate().for_each(|(r, orow)| {
                         let gb = r * 2 * nff;
                         for i in 0..nff {
-                            out[r * nff + i] = act_fn(act, gus[gb + i]) * gus[gb + nff + i];
+                            orow[i] = act_fn(act, gus[gb + i]) * gus[gb + nff + i];
                         }
-                    }
+                    });
                     vals[dst.0 as usize] = out;
                 }
                 Op::Add { a, b, dst, n } => {
@@ -3044,11 +3244,15 @@ impl Backend for CpuBackend {
                 }
                 Op::Softcap { x, dst, cap, n } => {
                     let n = n as usize;
-                    let xs = vals[x.0 as usize].clone();
+                    let xs = &vals[x.0 as usize];
+                    // Pure elementwise map (no cross-element dependency) — safe to fan out over
+                    // rayon with ZERO numeric change. At the lm_head's shape (256 rows × 262144
+                    // vocab = ~67M `tanh` calls) this was the single most expensive scalar loop in
+                    // the interpreter outside `Op::Linear`/`Op::MoeFfn`.
                     let mut out = vec![0f32; n];
-                    for i in 0..n {
-                        out[i] = cap * (xs[i] / cap).tanh();
-                    }
+                    out.par_iter_mut()
+                        .zip(xs.par_iter())
+                        .for_each(|(o, &x)| *o = cap * (x / cap).tanh());
                     vals[dst.0 as usize] = out;
                 }
                 Op::Copy {
@@ -3118,18 +3322,6 @@ impl Backend for CpuBackend {
                     // expert FFN independently per row — the reference semantics for the GPU
                     // adapter's GPU-routed batched form.
                     let rows = xs.len() / ne;
-                    // Stream a (row-major [out_f, in_f]) weight slice and matvec it against `v` —
-                    // dequant per row, exactly like `Op::Linear`, parallel over rows.
-                    let matvec = |bytes: &[u8], dt: DType, v: &[f32], in_f: usize, out_f: usize| {
-                        let bpr = bytes.len() / out_f;
-                        (0..out_f)
-                            .into_par_iter()
-                            .map(|r| {
-                                let row = bytes_to_f32(&bytes[r * bpr..r * bpr + bpr], dt);
-                                dot(&row, &v[..in_f])
-                            })
-                            .collect::<Vec<f32>>()
-                    };
                     let rbuf = bindings.get(router).expect("cpu backend: unbound router");
                     let gbuf = bindings
                         .get(gate_exps)
@@ -3140,6 +3332,7 @@ impl Backend for CpuBackend {
                     let rbytes = cpu_buf(rbuf).read();
                     let gb = cpu_buf(gbuf).read();
                     let db = cpu_buf(dbuf).read();
+                    let rdt = g.desc(router).dtype;
                     let gdt = g.desc(gate_exps).dtype;
                     let ddt = g.desc(down_exps).dtype;
                     // Fused: `gate_exps` holds BOTH roles ([ne, 2*n_ff_exp, n_expert], gate rows
@@ -3154,54 +3347,160 @@ impl Backend for CpuBackend {
                     let ust = ub.as_ref().map(|b| b.len() / n_expert);
                     let dst_ = db.len() / n_expert;
                     let dscale = down_scale.map(&weight); // per-expert scale [n_expert], if any
-                    let mut out = vec![0f32; rows * ne];
-                    for (r, orow) in out.chunks_mut(ne).enumerate() {
-                        let xr = &xs[r * ne..r * ne + ne];
-                        let xrr = &rxs[r * ne..r * ne + ne];
-                        // Router softmax over all experts (reads router_x, NOT the expert input).
-                        let logits = matvec(&rbytes, g.desc(router).dtype, xrr, ne, n_expert);
-                        let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                        let mut probs: Vec<f32> =
-                            logits.iter().map(|&v| (v - maxl).exp()).collect();
-                        let psum: f32 = probs.iter().sum();
-                        for p in probs.iter_mut() {
-                            *p /= psum;
+
+                    // ── Router: ONE batched matvec over every row (router_x is tiny — [n_expert, ne]
+                    // — so this alone replaces what used to be `rows` separate re-dequants of it),
+                    // then a per-row softmax + top-`n_used` selection (independent per row, so
+                    // parallel over rows is safe).
+                    let logits_all = expert_matvec_batch(&rbytes, rdt, &rxs, rows, ne, n_expert);
+                    struct RouteRow {
+                        /// Selected experts, sorted by DESCENDING router prob — the same order the
+                        /// original per-row loop accumulated in.
+                        idx: Vec<usize>,
+                        /// Final per-expert weight (renormalized top-k prob × `scale`), aligned to `idx`.
+                        w: Vec<f32>,
+                    }
+                    let routes: Vec<RouteRow> = (0..rows)
+                        .into_par_iter()
+                        .map(|r| {
+                            let logits = &logits_all[r * n_expert..r * n_expert + n_expert];
+                            let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                            let mut probs: Vec<f32> =
+                                logits.iter().map(|&v| (v - maxl).exp()).collect();
+                            let psum: f32 = probs.iter().sum();
+                            for p in probs.iter_mut() {
+                                *p /= psum;
+                            }
+                            let mut idx: Vec<usize> = (0..n_expert).collect();
+                            idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+                            idx.truncate(n_used);
+                            let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
+                            let w: Vec<f32> =
+                                idx.iter().map(|&e| probs[e] / wsum * scale).collect();
+                            RouteRow { idx, w }
+                        })
+                        .collect();
+
+                    // ── Invert the per-row top-k picks into per-EXPERT row buckets: `(row, rank)`
+                    // where `rank` is this row's position in ITS OWN `idx` — carried through so the
+                    // final accumulation below can replay the EXACT original per-row summation order
+                    // (bit-identical output; only the WORK is reordered/batched, not the arithmetic).
+                    let mut expert_tasks: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n_expert];
+                    for (r, rr) in routes.iter().enumerate() {
+                        for (rank, &e) in rr.idx.iter().enumerate() {
+                            expert_tasks[e].push((r, rank));
                         }
-                        // Top-`n_used` experts, renormalized weights.
-                        let mut idx: Vec<usize> = (0..n_expert).collect();
-                        idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
-                        idx.truncate(n_used);
-                        let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
-                        for &e in &idx {
+                    }
+
+                    // ── Per-expert FFN: gather this expert's bucketed rows into one small
+                    // contiguous batch and stream its gate_up/down weight ONCE (see
+                    // `expert_matvec_batch`'s doc) instead of once per selected row. Experts run in
+                    // parallel — a top-`n_used`-of-`n_expert` router already spreads ~`rows·n_used`
+                    // row-expert pairs over `n_expert` buckets, so this fan-out alone is enough
+                    // parallelism without ALSO parallelizing inside each expert.
+                    let per_expert: Vec<Vec<(usize, usize, Vec<f32>)>> = (0..n_expert)
+                        .into_par_iter()
+                        .filter(|&e| !expert_tasks[e].is_empty())
+                        .map(|e| {
+                            let tasks = &expert_tasks[e];
+                            let count = tasks.len();
+                            let mut xin = vec![0f32; count * ne];
+                            for (i, &(r, _)) in tasks.iter().enumerate() {
+                                xin[i * ne..i * ne + ne].copy_from_slice(&xs[r * ne..r * ne + ne]);
+                            }
                             let (gate, up) = if fused_gate_up {
-                                // One matvec over the fused [2*nffx, ne] expert slice; first nffx
-                                // rows are gate, next nffx are up (Op::GatedActFused's convention).
-                                let full =
-                                    matvec(&gb[e * gst..(e + 1) * gst], gdt, xr, ne, 2 * nffx);
-                                (full[..nffx].to_vec(), full[nffx..].to_vec())
+                                // One batched matvec over the fused [2*nffx, ne] expert slice; first
+                                // nffx rows are gate, next nffx are up (Op::GatedActFused's convention).
+                                let full = expert_matvec_batch(
+                                    &gb[e * gst..(e + 1) * gst],
+                                    gdt,
+                                    &xin,
+                                    count,
+                                    ne,
+                                    2 * nffx,
+                                );
+                                let mut gate = vec![0f32; count * nffx];
+                                let mut up = vec![0f32; count * nffx];
+                                for i in 0..count {
+                                    gate[i * nffx..i * nffx + nffx]
+                                        .copy_from_slice(&full[i * 2 * nffx..i * 2 * nffx + nffx]);
+                                    up[i * nffx..i * nffx + nffx].copy_from_slice(
+                                        &full[i * 2 * nffx + nffx..i * 2 * nffx + 2 * nffx],
+                                    );
+                                }
+                                (gate, up)
                             } else {
                                 let ub = ub.as_ref().expect("split gate/up: up_exps missing");
                                 let ust = ust.expect("split gate/up: up stride missing");
                                 (
-                                    matvec(&gb[e * gst..(e + 1) * gst], gdt, xr, ne, nffx),
-                                    matvec(&ub[e * ust..(e + 1) * ust], udt, xr, ne, nffx),
+                                    expert_matvec_batch(
+                                        &gb[e * gst..(e + 1) * gst],
+                                        gdt,
+                                        &xin,
+                                        count,
+                                        ne,
+                                        nffx,
+                                    ),
+                                    expert_matvec_batch(
+                                        &ub[e * ust..(e + 1) * ust],
+                                        udt,
+                                        &xin,
+                                        count,
+                                        ne,
+                                        nffx,
+                                    ),
                                 )
                             };
-                            let actv: Vec<f32> =
-                                (0..nffx).map(|i| act_fn(act, gate[i]) * up[i]).collect();
-                            let mut y = matvec(&db[e * dst_..(e + 1) * dst_], ddt, &actv, nffx, ne);
+                            let actv: Vec<f32> = (0..count * nffx)
+                                .map(|i| act_fn(act, gate[i]) * up[i])
+                                .collect();
+                            let mut y = expert_matvec_batch(
+                                &db[e * dst_..(e + 1) * dst_],
+                                ddt,
+                                &actv,
+                                count,
+                                nffx,
+                                ne,
+                            );
                             if let Some(ds) = &dscale {
                                 let s = ds[e];
                                 for v in y.iter_mut() {
                                     *v *= s;
                                 }
                             }
-                            let w_e = probs[e] / wsum * scale;
-                            for i in 0..ne {
-                                orow[i] += w_e * y[i];
-                            }
+                            tasks
+                                .iter()
+                                .enumerate()
+                                .map(|(i, &(r, rank))| (r, rank, y[i * ne..i * ne + ne].to_vec()))
+                                .collect()
+                        })
+                        .collect();
+
+                    // ── Scatter each expert's per-row result into that row's rank slot, then
+                    // accumulate in the SAME order the original per-row loop used (idx sorted by
+                    // descending router prob) — bit-identical to the old per-(row, expert) version.
+                    let mut row_slots: Vec<Vec<Option<Vec<f32>>>> =
+                        routes.iter().map(|rr| vec![None; rr.idx.len()]).collect();
+                    for expert_result in per_expert {
+                        for (r, rank, y) in expert_result {
+                            row_slots[r][rank] = Some(y);
                         }
                     }
+                    let mut out = vec![0f32; rows * ne];
+                    out.par_chunks_mut(ne)
+                        .zip(routes.par_iter())
+                        .zip(row_slots.par_iter())
+                        .for_each(|((orow, rr), slots)| {
+                            for (rank, y) in slots.iter().enumerate() {
+                                let y = y
+                                    .as_ref()
+                                    .expect("moe: expert result missing for a selected row");
+                                let w_e = rr.w[rank];
+                                for i in 0..ne {
+                                    orow[i] += w_e * y[i];
+                                }
+                            }
+                        });
                     vals[dst.0 as usize] = out;
                 }
                 Op::Conv1dSilu {
@@ -3414,6 +3713,16 @@ mod kernel_tests {
         }
         x
     }
+    /// The reference activation the `_32` native-block int8 kernels actually see: `d*q8` per 32-block.
+    fn dequant_q8_32(q8: &Q8x32) -> Vec<f32> {
+        let mut x = vec![0f32; q8.qs.len()];
+        for (b, &d) in q8.d.iter().enumerate() {
+            for i in 0..32 {
+                x[b * 32 + i] = d * q8.qs[b * 32 + i] as f32;
+            }
+        }
+        x
+    }
     fn rel_err(got: f32, want: f32) -> f32 {
         (got - want).abs() / want.abs().max(1.0)
     }
@@ -3480,6 +3789,60 @@ mod kernel_tests {
         let got = vec_dot_q5k(&w, &q8, in_f);
         let want = dot(&wref, &dequant_q8(&q8));
         assert!(rel_err(got, want) < 1e-3, "q5k: got {got}, want {want}");
+    }
+
+    /// MoE `down`'s native-32-block fast path (`in_f` not a multiple of 256, e.g. DiffusionGemma's
+    /// 704): the batched Q8_0 kernel must match the trusted `dequant_block` reference, for BOTH a
+    /// 256-aligned and a NON-256-aligned `in_f` (704 = 22×32, not a multiple of 256), and across a
+    /// multi-row batch (exercises the "decode weight row once, reuse across tokens" path itself).
+    #[test]
+    fn q8_0_32_batch_matches_dequant_reference() {
+        for in_f in [256usize, 704] {
+            let nb = in_f / 32;
+            let mut w = det_bytes(nb * 34, 20);
+            for k in 0..nb {
+                put_f16(&mut w[k * 34..k * 34 + 2], 0.02);
+            }
+            let wref = dequant_block(DType::Q8_0, &w).unwrap();
+            let xs: Vec<Vec<f32>> = (0..3).map(|i| det_x(in_f, 21 + i)).collect();
+            let q8s: Vec<Q8x32> = xs.iter().map(|x| quantize_q8_32(x)).collect();
+            let mut got = vec![0f32; 3];
+            vec_dot_q8_0_32_batch(&w, &q8s, in_f, &mut got);
+            for (r, q8) in q8s.iter().enumerate() {
+                let want = dot(&wref, &dequant_q8_32(q8));
+                assert!(
+                    rel_err(got[r], want) < 1e-3,
+                    "q8_0_32 in_f={in_f} row={r}: got {got_r}, want {want}",
+                    got_r = got[r]
+                );
+            }
+        }
+    }
+
+    /// Same shape of check as `q8_0_32_batch_matches_dequant_reference`, for Q5_0's 5-bit (4 nibble
+    /// + 1 high) native block.
+    #[test]
+    fn q5_0_32_batch_matches_dequant_reference() {
+        for in_f in [256usize, 704] {
+            let nb = in_f / 32;
+            let mut w = det_bytes(nb * 22, 30);
+            for k in 0..nb {
+                put_f16(&mut w[k * 22..k * 22 + 2], 0.03);
+            }
+            let wref = dequant_block(DType::Q5_0, &w).unwrap();
+            let xs: Vec<Vec<f32>> = (0..3).map(|i| det_x(in_f, 31 + i)).collect();
+            let q8s: Vec<Q8x32> = xs.iter().map(|x| quantize_q8_32(x)).collect();
+            let mut got = vec![0f32; 3];
+            vec_dot_q5_0_32_batch(&w, &q8s, in_f, &mut got);
+            for (r, q8) in q8s.iter().enumerate() {
+                let want = dot(&wref, &dequant_q8_32(q8));
+                assert!(
+                    rel_err(got[r], want) < 1e-3,
+                    "q5_0_32 in_f={in_f} row={r}: got {got_r}, want {want}",
+                    got_r = got[r]
+                );
+            }
+        }
     }
 
     #[test]
