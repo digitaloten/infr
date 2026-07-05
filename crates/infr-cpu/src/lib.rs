@@ -1034,11 +1034,81 @@ unsafe fn vec_dot_q4k_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &
     }
 }
 
+/// AVX512-VNNI variant of [`vec_dot_q4k_batch_avx512bw`]: `_mm512_dpbusd_epi32` fuses the
+/// maddubs+madd pair into ONE u8×s8→i32 dot-accumulate. Bit-identical — the i32 lanes hold the
+/// same per-4-byte-group sums the madd chain produced (q4 nibbles ≤15 × |q8| ≤127 never
+/// saturated maddubs' i16 either), and the hadd/scale order is unchanged.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw,avx512vnni")]
+unsafe fn vec_dot_q4k_batch_vnni(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let m = q8s.len();
+    let nb = in_f / 256;
+    let mask_lo = _mm256_set1_epi8(0x0F_u8 as i8);
+
+    let mut d_arr = vec![0f32; nb];
+    let mut dmin_arr = vec![0f32; nb];
+    let mut sc_arr = vec![[0u32; 8]; nb];
+    let mut m_arr = vec![[0u32; 8]; nb];
+    let mut q4_flat = vec![0u8; nb * 256];
+
+    for b in 0..nb {
+        let blk = &row[b * 144..b * 144 + 144];
+        d_arr[b] = rdf16(&blk[0..2]);
+        dmin_arr[b] = rdf16(&blk[2..4]);
+        let scales = &blk[4..16];
+        let qs = &blk[16..144];
+        for s in 0..8usize {
+            let (sc, mv) = k4(s, scales);
+            sc_arr[b][s] = sc;
+            m_arr[b][s] = mv;
+        }
+        let flat = &mut q4_flat[b * 256..b * 256 + 256];
+        for k in 0..4usize {
+            let nibbles = _mm256_loadu_si256(qs[k * 32..].as_ptr() as *const __m256i);
+            let lo_nib = _mm256_and_si256(nibbles, mask_lo);
+            let hi_nib = _mm256_and_si256(_mm256_srli_epi16(nibbles, 4), mask_lo);
+            _mm256_storeu_si256(flat[k * 64..].as_mut_ptr() as *mut __m256i, lo_nib);
+            _mm256_storeu_si256(flat[k * 64 + 32..].as_mut_ptr() as *mut __m256i, hi_nib);
+        }
+    }
+
+    for r in 0..m {
+        let q8 = &q8s[r];
+        let mut sumf = 0f32;
+        for b in 0..nb {
+            let (mut sd, mut sm) = (0i32, 0i32);
+            let flat = &q4_flat[b * 256..b * 256 + 256];
+            let q8b = &q8.qs[b * 256..b * 256 + 256];
+            for k in 0..4usize {
+                let (sc_e, m_e) = (sc_arr[b][2 * k], m_arr[b][2 * k]);
+                let (sc_o, m_o) = (sc_arr[b][2 * k + 1], m_arr[b][2 * k + 1]);
+                let q4_zmm = _mm512_loadu_si512(flat[k * 64..].as_ptr() as *const __m512i);
+                let q8_zmm = _mm512_loadu_si512(q8b[k * 64..].as_ptr() as *const __m512i);
+                let sum32 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), q4_zmm, q8_zmm);
+                let lo_ymm = _mm512_castsi512_si256(sum32);
+                let hi_ymm = _mm512_extracti64x4_epi64::<1>(sum32);
+                let iprod_e = hadd_i32_ymm(lo_ymm);
+                let iprod_o = hadd_i32_ymm(hi_ymm);
+                let isum_e = q8.bsums[b * 8 + 2 * k];
+                let isum_o = q8.bsums[b * 8 + 2 * k + 1];
+                sd += sc_e as i32 * iprod_e + sc_o as i32 * iprod_o;
+                sm += m_e as i32 * isum_e + m_o as i32 * isum_o;
+            }
+            sumf += q8.d[b] * (d_arr[b] * sd as f32 - dmin_arr[b] * sm as f32);
+        }
+        out[r] = sumf;
+    }
+}
+
 /// Batch Q4_K dot: `out[r] = vec_dot_q4k(row, &q8s[r], in_f)` for all r, bit-identical to
 /// the single-token kernel. The weight row is decoded ONCE; per-token work is the integer dot only.
 fn vec_dot_q4k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
     {
+        if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni") {
+            return unsafe { vec_dot_q4k_batch_vnni(row, q8s, in_f, out) };
+        }
         if is_x86_feature_detected!("avx512bw") {
             return unsafe { vec_dot_q4k_batch_avx512bw(row, q8s, in_f, out) };
         }
@@ -1181,6 +1251,121 @@ unsafe fn vec_dot_q4k_batch2_avx512bw(
     }
 }
 
+/// AVX512-VNNI variant of [`vec_dot_q4k_batch2_avx512bw`] (2-row tile, q8 loaded once per pair,
+/// dpbusd replacing maddubs+madd — see [`vec_dot_q4k_batch_vnni`]'s bit-identity note).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw,avx512vnni")]
+unsafe fn vec_dot_q4k_batch2_vnni(
+    row_a: &[u8],
+    row_b: &[u8],
+    q8s: &[Q8],
+    in_f: usize,
+    out_a: &mut [f32],
+    out_b: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    let m = q8s.len();
+    let nb = in_f / 256;
+    let mask_lo = _mm256_set1_epi8(0x0F_u8 as i8);
+
+    let mut d_a = vec![0f32; nb];
+    let mut dmin_a = vec![0f32; nb];
+    let mut sc_a = vec![[0u32; 8]; nb];
+    let mut m_a = vec![[0u32; 8]; nb];
+    let mut flat_a = vec![0u8; nb * 256];
+
+    let mut d_b = vec![0f32; nb];
+    let mut dmin_b = vec![0f32; nb];
+    let mut sc_b = vec![[0u32; 8]; nb];
+    let mut m_b = vec![[0u32; 8]; nb];
+    let mut flat_b = vec![0u8; nb * 256];
+
+    for b in 0..nb {
+        let blk_a = &row_a[b * 144..b * 144 + 144];
+        d_a[b] = rdf16(&blk_a[0..2]);
+        dmin_a[b] = rdf16(&blk_a[2..4]);
+        let scales_a = &blk_a[4..16];
+        let qs_a = &blk_a[16..144];
+        for s in 0..8usize {
+            let (sc, mv) = k4(s, scales_a);
+            sc_a[b][s] = sc;
+            m_a[b][s] = mv;
+        }
+        let fa = &mut flat_a[b * 256..b * 256 + 256];
+        for k in 0..4usize {
+            let nibs = _mm256_loadu_si256(qs_a[k * 32..].as_ptr() as *const __m256i);
+            let lo = _mm256_and_si256(nibs, mask_lo);
+            let hi = _mm256_and_si256(_mm256_srli_epi16(nibs, 4), mask_lo);
+            _mm256_storeu_si256(fa[k * 64..].as_mut_ptr() as *mut __m256i, lo);
+            _mm256_storeu_si256(fa[k * 64 + 32..].as_mut_ptr() as *mut __m256i, hi);
+        }
+
+        let blk_b = &row_b[b * 144..b * 144 + 144];
+        d_b[b] = rdf16(&blk_b[0..2]);
+        dmin_b[b] = rdf16(&blk_b[2..4]);
+        let scales_b = &blk_b[4..16];
+        let qs_b = &blk_b[16..144];
+        for s in 0..8usize {
+            let (sc, mv) = k4(s, scales_b);
+            sc_b[b][s] = sc;
+            m_b[b][s] = mv;
+        }
+        let fb = &mut flat_b[b * 256..b * 256 + 256];
+        for k in 0..4usize {
+            let nibs = _mm256_loadu_si256(qs_b[k * 32..].as_ptr() as *const __m256i);
+            let lo = _mm256_and_si256(nibs, mask_lo);
+            let hi = _mm256_and_si256(_mm256_srli_epi16(nibs, 4), mask_lo);
+            _mm256_storeu_si256(fb[k * 64..].as_mut_ptr() as *mut __m256i, lo);
+            _mm256_storeu_si256(fb[k * 64 + 32..].as_mut_ptr() as *mut __m256i, hi);
+        }
+    }
+
+    for r in 0..m {
+        let q8 = &q8s[r];
+        let mut sumf_a = 0f32;
+        let mut sumf_b = 0f32;
+        for b in 0..nb {
+            let (mut sd_a, mut sm_a) = (0i32, 0i32);
+            let (mut sd_b, mut sm_b) = (0i32, 0i32);
+            let fa = &flat_a[b * 256..b * 256 + 256];
+            let fb = &flat_b[b * 256..b * 256 + 256];
+            let q8b = &q8.qs[b * 256..b * 256 + 256];
+
+            for k in 0..4usize {
+                let (sca_e, ma_e) = (sc_a[b][2 * k], m_a[b][2 * k]);
+                let (sca_o, ma_o) = (sc_a[b][2 * k + 1], m_a[b][2 * k + 1]);
+                let (scb_e, mb_e) = (sc_b[b][2 * k], m_b[b][2 * k]);
+                let (scb_o, mb_o) = (sc_b[b][2 * k + 1], m_b[b][2 * k + 1]);
+
+                let q8_zmm = _mm512_loadu_si512(q8b[k * 64..].as_ptr() as *const __m512i);
+
+                let qa_zmm = _mm512_loadu_si512(fa[k * 64..].as_ptr() as *const __m512i);
+                let sum32_a = _mm512_dpbusd_epi32(_mm512_setzero_si512(), qa_zmm, q8_zmm);
+                let lo_a = _mm512_castsi512_si256(sum32_a);
+                let hi_a = _mm512_extracti64x4_epi64::<1>(sum32_a);
+
+                let qb_zmm = _mm512_loadu_si512(fb[k * 64..].as_ptr() as *const __m512i);
+                let sum32_b = _mm512_dpbusd_epi32(_mm512_setzero_si512(), qb_zmm, q8_zmm);
+                let lo_b = _mm512_castsi512_si256(sum32_b);
+                let hi_b = _mm512_extracti64x4_epi64::<1>(sum32_b);
+
+                let isum_e = q8.bsums[b * 8 + 2 * k];
+                let isum_o = q8.bsums[b * 8 + 2 * k + 1];
+
+                sd_a += sca_e as i32 * hadd_i32_ymm(lo_a) + sca_o as i32 * hadd_i32_ymm(hi_a);
+                sm_a += ma_e as i32 * isum_e + ma_o as i32 * isum_o;
+
+                sd_b += scb_e as i32 * hadd_i32_ymm(lo_b) + scb_o as i32 * hadd_i32_ymm(hi_b);
+                sm_b += mb_e as i32 * isum_e + mb_o as i32 * isum_o;
+            }
+            sumf_a += q8.d[b] * (d_a[b] * sd_a as f32 - dmin_a[b] * sm_a as f32);
+            sumf_b += q8.d[b] * (d_b[b] * sd_b as f32 - dmin_b[b] * sm_b as f32);
+        }
+        out_a[r] = sumf_a;
+        out_b[r] = sumf_b;
+    }
+}
+
 fn vec_dot_q4k_batch2(
     row_a: &[u8],
     row_b: &[u8],
@@ -1190,8 +1375,13 @@ fn vec_dot_q4k_batch2(
     out_b: &mut [f32],
 ) {
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx512bw") {
-        return unsafe { vec_dot_q4k_batch2_avx512bw(row_a, row_b, q8s, in_f, out_a, out_b) };
+    {
+        if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni") {
+            return unsafe { vec_dot_q4k_batch2_vnni(row_a, row_b, q8s, in_f, out_a, out_b) };
+        }
+        if is_x86_feature_detected!("avx512bw") {
+            return unsafe { vec_dot_q4k_batch2_avx512bw(row_a, row_b, q8s, in_f, out_a, out_b) };
+        }
     }
     // Scalar fallback: call single-row batch twice (still unpack once per row).
     vec_dot_q4k_batch(row_a, q8s, in_f, out_a);
@@ -2128,9 +2318,68 @@ fn quantize_q8_32(x: &[f32]) -> Q8x32 {
 /// DiffusionGemma's `down` projection kernel (`n_ff_exp=704` isn't a multiple of 256, so it can't use
 /// the K-quant/Q8_0-256 batch path above), previously the single largest scalar hot loop in the MoE
 /// arm (measured via `INFR_PROF_OPS=1`'s per-stage MoeFfn breakdown).
+/// AVX512-VNNI variant of [`vec_dot_q8_0_32_batch_avx512bw`]: dpbusd fuses the maddubs+madd pair
+/// (sign trick unchanged: `dpbusd(|qw|, sign(q8,qw))`; |qw| ≤128 × |q8| ≤127 never saturated the
+/// i16 chain either, so this is bit-identical — same per-4-byte i32 group sums, same hadd and the
+/// same two SEPARATE f32 adds per pair as the scalar oracle).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw,avx512vnni,avx512vl")]
+unsafe fn vec_dot_q8_0_32_batch_vnni(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let nb = in_f / 32;
+    let bpr = 34usize;
+    let pairs = nb / 2;
+    let mut d_arr = vec![0f32; nb];
+    for b in 0..nb {
+        d_arr[b] = rdf16(&row[b * bpr..b * bpr + 2]);
+    }
+    for (r, q8) in q8s.iter().enumerate() {
+        let mut sumf = 0f32;
+        for k in 0..pairs {
+            let (b0, b1) = (2 * k, 2 * k + 1);
+            let qw0 = _mm256_loadu_si256(row[b0 * bpr + 2..].as_ptr() as *const __m256i);
+            let qw1 = _mm256_loadu_si256(row[b1 * bpr + 2..].as_ptr() as *const __m256i);
+            let qx_z = _mm512_loadu_si512(q8.qs[b0 * 32..].as_ptr() as *const __m512i);
+            let qx0 = _mm512_castsi512_si256(qx_z);
+            let qx1 = _mm512_extracti64x4_epi64::<1>(qx_z);
+            let qw_abs0 = _mm256_abs_epi8(qw0);
+            let qw_abs1 = _mm256_abs_epi8(qw1);
+            let qx_s0 = _mm256_sign_epi8(qx0, qw0);
+            let qx_s1 = _mm256_sign_epi8(qx1, qw1);
+            let qw_a_z = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(qw_abs0), qw_abs1);
+            let qx_s_z = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(qx_s0), qx_s1);
+            let sum32_z = _mm512_dpbusd_epi32(_mm512_setzero_si512(), qw_a_z, qx_s_z);
+            let lo_ymm = _mm512_castsi512_si256(sum32_z);
+            let hi_ymm = _mm512_extracti64x4_epi64::<1>(sum32_z);
+            let iprod0 = hadd_i32_ymm(lo_ymm);
+            let iprod1 = hadd_i32_ymm(hi_ymm);
+            sumf += d_arr[b0] * q8.d[b0] * iprod0 as f32;
+            sumf += d_arr[b1] * q8.d[b1] * iprod1 as f32;
+        }
+        if nb % 2 == 1 {
+            let b = nb - 1;
+            let qw = _mm256_loadu_si256(row[b * bpr + 2..].as_ptr() as *const __m256i);
+            let q8v = _mm256_loadu_si256(q8.qs[b * 32..].as_ptr() as *const __m256i);
+            let qw_abs = _mm256_abs_epi8(qw);
+            let qx_signed = _mm256_sign_epi8(q8v, qw);
+            let sum32 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), qw_abs, qx_signed);
+            let iprod = hadd_i32_ymm(sum32);
+            sumf += d_arr[b] * q8.d[b] * iprod as f32;
+        }
+        out[r] = sumf;
+    }
+}
+
 fn vec_dot_q8_0_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
     {
+        if is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vnni")
+            && is_x86_feature_detected!("avx512vl")
+        {
+            // SAFETY: features detected at runtime; pointer bounds checked by slice indexing.
+            return unsafe { vec_dot_q8_0_32_batch_vnni(row, q8s, in_f, out) };
+        }
         if is_x86_feature_detected!("avx512bw") {
             // SAFETY: avx512bw detected at runtime; pointer bounds checked by slice indexing.
             return unsafe { vec_dot_q8_0_32_batch_avx512bw(row, q8s, in_f, out) };
