@@ -977,8 +977,9 @@ fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
 /// sc_pre_norm)`, `soft = softmax(logits·temp_inv) @ token_embd · √n_embd`.
 ///
 /// Runs entirely on the HOST: `soft` is a `[vocab]`-wide weighted sum of embedding rows, computed
-/// directly against the CPU runner's already-dequantized `token_embd` table (a plain threaded
-/// matvec) rather than materializing the reference's second on-device transposed-embedding
+/// directly against the CPU runner's already-dequantized `token_embd` table (a vocab-tiled
+/// threaded GEMM — see the `SC_VT` comment in the body) rather than materializing the
+/// reference's second on-device transposed-embedding
 /// weight (`sc_embT`, ~1.4 GB). CPU keeps this host path (this function). Phase-B moved the
 /// Vulkan denoise path's SC block IN-GRAPH instead (a `sc_embT` device weight + `Op::Softmax` +
 /// `Op::Linear`/`Op::GatedAct` — see the SC subgraph in `build` and `build_sc_embt` below) since
@@ -1004,34 +1005,61 @@ fn diffusion_self_cond(
     let nff = gate_w.len() / ne;
     let sqrt_ne = (ne as f32).sqrt();
     let eps = c.rms_eps;
+    // probs = softmax(logits * temp_inv) over the FULL vocab, all rows up front ([cc, vocab] —
+    // ~1 MB/row; materialized so the soft-embed below can be vocab-TILED across rows).
+    let mut probs = vec![0f32; cc * vocab];
+    probs
+        .par_chunks_mut(vocab)
+        .enumerate()
+        .for_each(|(row, pr)| {
+            let logits_row = &sc_logits[row * vocab..(row + 1) * vocab];
+            let mx = logits_row
+                .iter()
+                .fold(f32::NEG_INFINITY, |m, &v| m.max(v * temp_inv));
+            let mut denom = 0f32;
+            for (p, &v) in pr.iter_mut().zip(logits_row) {
+                *p = (v * temp_inv - mx).exp();
+                denom += *p;
+            }
+            for p in pr.iter_mut() {
+                *p /= denom;
+            }
+        });
+    // soft = (probs @ token_embd) — a [ne] weighted sum over ALL vocab rows per canvas row
+    // (token_embd is row-major [vocab, ne], already fully dequantized in host memory).
+    //
+    // TILED over vocab: the naive per-row loop streams the whole [vocab, ne] f32 table (~2 GB for
+    // gemma's 262k vocab) once per canvas row — cc=256 rows ≈ 540 GB of DRAM traffic, which alone
+    // was ~47% of every denoise step. Instead each `SC_VT`-row embedding tile (SC_VT·ne·4 B ≈
+    // 16 MB — L3-resident) is consumed by ALL cc rows while hot, so the table streams from DRAM
+    // ONCE per step. Bit-identical to the naive loop: for a fixed (row, e) the accumulation still
+    // visits v in ascending order (tiles ascend, v ascends within a tile), and the `p == 0.0`
+    // skip is preserved — no FP reassociation anywhere.
+    let mut soft_all = vec![0f32; cc * ne];
+    const SC_VT: usize = 2048;
+    for t0 in (0..vocab).step_by(SC_VT) {
+        let t1 = (t0 + SC_VT).min(vocab);
+        soft_all
+            .par_chunks_mut(ne)
+            .enumerate()
+            .for_each(|(row, sr)| {
+                let pr = &probs[row * vocab..(row + 1) * vocab];
+                for v in t0..t1 {
+                    let p = pr[v];
+                    if p == 0.0 {
+                        continue;
+                    }
+                    let row_e = &token_embd[v * ne..v * ne + ne];
+                    for (s, &e) in sr.iter_mut().zip(row_e) {
+                        *s += p * e;
+                    }
+                }
+            });
+    }
+    drop(probs);
     let mut sig = vec![0f32; cc * ne];
     sig.par_chunks_mut(ne).enumerate().for_each(|(row, out)| {
-        let logits_row = &sc_logits[row * vocab..(row + 1) * vocab];
-        // probs = softmax(logits * temp_inv) over the FULL vocab.
-        let mx = logits_row
-            .iter()
-            .fold(f32::NEG_INFINITY, |m, &v| m.max(v * temp_inv));
-        let mut probs = vec![0f32; vocab];
-        let mut denom = 0f32;
-        for (p, &v) in probs.iter_mut().zip(logits_row) {
-            *p = (v * temp_inv - mx).exp();
-            denom += *p;
-        }
-        for p in probs.iter_mut() {
-            *p /= denom;
-        }
-        // soft = (probs @ token_embd) * sqrt(ne) — a [ne] weighted sum over ALL vocab rows
-        // (token_embd is row-major [vocab, ne], already fully dequantized in host memory).
-        let mut soft = vec![0f32; ne];
-        for (v, &p) in probs.iter().enumerate() {
-            if p == 0.0 {
-                continue;
-            }
-            let row_e = &token_embd[v * ne..v * ne + ne];
-            for (s, &e) in soft.iter_mut().zip(row_e) {
-                *s += p * e;
-            }
-        }
+        let mut soft = soft_all[row * ne..(row + 1) * ne].to_vec();
         for s in soft.iter_mut() {
             *s *= sqrt_ne;
         }
