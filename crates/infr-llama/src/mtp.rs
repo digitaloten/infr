@@ -771,6 +771,34 @@ impl<'a> MtpHeadSession<'a> {
         )
     }
 
+    /// Construct over the Metal backend (raw native-dtype upload — mirrors
+    /// `cpu_backend.rs`'s `generate_dense_metal_session` weight closure).
+    #[cfg(target_os = "macos")]
+    pub fn new_metal(
+        mtl: &'a infr_metal::MetalBackend,
+        g: &Gguf,
+        cfg: &crate::Config,
+        head: &MtpHeadWeights,
+        embed_table: &'a [f32],
+        max_ctx: usize,
+    ) -> Result<Self> {
+        Self::build(
+            mtl,
+            &|_name, tb, dt, _n| {
+                let buf = mtl
+                    .alloc(tb.len().max(1), BufferUsage::Weights)
+                    .map_err(|e| anyhow!("{e}"))?;
+                mtl.upload(buf.as_ref(), &tb).map_err(|e| anyhow!("{e}"))?;
+                Ok((buf, dt))
+            },
+            g,
+            cfg,
+            head,
+            embed_table,
+            max_ctx,
+        )
+    }
+
     fn build(
         be: &'a dyn Backend,
         bind_weight: &BindWeightFn,
@@ -1002,8 +1030,13 @@ pub const DEFAULT_N_MAX: usize = 6;
 /// self-speculative decoding). Returns `(logits [m*vocab], h [m*n_embd])`, `m = tokens.len() -
 /// (tokens already cached in `state`)`.
 #[allow(clippy::too_many_arguments)]
+/// One TARGET-trunk verify forward over `tokens`, returning (all-row logits, all-row hidden
+/// states) — the hidden rows are the extra tap the MTP head consumes. Backend-generic: the
+/// trunk graph is `generate_dense_backend` (which already takes `be` + a bind closure), so this
+/// drives Vulkan, Metal, or CPU by the caller's binder.
 fn run_verify(
-    vk: &infr_vulkan::VulkanBackend,
+    be: &dyn Backend,
+    bind: &BindWeightFn,
     g: &Gguf,
     cfg: &crate::Config,
     token_embd: &[f32],
@@ -1014,16 +1047,8 @@ fn run_verify(
     let mut logits = Vec::new();
     let mut h = Vec::new();
     crate::cpu_backend::generate_dense_backend(
-        vk,
-        &|_name, tb, dt, _n| {
-            let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
-            let buf = vk
-                .alloc(padded.len(), BufferUsage::Weights)
-                .map_err(|e| anyhow!("{e}"))?;
-            vk.upload(buf.as_ref(), &padded)
-                .map_err(|e| anyhow!("{e}"))?;
-            Ok((buf, dt))
-        },
+        be,
+        bind,
         g,
         cfg,
         token_embd,
@@ -1190,6 +1215,130 @@ pub fn generate_mtp_spec_vulkan_timed(
     head: &MtpHeadWeights,
     prompt: &str,
     max_new: usize,
+    on_piece: impl FnMut(&str),
+) -> Result<(crate::GenStats, MtpTiming)> {
+    let cfg = model.config();
+    let max_ctx = model.encode(prompt)?.len() + max_new + DEFAULT_N_MAX + 8;
+    let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
+    let bind: &BindWeightFn = &|_name, tb, dt, _n| {
+        let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
+        let buf = vk
+            .alloc(padded.len(), BufferUsage::Weights)
+            .map_err(|e| anyhow!("{e}"))?;
+        vk.upload(buf.as_ref(), &padded)
+            .map_err(|e| anyhow!("{e}"))?;
+        Ok((buf, dt))
+    };
+    let mut head_sess =
+        MtpHeadSession::new_vulkan(&vk, model.gguf(), cfg, head, model.token_embd(), max_ctx)?;
+    generate_mtp_spec_core(
+        &vk,
+        bind,
+        model,
+        &mut head_sess,
+        max_ctx,
+        prompt,
+        max_new,
+        on_piece,
+    )
+}
+
+/// Metal twin of [`generate_mtp_spec_vulkan_timed`] — the SAME draft-verify-catchup driver over
+/// the Apple-GPU trunk + head (raw native-dtype weight upload, `MtpHeadSession::new_metal`).
+#[cfg(target_os = "macos")]
+pub fn generate_mtp_spec_metal_timed(
+    model: &crate::CpuModel,
+    head: &MtpHeadWeights,
+    prompt: &str,
+    max_new: usize,
+    on_piece: impl FnMut(&str),
+) -> Result<(crate::GenStats, MtpTiming)> {
+    let cfg = model.config();
+    let max_ctx = model.encode(prompt)?.len() + max_new + DEFAULT_N_MAX + 8;
+    let mtl = infr_metal::MetalBackend::new().map_err(|e| anyhow!("metal init: {e}"))?;
+    let bind: &BindWeightFn = &|_name, tb, dt, _n| {
+        let buf = mtl
+            .alloc(tb.len().max(1), BufferUsage::Weights)
+            .map_err(|e| anyhow!("{e}"))?;
+        mtl.upload(buf.as_ref(), &tb).map_err(|e| anyhow!("{e}"))?;
+        Ok((buf, dt))
+    };
+    let mut head_sess =
+        MtpHeadSession::new_metal(&mtl, model.gguf(), cfg, head, model.token_embd(), max_ctx)?;
+    generate_mtp_spec_core(
+        &mtl,
+        bind,
+        model,
+        &mut head_sess,
+        max_ctx,
+        prompt,
+        max_new,
+        on_piece,
+    )
+}
+
+/// CPU MTP driver — the exact-f32 reference (no GPU). Same draft-verify-catchup loop; used to
+/// establish the acceptance-rate oracle (a backend whose head numerics differ from the trunk's
+/// shows up as a lower alpha here vs on a GPU backend).
+pub fn generate_mtp_spec_cpu_timed(
+    model: &crate::CpuModel,
+    head: &MtpHeadWeights,
+    prompt: &str,
+    max_new: usize,
+    on_piece: impl FnMut(&str),
+) -> Result<(crate::GenStats, MtpTiming)> {
+    let cfg = model.config();
+    let max_ctx = model.encode(prompt)?.len() + max_new + DEFAULT_N_MAX + 8;
+    let cpu = infr_cpu::CpuBackend::new();
+    let bind: &BindWeightFn = &|_name, tb, dt, _n| match tb {
+        crate::cpu_backend::WBytes::Mmap(tb) => Ok((cpu.map_weight(tb), dt)),
+        crate::cpu_backend::WBytes::Owned(v) => {
+            let buf = cpu
+                .alloc(v.len().max(1), BufferUsage::Weights)
+                .map_err(|e| anyhow!("{e}"))?;
+            cpu.upload(buf.as_ref(), &v).map_err(|e| anyhow!("{e}"))?;
+            Ok((buf, dt))
+        }
+    };
+    let mut head_sess =
+        MtpHeadSession::new_cpu(&cpu, model.gguf(), cfg, head, model.token_embd(), max_ctx)?;
+    generate_mtp_spec_core(
+        &cpu,
+        bind,
+        model,
+        &mut head_sess,
+        max_ctx,
+        prompt,
+        max_new,
+        on_piece,
+    )
+}
+
+/// Non-timed Metal MTP driver (drops the [`MtpTiming`]) — the `ChatModel::generate` entry.
+#[cfg(target_os = "macos")]
+pub fn generate_mtp_spec_metal(
+    model: &crate::CpuModel,
+    head: &MtpHeadWeights,
+    prompt: &str,
+    max_new: usize,
+    on_piece: impl FnMut(&str),
+) -> Result<crate::GenStats> {
+    generate_mtp_spec_metal_timed(model, head, prompt, max_new, on_piece).map(|(stats, _)| stats)
+}
+
+/// The backend-generic MTP draft-verify-catchup loop — the shared body of the `_vulkan`/`_metal`
+/// drivers. The trunk verify runs through `run_verify(be, bind, …)`; the draft head is the
+/// caller-built [`MtpHeadSession`] (bound to the same `be`). Everything between — draft, accept,
+/// catch-up, streaming — is backend-agnostic.
+#[allow(clippy::too_many_arguments)]
+fn generate_mtp_spec_core(
+    be: &dyn Backend,
+    bind: &BindWeightFn,
+    model: &crate::CpuModel,
+    head_sess: &mut MtpHeadSession,
+    max_ctx: usize,
+    prompt: &str,
+    max_new: usize,
     mut on_piece: impl FnMut(&str),
 ) -> Result<(crate::GenStats, MtpTiming)> {
     let cfg = model.config();
@@ -1201,22 +1350,16 @@ pub fn generate_mtp_spec_vulkan_timed(
     let hit_eos = |t: u32| !ignore_eos && (cfg.eos_ids.contains(&t) || t == cfg.eos);
 
     let prompt_tokens = model.encode(prompt)?;
-    anyhow::ensure!(
-        !prompt_tokens.is_empty(),
-        "generate_mtp_spec_vulkan: empty prompt"
-    );
+    anyhow::ensure!(!prompt_tokens.is_empty(), "generate_mtp_spec: empty prompt");
     let p = prompt_tokens.len();
-    let max_ctx = p + max_new + n_max + 8;
 
-    let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
     let mut trunk_state: Option<crate::cpu_backend::SeamKv> = None;
-    let mut head_sess =
-        MtpHeadSession::new_vulkan(&vk, model.gguf(), cfg, head, model.token_embd(), max_ctx)?;
 
     // ── prime: one VERIFY over the whole prompt, then catch the head up over it ──────────────
     let t_prime = std::time::Instant::now();
     let (logits0, h_rows0) = run_verify(
-        &vk,
+        be,
+        bind,
         model.gguf(),
         cfg,
         model.token_embd(),
@@ -1235,7 +1378,7 @@ pub fn generate_mtp_spec_vulkan_timed(
     if p > 1 {
         shifted_h[ne..].copy_from_slice(&h_rows0[..(p - 1) * ne]);
     }
-    catch_up(&mut head_sess, &prompt_tokens, &shifted_h, 0)?;
+    catch_up(head_sess, &prompt_tokens, &shifted_h, 0)?;
 
     let mut committed = prompt_tokens.clone();
     let mut id_last = prompt_tokens[p - 1];
@@ -1268,7 +1411,7 @@ pub fn generate_mtp_spec_vulkan_timed(
 
         let t_draft = std::time::Instant::now();
         let drafted = draft(
-            &mut head_sess,
+            head_sess,
             id_last,
             &pending_h,
             n_past,
@@ -1282,7 +1425,8 @@ pub fn generate_mtp_spec_vulkan_timed(
         feed.extend_from_slice(&cand);
         let t_verify = std::time::Instant::now();
         let (logits, h_rows) = run_verify(
-            &vk,
+            be,
+            bind,
             model.gguf(),
             cfg,
             model.token_embd(),
@@ -1326,7 +1470,7 @@ pub fn generate_mtp_spec_vulkan_timed(
         let catchup_h = &catchup_h_all[..(accepted + 1) * ne];
 
         let t_catchup = std::time::Instant::now();
-        catch_up(&mut head_sess, &catchup_tokens, catchup_h, n_past + 1)?;
+        catch_up(head_sess, &catchup_tokens, catchup_h, n_past + 1)?;
         let catchup_secs = t_catchup.elapsed().as_secs_f64();
         pending_h = catchup_h[accepted * ne..].to_vec();
         sum_draft_secs += draft_secs;

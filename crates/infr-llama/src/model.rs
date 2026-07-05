@@ -452,6 +452,8 @@ impl ChatModel for DenseSeamChat {
 pub struct MetalSeamChat {
     model: CpuModel,
     session: Option<crate::cpu_model::DenseMetalSession>,
+    mtp_head: Option<crate::mtp::MtpHeadWeights>,
+    mtp_checked: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -460,7 +462,32 @@ impl MetalSeamChat {
         Self {
             model,
             session: None,
+            mtp_head: None,
+            mtp_checked: false,
         }
+    }
+
+    /// MTP mode is opt-in (`INFR_MTP=1`) and only for a qwen35 GGUF that ships an MTP head — the
+    /// Metal twin of [`DenseSeamChat::wants_mtp`]. Memoized so a non-MTP GGUF doesn't re-parse
+    /// its `Config` every turn.
+    fn wants_mtp(&mut self) -> Result<bool> {
+        if self.mtp_head.is_some() {
+            return Ok(true);
+        }
+        if self.mtp_checked {
+            return Ok(false);
+        }
+        self.mtp_checked = true;
+        if std::env::var("INFR_MTP").ok().as_deref() != Some("1")
+            || self.model.config().n_layer_nextn == 0
+        {
+            return Ok(false);
+        }
+        self.mtp_head = Some(crate::mtp::load_mtp_head(
+            self.model.gguf(),
+            self.model.config(),
+        )?);
+        Ok(true)
     }
 
     fn ensure_session(&mut self) -> Result<()> {
@@ -500,6 +527,16 @@ impl ChatModel for MetalSeamChat {
         max_new: usize,
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
+        // MTP (INFR_MTP=1 on a qwen35 head-bearing GGUF): the draft-verify-catchup loop over the
+        // Metal trunk + head, instead of the plain session decode. The committed stream is the
+        // target's greedy stream (the same invariant Vulkan MTP holds), so the two are
+        // token-identical — pinned by the greedy-equivalence check in the CLI validation.
+        if self.wants_mtp()? {
+            let head = self.mtp_head.as_ref().expect("wants_mtp loaded it");
+            return crate::mtp::generate_mtp_spec_metal(&self.model, head, prompt, max_new, |p| {
+                on_piece(p)
+            });
+        }
         self.ensure_session()?;
         self.model
             .generate_metal_session(self.session.as_mut().unwrap(), prompt, max_new, |p| {
@@ -652,6 +689,22 @@ impl ChatModel for CpuDenseChat {
             return Err(anyhow::anyhow!(
                 "the Metal backend is only available on macOS"
             ));
+        }
+        // CPU MTP (INFR_MTP=1 on a head-bearing qwen35 GGUF): the exact-f32 reference for the
+        // draft-verify loop — its acceptance rate is the oracle a GPU backend's alpha is judged
+        // against (a backend whose head numerics drift from its trunk shows a lower alpha here).
+        if std::env::var("INFR_MTP").ok().as_deref() == Some("1")
+            && self.model.config().n_layer_nextn > 0
+        {
+            let head = crate::mtp::load_mtp_head(self.model.gguf(), self.model.config())?;
+            return crate::mtp::generate_mtp_spec_cpu_timed(
+                &self.model,
+                &head,
+                prompt,
+                max_new,
+                |p| on_piece(p),
+            )
+            .map(|(stats, _)| stats);
         }
         self.model.generate_cpu(prompt, max_new, |p| on_piece(p))
     }
