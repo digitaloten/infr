@@ -14,6 +14,7 @@ mod gemm;
 pub mod linear;
 mod matmul;
 mod ops;
+mod pcache;
 mod recorder;
 
 pub use recorder::{RecordedCmd, Recorder};
@@ -97,6 +98,12 @@ struct VulkanShared {
     linear_kernel: std::sync::OnceLock<crate::linear::LinearKernel>,
     /// Generic cache of compute kernels by name (see `ops.rs`).
     kernels: Mutex<HashMap<&'static str, crate::ops::ComputeKernel>>,
+    /// Device pipeline cache, seeded from disk at init and persisted back (see `pcache.rs`) so
+    /// pipeline creation after the first-ever launch reuses cached driver binaries. Null when
+    /// creation failed (caching is then simply off — Vulkan accepts a null cache everywhere).
+    pipeline_cache: vk::PipelineCache,
+    /// Disk persistence for `pipeline_cache`; `None` = INFR_NO_PIPELINE_CACHE or no cache dir.
+    pcache: Option<crate::pcache::PcachePersist>,
     /// Active weight-load progress bar (see [`VulkanBackend::weight_progress`]). Every
     /// `BufferUsage::Weights` allocation advances it, so no model loader can forget to tick it.
     weight_pb: Mutex<Option<indicatif::ProgressBar>>,
@@ -106,6 +113,16 @@ struct VulkanShared {
 // accessed through our Mutexes.
 unsafe impl Send for VulkanShared {}
 unsafe impl Sync for VulkanShared {}
+
+impl VulkanShared {
+    /// Debounced disk save of the pipeline cache — call after a NEW pipeline lands so long-lived
+    /// processes (serve) persist without waiting for a clean Drop.
+    pub(crate) fn persist_pipeline_cache(&self) {
+        if let Some(pc) = &self.pcache {
+            pc.maybe_save(&self.device, self.pipeline_cache);
+        }
+    }
+}
 
 impl Drop for VulkanShared {
     fn drop(&mut self) {
@@ -120,6 +137,13 @@ impl Drop for VulkanShared {
                     crate::ops::destroy_compute_kernel(&self.device, k);
                 }
             }
+            // Persist the pipeline cache (final save — the debounced mid-run saves may have
+            // missed the tail) and destroy it.
+            if let Some(pc) = &self.pcache {
+                pc.save(&self.device, self.pipeline_cache);
+            }
+            self.device
+                .destroy_pipeline_cache(self.pipeline_cache, None);
             // Destroy command pool.
             let pool = *self.cmd_pool.lock().unwrap();
             self.device.destroy_command_pool(pool, None);
@@ -469,6 +493,20 @@ impl VulkanBackend {
         })
         .map_err(|e| be(format!("gpu_allocator::Allocator::new: {e}")))?;
 
+        // ── on-disk pipeline cache (see `pcache.rs`) ───────────────────────────
+        let pcache = crate::pcache::PcachePersist::new(&props);
+        let initial = pcache.as_ref().and_then(|p| p.load()).unwrap_or_default();
+        let mut pc_info = vk::PipelineCacheCreateInfo::default();
+        if !initial.is_empty() {
+            pc_info = pc_info.initial_data(&initial);
+        }
+        // A corrupt-but-well-enveloped blob can still fail creation: retry empty, never fatal.
+        let pipeline_cache = unsafe { device.create_pipeline_cache(&pc_info, None) }
+            .or_else(|_| unsafe {
+                device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None)
+            })
+            .unwrap_or(vk::PipelineCache::null());
+
         Ok(Self {
             shared: Arc::new(VulkanShared {
                 _entry: entry,
@@ -484,6 +522,8 @@ impl VulkanBackend {
                 weight_arena: Mutex::new(None),
                 linear_kernel: std::sync::OnceLock::new(),
                 kernels: Mutex::new(HashMap::new()),
+                pipeline_cache,
+                pcache,
                 weight_pb: Mutex::new(None),
             }),
         })

@@ -29,6 +29,7 @@ pub(crate) struct ComputeKernel {
 
 pub(crate) fn make_compute_kernel(
     device: &ash::Device,
+    pcache: vk::PipelineCache,
     spv: &[u32],
     n_buf: usize,
     push_size: u32,
@@ -84,7 +85,7 @@ pub(crate) fn make_compute_kernel(
     let pipeline = unsafe {
         device
             .create_compute_pipelines(
-                vk::PipelineCache::null(),
+                pcache, // disk-persisted device cache (see pcache.rs); null = caching off
                 &[vk::ComputePipelineCreateInfo::default()
                     .stage(stage)
                     .layout(pipeline_layout)],
@@ -137,10 +138,20 @@ impl VulkanBackend {
         n_buf: usize,
         push_size: u32,
     ) -> ComputeKernel {
-        let mut map = self.shared.kernels.lock().unwrap();
-        *map.entry(name).or_insert_with(|| {
-            make_compute_kernel(&self.shared.device, spv, n_buf, push_size, None)
-        })
+        if let Some(k) = self.shared.kernels.lock().unwrap().get(name) {
+            return *k;
+        }
+        let k = make_compute_kernel(
+            &self.shared.device,
+            self.shared.pipeline_cache,
+            spv,
+            n_buf,
+            push_size,
+            None,
+        );
+        self.shared.kernels.lock().unwrap().insert(name, k);
+        self.shared.persist_pipeline_cache(); // new pipeline -> debounced disk save
+        k
     }
 
     /// Like `kernel`, but pins the pipeline's subgroup size (coopmat needs wave32 on RDNA3).
@@ -152,10 +163,20 @@ impl VulkanBackend {
         push_size: u32,
         sg_size: u32,
     ) -> ComputeKernel {
-        let mut map = self.shared.kernels.lock().unwrap();
-        *map.entry(name).or_insert_with(|| {
-            make_compute_kernel(&self.shared.device, spv, n_buf, push_size, Some(sg_size))
-        })
+        if let Some(k) = self.shared.kernels.lock().unwrap().get(name) {
+            return *k;
+        }
+        let k = make_compute_kernel(
+            &self.shared.device,
+            self.shared.pipeline_cache,
+            spv,
+            n_buf,
+            push_size,
+            Some(sg_size),
+        );
+        self.shared.kernels.lock().unwrap().insert(name, k);
+        self.shared.persist_pipeline_cache(); // new pipeline -> debounced disk save
+        k
     }
 
     /// Eagerly run a kernel: bind `inputs` (read) then one output buffer (read_write), push

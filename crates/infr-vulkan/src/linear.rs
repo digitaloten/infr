@@ -221,7 +221,10 @@ pub(crate) struct LinearKernel {
     pub desc_pool: vk::DescriptorPool,
 }
 
-pub(crate) fn create_linear_kernel(device: &ash::Device) -> LinearKernel {
+pub(crate) fn create_linear_kernel(
+    device: &ash::Device,
+    pcache: vk::PipelineCache,
+) -> LinearKernel {
     let spv = linear_spv();
     let shader = unsafe {
         device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(spv), None)
@@ -267,7 +270,7 @@ pub(crate) fn create_linear_kernel(device: &ash::Device) -> LinearKernel {
     let pipeline = unsafe {
         device
             .create_compute_pipelines(
-                vk::PipelineCache::null(),
+                pcache, // disk-persisted device cache (see pcache.rs)
                 &[vk::ComputePipelineCreateInfo::default()
                     .stage(stage)
                     .layout(pipeline_layout)],
@@ -312,9 +315,15 @@ pub(crate) fn destroy_linear_kernel(device: &ash::Device, k: &LinearKernel) {
 
 impl VulkanBackend {
     fn linear_kernel(&self) -> &LinearKernel {
-        self.shared
+        let first = self.shared.linear_kernel.get().is_none();
+        let k = self
+            .shared
             .linear_kernel
-            .get_or_init(|| create_linear_kernel(&self.shared.device))
+            .get_or_init(|| create_linear_kernel(&self.shared.device, self.shared.pipeline_cache));
+        if first {
+            self.shared.persist_pipeline_cache(); // new pipeline -> debounced disk save
+        }
+        k
     }
 
     /// Upload an `[out, in]` f32 weight to a persistent device buffer.

@@ -115,7 +115,7 @@ impl VulkanBackend {
         let pipeline = unsafe {
             device
                 .create_compute_pipelines(
-                    vk::PipelineCache::null(),
+                    self.shared.pipeline_cache, // disk-persisted device cache (see pcache.rs)
                     &[vk::ComputePipelineCreateInfo::default()
                         .stage(stage)
                         .layout(pipeline_layout)],

@@ -731,6 +731,23 @@ fn main() {
             .expect("failed to run glslc — install shaderc (provides glslc)");
         assert!(status.success(), "glslc failed for {src}");
     }
+    // Shader-set fingerprint for the on-disk vkPipelineCache (see src/pcache.rs): FNV-1a over
+    // every compiled SPIR-V blob in the (stable) build-list order. Any shader edit, new variant,
+    // or glslc/define change flips it, and the persisted cache file is discarded wholesale —
+    // stale pipeline entries never accumulate across shader-set changes.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for (_, dst_stem, _) in builds {
+        let bytes = std::fs::read(format!("{out}/{dst_stem}.spv")).expect("read spv for hash");
+        for b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    }
+    std::fs::write(
+        format!("{out}/shader_fingerprint.rs"),
+        format!("pub(crate) const SHADER_SET_FINGERPRINT: u64 = {h:#x};\n"),
+    )
+    .expect("write shader_fingerprint.rs");
 }
 
 /// Generate `native_grids.glsl` (the i-quant lookup tables as GLSL `const` arrays) from
