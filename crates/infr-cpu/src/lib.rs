@@ -2348,7 +2348,14 @@ fn expert_matvec_batch(
     // Fast path 1: int8-activation batched dot at the 256-element super-block granularity (same
     // kernels `Op::Linear`'s m>1 path uses) — needs `in_f` to be a whole number of super-blocks;
     // true for MoE's `gate`/`up` (`in_f = n_embd`), not guaranteed for `down`.
-    if matches!(dt, DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q5K) && in_f.is_multiple_of(256)
+    // Both int8 fast paths are gated on count >= 2: the activation quantization is a real (small)
+    // approximation, and every SINGLE-row consumer — the Metal MoE parity tests (1e-3 elementwise
+    // vs the device), qwen3moe's per-token decode — was calibrated against the exact
+    // dequant+f32-dot path below. Batched callers (DiffusionGemma's 256-row denoise buckets,
+    // average ~16 rows/expert) keep the win; count==1 keeps pre-batching numerics exactly.
+    if count >= 2
+        && matches!(dt, DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q5K)
+        && in_f.is_multiple_of(256)
     {
         let q8s: Vec<Q8> = (0..count)
             .map(|r| quantize_q8(&xin[r * in_f..r * in_f + in_f]))
@@ -2371,7 +2378,7 @@ fn expert_matvec_batch(
     }
     // Fast path 2: Q8_0/Q5_0 at THEIR OWN 32-element native block — covers `down`'s misaligned
     // `in_f` (e.g. 704) without ever materializing a dequantized f32 row.
-    if matches!(dt, DType::Q8_0 | DType::Q5_0) && in_f.is_multiple_of(32) {
+    if count >= 2 && matches!(dt, DType::Q8_0 | DType::Q5_0) && in_f.is_multiple_of(32) {
         let q8s: Vec<Q8x32> = (0..count)
             .map(|r| quantize_q8_32(&xin[r * in_f..r * in_f + in_f]))
             .collect();
