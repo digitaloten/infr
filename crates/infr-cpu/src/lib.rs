@@ -1517,14 +1517,139 @@ unsafe fn vec_dot_q4k_batch8_avx512bw(
     }
 }
 
+/// AVX512-VNNI variant of [`vec_dot_q4k_batch8_avx512bw`]: dpbusd replaces the maddubs+madd
+/// pair inside the deferred-hadd 8-row tile (bit-identical — see [`vec_dot_q4k_batch_vnni`];
+/// the deferred mullo/add accumulation and final hadds are unchanged).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw,avx512vnni")]
+unsafe fn vec_dot_q4k_batch8_vnni(
+    rows: [&[u8]; 8],
+    q8s: &[Q8],
+    in_f: usize,
+    outs: [&mut [f32]; 8],
+) {
+    use std::arch::x86_64::*;
+    let m = q8s.len();
+    let nb = in_f / 256;
+    let mask_lo = _mm256_set1_epi8(0x0F_u8 as i8);
+
+    // Pre-expand all 8 weight rows once. Layout identical to the single-row AVX-512BW
+    // batch kernel: flat[i][b*256 + k*64 .. +64] = [lo_nib 32B, hi_nib 32B] for pair k.
+    let mut flats: [Vec<u8>; 8] = std::array::from_fn(|_| vec![0u8; nb * 256]);
+    let mut d_arr: [Vec<f32>; 8] = std::array::from_fn(|_| vec![0f32; nb]);
+    let mut dmin_arr: [Vec<f32>; 8] = std::array::from_fn(|_| vec![0f32; nb]);
+    let mut sc_arr: [Vec<[u32; 8]>; 8] = std::array::from_fn(|_| vec![[0u32; 8]; nb]);
+    let mut m_arr: [Vec<[u32; 8]>; 8] = std::array::from_fn(|_| vec![[0u32; 8]; nb]);
+
+    for i in 0..8 {
+        for b in 0..nb {
+            let blk = &rows[i][b * 144..b * 144 + 144];
+            d_arr[i][b] = rdf16(&blk[0..2]);
+            dmin_arr[i][b] = rdf16(&blk[2..4]);
+            let scales = &blk[4..16];
+            let qs = &blk[16..144];
+            for s in 0..8usize {
+                let (sc, mv) = k4(s, scales);
+                sc_arr[i][b][s] = sc;
+                m_arr[i][b][s] = mv;
+            }
+            let f = &mut flats[i][b * 256..b * 256 + 256];
+            for k in 0..4usize {
+                let nibs = _mm256_loadu_si256(qs[k * 32..].as_ptr() as *const __m256i);
+                let lo = _mm256_and_si256(nibs, mask_lo);
+                let hi = _mm256_and_si256(_mm256_srli_epi16(nibs, 4), mask_lo);
+                _mm256_storeu_si256(f[k * 64..].as_mut_ptr() as *mut __m256i, lo);
+                _mm256_storeu_si256(f[k * 64 + 32..].as_mut_ptr() as *mut __m256i, hi);
+            }
+        }
+    }
+
+    // Destructure outs so we can write to 8 independent &mut [f32] without aliasing.
+    let [o0, o1, o2, o3, o4, o5, o6, o7] = outs;
+
+    // Per-token dot: for each token r, load the Q8 activation zmm ONCE per (b, k) pair
+    // and reuse it across all 8 weight rows — 8× the FMAs per activation load.
+    for r in 0..m {
+        let q8 = &q8s[r];
+        let mut sumf = [0f32; 8];
+
+        for b in 0..nb {
+            // ── Deferred-hadd accumulation ──────────────────────────────────────────
+            // Instead of hadd_i32_ymm inside the k loop (8 rows × 2 hadd × 4 k = 64
+            // hadd calls/block, all on port 5), we accumulate scaled ymm vectors and
+            // hadd once per row after all k-pairs are done (16 hadd calls/block).
+            //
+            // Bit-identical: hadd(Σ_k scale[k]·v[k]) = Σ_k scale[k]·hadd(v[k])
+            // because hadd is a linear sum and integer mullo is exact (no overflow for
+            // our value ranges: sc≤63, per-element sum≤4×15×127 ≈ 7620 → product ≤ ~480k
+            // → fits i32; 8-element accumulation ≤ ~3.8M → fits i32).
+            //
+            // acc_lo[i] = Σ_k ( sc_e[k] × lo_ymm[k] )   — 8 × i32 lanes
+            // acc_hi[i] = Σ_k ( sc_o[k] × hi_ymm[k] )   — 8 × i32 lanes
+            // sd_i     = hadd(acc_lo[i]) + hadd(acc_hi[i])
+            let mut acc_lo = [_mm256_setzero_si256(); 8];
+            let mut acc_hi = [_mm256_setzero_si256(); 8];
+            let mut sm = [0i32; 8];
+            let q8b = &q8.qs[b * 256..b * 256 + 256];
+
+            for k in 0..4usize {
+                // ── ONE activation load for pair k, shared by all 8 weight rows ──
+                let q8_zmm = _mm512_loadu_si512(q8b[k * 64..].as_ptr() as *const __m512i);
+                let isum_e = q8.bsums[b * 8 + 2 * k];
+                let isum_o = q8.bsums[b * 8 + 2 * k + 1];
+
+                // ── 8 weight row dots against the shared q8_zmm ──
+                for i in 0..8usize {
+                    let (sc_e, ma_e) = (sc_arr[i][b][2 * k], m_arr[i][b][2 * k]);
+                    let (sc_o, ma_o) = (sc_arr[i][b][2 * k + 1], m_arr[i][b][2 * k + 1]);
+                    let qi_zmm =
+                        _mm512_loadu_si512(flats[i][b * 256 + k * 64..].as_ptr() as *const __m512i);
+                    let sum32 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), qi_zmm, q8_zmm);
+                    let lo_ymm = _mm512_castsi512_si256(sum32);
+                    let hi_ymm = _mm512_extracti64x4_epi64::<1>(sum32);
+                    // Scale each 8×i32 sub-block by its per-sub-block scale and
+                    // accumulate into ymm registers — no hadd in the hot path.
+                    acc_lo[i] = _mm256_add_epi32(
+                        acc_lo[i],
+                        _mm256_mullo_epi32(lo_ymm, _mm256_set1_epi32(sc_e as i32)),
+                    );
+                    acc_hi[i] = _mm256_add_epi32(
+                        acc_hi[i],
+                        _mm256_mullo_epi32(hi_ymm, _mm256_set1_epi32(sc_o as i32)),
+                    );
+                    sm[i] += ma_e as i32 * isum_e + ma_o as i32 * isum_o;
+                }
+            }
+            // ── 2 hadd per row per block (vs 8 in eager version) ──────────────────
+            for i in 0..8 {
+                let sd_i = hadd_i32_ymm(acc_lo[i]) + hadd_i32_ymm(acc_hi[i]);
+                sumf[i] += q8.d[b] * (d_arr[i][b] * sd_i as f32 - dmin_arr[i][b] * sm[i] as f32);
+            }
+        }
+        o0[r] = sumf[0];
+        o1[r] = sumf[1];
+        o2[r] = sumf[2];
+        o3[r] = sumf[3];
+        o4[r] = sumf[4];
+        o5[r] = sumf[5];
+        o6[r] = sumf[6];
+        o7[r] = sumf[7];
+    }
+}
+
 /// Batch Q4_K 8-row tile: `outs[i][r] = vec_dot_q4k(rows[i], &q8s[r], in_f)` for all i,r.
 /// Bit-identical to the single-token kernel. On AVX-512BW machines the Q8 activation is
 /// loaded once per (block, nibble-pair) and dotted against all 8 weight rows — 8× activation
 /// reuse over single-row, 4× over 2-row. Falls back to 8× `vec_dot_q4k_batch` on older CPUs.
 fn vec_dot_q4k_batch8(rows: [&[u8]; 8], q8s: &[Q8], in_f: usize, outs: [&mut [f32]; 8]) {
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx512bw") {
-        return unsafe { vec_dot_q4k_batch8_avx512bw(rows, q8s, in_f, outs) };
+    {
+        if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni") {
+            return unsafe { vec_dot_q4k_batch8_vnni(rows, q8s, in_f, outs) };
+        }
+        if is_x86_feature_detected!("avx512bw") {
+            return unsafe { vec_dot_q4k_batch8_avx512bw(rows, q8s, in_f, outs) };
+        }
     }
     // Fallback: call the per-row batch kernel (avx2/scalar dispatch) for each of the 8 rows.
     let [row0, row1, row2, row3, row4, row5, row6, row7] = rows;
@@ -2508,6 +2633,111 @@ unsafe fn vec_dot_q8_0_32_batch_avx512bw(row: &[u8], q8s: &[Q8x32], in_f: usize,
 /// bits from `qs` + 1 high bit from `qh`, per `dequant_block`'s Q5_0 case) — so
 /// `Σy·x = d_w·(Σcode·x − 16·Σx) ≈ d_w·d8·(Σcode·q8 − 16·bsum)`.
 fn vec_dot_q5_0_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vnni")
+            && is_x86_feature_detected!("avx512vl")
+        {
+            // SAFETY: features detected at runtime; pointer bounds checked by slice indexing.
+            return unsafe { vec_dot_q5_0_32_batch_vnni(row, q8s, in_f, out) };
+        }
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { vec_dot_q5_0_32_batch_avx2(row, q8s, in_f, out) };
+        }
+    }
+    vec_dot_q5_0_32_batch_scalar(row, q8s, in_f, out);
+}
+
+/// Expand one weight row's Q5_0 codes (5-bit, 0..31, the UNSIGNED pre-`−16` values) into a flat
+/// `[nb*32]` u8 buffer ONCE per row — the scalar kernel re-decoded nibble+high-bit per
+/// (activation-row, block), which multiplied the decode cost by the batch size. Shared by the
+/// SIMD kernels; layout `flat[b*32 + j]` = code j of block b (j 0..15 = lo nibbles, 16..31 = hi).
+#[inline]
+fn q5_0_expand_codes(row: &[u8], nb: usize, bpr: usize) -> (Vec<u8>, Vec<f32>) {
+    let mut flat = vec![0u8; nb * 32];
+    let mut d_arr = vec![0f32; nb];
+    for b in 0..nb {
+        let blk = &row[b * bpr..b * bpr + bpr];
+        d_arr[b] = rdf16(&blk[0..2]);
+        let qh = u32::from_le_bytes(blk[2..6].try_into().unwrap());
+        let qs = &blk[6..22];
+        let f = &mut flat[b * 32..b * 32 + 32];
+        for j in 0..16 {
+            let xh0 = ((qh >> j) << 4) & 0x10;
+            let xh1 = (qh >> (j + 12)) & 0x10;
+            f[j] = (qs[j] as u32 & 0x0F | xh0) as u8;
+            f[j + 16] = (qs[j] as u32 >> 4 | xh1) as u8;
+        }
+    }
+    (flat, d_arr)
+}
+
+/// AVX2 kernel for `vec_dot_q5_0_32_batch`: codes pre-expanded once (see [`q5_0_expand_codes`]),
+/// then one `maddubs(code_u8, q8_s8)` block dot per (row, block) — codes ≤31 × |q8| ≤127 can't
+/// saturate the i16 pair sums. Bit-identical to the scalar oracle (integer dot exact; the
+/// per-block f32 accumulation expression and order are unchanged).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn vec_dot_q5_0_32_batch_avx2(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let nb = in_f / 32;
+    let bpr = 22usize;
+    let ones = _mm256_set1_epi16(1i16);
+    let (flat, d_arr) = q5_0_expand_codes(row, nb, bpr);
+    for (r, q8) in q8s.iter().enumerate() {
+        let mut sumf = 0f32;
+        for b in 0..nb {
+            let code = _mm256_loadu_si256(flat[b * 32..].as_ptr() as *const __m256i);
+            let q8v = _mm256_loadu_si256(q8.qs[b * 32..].as_ptr() as *const __m256i);
+            let prod = _mm256_maddubs_epi16(code, q8v);
+            let sum32 = _mm256_madd_epi16(prod, ones);
+            let iprod = hadd_i32_ymm(sum32);
+            sumf += d_arr[b] * q8.d[b] * (iprod as f32 - 16.0 * q8.bsum[b] as f32);
+        }
+        out[r] = sumf;
+    }
+}
+
+/// AVX512-VNNI kernel for `vec_dot_q5_0_32_batch`: two blocks per zmm, `dpbusd` in place of the
+/// maddubs+madd pair (see the AVX2 variant's bit-identity note; the two per-block f32 adds stay
+/// SEPARATE and in scalar order).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw,avx512vnni,avx512vl")]
+unsafe fn vec_dot_q5_0_32_batch_vnni(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let nb = in_f / 32;
+    let bpr = 22usize;
+    let pairs = nb / 2;
+    let (flat, d_arr) = q5_0_expand_codes(row, nb, bpr);
+    for (r, q8) in q8s.iter().enumerate() {
+        let mut sumf = 0f32;
+        for k in 0..pairs {
+            let (b0, b1) = (2 * k, 2 * k + 1);
+            let code_z = _mm512_loadu_si512(flat[b0 * 32..].as_ptr() as *const __m512i);
+            let qx_z = _mm512_loadu_si512(q8.qs[b0 * 32..].as_ptr() as *const __m512i);
+            let sum32_z = _mm512_dpbusd_epi32(_mm512_setzero_si512(), code_z, qx_z);
+            let lo_ymm = _mm512_castsi512_si256(sum32_z);
+            let hi_ymm = _mm512_extracti64x4_epi64::<1>(sum32_z);
+            let iprod0 = hadd_i32_ymm(lo_ymm);
+            let iprod1 = hadd_i32_ymm(hi_ymm);
+            sumf += d_arr[b0] * q8.d[b0] * (iprod0 as f32 - 16.0 * q8.bsum[b0] as f32);
+            sumf += d_arr[b1] * q8.d[b1] * (iprod1 as f32 - 16.0 * q8.bsum[b1] as f32);
+        }
+        if nb % 2 == 1 {
+            let b = nb - 1;
+            let code = _mm256_loadu_si256(flat[b * 32..].as_ptr() as *const __m256i);
+            let q8v = _mm256_loadu_si256(q8.qs[b * 32..].as_ptr() as *const __m256i);
+            let sum32 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), code, q8v);
+            let iprod = hadd_i32_ymm(sum32);
+            sumf += d_arr[b] * q8.d[b] * (iprod as f32 - 16.0 * q8.bsum[b] as f32);
+        }
+        out[r] = sumf;
+    }
+}
+
+/// Scalar oracle for `vec_dot_q5_0_32_batch` (also the non-x86 path).
+fn vec_dot_q5_0_32_batch_scalar(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
     let nb = in_f / 32;
     let bpr = 22usize; // f16 d (2B) + u32 qh (4B) + 16 × packed-nibble qs
     let mut d_arr = vec![0f32; nb];
@@ -2740,22 +2970,58 @@ fn expert_matvec_batch(
                 _ => unreachable!(),
             }
         };
+        // Q4_K rides the 8-row tile (`vec_dot_q4k_batch8`): the q8 activations are loaded once
+        // per (block, pair) and dotted against 8 weight rows — 8x the activation reuse of the
+        // per-row kernel, which is the dominant L2/L3 traffic in a big expert bucket (the same
+        // structural trick the Linear m>1 path already uses). `cols8` is a [8*count] scratch a
+        // whole output-row group owns; the tail (out_f % 8) falls back to the per-row kernel.
+        let q4k_tile = dt == DType::Q4K;
+        let dot_cols8 = |o8: usize, cols: &mut [f32]| {
+            debug_assert_eq!(cols.len(), 8 * count);
+            let rows: [&[u8]; 8] =
+                std::array::from_fn(|i| &wbytes[(o8 + i) * bpr..(o8 + i) * bpr + bpr]);
+            let mut it = cols.chunks_mut(count);
+            let outs: [&mut [f32]; 8] = std::array::from_fn(|_| it.next().unwrap());
+            vec_dot_q4k_batch8(rows, &q8s, in_f, outs);
+        };
+        let groups = if q4k_tile { out_f / 8 } else { 0 };
+        let tail_start = groups * 8;
         if par_o {
-            // Transposed scratch (`out_t[o*count+r]`) so each `o` owns a disjoint slice — no
-            // shared `col` to serialize on. Un-transposed into `out` in one final pass.
+            // Transposed scratch (`out_t[o*count+r]`) so each `o` (or 8-row group) owns a
+            // disjoint slice — no shared `col` to serialize on. Un-transposed into `out` once.
             let mut out_t = vec![0f32; out_f * count];
-            out_t
-                .par_chunks_mut(count)
-                .enumerate()
-                .for_each(|(o, col)| dot_col(o, col));
+            let (tiled, tail) = out_t.split_at_mut(tail_start * count);
+            rayon::join(
+                || {
+                    tiled
+                        .par_chunks_mut(8 * count)
+                        .enumerate()
+                        .for_each(|(g, cols)| dot_cols8(g * 8, cols));
+                },
+                || {
+                    tail.par_chunks_mut(count)
+                        .enumerate()
+                        .for_each(|(i, col)| dot_col(tail_start + i, col));
+                },
+            );
             for o in 0..out_f {
                 for r in 0..count {
                     out[r * out_f + o] = out_t[o * count + r];
                 }
             }
         } else {
+            let mut cols8 = vec![0f32; 8 * count];
+            for g in 0..groups {
+                dot_cols8(g * 8, &mut cols8);
+                for i in 0..8 {
+                    let o = g * 8 + i;
+                    for r in 0..count {
+                        out[r * out_f + o] = cols8[i * count + r];
+                    }
+                }
+            }
             let mut col = vec![0f32; count];
-            for o in 0..out_f {
+            for o in tail_start..out_f {
                 dot_col(o, &mut col);
                 for r in 0..count {
                     out[r * out_f + o] = col[r];
@@ -4304,6 +4570,34 @@ mod kernel_tests {
     /// only the final `d_w * d8 * iprod` formula does, which is shared. Runs whichever SIMD tier this
     /// CPU actually has (falls through to the same scalar fn on non-x86 or pre-AVX2 hardware, in which
     /// case the assertion is trivially true).
+    #[test]
+    fn q5_0_32_batch_simd_bit_identical_to_scalar() {
+        for in_f in [256usize, 704] {
+            let nb = in_f / 32;
+            let m = 5usize;
+            let mut w = det_bytes(nb * 22, 41);
+            for k in 0..nb {
+                put_f16(&mut w[k * 22..k * 22 + 2], 0.02);
+            }
+            let q8s: Vec<Q8x32> = (0..m)
+                .map(|r| quantize_q8_32(&det_x(in_f, 42 + r as u64)))
+                .collect();
+            let mut simd_out = vec![0f32; m];
+            vec_dot_q5_0_32_batch(&w, &q8s, in_f, &mut simd_out);
+            let mut scalar_out = vec![0f32; m];
+            vec_dot_q5_0_32_batch_scalar(&w, &q8s, in_f, &mut scalar_out);
+            for r in 0..m {
+                assert_eq!(
+                    simd_out[r].to_bits(),
+                    scalar_out[r].to_bits(),
+                    "q5_0_32 in_f={in_f} row={r}: simd {}, scalar {}",
+                    simd_out[r],
+                    scalar_out[r]
+                );
+            }
+        }
+    }
+
     #[test]
     fn q8_0_32_batch_simd_bit_identical_to_scalar() {
         for in_f in [256usize, 704] {
