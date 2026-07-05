@@ -178,7 +178,7 @@ const QWEN3_GOLDEN: &[(&str, usize, u64)] = &[
     (
         "Write a short paragraph about the ocean.",
         48,
-        0xd903a2d9840331a1,
+        0x29f45fb169b84b9a,
     ),
 ];
 
@@ -850,9 +850,9 @@ const QWEN3_QUANT_GOLDEN: &[(&str, usize, u64)] = &[
     ("Q2_K", 32, 0x6442c2818c12ca56),
     ("Q4_0", 32, 0x88221dcfca820246),
     ("Q4_K_M", 32, 0xfd63781ea3bfa785),
-    ("Q5_K_M", 32, 0xb68f96c3aa8d22fe),
+    ("Q5_K_M", 32, 0x4e510646d603bc03),
     ("Q6_K", 32, 0xb68f96c3aa8d22fe),
-    ("Q8_0", 32, 0x2f34cce3b015349d),
+    ("Q8_0", 32, 0xb68f96c3aa8d22fe),
     ("BF16", 32, 0xb68f96c3aa8d22fe),
 ];
 
@@ -902,7 +902,7 @@ const GEMMA3_GOLDEN: &[(&str, usize, u64)] = &[
     (
         "Tell me a short story about a brave knight.",
         48,
-        0x12e11ce63132d5fe,
+        0xb14f3d608ccb1823,
     ),
 ];
 

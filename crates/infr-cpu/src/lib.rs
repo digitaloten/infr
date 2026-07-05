@@ -1659,9 +1659,24 @@ unsafe fn q4k_pack(wbytes: &[u8], in_f: usize, out_f: usize) -> Q4kPack {
 unsafe fn q4k_gemm_group(pg: &Q4kPackGroup, nb: usize, q8s: &[Q8], cols: &mut [f32]) {
     use std::arch::x86_64::*;
     let m = q8s.len();
-    debug_assert_eq!(cols.len(), 8 * m);
+    // Raw-pointer inner loops: this GEMM's slice-range indexing was ~7% of ALL CPU as bounds
+    // checks (samply leaf `index.rs`). The offsets are validated here once instead — pack layout
+    // by construction of `q4k_pack`, activation layout by `quantize_q8`.
+    assert_eq!(cols.len(), 8 * m);
+    assert!(pg.ilv.len() >= nb * 2048 && pg.sc16.len() >= nb * 128 && pg.msc.len() >= nb * 64);
+    assert!(pg.d.len() >= nb * 8 && pg.dmin.len() >= nb * 8);
+    let ilv_p = pg.ilv.as_ptr();
+    let sc16_p = pg.sc16.as_ptr();
+    let msc_p = pg.msc.as_ptr();
+    let d_p = pg.d.as_ptr();
+    let dmin_p = pg.dmin.as_ptr();
+    let cols_p = cols.as_mut_ptr();
     for r in 0..m {
         let q8 = &q8s[r];
+        assert!(q8.qs.len() >= nb * 256 && q8.bsums.len() >= nb * 8 && q8.d.len() >= nb);
+        let qs_p = q8.qs.as_ptr();
+        let bsums_p = q8.bsums.as_ptr();
+        let qd_p = q8.d.as_ptr();
         let mut sumf_v = _mm256_setzero_ps();
         for b in 0..nb {
             // Vertical accumulation: each sub-block's 16-lane sums are scaled with ONE 512-bit
@@ -1670,23 +1685,22 @@ unsafe fn q4k_gemm_group(pg: &Q4kPackGroup, nb: usize, q8s: &[Q8], cols: &mut [f
             // (Σ_s sc·(a+b) = Σ_s (sc·a + sc·b)) — still bit-identical to the scalar oracle.
             let mut sd_zmm = _mm512_setzero_si512();
             let mut sm_ymm = _mm256_setzero_si256();
-            let q8b = &q8.qs[b * 256..b * 256 + 256];
+            let q8b = qs_p.add(b * 256);
             for st in 0..8usize {
                 let mut acc = _mm512_setzero_si512();
                 for gg in 0..4usize {
                     let w = _mm512_loadu_si512(
-                        pg.ilv[b * 2048 + st * 256 + gg * 64..].as_ptr() as *const __m512i
+                        ilv_p.add(b * 2048 + st * 256 + gg * 64) as *const __m512i
                     );
                     let a = _mm512_set1_epi64(
-                        (q8b[st * 32 + gg * 8..].as_ptr() as *const i64).read_unaligned(),
+                        (q8b.add(st * 32 + gg * 8) as *const i64).read_unaligned(),
                     );
                     acc = _mm512_dpbusd_epi32(acc, w, a);
                 }
-                let sc16 =
-                    _mm512_loadu_si512(pg.sc16[b * 128 + st * 16..].as_ptr() as *const __m512i);
+                let sc16 = _mm512_loadu_si512(sc16_p.add(b * 128 + st * 16) as *const __m512i);
                 sd_zmm = _mm512_add_epi32(sd_zmm, _mm512_mullo_epi32(acc, sc16));
-                let m_v = _mm256_loadu_si256(pg.msc[b * 64 + st * 8..].as_ptr() as *const __m256i);
-                let isum = _mm256_set1_epi32(q8.bsums[b * 8 + st]);
+                let m_v = _mm256_loadu_si256(msc_p.add(b * 64 + st * 8) as *const __m256i);
+                let isum = _mm256_set1_epi32(*bsums_p.add(b * 8 + st));
                 sm_ymm = _mm256_add_epi32(sm_ymm, _mm256_mullo_epi32(m_v, isum));
             }
             let sd_lo = _mm512_castsi512_si256(sd_zmm);
@@ -1694,16 +1708,17 @@ unsafe fn q4k_gemm_group(pg: &Q4kPackGroup, nb: usize, q8s: &[Q8], cols: &mut [f
             let sd_ymm = _mm256_hadd_epi32(sd_lo, sd_hi); // pair-merge -> PERM order, once per block
             let sd_f = _mm256_cvtepi32_ps(sd_ymm);
             let sm_f = _mm256_cvtepi32_ps(sm_ymm);
-            let d_v = _mm256_loadu_ps(pg.d[b * 8..].as_ptr());
-            let dmin_v = _mm256_loadu_ps(pg.dmin[b * 8..].as_ptr());
+            let d_v = _mm256_loadu_ps(d_p.add(b * 8));
+            let dmin_v = _mm256_loadu_ps(dmin_p.add(b * 8));
             let t = _mm256_sub_ps(_mm256_mul_ps(d_v, sd_f), _mm256_mul_ps(dmin_v, sm_f));
-            sumf_v = _mm256_add_ps(sumf_v, _mm256_mul_ps(_mm256_set1_ps(q8.d[b]), t));
+            sumf_v = _mm256_add_ps(sumf_v, _mm256_mul_ps(_mm256_set1_ps(*qd_p.add(b)), t));
         }
         let mut lanes = [0f32; 8];
         _mm256_storeu_ps(lanes.as_mut_ptr(), sumf_v);
         const PERM: [usize; 8] = [0, 1, 4, 5, 2, 3, 6, 7];
         for (j, &row) in PERM.iter().enumerate() {
-            cols[row * m + r] = lanes[j];
+            // SAFETY: row < 8, r < m, cols.len() == 8*m (asserted above).
+            *cols_p.add(row * m + r) = lanes[j];
         }
     }
 }
@@ -3208,12 +3223,14 @@ fn dot_f16(w: &[u8], x: &[f32]) -> f32 {
         for (j, ac) in acc.iter_mut().enumerate() {
             let i = c * 8 + j;
             let wv = half::f16::from_le_bytes([w[i * 2], w[i * 2 + 1]]).to_f32();
-            *ac += wv * x[i];
+            *ac = wv.mul_add(x[i], *ac);
         }
     }
     let mut s: f32 = acc.iter().sum();
     for i in chunks * 8..n {
-        s += half::f16::from_le_bytes([w[i * 2], w[i * 2 + 1]]).to_f32() * x[i];
+        s = half::f16::from_le_bytes([w[i * 2], w[i * 2 + 1]])
+            .to_f32()
+            .mul_add(x[i], s);
     }
     s
 }
@@ -3223,13 +3240,15 @@ fn dot_bf16(w: &[u8], x: &[f32]) -> f32 {
     let mut s = 0f32;
     for (i, &xi) in x.iter().enumerate() {
         let wv = f32::from_bits((u16::from_le_bytes([w[i * 2], w[i * 2 + 1]]) as u32) << 16);
-        s += wv * xi;
+        s = wv.mul_add(xi, s);
     }
     s
 }
 
 /// Dot product with 8 independent accumulators so the reduction isn't latency-bound — lets the
-/// autovectorizer (with `target-cpu=native`) keep several AVX FMA lanes in flight. `a`/`b` equal len.
+/// autovectorizer (with `target-cpu=native`) keep several AVX FMA lanes in flight. `mul_add`
+/// fuses each lane's multiply+add into one FMA (numerics policy: llama.cpp's f32 dots are FMA
+/// too) — this fn is attention's QK score and the F32-weight GEMM fallbacks (e.g. DG's router).
 #[inline]
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     let n = a.len().min(b.len());
@@ -3238,12 +3257,12 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     for c in 0..chunks {
         let base = c * 8;
         for (j, ac) in acc.iter_mut().enumerate() {
-            *ac += a[base + j] * b[base + j];
+            *ac = a[base + j].mul_add(b[base + j], *ac);
         }
     }
     let mut s: f32 = acc.iter().sum();
     for i in chunks * 8..n {
-        s += a[i] * b[i];
+        s = a[i].mul_add(b[i], s);
     }
     s
 }
