@@ -173,12 +173,12 @@ const QWEN3_GOLDEN: &[(&str, usize, u64)] = &[
     (
         "Explain how a computer works in simple terms.",
         48,
-        0xcb0381bae31a7d8f,
+        0xcf56ba8c4bb5c455,
     ),
     (
         "Write a short paragraph about the ocean.",
         48,
-        0xabca2bf79a3cdda2,
+        0xd903a2d9840331a1,
     ),
 ];
 
@@ -851,8 +851,8 @@ const QWEN3_QUANT_GOLDEN: &[(&str, usize, u64)] = &[
     ("Q4_0", 32, 0x88221dcfca820246),
     ("Q4_K_M", 32, 0xfd63781ea3bfa785),
     ("Q5_K_M", 32, 0xb68f96c3aa8d22fe),
-    ("Q6_K", 32, 0x925b523a6f67356b),
-    ("Q8_0", 32, 0xb68f96c3aa8d22fe),
+    ("Q6_K", 32, 0xb68f96c3aa8d22fe),
+    ("Q8_0", 32, 0x2f34cce3b015349d),
     ("BF16", 32, 0xb68f96c3aa8d22fe),
 ];
 
@@ -893,16 +893,16 @@ fn llama32_1b() -> Option<PathBuf> {
     )
 }
 
-// Captured + verified coherent: "Paris! 🇫🇷", a brave-knight short story (mournful Obsidian Peaks).
-// Knight hash re-blessed when dense Q5_0 Linear m>1 moved from the dequant+f32-dot fallback to
-// the int8 Q8x32 batch kernel (same regime as every other quantized dtype); output stayed
-// coherent, France-prompt hash unchanged.
+// Captured + verified coherent: "Paris! France is a country in Western Europe", a brave-knight
+// short story (Sir Kaelan, "gentle wonder and a touch of melancholy"). Re-blessed twice: dense
+// Q5_0 Linear onto the int8 kernel, then the attention-SIMD reassociation (numerics policy =
+// match-or-beat llama.cpp CPU precision; coherence re-verified each time).
 const GEMMA3_GOLDEN: &[(&str, usize, u64)] = &[
-    ("The capital of France is", 32, 0x4597cda816a0d1e7),
+    ("The capital of France is", 32, 0xbafb15f4284f726a),
     (
         "Tell me a short story about a brave knight.",
         48,
-        0x92fc5eeefb169094,
+        0x12e11ce63132d5fe,
     ),
 ];
 
@@ -934,7 +934,7 @@ const QWEN35_GOLDEN: &[(&str, usize, u64)] = &[
     (
         "Tell me a short story about a brave knight.",
         48,
-        0x0a0d2a6554ca9f21, // prefilled-think reasoning (story planning process)
+        0xbe06c5580ea33d78, // prefilled-think reasoning (story planning process)
     ),
 ];
 
@@ -1597,11 +1597,11 @@ fn qwen3moe_30b() -> Option<PathBuf> {
 // Captured + verified coherent (qwen3moe: routed-expert FFN, ~3B active of 30B).
 // Re-blessed 2026-07-05 for the whole-call int8 MoE gate (multi-row PREFILL calls now run the
 // int8-activation fast path in every bucket — a deliberate numeric-regime change; see
-// `expert_matvec_batch`'s `int8_ok` doc). Verified coherent ("<think>\nOkay, the user is asking,
-// \"The capital of France is...\" and then it cuts off. I need") — a near-tie token flipped
-// mid-thought vs the previous capture, same meaning.
+// the staged-MoE `int8_ok` doc). Verified coherent ("<think>\nOkay, the user is asking, \"The
+// capital of France is\". I need to provide the correct answer.") — re-blessed for the
+// attention-SIMD reassociation (numerics policy: match-or-beat llama.cpp CPU precision).
 const QWEN3MOE_GOLDEN: &[(&str, usize, u64)] =
-    &[("The capital of France is", 24, 0xa68ab7f4d15ad931)];
+    &[("The capital of France is", 24, 0xbc4f22b22d3e3c1d)];
 
 /// Whole-vector cosine similarity (f64 accumulation) — used by the CPU/Vulkan cross-backend
 /// logits check below.

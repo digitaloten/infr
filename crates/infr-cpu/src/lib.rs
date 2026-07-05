@@ -4244,11 +4244,14 @@ impl Backend for CpuBackend {
                         let n_keys = hi - lo;
                         let mut sc = vec![0f32; n_keys];
                         let mut mx = f32::NEG_INFINITY;
+                        let qrow = &qs[qb..qb + hd];
                         for (jj, scj) in sc.iter_mut().enumerate() {
                             let j = lo + jj;
                             let kb = (j * nkv + kvh) * hd;
-                            let d: f32 = (0..hd).map(|x| qs[qb + x] * ks[kb + x]).sum();
-                            *scj = d * scale;
+                            // 8-accumulator SIMD dot (was a serial per-element f32 chain — kept
+                            // scalar in an earlier campaign only because the reassociation
+                            // flipped a golden hash; the numerics policy now allows it).
+                            *scj = dot(qrow, &ks[kb..kb + hd]) * scale;
                             mx = mx.max(*scj);
                         }
                         let mut l = 0f32;
@@ -4259,8 +4262,9 @@ impl Backend for CpuBackend {
                             let j = lo + jj;
                             let p = (s - mx).exp() / l;
                             let vb = (j * nkv + kvh) * hd;
-                            for x in 0..hd {
-                                ob_slice[x] += p * vs[vb + x];
+                            // Independent lanes — vectorizes to FMA.
+                            for (o, &v) in ob_slice.iter_mut().zip(&vs[vb..vb + hd]) {
+                                *o = v.mul_add(p, *o);
                             }
                         }
                     });
