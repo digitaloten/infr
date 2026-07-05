@@ -5,7 +5,7 @@
 
 use crate::{dequant_block, Config, GenStats, PerLayerEmbd};
 use anyhow::{anyhow, Result as AResult};
-use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage};
+use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Plan};
 use infr_core::graph::{Activation, AttnMask, Graph, Op};
 use infr_core::tensor::{DType, TensorDesc, TensorId};
 use infr_core::WeightSource;
@@ -600,6 +600,31 @@ pub(crate) fn kv_fmt_bytes(dt: DType, elems: usize) -> usize {
     }
 }
 
+/// Phase-A perf: one (canvas_len, prompt_len)-shaped DiffusionGemma canvas-denoise graph, compiled
+/// once and replayed across every denoise step that shares the shape (see the `denoise_req` branch
+/// in `generate_dense_backend`). `cc` (canvas length) never changes within a session — it's the
+/// model's fixed `canvas_length` — and `p` (prompt length) only changes when a block commits and
+/// the next block's prefill grows the prefix. So within one block every step hits this cache: only
+/// the canvas hidden/positions get re-uploaded into the buffers held here, the plan itself replays.
+struct DenoiseCache {
+    cc: usize,
+    p: usize,
+    plan: Box<dyn Plan>,
+    dh: DecodeHandles,
+    hidden_buf: Box<dyn Buffer>,
+    pos_buf: Box<dyn Buffer>,
+    logits_buf: Box<dyn Buffer>,
+}
+
+/// Phase-A perf: DiffusionGemma's self-conditioning gated-MLP weights, dequantized ONCE (see
+/// `SeamKv::self_cond_w`) instead of on every `diffusion_self_cond` call.
+struct SelfCondWeights {
+    pre_norm: Vec<f32>,
+    gate_w: Vec<f32>, // [nff, ne]
+    up_w: Vec<f32>,   // [nff, ne]
+    down_w: Vec<f32>, // [ne, nff]
+}
+
 pub(crate) struct SeamKv {
     /// The uploaded weights, SHARED across slots (Arc): forking a new conversation slot costs
     /// only its KV + IO buffers, never a re-upload.
@@ -617,6 +642,14 @@ pub(crate) struct SeamKv {
     max_ctx: usize,
     /// Token ids whose KV rows are materialized (prompt + generated of the last turn).
     cached: Vec<u32>,
+    /// Phase-A perf: DiffusionGemma canvas-denoise plan + staging buffers, `None` for every
+    /// non-diffusion-gemma caller (never populated). Reset to `None` whenever the (cc, p) key
+    /// changes (see `DenoiseCache`).
+    denoise_cache: Option<DenoiseCache>,
+    /// Phase-A perf: DiffusionGemma self-conditioning MLP weights, dequantized lazily on the first
+    /// denoise call with self-conditioning ON. `Arc` so `fork()` shares it with forked conversation
+    /// slots for free (a pure function of the model, not per-conversation state).
+    self_cond_w: Option<std::sync::Arc<SelfCondWeights>>,
 }
 
 /// The upload-once half of a [`SeamKv`]: weight buffers + their declared (dtype, numel) specs and
@@ -717,6 +750,12 @@ impl SeamKv {
                 .map_err(|e| anyhow!("{e}"))?,
             max_ctx: self.max_ctx,
             cached: Vec::new(),
+            // The forked slot's KV/weight buffers are new objects, so a cached plan's bindings
+            // (which point at the OLD slot's buffers) don't carry over — rebuild lazily on this
+            // slot's first denoise call. `self_cond_w` is model-derived, not buffer-derived, so it
+            // DOES carry over (cheap Arc clone, skips a redundant dequant on the forked slot).
+            denoise_cache: None,
+            self_cond_w: self.self_cond_w.clone(),
         })
     }
 
@@ -813,8 +852,11 @@ fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
 /// weight (`sc_embT`, ~1.4 GB) — see the Phase-2 report's "deviation from spec" note. The Vulkan
 /// denoise path reuses this SAME host routine (identical math, so CPU/Vulkan self-cond agree
 /// bit-for-bit modulo the usual f32 rounding-order noise) rather than a GPU-resident soft-embed.
+///
+/// Phase-A perf: `scw` is the ONE-TIME dequant of the four self-cond tensors (see
+/// `SeamKv::self_cond_w`) — this used to re-dequantize all four on EVERY call.
 fn diffusion_self_cond(
-    g: &Gguf,
+    scw: &SelfCondWeights,
     c: &Config,
     token_embd: &[f32],
     sc_logits: &[f32],
@@ -825,10 +867,7 @@ fn diffusion_self_cond(
     let ne = c.n_embd;
     let vocab = c.vocab;
     debug_assert_eq!(sc_logits.len(), cc * vocab);
-    let (pre_norm, _) = crate::load_tensor_dequant(g, "self_cond_pre_norm.weight")?;
-    let (gate_w, _) = crate::load_tensor_dequant(g, "self_cond_gate.weight")?; // [nff, ne]
-    let (up_w, _) = crate::load_tensor_dequant(g, "self_cond_up.weight")?; // [nff, ne]
-    let (down_w, _) = crate::load_tensor_dequant(g, "self_cond_down.weight")?; // [ne, nff]
+    let (pre_norm, gate_w, up_w, down_w) = (&scw.pre_norm, &scw.gate_w, &scw.up_w, &scw.down_w);
     let nff = gate_w.len() / ne;
     let sqrt_ne = (ne as f32).sqrt();
     let eps = c.rms_eps;
@@ -868,7 +907,7 @@ fn diffusion_self_cond(
         let inv = 1.0 / (ms + eps).sqrt();
         let normed: Vec<f32> = soft
             .iter()
-            .zip(&pre_norm)
+            .zip(pre_norm.iter())
             .map(|(&x, &w)| x * inv * w)
             .collect();
         // Gated-GELU MLP: down(gelu_tanh(gate·normed) * (up·normed)).
@@ -1453,6 +1492,8 @@ pub(crate) fn generate_dense_backend(
             logits_buf,
             max_ctx: want_ctx,
             cached: Vec::new(),
+            denoise_cache: None,
+            self_cond_w: None,
         });
     }
     let SeamKv {
@@ -1467,6 +1508,8 @@ pub(crate) fn generate_dense_backend(
         logits_buf,
         max_ctx,
         cached,
+        denoise_cache,
+        self_cond_w,
     } = state.as_mut().expect("seam state just initialized");
     let SeamWeights {
         wbufs,
@@ -2793,6 +2836,10 @@ pub(crate) fn generate_dense_backend(
                 "canvas denoise forward: diffusion-gemma models only"
             ));
         }
+        // Phase-A perf: per-step timing, gated on INFR_DIFFUSION_TIME=1 (stderr, one line/step) —
+        // sizes how much of the ~6.6s/step wall time is this host block vs build/exec/download, so
+        // Phase B/C can target the right piece.
+        let time_diffusion = std::env::var("INFR_DIFFUSION_TIME").is_ok();
         let canvas = req.canvas_tokens;
         let cc = canvas.len();
         let p = denoise_p;
@@ -2801,6 +2848,7 @@ pub(crate) fn generate_dense_backend(
                 "denoise: prompt {p} + canvas {cc} exceeds the session KV capacity {max_ctx}"
             ));
         }
+        let t_sc0 = std::time::Instant::now();
         // 1. Canvas embedding: e = embed(tok)·√n_embd [+ self-cond], then weightless rms-norm
         // (no scale weight — matches `dg_canvas_embed` in the reference exactly). diffusion-gemma
         // is always gemma-family, so `embed_scale` is always √n_embd — computed locally (the
@@ -2820,7 +2868,22 @@ pub(crate) fn generate_dense_backend(
                     c.vocab
                 ));
             }
-            let sc_sig = diffusion_self_cond(g, c, token_embd, sc_logits, req.temp_inv, cc)?;
+            // Phase-A perf: dequantize the self-cond MLP weights ONCE per session, not once per
+            // call — `diffusion_self_cond` used to re-run four `load_tensor_dequant`s every step.
+            if self_cond_w.is_none() {
+                let (pre_norm, _) = crate::load_tensor_dequant(g, "self_cond_pre_norm.weight")?;
+                let (gate_w, _) = crate::load_tensor_dequant(g, "self_cond_gate.weight")?; // [nff, ne]
+                let (up_w, _) = crate::load_tensor_dequant(g, "self_cond_up.weight")?; // [nff, ne]
+                let (down_w, _) = crate::load_tensor_dequant(g, "self_cond_down.weight")?; // [ne, nff]
+                *self_cond_w = Some(std::sync::Arc::new(SelfCondWeights {
+                    pre_norm,
+                    gate_w,
+                    up_w,
+                    down_w,
+                }));
+            }
+            let scw = self_cond_w.as_ref().expect("just populated above");
+            let sc_sig = diffusion_self_cond(scw, c, token_embd, sc_logits, req.temp_inv, cc)?;
             for (h, s) in hidden_host.iter_mut().zip(sc_sig.iter()) {
                 *h += s;
             }
@@ -2832,47 +2895,84 @@ pub(crate) fn generate_dense_backend(
                 *v *= inv;
             }
         }
+        let sc_secs = t_sc0.elapsed().as_secs_f64();
         let dn_positions: Vec<i32> = (p as i32..(p + cc) as i32).collect();
-        let dn_hidden_buf = be
-            .alloc(cc * ne * 4, BufferUsage::Staging)
+
+        // Phase-A perf: cache the compiled plan + its staging buffers across denoise() calls,
+        // keyed by (cc, p) — see `DenoiseCache`'s doc. A hit skips `build`+`compile`+3 `alloc`s
+        // entirely; a miss (first call, new block, or a resized canvas) rebuilds once and the
+        // NEXT call on this (cc, p) hits.
+        let t_build0 = std::time::Instant::now();
+        let stale = match denoise_cache {
+            Some(dcache) => dcache.cc != cc || dcache.p != p,
+            None => true,
+        };
+        if stale {
+            // 2/3/4. Per-layer forward: the decoder-scalar / Canvas-mask denoise variant of
+            // `build`; 5. logits over ALL C rows (logits_rows = cc).
+            let (dg, dh) = build(cc, p, cc, true);
+            let plan = be.compile(&dg).map_err(|e| anyhow!("{e}"))?;
+            let hidden_buf = be
+                .alloc(cc * ne * 4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?;
+            let pos_buf = be
+                .alloc(cc * 4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?;
+            let logits_buf = be
+                .alloc(cc * c.vocab * 4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?;
+            *denoise_cache = Some(DenoiseCache {
+                cc,
+                p,
+                plan,
+                dh,
+                hidden_buf,
+                pos_buf,
+                logits_buf,
+            });
+        }
+        let build_secs = t_build0.elapsed().as_secs_f64();
+        let dcache = denoise_cache.as_ref().expect("just ensured present above");
+
+        be.upload(
+            dcache.hidden_buf.as_ref(),
+            bytemuck::cast_slice(&hidden_host),
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+        be.upload(dcache.pos_buf.as_ref(), bytemuck::cast_slice(&dn_positions))
             .map_err(|e| anyhow!("{e}"))?;
-        let dn_pos_buf = be
-            .alloc(cc * 4, BufferUsage::Staging)
-            .map_err(|e| anyhow!("{e}"))?;
-        let dn_logits_buf = be
-            .alloc(cc * c.vocab * 4, BufferUsage::Staging)
-            .map_err(|e| anyhow!("{e}"))?;
-        be.upload(dn_hidden_buf.as_ref(), bytemuck::cast_slice(&hidden_host))
-            .map_err(|e| anyhow!("{e}"))?;
-        be.upload(dn_pos_buf.as_ref(), bytemuck::cast_slice(&dn_positions))
-            .map_err(|e| anyhow!("{e}"))?;
-        // 2/3/4. Per-layer forward: the decoder-scalar / Canvas-mask denoise variant of `build`;
-        // 5. logits over ALL C rows (logits_rows = cc).
-        let (dg, dh) = build(cc, p, cc, true);
-        let dplan = be.compile(&dg).map_err(|e| anyhow!("{e}"))?;
         let mut db = Bindings::new();
-        db.bind(dh.hidden, dn_hidden_buf.as_ref());
-        db.bind(dh.positions, dn_pos_buf.as_ref());
-        if let (Some(rid), Some((rb, _))) = (dh.rope_freqs, &rf_buf) {
+        db.bind(dcache.dh.hidden, dcache.hidden_buf.as_ref());
+        db.bind(dcache.dh.positions, dcache.pos_buf.as_ref());
+        if let (Some(rid), Some((rb, _))) = (dcache.dh.rope_freqs, &rf_buf) {
             db.bind(rid, rb.as_ref());
         }
         for l in 0..c.n_layer {
-            db.bind(dh.k_cache[l], kbufs[l].as_ref());
-            db.bind(dh.v_cache[l], vbufs[l].as_ref());
+            db.bind(dcache.dh.k_cache[l], kbufs[l].as_ref());
+            db.bind(dcache.dh.v_cache[l], vbufs[l].as_ref());
         }
-        for (i, wid) in dh.weights.iter().enumerate() {
+        for (i, wid) in dcache.dh.weights.iter().enumerate() {
             db.bind(*wid, wbufs[i].as_ref());
         }
-        db.bind(dh.logits, dn_logits_buf.as_ref());
-        let t0 = std::time::Instant::now();
-        be.execute(dplan.as_ref(), &db)
+        db.bind(dcache.dh.logits, dcache.logits_buf.as_ref());
+        let t_exec0 = std::time::Instant::now();
+        be.execute(dcache.plan.as_ref(), &db)
             .map_err(|e| anyhow!("{e}"))?;
+        let exec_secs = t_exec0.elapsed().as_secs_f64();
         req.out_logits.resize(cc * c.vocab, 0.0);
+        let t_dl0 = std::time::Instant::now();
         be.download(
-            dn_logits_buf.as_ref(),
+            dcache.logits_buf.as_ref(),
             bytemuck::cast_slice_mut(req.out_logits),
         )
         .map_err(|e| anyhow!("{e}"))?;
+        let dl_secs = t_dl0.elapsed().as_secs_f64();
+        if time_diffusion {
+            eprintln!(
+                "[diffusion denoise] sc={sc_secs:.3}s build={build_secs:.3}s exec={exec_secs:.3}s dl={dl_secs:.3}s total={:.3}s",
+                sc_secs + build_secs + exec_secs + dl_secs,
+            );
+        }
         // `cached`/`start` were left untouched above (the canvas isn't part of the prompt/gen
         // token stream) — the prompt-KV rows 0..P stay exactly as the prior prefill call left
         // them, so the NEXT denoise call (same or different canvas) re-overwrites rows P..P+C
@@ -2881,7 +2981,7 @@ pub(crate) fn generate_dense_backend(
             Vec::new(),
             GenStats {
                 n_prompt: 0,
-                prompt_secs: t0.elapsed().as_secs_f64(),
+                prompt_secs: sc_secs + build_secs + exec_secs + dl_secs,
                 n_gen: 0,
                 decode_secs: 0.0,
             },
