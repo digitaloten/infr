@@ -59,6 +59,28 @@ impl DiffusionSession for DiffusionGemmaVulkanSession {
     }
 }
 
+#[cfg(target_os = "macos")]
+impl DiffusionSession for crate::cpu_model::DiffusionGemmaMetalSession {
+    fn prefill(&mut self, model: &CpuModel, tokens: &[u32]) -> Result<()> {
+        crate::cpu_model::DiffusionGemmaMetalSession::prefill(self, model, tokens)
+    }
+    fn denoise(
+        &mut self,
+        model: &CpuModel,
+        canvas_tokens: &[u32],
+        sc_logits: Option<&[f32]>,
+        temp_inv: f32,
+    ) -> Result<Vec<f32>> {
+        crate::cpu_model::DiffusionGemmaMetalSession::denoise(
+            self,
+            model,
+            canvas_tokens,
+            sc_logits,
+            temp_inv,
+        )
+    }
+}
+
 /// The entropy-bound sampler's tunables (`diffusion.eb_*` GGUF metadata — see `Config`'s fields
 /// and `diffusion-cli.cpp`'s `meta_f`/`meta_i` fallbacks).
 #[derive(Clone, Copy, Debug)]
