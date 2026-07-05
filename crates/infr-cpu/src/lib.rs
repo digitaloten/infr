@@ -3429,7 +3429,7 @@ fn expert_gemm_range(
     o1: usize,
     out_t: &mut [f32],
 ) {
-    debug_assert!(o0 % 8 == 0 && o0 <= o1 && o1 <= out_f);
+    debug_assert!(o0.is_multiple_of(8) && o0 <= o1 && o1 <= out_f);
     let bpr = wbytes.len() / out_f;
     let count = if o1 > o0 { out_t.len() / (o1 - o0) } else { 0 };
     match acts {
