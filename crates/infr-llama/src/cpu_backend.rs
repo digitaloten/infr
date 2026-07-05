@@ -745,6 +745,12 @@ struct SelfCondWeights {
     gate_w: Vec<f32>, // [nff, ne]
     up_w: Vec<f32>,   // [nff, ne]
     down_w: Vec<f32>, // [ne, nff]
+    /// f16 copy of `token_embd` (row-major [vocab, ne], f16 bits) for the SC soft-embed: the
+    /// vocab-tiled loop is L3-BANDWIDTH-bound (each canvas row re-reads the tile from L3 —
+    /// FMA alone measured neutral), so halving the element width halves the traffic. Same
+    /// precision as the reference, whose `sc_embT` is f16 (its CPU matmul then also converts
+    /// through f16). ~1.5 GB for gemma's 262k vocab, built once per session.
+    emb16: Vec<u16>,
 }
 
 pub(crate) struct SeamKv {
@@ -992,7 +998,6 @@ fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
 fn diffusion_self_cond(
     scw: &SelfCondWeights,
     c: &Config,
-    token_embd: &[f32],
     sc_logits: &[f32],
     temp_inv: f32,
     cc: usize,
@@ -1050,9 +1055,9 @@ fn diffusion_self_cond(
                     if p == 0.0 {
                         continue;
                     }
-                    let row_e = &token_embd[v * ne..v * ne + ne];
+                    let row_e = &scw.emb16[v * ne..v * ne + ne];
                     for (s, &e) in sr.iter_mut().zip(row_e) {
-                        *s = e.mul_add(p, *s);
+                        *s = half::f16::from_bits(e).to_f32().mul_add(p, *s);
                     }
                 }
             });
@@ -3316,15 +3321,29 @@ pub(crate) fn generate_dense_backend(
                     let (gate_w, _) = crate::load_tensor_dequant(g, "self_cond_gate.weight")?; // [nff, ne]
                     let (up_w, _) = crate::load_tensor_dequant(g, "self_cond_up.weight")?; // [nff, ne]
                     let (down_w, _) = crate::load_tensor_dequant(g, "self_cond_down.weight")?; // [ne, nff]
+                                                                                               // One-time f16 conversion of the embedding table (see `SelfCondWeights::emb16`).
+                    let mut emb16 = vec![0u16; token_embd.len()];
+                    {
+                        use rayon::prelude::*;
+                        emb16
+                            .par_chunks_mut(1 << 16)
+                            .zip(token_embd.par_chunks(1 << 16))
+                            .for_each(|(dst, src)| {
+                                for (d, &v) in dst.iter_mut().zip(src) {
+                                    *d = half::f16::from_f32(v).to_bits();
+                                }
+                            });
+                    }
                     *self_cond_w = Some(std::sync::Arc::new(SelfCondWeights {
                         pre_norm,
                         gate_w,
                         up_w,
                         down_w,
+                        emb16,
                     }));
                 }
                 let scw = self_cond_w.as_ref().expect("just populated above");
-                let sc_sig = diffusion_self_cond(scw, c, token_embd, sc_logits, req.temp_inv, cc)?;
+                let sc_sig = diffusion_self_cond(scw, c, sc_logits, req.temp_inv, cc)?;
                 for (h, s) in hidden_host.iter_mut().zip(sc_sig.iter()) {
                     *h += s;
                 }
