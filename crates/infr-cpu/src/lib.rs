@@ -1526,6 +1526,10 @@ unsafe fn vec_dot_q4k_batch8_avx512bw(
 /// `(entries keyed by weight-slice (addr, len), total cached bytes)` — see `repack_cache`'s doc.
 type RepackCacheState = (HashMap<(usize, usize), Arc<Q4kPack>>, usize);
 
+// Only the x86 ilv kernels read these — plain data everywhere else (aarch64 CI builds with
+// -D warnings, so the not-x86 dead-code must be explicitly allowed rather than cfg'd away:
+// the types appear in cross-target signatures like `expert_matvec_batch`).
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 struct Q4kPackGroup {
     ilv: Vec<u8>,   // [nb * 2048]
     sc: Vec<i32>,   // [nb * 8 subs * 8 lanes], PERM order
@@ -1536,12 +1540,14 @@ struct Q4kPackGroup {
 
 /// A whole Q4_K weight bank (e.g. one MoE expert's fused gate_up) packed as full 8-row groups —
 /// `out_f % 8` tail rows are NOT packed (callers run them through the per-row kernel).
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) struct Q4kPack {
     groups: Vec<Q4kPackGroup>,
     nb: usize,
 }
 
 impl Q4kPack {
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     fn bytes(&self) -> usize {
         self.groups
             .iter()
@@ -3234,6 +3240,7 @@ pub struct CpuBackend {
     /// its `block_q4_Kx8` repack once at LOAD; this pays it once per (expert, session) instead
     /// of once per CALL. Byte-budgeted (`INFR_CPU_REPACK_MB`, default 4096): over budget, packs
     /// are built transient and not inserted. The `usize` is the current cached-bytes total.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     repack_cache: Mutex<RepackCacheState>,
 }
 
@@ -3304,6 +3311,7 @@ fn bytes_to_f32(bytes: &[u8], dtype: DType) -> Vec<f32> {
 /// multiple of 32, Q8_0/Q5_0's own native block, so THAT granularity gets its own int8 fast path
 /// below instead of falling all the way back to the plain f32 dequant+dot).
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
 fn expert_matvec_batch(
     wbytes: &[u8],
     dt: DType,
