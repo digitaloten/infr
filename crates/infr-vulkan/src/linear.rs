@@ -160,6 +160,12 @@ pub fn native_gemm_kernel_name(dtype: infr_core::DType) -> &'static str {
 ///
 /// The MoE *stacked/id-indexed* path (`native_id_*`/`native_idm_*`) is narrower — affine only; use
 /// [`native_id_kernel_name`] for that.
+/// Formats the `embed_gather` kernel family covers (`Op::EmbedGather` — see
+/// `gemm::embed_gather_build_spv`). The runner gates the token-ids input path on this.
+pub fn embed_gather_supported(dtype: infr_core::DType) -> bool {
+    crate::gemm::embed_gather_build_spv(dtype).is_some()
+}
+
 pub fn native_dense_supported(dtype: infr_core::DType) -> bool {
     use infr_core::DType::*;
     matches!(

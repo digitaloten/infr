@@ -259,6 +259,58 @@ pub(crate) fn moe_topk_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// SPIR-V for the embedding-row gather+dequant (`Op::EmbedGather`). `None` = format has no
+/// build (grid-table IQ formats) — the runner then keeps the host embed path.
+pub(crate) fn embed_gather_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            S.get_or_init(|| {
+                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+            })
+            .as_slice()
+        }};
+    }
+    Some(match dtype {
+        Q8_0 => v!("embed_gather_q8_0"),
+        Bf16 => v!("embed_gather_bf16"),
+        F16 => v!("embed_gather_f16"),
+        Q4_0 => v!("embed_gather_q4_0"),
+        Q4_1 => v!("embed_gather_q4_1"),
+        Q5_0 => v!("embed_gather_q5_0"),
+        Q5_1 => v!("embed_gather_q5_1"),
+        Q2K => v!("embed_gather_q2k"),
+        Q3K => v!("embed_gather_q3k"),
+        Q4K => v!("embed_gather_q4k"),
+        Q5K => v!("embed_gather_q5k"),
+        Q6K => v!("embed_gather_q6k"),
+        Iq4Nl => v!("embed_gather_iq4nl"),
+        Iq4Xs => v!("embed_gather_iq4xs"),
+        _ => return None,
+    })
+}
+/// Kernel-cache name for the embedding-row gather.
+pub(crate) fn embed_gather_kernel_name(dtype: infr_core::DType) -> &'static str {
+    use infr_core::DType::*;
+    match dtype {
+        Q8_0 => "embed_gather_q8_0",
+        Bf16 => "embed_gather_bf16",
+        F16 => "embed_gather_f16",
+        Q4_0 => "embed_gather_q4_0",
+        Q4_1 => "embed_gather_q4_1",
+        Q5_0 => "embed_gather_q5_0",
+        Q5_1 => "embed_gather_q5_1",
+        Q2K => "embed_gather_q2k",
+        Q3K => "embed_gather_q3k",
+        Q4K => "embed_gather_q4k",
+        Q5K => "embed_gather_q5k",
+        Q6K => "embed_gather_q6k",
+        Iq4Nl => "embed_gather_iq4nl",
+        Iq4Xs => "embed_gather_iq4xs",
+        _ => unreachable!("embed_gather_kernel_name: gated by embed_gather_build_spv"),
+    }
+}
 /// SPIR-V for the greedy-argmax slice pass (256 workgroups → 256 (val, idx) partials).
 pub(crate) fn argmax_part_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/argmax_part.spv"));

@@ -42,6 +42,10 @@ pub(super) struct DecodeHandles {
     // download). This is the primitive Phase 2's MTP head needs (`h_p` in `docs/MTP.md`'s forward
     // pseudocode) — Phase 1 only exposes the tap, no head graph reads it yet.
     h_out: Option<TensorId>,
+    // GPU embed gather (`use_ids` on `build`): the I32 token-id Input the driver binds instead
+    // of uploading embedded f32 rows into `hidden` (which is then an Internal fed by the
+    // in-graph `Op::EmbedGather`). `None` on host-embed builds.
+    tok_ids: Option<TensorId>,
     // GPU-resident greedy sampling (`gpu_argmax` on `build`): the `Op::Argmax` output — one u32
     // token id (as an f32-slot bit-pattern). The decode loop reads THIS back (4 bytes) instead of
     // the `[vocab]` logits. `None` when the build didn't append the op (sampling temp > 0, a
@@ -199,6 +203,21 @@ pub(crate) fn generate_dense_backend(
                 && c.layer_n_kv(l) == c.n_kv
                 && c.has_own_kv(l)
         });
+
+    // GPU embed gather (Op::EmbedGather, task #28): the host feeds token IDS (4 bytes each) and
+    // the device gathers+dequantizes the embedding rows from the resident quantized table —
+    // decode and prefill stop uploading f32 embedding rows entirely (a 512-token prefill chunk
+    // was 4*n_embd*512 = ~8 MB of host-embedded f32; now it's 2 KB of ids). Tied-lm_head models
+    // reuse the already-uploaded lm_head buffer (same tensor); untied models upload token_embd
+    // once more (extra VRAM = its on-disk size). INFR_NO_GPU_EMBED forces the host path (A/B).
+    let untied_lm = g.tensors().iter().any(|t| t.name == "output.weight");
+    let gpu_embed = be.capabilities().embed_gather
+        && c.n_embd.is_multiple_of(32)
+        && g.tensors()
+            .iter()
+            .find(|t| t.name == "token_embd.weight")
+            .is_some_and(|t| infr_vulkan::linear::embed_gather_supported(t.dtype))
+        && std::env::var("INFR_NO_GPU_EMBED").is_err();
 
     // KV cache dtype, chosen PER-SIDE (K and V independent, like llama's --cache-type-k /
     // --cache-type-v). Q8_0 stores 34 bytes / 32 elems — half the f16 footprint and bandwidth.
@@ -478,6 +497,12 @@ pub(crate) fn generate_dense_backend(
         } else {
             wload(&["token_embd.weight"])?;
         }
+        // GPU embed gather: untied models upload the quantized token_embd as one extra weight
+        // slot (tied models reuse the lm_head slot above — same tensor). Order-sensitive:
+        // mirrors `build`'s `w_embd` wpush, right after `w_lm`.
+        if gpu_embed && untied_lm {
+            wload(&["token_embd.weight"])?;
+        }
         // diffusion-gemma: top-level self-conditioning gated MLP. LOADED (occupies a weight-buffer
         // slot like any other tensor) but NOT READ by any Op this phase — Phase 1 is the
         // encoder-only causal prefill, which runs with self-conditioning permanently off (see
@@ -742,7 +767,10 @@ pub(crate) fn generate_dense_backend(
                  gpu_sc: Option<bool>,
                  dyn_sc_scale: bool,
                  h_tap: bool,
-                 gpu_argmax: bool|
+                 gpu_argmax: bool,
+                 // build the graph input as TOKEN IDS + an in-graph EmbedGather (gpu_embed
+                 // callers) instead of the host-embedded f32 `hidden` rows.
+                 use_ids: bool|
      -> (Graph, DecodeHandles) {
         let mut g = Graph::new();
         let f32d = |n: usize| TensorDesc::new(vec![n], DType::F32);
@@ -754,7 +782,14 @@ pub(crate) fn generate_dense_backend(
         let kd = |n: usize| TensorDesc::new(vec![n], k_fmt);
         let vd = |n: usize| TensorDesc::new(vec![n], v_fmt);
         let f16d = |n: usize| TensorDesc::new(vec![n], DType::F16);
-        let hidden = g.input(f32d(batch * ne));
+        // GPU embed gather: `hidden` becomes an Internal computed by the Op::EmbedGather pushed
+        // just before the first layer op (after the table weight handle is declared).
+        let (hidden, tok_ids) = if use_ids {
+            let ids = g.input(TensorDesc::new(vec![batch], DType::I32));
+            (g.internal(f32d(batch * ne)), Some(ids))
+        } else {
+            (g.input(f32d(batch * ne)), None)
+        };
         let positions = g.input(TensorDesc::new(vec![batch], DType::I32));
         let rope_freqs = rf_buf.as_ref().map(|(_, n)| g.input(f32d(*n)));
         // gemma4 E2B per-(token,layer) TOKEN embedding rows `[batch, n_layer*npl]` — host-gathered
@@ -966,6 +1001,17 @@ pub(crate) fn generate_dense_backend(
         }
         let w_out_norm = wpush(&mut g, &mut weights);
         let w_lm = wpush(&mut g, &mut weights);
+        // GPU embed gather table: tied-lm_head models read the w_lm slot (same tensor); untied
+        // models declare the extra upload here (mirrors the wload order).
+        let w_embd = if use_ids {
+            if untied_lm {
+                Some(wpush(&mut g, &mut weights))
+            } else {
+                Some(w_lm)
+            }
+        } else {
+            None
+        };
         // diffusion-gemma: self-conditioning gated-MLP handles — declared to match `wload`'s
         // upload order (right after lm_head, before the e2b projection weights). Read by the
         // in-graph SC subgraph below when `gpu_sc == Some(true)`; harmlessly unread otherwise
@@ -1089,6 +1135,19 @@ pub(crate) fn generate_dense_backend(
         let dn_out = g.internal(f32d(batch * (q35_nv * q35_vd).max(1)));
 
         let eps = c.rms_eps;
+
+        // GPU embed gather: materialize `hidden` from the token ids ON the device — the first op
+        // of the graph, so every consumer below is unchanged. Bakes Gemma's sqrt(n_embd) scale.
+        if let (Some(ids), Some(tbl)) = (tok_ids, w_embd) {
+            g.push(Op::EmbedGather {
+                ids,
+                table: tbl,
+                dst: hidden,
+                rows: batch as u32,
+                ne: ne as u32,
+                scale: if gemma { (ne as f32).sqrt() } else { 1.0 },
+            });
+        }
 
         // gemma4 E2B prologue: compute the full per-(token,layer) input vector `per_layer_inp`
         // ([batch, n_layer*npl]) that the layer loop below consumes, on the GPU — matches
@@ -2198,6 +2257,7 @@ pub(crate) fn generate_dense_backend(
                 temp_inv: temp_inv_id,
                 logits,
                 h_out,
+                tok_ids,
                 tok_id,
                 k_cache,
                 v_cache,
@@ -2399,6 +2459,7 @@ pub(crate) fn generate_dense_backend(
                 dyn_sc,
                 false, // MTP h-tap: diffusion-gemma denoise never taps
                 false, // gpu_argmax: denoise samples via the EB reducer, not Op::Argmax
+                false, // use_ids: the canvas rows are soft-embeds, not token ids
             );
             let plan = be.compile(&dg).map_err(|e| anyhow!("{e}"))?;
             let hidden_buf = be
@@ -2671,7 +2732,7 @@ pub(crate) fn generate_dense_backend(
         let time_verify = std::env::var("INFR_MTP_TIME").is_ok();
         let full_reprefill = start == 0 && m > 1;
         let t_vbuild0 = std::time::Instant::now();
-        let (vg, vh) = build(m, start, m, false, None, false, want_h, false);
+        let (vg, vh) = build(m, start, m, false, None, false, want_h, false, false);
         let vbuild_secs = t_vbuild0.elapsed().as_secs_f64();
         let t_vcompile0 = std::time::Instant::now();
         let vplan = be.compile(&vg).map_err(|e| anyhow!("{e}"))?;
@@ -2754,6 +2815,11 @@ pub(crate) fn generate_dense_backend(
     let tok_id_buf = be
         .alloc(4, BufferUsage::Readback)
         .map_err(|e| anyhow!("{e}"))?;
+    // GPU embed gather: the decode loop's 4-byte token-id input (replaces the n_embd*4 host
+    // embed + hidden upload when `gpu_embed`).
+    let dec_ids_buf = be
+        .alloc(4, BufferUsage::Staging)
+        .map_err(|e| anyhow!("{e}"))?;
     let embed_scale = if gemma { (ne as f32).sqrt() } else { 1.0 };
     let mut out = Vec::new();
     let mut cur = prompt.to_vec();
@@ -2821,20 +2887,34 @@ pub(crate) fn generate_dense_backend(
         while cstart < pf_end {
             let cend = (cstart + ubatch).min(pf_end);
             let pf_m = cend - cstart;
-            let mut pf_hidden: Vec<f32> = Vec::with_capacity(pf_m * ne);
-            for &tok in &prompt[cstart..cend] {
-                let base = tok as usize * ne;
-                pf_hidden.extend(token_embd[base..base + ne].iter().map(|&x| x * embed_scale));
-            }
+            // GPU embed gather: upload the chunk's token IDS (4*pf_m bytes) — the graph's
+            // Op::EmbedGather dequantizes the rows on-device. Host-embed fallback keeps the
+            // old f32 rows upload (4*n_embd*pf_m bytes).
+            let pf_hidden_buf = if gpu_embed {
+                let ids: Vec<i32> = prompt[cstart..cend].iter().map(|&t| t as i32).collect();
+                let b = be
+                    .alloc(pf_m * 4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?;
+                be.upload(b.as_ref(), bytemuck::cast_slice(&ids))
+                    .map_err(|e| anyhow!("{e}"))?;
+                b
+            } else {
+                let mut pf_hidden: Vec<f32> = Vec::with_capacity(pf_m * ne);
+                for &tok in &prompt[cstart..cend] {
+                    let base = tok as usize * ne;
+                    pf_hidden.extend(token_embd[base..base + ne].iter().map(|&x| x * embed_scale));
+                }
+                let b = be
+                    .alloc(pf_m * ne * 4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?;
+                be.upload(b.as_ref(), bytemuck::cast_slice(&pf_hidden))
+                    .map_err(|e| anyhow!("{e}"))?;
+                b
+            };
             // Absolute positions [cstart, ..., cend-1].
             let pf_positions: Vec<i32> = (cstart as i32..cend as i32).collect();
-            let pf_hidden_buf = be
-                .alloc(pf_m * ne * 4, BufferUsage::Staging)
-                .map_err(|e| anyhow!("{e}"))?;
             let pf_pos_buf = be
                 .alloc(pf_m * 4, BufferUsage::Staging)
-                .map_err(|e| anyhow!("{e}"))?;
-            be.upload(pf_hidden_buf.as_ref(), bytemuck::cast_slice(&pf_hidden))
                 .map_err(|e| anyhow!("{e}"))?;
             be.upload(pf_pos_buf.as_ref(), bytemuck::cast_slice(&pf_positions))
                 .map_err(|e| anyhow!("{e}"))?;
@@ -2859,12 +2939,19 @@ pub(crate) fn generate_dense_backend(
             // here yet. The MTP catch-up driver needs `h` for EVERY prefill row (not just chunk
             // tails); wiring that requires this path to also carry `logits_rows == pf_m` on
             // demand, which Phase 2 will add alongside the actual head forward.
-            let (pf_g, pf_h) = build(pf_m, cstart, 1, false, None, false, false, false);
+            let (pf_g, pf_h) = build(pf_m, cstart, 1, false, None, false, false, false, gpu_embed);
             let t_build = pf_t0.elapsed();
             let pf_plan = be.compile(&pf_g).map_err(|e| anyhow!("{e}"))?;
             let t_compile = pf_t0.elapsed();
             let mut pf_b = Bindings::new();
-            pf_b.bind(pf_h.hidden, pf_hidden_buf.as_ref());
+            match pf_h.tok_ids {
+                Some(ids) => {
+                    pf_b.bind(ids, pf_hidden_buf.as_ref());
+                }
+                None => {
+                    pf_b.bind(pf_h.hidden, pf_hidden_buf.as_ref());
+                }
+            }
             pf_b.bind(pf_h.positions, pf_pos_buf.as_ref());
             // gemma4's proportional-RoPE divisors are a graph input too — bind them (the per-token
             // decode loop below does the same). Without this the batched graph has an unbound
@@ -2950,10 +3037,17 @@ pub(crate) fn generate_dense_backend(
         // slower, but this is a validation-only hook (see `h_out`'s doc), never a hot path.
         && h_out.is_none();
     let ro = if dyn_replay {
-        let (g, h) = build(1, 0, 1, false, None, false, false, gpu_argmax);
+        let (g, h) = build(1, 0, 1, false, None, false, false, gpu_argmax, gpu_embed);
         let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
         let mut b = Bindings::new();
-        b.bind(h.hidden, hidden_buf.as_ref());
+        match h.tok_ids {
+            Some(ids) => {
+                b.bind(ids, dec_ids_buf.as_ref());
+            }
+            None => {
+                b.bind(h.hidden, hidden_buf.as_ref());
+            }
+        }
         b.bind(h.positions, pos_buf.as_ref());
         if let (Some(rid), Some((rb, _))) = (h.rope_freqs, &rf_buf) {
             b.bind(rid, rb.as_ref());
@@ -2987,13 +3081,19 @@ pub(crate) fn generate_dense_backend(
         }
         let step_t0 = std::time::Instant::now();
         let tok = cur[pos] as usize;
-        // embed (gemma scales by √n_embd; qwen3/llama identity)
-        let emb: Vec<f32> = token_embd[tok * ne..tok * ne + ne]
-            .iter()
-            .map(|&x| x * embed_scale)
-            .collect();
-        be.upload(hidden_buf.as_ref(), bytemuck::cast_slice(&emb))
-            .map_err(|e| anyhow!("{e}"))?;
+        if gpu_embed {
+            // GPU embed gather: feed the 4-byte token id — the device dequantizes the row.
+            be.upload(dec_ids_buf.as_ref(), bytemuck::cast_slice(&[tok as i32]))
+                .map_err(|e| anyhow!("{e}"))?;
+        } else {
+            // embed (gemma scales by √n_embd; qwen3/llama identity)
+            let emb: Vec<f32> = token_embd[tok * ne..tok * ne + ne]
+                .iter()
+                .map(|&x| x * embed_scale)
+                .collect();
+            be.upload(hidden_buf.as_ref(), bytemuck::cast_slice(&emb))
+                .map_err(|e| anyhow!("{e}"))?;
+        }
         be.upload(pos_buf.as_ref(), bytemuck::cast_slice(&[pos as i32]))
             .map_err(|e| anyhow!("{e}"))?;
 
@@ -3032,10 +3132,17 @@ pub(crate) fn generate_dense_backend(
             be.execute(plan.as_ref(), b).map_err(|e| anyhow!("{e}"))?;
             exec_el = t_exec.elapsed();
         } else {
-            let (g, h) = build(1, pos, 1, false, None, false, want_h, gpu_argmax);
+            let (g, h) = build(1, pos, 1, false, None, false, want_h, gpu_argmax, gpu_embed);
             let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
             let mut b = Bindings::new();
-            b.bind(h.hidden, hidden_buf.as_ref());
+            match h.tok_ids {
+                Some(ids) => {
+                    b.bind(ids, dec_ids_buf.as_ref());
+                }
+                None => {
+                    b.bind(h.hidden, hidden_buf.as_ref());
+                }
+            }
             b.bind(h.positions, pos_buf.as_ref());
             if let (Some(rid), Some((rb, _))) = (h.rope_freqs, &rf_buf) {
                 b.bind(rid, rb.as_ref());

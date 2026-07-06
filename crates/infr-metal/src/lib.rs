@@ -219,6 +219,7 @@ impl Backend for MetalBackend {
             // One fused [2*nff, ne] gate+up Linear + GatedActFused per FFN — one dispatch and
             // one contiguous weight stream instead of two.
             combined_gu: true,
+            embed_gather: false,
         }
     }
 

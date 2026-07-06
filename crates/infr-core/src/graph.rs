@@ -271,6 +271,19 @@ pub enum Op {
     /// (4 bytes), not the `[vocab]` logits. Strict `>` keeps the lowest index on ties, matching
     /// the host-side sampler.
     Argmax { x: TensorId, dst: TensorId, n: u32 },
+    /// Gather + dequantize embedding rows: `dst[r, :] = table[ids[r], :] * scale` for `rows`
+    /// rows of `ne` elements. `ids` is an I32 input holding token ids; `table` is the (quantized)
+    /// `token_embd` Weight; `scale` bakes Gemma's sqrt(n_embd) embed scaling. Lets the host feed
+    /// TOKEN IDS instead of dequantized f32 embedding rows — the model's input stream stays
+    /// 4 bytes/token end to end.
+    EmbedGather {
+        ids: TensorId,
+        table: TensorId,
+        dst: TensorId,
+        rows: u32,
+        ne: u32,
+        scale: f32,
+    },
     /// Copy `n` elements `src[src_off..] -> dst[dst_off..]` (extract last row, gather a slice).
     Copy {
         src: TensorId,
@@ -398,6 +411,7 @@ impl Op {
             Op::MulVec { .. } => "MulVec",
             Op::Softcap { .. } => "Softcap",
             Op::Argmax { .. } => "Argmax",
+            Op::EmbedGather { .. } => "EmbedGather",
             Op::Copy { .. } => "Copy",
             Op::CopyStrided { .. } => "CopyStrided",
             Op::MoeFfn { .. } => "MoeFfn",

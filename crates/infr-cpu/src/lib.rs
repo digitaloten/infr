@@ -297,6 +297,7 @@ impl Backend for CpuBackend {
             // must be rebuilt per token — no record-once replay.
             decode_replay: false,
             combined_gu: false,
+            embed_gather: true,
         }
     }
 
@@ -1151,6 +1152,34 @@ impl Backend for CpuBackend {
                             *o = cap * (xs[base + i] / cap).tanh();
                         }
                     });
+                    vals[dst.0 as usize] = out;
+                }
+                Op::EmbedGather {
+                    ids,
+                    table,
+                    dst,
+                    rows,
+                    ne,
+                    scale,
+                } => {
+                    // Dequantize the selected rows straight from the raw (mmap'd) table bytes —
+                    // identical math to the load-time dequant that used to build the host f32
+                    // table, so outputs are bit-equal to the old host-embed path.
+                    let (rows, ne) = (rows as usize, ne as usize);
+                    let buf = bindings.get(table).expect("cpu backend: unbound Weight");
+                    let bytes = cpu_buf(buf).read();
+                    let dt = g.desc(table).dtype;
+                    let total_rows = g.desc(table).numel() / ne;
+                    let bpr = bytes.len() / total_rows;
+                    let ids_v = vals[ids.0 as usize].clone();
+                    let mut out = vec![0f32; rows * ne];
+                    for r in 0..rows {
+                        let tok = ids_v[r] as usize;
+                        let row = bytes_to_f32(&bytes[tok * bpr..(tok + 1) * bpr], dt);
+                        for (o, v) in out[r * ne..(r + 1) * ne].iter_mut().zip(&row) {
+                            *o = v * scale;
+                        }
+                    }
                     vals[dst.0 as usize] = out;
                 }
                 Op::Argmax { x, dst, n } => {

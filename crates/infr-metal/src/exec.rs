@@ -342,6 +342,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::MulVec { .. } => "MulVec",
         Op::Softcap { .. } => "Softcap",
         Op::Argmax { .. } => "Argmax",
+        Op::EmbedGather { .. } => "EmbedGather",
         Op::Copy { .. } => "Copy",
         Op::CopyStrided { .. } => "CopyStrided",
         Op::MoeFfn { .. } => "MoeFfn",
@@ -1993,6 +1994,13 @@ impl MetalBackend {
                 p.extend_from_slice(&(n as u32).to_ne_bytes());
                 self.encode(r, &pso, &[bx.as_ref(), bd.as_ref()], &p, n);
                 r.loc[dst.0 as usize] = Loc::Device;
+            }
+            Op::EmbedGather { .. } => {
+                // Capability-gated off (Capabilities::embed_gather = false): the runner keeps the
+                // host embed path on Metal, so this is unreachable.
+                return Err(be(
+                    "Metal Op::EmbedGather: unimplemented (embed_gather capability is false)",
+                ));
             }
             Op::Argmax { x, dst, n } => {
                 // Greedy device-side sampling: one 256-thread threadgroup, the token id (u32

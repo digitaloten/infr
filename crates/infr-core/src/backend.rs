@@ -39,6 +39,12 @@ pub struct Capabilities {
     /// Costs an owned copy of both weights at load, so zero-copy mmap backends (CPU) leave this
     /// false and keep the separate-tensor form.
     pub combined_gu: bool,
+    /// The backend executes [`crate::Op::EmbedGather`] (dequantize embedding-table rows selected
+    /// by a device-side id buffer). When set, the runner uploads TOKEN IDS (4 bytes each) instead
+    /// of host-dequantized f32 embedding rows — decode feeds 4B/token, prefill 4B/token instead
+    /// of `4*n_embd`. Backends without a table-row dequant kernel leave this false and keep the
+    /// host embed path.
+    pub embed_gather: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

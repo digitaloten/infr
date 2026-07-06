@@ -542,6 +542,7 @@ impl VulkanBackend {
             // kernels); the runner compiles the eligible qwen3 decode graph once.
             decode_replay: true,
             combined_gu: true,
+            embed_gather: true,
         };
 
         // ── gpu-allocator ──────────────────────────────────────────────────────

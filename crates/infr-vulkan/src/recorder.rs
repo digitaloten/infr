@@ -1119,6 +1119,37 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Gather + dequantize embedding rows (`Op::EmbedGather`): `dst[r,:] = table[ids[r],:] *
+    /// scale`. One workgroup per row; per-format decode from native_decode.glsl. Caller gates on
+    /// [`crate::gemm::embed_gather_build_spv`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn embed_gather(
+        &self,
+        dtype: infr_core::DType,
+        table: &dyn Buffer,
+        ids: &dyn Buffer,
+        dst: &dyn Buffer,
+        rows: usize,
+        ne: usize,
+        scale: f32,
+    ) {
+        self.stamp("embed_gather");
+        let name = crate::gemm::embed_gather_kernel_name(dtype);
+        let spv = crate::gemm::embed_gather_build_spv(dtype).expect("embed_gather spv");
+        let k = self.be.kernel(name, spv, 3, 12);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&scale.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(table), Self::vkb(ids), Self::vkb(dst)],
+            1,
+            &push,
+            rows as u32,
+        );
+    }
+
     /// Int8 dp4a decode GEMV (m=1): `y = x·Wᵀ` with `x` pre-quantized via [`Self::quant_q8`]
     /// (qa/dact/sact). NUM_ROWS=2 — one workgroup per 2 consecutive outputs (`ceil(out_f/2)`
     /// grid), the activation block read once for both. `w_base` = element offset (fused-QKV

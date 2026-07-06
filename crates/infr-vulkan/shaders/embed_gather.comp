@@ -1,0 +1,27 @@
+#version 460
+// Gather + dequantize embedding rows (Op::EmbedGather): dst[r, :] = table[ids[r], :] * scale.
+// One workgroup per row, 64 threads each dequantize whole 32-element sub-blocks via the shared
+// native_decode.glsl dqblk (same per-format decode as the native GEMV/GEMM family; -DFMT_*
+// selects the format). `ids` is the i32 token-id input — the host uploads 4 bytes per token
+// instead of a dequantized f32 embedding row.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC { uint rows; uint ne; float scale; } pc;
+layout(binding = 0) readonly buffer WB { uint nw[]; };  // raw GGUF table bytes (padded u32)
+layout(binding = 1) readonly buffer IB { int ids[]; };
+layout(binding = 2) writeonly buffer YB { float y_buf[]; };
+
+#include "native_decode.glsl"
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.rows) { return; }
+    uint t = gl_LocalInvocationID.x;
+    uint base = uint(ids[row]) * pc.ne; // table element offset of this token's row
+    uint nsub = pc.ne / 32u;
+    for (uint s = t; s < nsub; s += 64u) {
+        float v[32];
+        dqblk(base + s * 32u, v);
+        uint o = row * pc.ne + s * 32u;
+        for (uint w = 0u; w < 32u; w++) { y_buf[o + w] = v[w] * pc.scale; }
+    }
+}

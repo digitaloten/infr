@@ -1720,6 +1720,25 @@ fn lower_op(
         Op::Softcap { x, dst, cap, n } => {
             rec.softcap(r(*x)?, r(*dst)?, *cap, *n as usize);
         }
+        Op::EmbedGather {
+            ids,
+            table,
+            dst,
+            rows,
+            ne,
+            scale,
+        } => {
+            let dt = graph.desc(*table).dtype;
+            rec.embed_gather(
+                dt,
+                r(*table)?,
+                r(*ids)?,
+                r(*dst)?,
+                *rows as usize,
+                *ne as usize,
+                *scale,
+            );
+        }
         Op::Argmax { x, dst, n } => {
             let part = pooled(pool, be_, "argmax_part", 512 * 4)?;
             rec.argmax(r(*x)?, pool[&part].as_ref(), r(*dst)?, *n as usize);
