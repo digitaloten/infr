@@ -271,6 +271,21 @@ pub enum Op {
     /// (4 bytes), not the `[vocab]` logits. Strict `>` keeps the lowest index on ties, matching
     /// the host-side sampler.
     Argmax { x: TensorId, dst: TensorId, n: u32 },
+    /// Device-side stochastic sampling: `dst[0] = sample(x[0..n])` (u32 id bit-pattern in the f32
+    /// slot) via temperature + top-k + top-p, inverse-CDF'd with the uniform draw read from the
+    /// 1-float `u` Input — the host draws u (4 bytes/token) and reads back only the id, the
+    /// `[vocab]` logits never leave the device. Same order of operations as the host sampler
+    /// (top-k select desc → softmax(temp) → nucleus cutoff → CDF walk), so the same `u` picks the
+    /// same token. `top_k` must be `2..=64` (backend kernel bound); the runner gates.
+    Sample {
+        x: TensorId,
+        u: TensorId,
+        dst: TensorId,
+        n: u32,
+        top_k: u32,
+        temp: f32,
+        top_p: f32,
+    },
     /// Gather + dequantize embedding rows: `dst[r, :] = table[ids[r], :] * scale` for `rows`
     /// rows of `ne` elements. `ids` is an I32 input holding token ids; `table` is the (quantized)
     /// `token_embd` Weight; `scale` bakes Gemma's sqrt(n_embd) embed scaling. Lets the host feed
@@ -411,6 +426,7 @@ impl Op {
             Op::MulVec { .. } => "MulVec",
             Op::Softcap { .. } => "Softcap",
             Op::Argmax { .. } => "Argmax",
+            Op::Sample { .. } => "Sample",
             Op::EmbedGather { .. } => "EmbedGather",
             Op::Copy { .. } => "Copy",
             Op::CopyStrided { .. } => "CopyStrided",

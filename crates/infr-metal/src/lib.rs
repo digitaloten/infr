@@ -220,6 +220,7 @@ impl Backend for MetalBackend {
             // one contiguous weight stream instead of two.
             combined_gu: true,
             embed_gather: false,
+            gpu_sample: false,
         }
     }
 

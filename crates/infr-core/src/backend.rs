@@ -45,6 +45,10 @@ pub struct Capabilities {
     /// of `4*n_embd`. Backends without a table-row dequant kernel leave this false and keep the
     /// host embed path.
     pub embed_gather: bool,
+    /// The backend executes [`crate::Op::Sample`] (device-side temperature + top-k + top-p
+    /// sampling; only the 4-byte token id reads back). False = the runner downloads the logits
+    /// and samples on the host.
+    pub gpu_sample: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

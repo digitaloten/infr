@@ -342,6 +342,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::MulVec { .. } => "MulVec",
         Op::Softcap { .. } => "Softcap",
         Op::Argmax { .. } => "Argmax",
+        Op::Sample { .. } => "Sample",
         Op::EmbedGather { .. } => "EmbedGather",
         Op::Copy { .. } => "Copy",
         Op::CopyStrided { .. } => "CopyStrided",
@@ -1994,6 +1995,13 @@ impl MetalBackend {
                 p.extend_from_slice(&(n as u32).to_ne_bytes());
                 self.encode(r, &pso, &[bx.as_ref(), bd.as_ref()], &p, n);
                 r.loc[dst.0 as usize] = Loc::Device;
+            }
+            Op::Sample { .. } => {
+                // Capability-gated off (Capabilities::gpu_sample = false): the runner samples on
+                // the host on Metal, so this is unreachable.
+                return Err(be(
+                    "Metal Op::Sample: unimplemented (gpu_sample capability is false)",
+                ));
             }
             Op::EmbedGather { .. } => {
                 // Capability-gated off (Capabilities::embed_gather = false): the runner keeps the

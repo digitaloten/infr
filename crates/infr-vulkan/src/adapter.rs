@@ -1739,6 +1739,27 @@ fn lower_op(
                 *scale,
             );
         }
+        Op::Sample {
+            x,
+            u,
+            dst,
+            n,
+            top_k,
+            temp,
+            top_p,
+        } => {
+            let cand = pooled(pool, be_, "sample_cand", 2 * 256 * *top_k as usize * 4)?;
+            rec.sample_topk(
+                r(*x)?,
+                pool[&cand].as_ref(),
+                r(*u)?,
+                r(*dst)?,
+                *n as usize,
+                *top_k as usize,
+                *temp,
+                *top_p,
+            );
+        }
         Op::Argmax { x, dst, n } => {
             let part = pooled(pool, be_, "argmax_part", 512 * 4)?;
             rec.argmax(r(*x)?, pool[&part].as_ref(), r(*dst)?, *n as usize);

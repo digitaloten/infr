@@ -451,6 +451,10 @@ fn main() {
         ("embed_gather", "embed_gather_q6k", &["-DFMT_Q6K"]),
         ("embed_gather", "embed_gather_iq4nl", &["-DFMT_IQ4NL"]),
         ("embed_gather", "embed_gather_iq4xs", &["-DFMT_IQ4XS"]),
+        // Two-stage vocab-scale stochastic sampler (Op::Sample): per-slice top-k candidates,
+        // then select+softmax+nucleus+CDF over the union.
+        ("sample_topk", "sample_topk_part", &[]),
+        ("sample_topk", "sample_topk", &["-DPASS2"]),
         // Two-stage greedy argmax (Op::Argmax): slice partials, then a one-workgroup reduce.
         ("argmax", "argmax_part", &[]),
         ("argmax", "argmax", &["-DPASS2"]),

@@ -298,6 +298,7 @@ impl Backend for CpuBackend {
             decode_replay: false,
             combined_gu: false,
             embed_gather: true,
+            gpu_sample: true,
         }
     }
 
@@ -1181,6 +1182,63 @@ impl Backend for CpuBackend {
                         }
                     }
                     vals[dst.0 as usize] = out;
+                }
+                Op::Sample {
+                    x,
+                    u,
+                    dst,
+                    n,
+                    top_k,
+                    temp,
+                    top_p,
+                } => {
+                    // Device-side stochastic sampling — IDENTICAL order of operations to the host
+                    // `sample_logits` (top-k select desc, softmax(temp), nucleus, CDF walk) with
+                    // the uniform draw factored out into the 1-float `u` input.
+                    let logits = &vals[x.0 as usize][..n as usize];
+                    let uu = vals[u.0 as usize][0];
+                    let k = (top_k as usize).min(logits.len());
+                    let cmp = |a: &usize, b: &usize| {
+                        logits[*b]
+                            .partial_cmp(&logits[*a])
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    };
+                    let mut idx: Vec<usize> = (0..logits.len()).collect();
+                    if k < logits.len() {
+                        idx.select_nth_unstable_by(k - 1, cmp);
+                        idx.truncate(k);
+                    }
+                    idx.sort_unstable_by(cmp);
+                    let maxl = logits[idx[0]];
+                    let mut probs: Vec<f32> = idx
+                        .iter()
+                        .map(|&i| ((logits[i] - maxl) / temp).exp())
+                        .collect();
+                    let sum: f32 = probs.iter().sum();
+                    for p in probs.iter_mut() {
+                        *p /= sum;
+                    }
+                    let mut cum = 0.0;
+                    let mut cutoff = probs.len();
+                    for (j, &p) in probs.iter().enumerate() {
+                        cum += p;
+                        if cum >= top_p {
+                            cutoff = j + 1;
+                            break;
+                        }
+                    }
+                    let total: f32 = probs[..cutoff].iter().sum();
+                    let r = uu * total;
+                    let mut tok = idx[cutoff - 1] as u32;
+                    let mut acc = 0.0;
+                    for j in 0..cutoff {
+                        acc += probs[j];
+                        if r <= acc {
+                            tok = idx[j] as u32;
+                            break;
+                        }
+                    }
+                    vals[dst.0 as usize] = vec![f32::from_bits(tok)];
                 }
                 Op::Argmax { x, dst, n } => {
                     // Greedy device-side sampling: strict `>` keeps the lowest index on ties —

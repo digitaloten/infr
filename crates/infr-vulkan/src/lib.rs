@@ -543,6 +543,7 @@ impl VulkanBackend {
             decode_replay: true,
             combined_gu: true,
             embed_gather: true,
+            gpu_sample: true,
         };
 
         // ── gpu-allocator ──────────────────────────────────────────────────────

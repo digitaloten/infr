@@ -55,6 +55,18 @@ pub(crate) fn seed_rng() -> u64 {
         | 1
 }
 
+/// Advance the xorshift64 state and return a uniform draw in [0, 1) — the factored-out RNG step
+/// shared by the host sampler and the GPU `Op::Sample` path (which uploads the draw as the
+/// kernel's `u` input, keeping the two paths distribution-identical).
+pub(crate) fn next_uniform(rng: &mut u64) -> f32 {
+    let mut x = *rng;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *rng = x;
+    (x >> 40) as f32 / (1u64 << 24) as f32
+}
+
 pub(crate) fn argmax(v: &[f32]) -> usize {
     let mut bi = 0;
     let mut bv = f32::NEG_INFINITY;
@@ -106,14 +118,7 @@ pub(crate) fn sample_logits(logits: &[f32], s: Sampler, rng: &mut u64) -> u32 {
         }
     }
     let total: f32 = probs[..cutoff].iter().sum();
-    // xorshift64 → uniform [0, total)
-    let mut x = *rng;
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    *rng = x;
-    let u = (x >> 40) as f32 / (1u64 << 24) as f32;
-    let r = u * total;
+    let r = next_uniform(rng) * total;
     let mut acc = 0.0;
     for j in 0..cutoff {
         acc += probs[j];
