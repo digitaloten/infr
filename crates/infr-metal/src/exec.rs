@@ -1999,15 +1999,15 @@ impl MetalBackend {
             Op::Sample { .. } => {
                 // Capability-gated off (Capabilities::gpu_sample = false): the runner samples on
                 // the host on Metal, so this is unreachable.
-                return Err(be(
-                    "Metal Op::Sample: unimplemented (gpu_sample capability is false)",
+                return Err(Error::Unsupported(
+                    "Metal Op::Sample: gpu_sample capability is false".into(),
                 ));
             }
             Op::EmbedGather { .. } => {
                 // Capability-gated off (Capabilities::embed_gather = false): the runner keeps the
                 // host embed path on Metal, so this is unreachable.
-                return Err(be(
-                    "Metal Op::EmbedGather: unimplemented (embed_gather capability is false)",
+                return Err(Error::Unsupported(
+                    "Metal Op::EmbedGather: embed_gather capability is false".into(),
                 ));
             }
             Op::Argmax { x, dst, n } => {
@@ -2016,7 +2016,7 @@ impl MetalBackend {
                 let bx = self.ensure_device(r, x);
                 let bd = self.dev_dst(r, dst, 1);
                 let pso = self.pipelines.get("argmax_f32")?;
-                let p = (*n).to_ne_bytes().to_vec();
+                let p = n.to_ne_bytes().to_vec();
                 self.encode_tg(r, &pso, &[bx.as_ref(), bd.as_ref()], &p, 256, 256);
                 r.loc[dst.0 as usize] = Loc::Device;
             }
