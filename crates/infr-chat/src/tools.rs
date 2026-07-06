@@ -264,17 +264,61 @@ pub fn parse_hermes_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
     (clean.trim().to_owned(), calls)
 }
 
-/// Parse one `<tool_call>` body (`{"name":..,"arguments":..}`) into a [`ToolCall`]. Tolerates
-/// `arguments` given as a nested object or as an embedded JSON string.
+/// Parse one `<tool_call>` body into a [`ToolCall`]. Two body dialects exist in the wild:
+/// - Hermes/Qwen3 JSON: `{"name":..,"arguments":..}` (`arguments` tolerated as a nested object
+///   or an embedded JSON string);
+/// - the XML-parameter format Qwen3.5/3.6-class templates mandate (llama.cpp's "qwen3-coder"
+///   handler): `<function=NAME><parameter=KEY>VALUE</parameter>…</function>` — the model follows
+///   its template, so a JSON-only parser silently DROPPED these calls (empty serve replies with
+///   `finish_reason:"stop"`, found via hrdr against Qwen3.6-27B).
 fn parse_hermes_body(body: &str) -> Option<ToolCall> {
-    let v: Value = serde_json::from_str(body).ok()?;
-    let name = v.get("name")?.as_str()?.to_owned();
-    let arguments = match v.get("arguments") {
-        Some(Value::String(s)) => serde_json::from_str(s).unwrap_or(Value::String(s.clone())),
-        Some(other) => other.clone(),
-        None => Value::Object(serde_json::Map::new()),
-    };
-    Some(ToolCall { name, arguments })
+    if let Ok(v) = serde_json::from_str::<Value>(body) {
+        let name = v.get("name")?.as_str()?.to_owned();
+        let arguments = match v.get("arguments") {
+            Some(Value::String(s)) => serde_json::from_str(s).unwrap_or(Value::String(s.clone())),
+            Some(other) => other.clone(),
+            None => Value::Object(serde_json::Map::new()),
+        };
+        return Some(ToolCall { name, arguments });
+    }
+    parse_xml_function_body(body)
+}
+
+/// The XML-parameter dialect: `<function=NAME>` then zero or more
+/// `<parameter=KEY>\nVALUE\n</parameter>` blocks (values may span lines), `</function>`.
+/// Values are JSON-coerced when they parse (numbers, booleans, objects), else kept as strings —
+/// matching llama.cpp's qwen3-coder chat handler.
+fn parse_xml_function_body(body: &str) -> Option<ToolCall> {
+    let body = body.trim();
+    let rest = body.strip_prefix("<function=")?;
+    let name_end = rest.find('>')?;
+    let name = rest[..name_end].trim().to_owned();
+    if name.is_empty() {
+        return None;
+    }
+    let mut args = serde_json::Map::new();
+    let mut rest = &rest[name_end + 1..];
+    while let Some(pstart) = rest.find("<parameter=") {
+        let after = &rest[pstart + "<parameter=".len()..];
+        let Some(key_end) = after.find('>') else {
+            break;
+        };
+        let key = after[..key_end].trim().to_owned();
+        let val_area = &after[key_end + 1..];
+        let Some(vend) = val_area.find("</parameter>") else {
+            break;
+        };
+        // The template frames values with newlines; strip exactly the framing whitespace.
+        let raw = val_area[..vend].trim();
+        let value =
+            serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.to_owned()));
+        args.insert(key, value);
+        rest = &val_area[vend + "</parameter>".len()..];
+    }
+    Some(ToolCall {
+        name,
+        arguments: Value::Object(args),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -583,5 +627,15 @@ mod tests {
         assert_eq!(out[0].role, "user");
         assert_eq!(out[1].tool_call_id.as_deref(), Some("tc_1"));
         assert_eq!(out[1].name.as_deref(), Some("my_fn"));
+    }
+
+    #[test]
+    fn parses_xml_function_tool_call_qwen36() {
+        let text = "<tool_call>\n<function=ls>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>";
+        let (clean, calls) = parse_hermes_tool_calls(text);
+        assert!(clean.is_empty(), "clean: {clean:?}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "ls");
+        assert_eq!(calls[0].arguments["path"], serde_json::json!("."));
     }
 }
