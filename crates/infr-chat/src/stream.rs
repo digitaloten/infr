@@ -52,7 +52,9 @@ impl ChatStream {
         self.emit(true, on_delta); // flush the held-back tails (no marker can still be forming)
         if self.allow_tools {
             let (_r, body) = crate::split_think(&self.raw);
-            let (_content, calls) = crate::parse_hermes_tool_calls(&body);
+            // Dialect-aware: hermes JSON + qwen3.5/3.6 XML + gemma pipe-marker + llama3 bare JSON
+            // (hermes-only here silently dropped every non-qwen3 model's calls over serve).
+            let (_content, calls) = crate::parse_any_tool_calls(&body);
             for call in calls {
                 on_delta(Delta::ToolCall {
                     name: call.name,

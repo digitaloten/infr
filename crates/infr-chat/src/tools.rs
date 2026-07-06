@@ -321,6 +321,52 @@ fn parse_xml_function_body(body: &str) -> Option<ToolCall> {
     })
 }
 
+/// Dialect-aware tool-call extraction — THE entry point consumers should use. Supported models
+/// emit three tool-call dialects, per their GGUF chat templates:
+/// - Hermes/Qwen3 JSON and the Qwen3.5/3.6 XML-parameter body, both inside `<tool_call>` tags
+///   ([`parse_hermes_tool_calls`]);
+/// - the gemma-4 / E2B / DiffusionGemma pipe-marker form `<|tool_call>call:NAME{..}<tool_call|>`
+///   ([`parse_tool_calls`]) — serve previously never tried this one, silently dropping those
+///   models' calls;
+/// - Llama-3.x's bare-JSON form: the template instructs `{"name": .., "parameters": {..}}` as
+///   the WHOLE response, no markers at all.
+/// Dialects are tried in that order; the bare-JSON form only counts when the entire (trimmed)
+/// body is a single such object, so ordinary prose mentioning JSON is never misparsed. Callers
+/// gate on tools-present (`allow_tools`) as before.
+pub fn parse_any_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
+    let (clean, calls) = parse_hermes_tool_calls(text);
+    if !calls.is_empty() {
+        return (clean, calls);
+    }
+    let (clean, calls) = parse_tool_calls(text);
+    if !calls.is_empty() {
+        return (clean, calls);
+    }
+    if let Some(call) = parse_bare_json_call(text) {
+        return (String::new(), vec![call]);
+    }
+    (text.trim().to_owned(), Vec::new())
+}
+
+/// Llama-3.x dialect: the whole body is one JSON object `{"name": .., "parameters"|"arguments":
+/// {..}}` (the template literally instructs 'respond with JSON for a function call' in exactly
+/// this format). Anything else — prose, JSON missing "name", arrays — is not a call.
+fn parse_bare_json_call(text: &str) -> Option<ToolCall> {
+    let t = text.trim();
+    if !t.starts_with('{') || !t.ends_with('}') {
+        return None;
+    }
+    let v: Value = serde_json::from_str(t).ok()?;
+    let name = v.get("name")?.as_str()?.to_owned();
+    let arguments = match v.get("parameters").or_else(|| v.get("arguments")) {
+        Some(Value::Object(m)) => Value::Object(m.clone()),
+        Some(Value::String(s)) => serde_json::from_str(s).unwrap_or(Value::String(s.clone())),
+        None => Value::Object(serde_json::Map::new()),
+        Some(_) => return None,
+    };
+    Some(ToolCall { name, arguments })
+}
+
 // ---------------------------------------------------------------------------
 // Reasoning split (`<think>…</think>`)
 // ---------------------------------------------------------------------------
@@ -637,5 +683,39 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "ls");
         assert_eq!(calls[0].arguments["path"], serde_json::json!("."));
+    }
+
+    #[test]
+    fn any_dialect_pipe_marker_gemma4() {
+        let text = "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|>";
+        let (_, calls) = parse_any_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_weather");
+    }
+
+    #[test]
+    fn any_dialect_xml_function_qwen36() {
+        let text = "<tool_call>\n<function=ls>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>";
+        let (_, calls) = parse_any_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "ls");
+    }
+
+    #[test]
+    fn any_dialect_bare_json_llama3() {
+        let text = "{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}}";
+        let (clean, calls) = parse_any_tool_calls(text);
+        assert!(clean.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_weather");
+        assert_eq!(calls[0].arguments["city"], serde_json::json!("Paris"));
+    }
+
+    #[test]
+    fn any_dialect_prose_with_json_is_not_a_call() {
+        let text = "The config looks like {\"name\": \"x\"} but I did not call anything.";
+        let (clean, calls) = parse_any_tool_calls(text);
+        assert!(calls.is_empty());
+        assert_eq!(clean, text);
     }
 }
