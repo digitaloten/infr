@@ -9,6 +9,15 @@
 // a few hundred KB) — so the per-call cost stays near the m=1 GEMV for every m ≤ 8.
 // -DFMT_* selects the format (shared native_decode.glsl). MR is fixed at 8; the r-loops are
 // compile-time unrolled with uniform `r < pc.rows` guards, keeping acc[] in registers.
+// Reduction: per-row subgroupAdd within each wave + one shared combine across the gl_NumSubgroups
+// waves (one barrier total, wave-size-agnostic — same pattern as rmsnorm.comp/mul_mat_vec_q.comp)
+// — replaces the old 8-row shared-tree reduce (6 levels / 7 barriers over 2KB of LDS). The m=1
+// native_gemv.comp deliberately KEEPS its tree: measured neutral-to-negative there (RDNA3 wave64
+// runs a 64-thread workgroup as one wave, so its barriers are nearly free; qwen3-8b tg128 lost 6%
+// with the subgroup form), while this kernel's 8-row tree was the real cost.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 // Same push layout as native_gemv (w_base = element offset for fused-QKV slices / MoE experts).
@@ -21,7 +30,8 @@ layout(binding = 1) readonly buffer XB { vec4 x4[]; };
 layout(binding = 2) buffer YB { float y_buf[]; };
 
 const uint MR = 8u;
-shared float red[MR * 64u];
+const uint MAX_SG = 8u;             // 64 threads / min 8-wide subgroup
+shared float part[MR * MAX_SG];     // one partial per (row, subgroup)
 
 #include "native_decode.glsl"
 
@@ -54,16 +64,15 @@ void main() {
         }
     }
     for (uint r = 0u; r < MR; r++) {
-        if (r < pc.rows) { red[r * 64u + t] = acc[r]; }
+        if (r < pc.rows) {
+            float sg = subgroupAdd(acc[r]);
+            if (subgroupElect()) { part[r * MAX_SG + gl_SubgroupID] = sg; }
+        }
     }
     barrier();
-    for (uint stride = 32u; stride > 0u; stride /= 2u) {
-        if (t < stride) {
-            for (uint r = 0u; r < MR; r++) {
-                if (r < pc.rows) { red[r * 64u + t] += red[r * 64u + t + stride]; }
-            }
-        }
-        barrier();
+    if (t < pc.rows) {
+        float tot = 0.0;
+        for (uint s = 0u; s < gl_NumSubgroups; s++) { tot += part[t * MAX_SG + s]; }
+        y_buf[t * pc.out_f + o] = tot;
     }
-    if (t < pc.rows) { y_buf[t * pc.out_f + o] = red[t * 64u]; }
 }

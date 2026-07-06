@@ -3,6 +3,12 @@
 // stacked role tensor (element base = ids[slot] * stride). Same cooperative-over-K dequant as
 // native_gemv (shared native_decode.glsl, -DFMT_* selects the format) but the expert is chosen from
 // a GPU buffer — lets the GPU-resident decode run router→top-k→experts in one submit, no readback.
+// Reduction: subgroupAdd within each wave + one shared combine across the gl_NumSubgroups waves,
+// one barrier total, wave-size-agnostic (no pinned subgroup size) — same pattern as rmsnorm.comp /
+// mul_mat_vec_q.comp; see native_gemv_mrow.comp for why the m=1 native_gemv keeps its tree.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 layout(push_constant) uniform PC { uint rows; uint in_f; uint out_f; uint slot; uint stride; } pc;
 layout(binding = 0) readonly buffer WB { uint nw[]; };
@@ -10,7 +16,7 @@ layout(binding = 1) readonly buffer XB { float x_buf[]; };
 layout(binding = 2) readonly buffer IDB { uint ids[]; };
 layout(binding = 3) buffer YB { float y_buf[]; };
 
-shared float red[64];
+shared float part[8];   // one partial per subgroup (64 threads / min 8-wide subgroup = 8 max)
 
 #include "native_decode.glsl"
 
@@ -34,11 +40,12 @@ void main() {
     for (uint s = t; s < nsub; s += 64u) {
         acc += dqsub(wbase + s * 32u, xbase + s * 32u);
     }
-    red[t] = acc;
+    float sg = subgroupAdd(acc);
+    if (subgroupElect()) { part[gl_SubgroupID] = sg; }
     barrier();
-    for (uint rs = 32u; rs > 0u; rs /= 2u) {
-        if (t < rs) { red[t] += red[t + rs]; }
-        barrier();
+    if (t == 0u) {
+        float tot = 0.0;
+        for (uint s = 0u; s < gl_NumSubgroups; s++) { tot += part[s]; }
+        y_buf[unit] = tot;
     }
-    if (t == 0u) { y_buf[unit] = red[0]; }
 }
