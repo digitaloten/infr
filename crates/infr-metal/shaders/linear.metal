@@ -224,6 +224,61 @@ constant float kvalues_iq4nl_f[16] = {
     uint h4 = (bi & 1u) * 4u;                                                                     \
     for (uint k = 0; k < 16u; k++) wk[k] = d * kvalues_iq4nl_f[(qs[k] >> h4) & 0xFu];
 
+// NATIVE IQ2_XXS block (66 B / 256 elems): [f16 d][64 B qs]. 2.06 bpw. 8 sub-blocks of 32 elems;
+// each sub-block's 8 qs bytes are aux0 (four 8-bit grid indices into IQ2XXS_GRID[256]) + aux1
+// (four 7-bit sign indices into KSIGNS_IQ2XS, and a 4-bit scale magnitude in the top nibble).
+// Each grid entry expands to 8 signed values, so a 16-element group covers two grid entries.
+// IQ2XXS_GRID/KSIGNS_IQ2XS are generated into the source ahead of this file from the same tables
+// the CPU reads, so this matches dequant_codebook (ggml dequantize_row_iq2_xxs) bit-for-bit.
+// Without it, IQ2_XXS dequanted to a cached f32 weight — OOM on any large model.
+#define DEC16_IQ2XXS(wk)                                                                          \
+    device const uchar* blk = codes + (ulong)(bi >> 4) * 66ul;                                    \
+    float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));                     \
+    uint g = (uint)(bi & 15ul);                                                                   \
+    device const uchar* qs = blk + 2u + (g >> 1u) * 8u;                                           \
+    uint aux0 = (uint)qs[0] | ((uint)qs[1] << 8) | ((uint)qs[2] << 16) | ((uint)qs[3] << 24);     \
+    uint aux1 = (uint)qs[4] | ((uint)qs[5] << 8) | ((uint)qs[6] << 16) | ((uint)qs[7] << 24);     \
+    float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;                                           \
+    uint lbase = (g & 1u) * 2u;                                                                    \
+    for (uint li = 0u; li < 2u; li++) {                                                            \
+        uint l = lbase + li;                                                                       \
+        ulong grid = IQ2XXS_GRID[(aux0 >> (8u * l)) & 0xFFu];                                      \
+        uint signs = (uint)KSIGNS_IQ2XS[(aux1 >> (7u * l)) & 127u];                                \
+        for (uint j = 0u; j < 8u; j++) {                                                           \
+            char gv = (char)((grid >> (8u * j)) & 0xFFu);                                          \
+            wk[li * 8u + j] = db * (float)gv * ((signs & (1u << j)) ? -1.0f : 1.0f);               \
+        }                                                                                          \
+    }
+
+// NATIVE IQ3_XXS block (98 B / 256 elems): [f16 d][64 B grid indices][32 B scales_and_signs].
+// 3.06 bpw. 8 sub-blocks of 32; each sub-block's 4-byte sas word holds four 7-bit sign indices
+// into KSIGNS_IQ2XS plus a 4-bit scale in the top nibble. Each of the sub-block's 8 grid-index
+// bytes selects an IQ3XXS_GRID[256] entry (a u32 packing FOUR signed values), and the entries
+// come in pairs (g1 uses signs bits 0..3, g2 uses bits 4..7) — a 16-element group spans two
+// pairs. Generated grid ⇒ bit-exact vs dequant_block (ggml dequantize_row_iq3_xxs).
+#define DEC16_IQ3XXS(wk)                                                                          \
+    device const uchar* blk = codes + (ulong)(bi >> 4) * 98ul;                                    \
+    float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));                     \
+    uint g = (uint)(bi & 15ul);                                                                   \
+    uint ib32 = g >> 1u;                                                                          \
+    device const uchar* qs = blk + 2u + ib32 * 8u;                                                \
+    device const uchar* sas = blk + 66u + ib32 * 4u;                                              \
+    uint aux32 = (uint)sas[0] | ((uint)sas[1] << 8) | ((uint)sas[2] << 16) | ((uint)sas[3] << 24);\
+    float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;                                           \
+    uint lbase = (g & 1u) * 2u;                                                                    \
+    for (uint li = 0u; li < 2u; li++) {                                                            \
+        uint l = lbase + li;                                                                       \
+        uint signs = (uint)KSIGNS_IQ2XS[(aux32 >> (7u * l)) & 127u];                               \
+        uint g1 = IQ3XXS_GRID[qs[2u * l]];                                                         \
+        uint g2 = IQ3XXS_GRID[qs[2u * l + 1u]];                                                    \
+        for (uint j = 0u; j < 4u; j++) {                                                           \
+            char v1 = (char)((g1 >> (8u * j)) & 0xFFu);                                            \
+            char v2 = (char)((g2 >> (8u * j)) & 0xFFu);                                            \
+            wk[li * 8u + j] = db * (float)v1 * ((signs & (1u << j)) ? -1.0f : 1.0f);               \
+            wk[li * 8u + j + 4u] = db * (float)v2 * ((signs & (1u << (j + 4u))) ? -1.0f : 1.0f);   \
+        }                                                                                          \
+    }
+
 // NATIVE Q8_0 block (34 B / 32 elems): [f16 d][32 x i8]. 8.5 bpw streamed vs the factored
 // form's ~10.2 (codes + scm + dd) — the decode GEMV is bound on exactly this stream. 34 % 4 != 0,
 // so d assembles from bytes and the quants are char loads (same convention as Q6_K's byte loads).

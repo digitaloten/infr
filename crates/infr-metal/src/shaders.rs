@@ -25,7 +25,66 @@ unsafe impl Sync for Pipelines {}
 /// separately-maintained file list in the test would drift the same way a duplicated source
 /// copy once did).
 pub fn msl_source() -> String {
-    MSL_PARTS.concat()
+    // The IQ codebook grids (IQ2/IQ3) are generated from `infr_core::iquant_grids` — the SAME
+    // tables the CPU dequant reads, so the native kernels stay bit-exact by construction rather
+    // than by hand-transcribing 256..1024-entry tables into MSL. They must land before
+    // `linear.metal` (whose DEC16_IQ2XXS etc reference them): common + norms, then grids, then
+    // the rest in order.
+    let mut s = String::with_capacity(256 * 1024);
+    s.push_str(MSL_PARTS[0]);
+    s.push_str(MSL_PARTS[1]);
+    s.push_str(&iquant_grids_msl());
+    for part in &MSL_PARTS[2..] {
+        s.push_str(part);
+    }
+    s
+}
+
+/// Emit the IQ codebook grid + sign tables as MSL `constant` arrays, formatted from the Rust
+/// statics in `infr_core::iquant_grids` so there is exactly one copy of each table.
+fn iquant_grids_msl() -> String {
+    use infr_core::iquant_grids as ig;
+    use std::fmt::Write;
+    let mut s =
+        String::from("// Auto-generated from infr_core::iquant_grids (single source of truth).\n");
+    write!(
+        s,
+        "constant ulong IQ2XXS_GRID[{}] = {{",
+        ig::IQ2XXS_GRID.len()
+    )
+    .unwrap();
+    for (i, v) in ig::IQ2XXS_GRID.iter().enumerate() {
+        if i % 8 == 0 {
+            s.push('\n');
+        }
+        write!(s, "{v}ul,").unwrap();
+    }
+    write!(
+        s,
+        "\n}};\nconstant uchar KSIGNS_IQ2XS[{}] = {{",
+        ig::KSIGNS_IQ2XS.len()
+    )
+    .unwrap();
+    for (i, v) in ig::KSIGNS_IQ2XS.iter().enumerate() {
+        if i % 16 == 0 {
+            s.push('\n');
+        }
+        write!(s, "{v},").unwrap();
+    }
+    write!(
+        s,
+        "\n}};\nconstant uint IQ3XXS_GRID[{}] = {{",
+        ig::IQ3XXS_GRID.len()
+    )
+    .unwrap();
+    for (i, v) in ig::IQ3XXS_GRID.iter().enumerate() {
+        if i % 8 == 0 {
+            s.push('\n');
+        }
+        write!(s, "{v}u,").unwrap();
+    }
+    s.push_str("\n};\n");
+    s
 }
 
 impl Pipelines {
