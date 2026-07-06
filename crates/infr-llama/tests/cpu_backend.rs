@@ -1864,9 +1864,18 @@ fn gpu_seam_matches_cpu_diffusion_gemma_denoise() {
         .expect("vulkan session");
     vk_session.prefill(&model, &tokens).expect("vulkan prefill");
     let t1 = std::time::Instant::now();
-    let gpu_logits = vk_session
-        .denoise(&model, &canvas, None, 1.0)
+    // `u: None` opts out of the perf-slice-3 GPU reducer (docs/DIFFUSIONGEMMA.md) — this test
+    // wants the FULL `[canvas_len, vocab]` array back for its row-by-row cosine comparison below,
+    // not just the reduced {argmax, entropy, sampled}.
+    let gpu_outcome = vk_session
+        .denoise(&model, &canvas, None, 1.0, 1.0, None)
         .expect("vulkan denoise");
+    let gpu_logits = match gpu_outcome {
+        infr_llama::seam::DenoiseOutcome::Logits(v) => v,
+        infr_llama::seam::DenoiseOutcome::Reduced(_) => {
+            panic!("u: None must always take the full-logits path")
+        }
+    };
     let gpu_secs = t1.elapsed().as_secs_f64();
     eprintln!(
         "gpu_seam_matches_cpu_diffusion_gemma_denoise: cpu {cpu_secs:.1}s vulkan {gpu_secs:.1}s"

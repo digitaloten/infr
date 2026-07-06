@@ -3219,6 +3219,45 @@ impl<'a> Recorder<'a> {
         self.dispatch(k, &[Self::vkb(logits), Self::vkb(out_id)], 1, &push, 1);
     }
 
+    /// DiffusionGemma perf slice 3 (docs/DIFFUSIONGEMMA.md): fused per-canvas-row entropy-bound
+    /// sampler reduction — argmax/entropy/CDF-sample over `[rows, dim]` logits, one workgroup per
+    /// row. `u` is `rows` host-drawn uniform `[0,1)` floats (the CDF-inversion target draw).
+    /// Writes `argmax_out`/`entropy_out`/`sampled_out` (each `[rows]`) — only those tiny arrays
+    /// need to leave the GPU, not the `[rows, dim]` logits themselves. See `dg_eb_sample.comp`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dg_eb_sample(
+        &self,
+        logits: &dyn Buffer,
+        u: &dyn Buffer,
+        argmax_out: &dyn Buffer,
+        entropy_out: &dyn Buffer,
+        sampled_out: &dyn Buffer,
+        rows: usize,
+        dim: usize,
+        temp_inv: f32,
+    ) {
+        self.stamp("dg_eb_sample");
+        let k = self
+            .be
+            .kernel_sg("dg_eb_sample", crate::gemm::dg_eb_sample_spv(), 5, 8, 32);
+        let mut push = [0u8; 8];
+        push[0..4].copy_from_slice(&(dim as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&temp_inv.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[
+                Self::vkb(logits),
+                Self::vkb(u),
+                Self::vkb(argmax_out),
+                Self::vkb(entropy_out),
+                Self::vkb(sampled_out),
+            ],
+            3,
+            &push,
+            rows as u32,
+        );
+    }
+
     /// Zero a buffer's first `n` 4-byte elements (cmd_fill_buffer) — clears the bucket counters.
     pub fn zero(&self, buf: &dyn Buffer, n: usize) {
         self.sync(&[], &[Self::vkb(buf)], true);

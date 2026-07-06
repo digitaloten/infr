@@ -989,6 +989,7 @@ impl DiffusionGemmaCpuSession {
         temp_inv: f32,
     ) -> Result<Vec<f32>> {
         let mut out_logits = Vec::new();
+        let mut reduced = None; // CPU never requests the GPU reducer (`u: None` below) — stays `None`
         crate::seam::generate_dense_backend(
             &self.be,
             &|_name, tb, dt, _n| match tb {
@@ -1022,6 +1023,9 @@ impl DiffusionGemmaCpuSession {
                 sc_logits,
                 temp_inv,
                 out_logits: &mut out_logits,
+                u: None,
+                sample_temp_inv: 0.0,
+                reduced: &mut reduced,
             }),
         )?;
         Ok(out_logits)
@@ -1062,15 +1066,28 @@ impl DiffusionGemmaVulkanSession {
         Ok(())
     }
 
-    /// [`DiffusionGemmaCpuSession::denoise`]'s Vulkan twin.
+    /// [`DiffusionGemmaCpuSession::denoise`]'s Vulkan twin. Perf slice 3
+    /// (docs/DIFFUSIONGEMMA.md): when `u` is `Some`, this asks `generate_dense_backend` to try the
+    /// GPU entropy-bound sampler reducer on this step's logits (see
+    /// [`crate::seam::DenoiseOutcome`]) — `sample_temp_inv` is THIS step's sampler temperature
+    /// divisor (`denoise_block`'s local `temp_inv`, distinct from `temp_inv` above, which is the
+    /// PREVIOUS step's self-conditioning divisor) and `u` is `canvas_tokens.len()` host-drawn
+    /// uniform `[0,1)` floats (the seeded CDF-inversion draw). `u: None` always takes the ordinary
+    /// full-logits path (`gpu_seam_matches_cpu_diffusion_gemma_denoise`'s direct row-by-row
+    /// comparison needs the full array); the backend may ALSO decline on its own (falls back to
+    /// `DenoiseOutcome::Logits`) even when `u` is `Some` — the caller (`diffusion.rs::denoise_block`,
+    /// or a direct test) handles both outcomes.
     pub fn denoise(
         &mut self,
         model: &SeamModel,
         canvas_tokens: &[u32],
         sc_logits: Option<&[f32]>,
         temp_inv: f32,
-    ) -> Result<Vec<f32>> {
+        sample_temp_inv: f32,
+        u: Option<&[f32]>,
+    ) -> Result<crate::seam::DenoiseOutcome> {
         let mut out_logits = Vec::new();
+        let mut reduced = None;
         crate::seam::generate_dense_backend(
             &self.be,
             &|_name, tb, dt, _n| {
@@ -1102,9 +1119,15 @@ impl DiffusionGemmaVulkanSession {
                 sc_logits,
                 temp_inv,
                 out_logits: &mut out_logits,
+                u,
+                sample_temp_inv,
+                reduced: &mut reduced,
             }),
         )?;
-        Ok(out_logits)
+        Ok(match reduced {
+            Some(r) => crate::seam::DenoiseOutcome::Reduced(r),
+            None => crate::seam::DenoiseOutcome::Logits(out_logits),
+        })
     }
 }
 
@@ -1158,6 +1181,7 @@ impl DiffusionGemmaMetalSession {
         temp_inv: f32,
     ) -> Result<Vec<f32>> {
         let mut out_logits = Vec::new();
+        let mut reduced = None; // Metal never requests the GPU reducer (`u: None` below, Phase D — Vulkan only for this slice)
         crate::seam::generate_dense_backend(
             &self.be,
             &|_name, tb, dt, _n| {
@@ -1188,6 +1212,9 @@ impl DiffusionGemmaMetalSession {
                 sc_logits,
                 temp_inv,
                 out_logits: &mut out_logits,
+                u: None,
+                sample_temp_inv: 0.0,
+                reduced: &mut reduced,
             }),
         )?;
         Ok(out_logits)

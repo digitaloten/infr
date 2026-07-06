@@ -2,7 +2,9 @@
 //! drives it through a [`Backend`]. This is the giant `generate_dense_backend` — the single
 //! forward every entry point in `super` (CPU/Vulkan/Metal, one-shot/session/verify/denoise) funnels
 //! through. Pure-move split of `seam.rs` — see `super` for the module overview.
-use super::sc::{build_sc_embt, diffusion_self_cond, DenoiseCache, DenoiseReq, SelfCondWeights};
+use super::sc::{
+    build_sc_embt, diffusion_self_cond, DenoiseCache, DenoiseReq, EbReduced, SelfCondWeights,
+};
 use super::weights::{AttnW, DeltaW, FfnW, LayerW, MixerW, SeamKv, SeamWeights};
 use super::{common_prefix_len, e2b_ipl_rows, kv_fmt_bytes, kv_forces_static, BindWeight, WBytes};
 use crate::{Config, GenStats, PerLayerEmbd};
@@ -2233,7 +2235,12 @@ pub(crate) fn generate_dense_backend(
         // upload further down. Vulkan's `dyn_sc` path never populates this — see `use_ping`'s doc.
         let mut sc_logits_host: Option<Vec<f32>> = None;
         if let Some(sc_logits) = req.sc_logits {
-            if sc_logits.len() != cc * c.vocab {
+            // Perf slice 3: on the Vulkan `dyn_sc` ping path the VALUES here are never read (the
+            // previous step's raw logits are already GPU-resident in `sc_ping` — see `use_ping`'s
+            // doc), so `sc_logits` may be a placeholder slice when the GPU reducer produced the
+            // previous step's outcome (no full `[C,vocab]` host buffer to hand back). Only
+            // enforce the real shape where the values actually get read below.
+            if !dyn_sc && sc_logits.len() != cc * c.vocab {
                 return Err(anyhow!(
                     "denoise: sc_logits length {} != {cc}*{} (canvas rows * vocab)",
                     sc_logits.len(),
@@ -2465,10 +2472,69 @@ pub(crate) fn generate_dense_backend(
         be.execute(dcache.plan.as_ref(), &db)
             .map_err(|e| anyhow!("{e}"))?;
         let exec_secs = t_exec0.elapsed().as_secs_f64();
-        req.out_logits.resize(cc * c.vocab, 0.0);
+
         let t_dl0 = std::time::Instant::now();
-        be.download(logits_out_buf, bytemuck::cast_slice_mut(req.out_logits))
-            .map_err(|e| anyhow!("{e}"))?;
+        // Perf slice 3 (docs/DIFFUSIONGEMMA.md): try the GPU entropy-bound sampler reducer on
+        // THIS step's freshly-written logits before falling back to the full `[cc, vocab]`
+        // download — see `EbReduced`'s doc. `req.u` is `None` for CPU/Metal (they never reach
+        // this branch's Vulkan-only `use_ping` path anyway) and for Vulkan callers that opt out.
+        let mut reduced_now: Option<EbReduced> = None;
+        if let Some(u_host) = req.u {
+            if u_host.len() != cc {
+                return Err(anyhow!(
+                    "denoise: u length {} != {cc} (canvas rows)",
+                    u_host.len()
+                ));
+            }
+            let u_buf = be
+                .alloc(cc * 4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?;
+            be.upload(u_buf.as_ref(), bytemuck::cast_slice(u_host))
+                .map_err(|e| anyhow!("{e}"))?;
+            let argmax_buf = be
+                .alloc(cc * 4, BufferUsage::Readback)
+                .map_err(|e| anyhow!("{e}"))?;
+            let entropy_buf = be
+                .alloc(cc * 4, BufferUsage::Readback)
+                .map_err(|e| anyhow!("{e}"))?;
+            let sampled_buf = be
+                .alloc(cc * 4, BufferUsage::Readback)
+                .map_err(|e| anyhow!("{e}"))?;
+            let ok = be
+                .eb_sample_reduce(
+                    logits_out_buf,
+                    u_buf.as_ref(),
+                    cc,
+                    c.vocab,
+                    req.sample_temp_inv,
+                    argmax_buf.as_ref(),
+                    entropy_buf.as_ref(),
+                    sampled_buf.as_ref(),
+                )
+                .map_err(|e| anyhow!("{e}"))?;
+            if ok {
+                let mut argmax = vec![0u32; cc];
+                be.download(argmax_buf.as_ref(), bytemuck::cast_slice_mut(&mut argmax))
+                    .map_err(|e| anyhow!("{e}"))?;
+                let mut entropy = vec![0f32; cc];
+                be.download(entropy_buf.as_ref(), bytemuck::cast_slice_mut(&mut entropy))
+                    .map_err(|e| anyhow!("{e}"))?;
+                let mut sampled = vec![0u32; cc];
+                be.download(sampled_buf.as_ref(), bytemuck::cast_slice_mut(&mut sampled))
+                    .map_err(|e| anyhow!("{e}"))?;
+                reduced_now = Some(EbReduced {
+                    argmax,
+                    entropy,
+                    sampled,
+                });
+            }
+        }
+        if reduced_now.is_none() {
+            req.out_logits.resize(cc * c.vocab, 0.0);
+            be.download(logits_out_buf, bytemuck::cast_slice_mut(req.out_logits))
+                .map_err(|e| anyhow!("{e}"))?;
+        }
+        *req.reduced = reduced_now;
         let dl_secs = t_dl0.elapsed().as_secs_f64();
         // Vulkan: flip which ping slot is "write" vs "read" for the NEXT call — this call's output
         // (just downloaded above) becomes the next call's self-conditioning input, already

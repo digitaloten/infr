@@ -425,6 +425,9 @@ fn main() {
         ("moe_topk", "moe_topk", &[]),
         ("argmax", "argmax", &[]),
         ("moe_sample", "moe_sample", &[]),
+        // DiffusionGemma perf slice 3 (docs/DIFFUSIONGEMMA.md): fused per-row entropy-bound
+        // sampler reduction — argmax/entropy/CDF-sample over [rows, vocab] logits on-GPU.
+        ("dg_eb_sample", "dg_eb_sample", &[]),
         ("moe_bucket_count", "moe_bucket_count", &[]),
         ("moe_bucket_scan", "moe_bucket_scan", &[]),
         ("moe_bucket_scatter", "moe_bucket_scatter", &[]),

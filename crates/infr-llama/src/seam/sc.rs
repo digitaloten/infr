@@ -237,10 +237,54 @@ pub(crate) struct DenoiseReq<'a> {
     pub canvas_tokens: &'a [u32],
     /// Previous step's raw (pre-softmax, post-softcap) canvas logits `[C * vocab]`, for self-
     /// conditioning. `None` = SC off (`sc_use = 0`, matching the reference's step-0 gate).
+    /// Perf slice 3 (Vulkan `dyn_sc`): the VALUES are only ever read when `!dyn_sc` (the length
+    /// check below is scoped accordingly) — on the Vulkan ping path this is `Some` purely as a
+    /// presence marker (see `EbReduced`'s doc), so it may be a placeholder slice of any length.
     pub sc_logits: Option<&'a [f32]>,
     /// Self-conditioning softmax temperature divisor (`probs = softmax(sc_logits · temp_inv)`).
     /// Unused when `sc_logits` is `None`.
     pub temp_inv: f32,
-    /// Filled with `[C * vocab]` raw logits (pre-softmax, post-softcap) on success.
+    /// Filled with `[C * vocab]` raw logits (pre-softmax, post-softcap) on success — UNLESS the
+    /// GPU reducer ran this call (`reduced` comes back `Some`), in which case this is left empty
+    /// (no full download — see `u`'s doc).
     pub out_logits: &'a mut Vec<f32>,
+    /// Perf slice 3 (docs/DIFFUSIONGEMMA.md): `Some` when the caller wants THIS step's raw logits
+    /// reduced on-GPU into {argmax, entropy, sampled} instead of downloaded whole (see
+    /// `Backend::eb_sample_reduce`) — `Some(u)` where `u` is `canvas_tokens.len()` host-drawn
+    /// uniform `[0,1)` floats (the seeded CDF-inversion draw, `Rng::next_f32_01` per canvas row).
+    /// `None` (CPU/Metal sessions) always takes the ordinary full-logits path. Even when `Some`,
+    /// the backend may not support the reducer (falls back to full logits) — check `reduced`.
+    pub u: Option<&'a [f32]>,
+    /// This step's sampler temperature divisor (`softmax(raw * sample_temp_inv)`, i.e.
+    /// `denoise_block`'s local `temp_inv` — NOT `Self::temp_inv`, which is the PREVIOUS step's
+    /// self-conditioning divisor). Only meaningful when `u` is `Some`.
+    pub sample_temp_inv: f32,
+    /// Filled `Some` iff the GPU reducer actually ran this call (`u.is_some()` AND the backend
+    /// supports it) — see `u`'s doc. `None` on entry; still `None` on return means the caller
+    /// must read the (fully populated) `out_logits` instead.
+    pub reduced: &'a mut Option<EbReduced>,
+}
+
+/// Perf slice 3 (docs/DIFFUSIONGEMMA.md, `Backend::eb_sample_reduce`): one denoise step's sampler
+/// state reduced entirely on-GPU, one entry per canvas row — the `argmax`/`entropy`/`sampled`
+/// triple `diffusion.rs::denoise_block`'s host `per_pos` closure used to compute from the FULL
+/// downloaded `[C, vocab]` logits. Mirrors that closure's math exactly (NOT bit-identical — see
+/// `Backend::eb_sample_reduce`'s doc); `sampled[pos]` is only ever consumed by the caller for
+/// positions this step's entropy bound actually ACCEPTS (see `denoise_block`'s accept loop) — the
+/// renoise path never reads GPU data.
+// `pub` (not `pub(crate)`): both types below flow through `DiffusionSession::denoise`'s return
+// type, and that trait is `pub` (`crate::diffusion`) — a private type in a public trait's
+// signature is a hard compile error, not just a lint.
+pub struct EbReduced {
+    pub argmax: Vec<u32>,
+    pub entropy: Vec<f32>,
+    pub sampled: Vec<u32>,
+}
+
+/// A [`crate::diffusion::DiffusionSession::denoise`] call's outcome — either the ordinary full
+/// `[C, vocab]` raw logits (CPU/Metal always; Vulkan when the GPU reducer wasn't requested or
+/// wasn't available) or this step's sampler state already reduced on-GPU (Vulkan perf slice 3).
+pub enum DenoiseOutcome {
+    Logits(Vec<f32>),
+    Reduced(EbReduced),
 }

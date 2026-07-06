@@ -12,21 +12,32 @@
 //! the SAME schedule/acceptance/stop semantics under a fixed seed.
 
 use crate::seam::model::{DiffusionGemmaCpuSession, DiffusionGemmaVulkanSession, SeamModel};
+use crate::seam::DenoiseOutcome;
 use crate::{Config, GenStats};
 use anyhow::Result;
 use rayon::prelude::*;
 
 /// The two DiffusionGemma sessions' shared shape (Phase 2, `seam/model.rs`): causal prefill of the
 /// committed prefix, then a canvas denoise forward. One decode loop below drives either backend.
+///
+/// Perf slice 3 (docs/DIFFUSIONGEMMA.md): `sample_temp_inv`/`u` let a Vulkan session try the GPU
+/// entropy-bound sampler reducer for THIS step (see [`DenoiseOutcome`]) — `sample_temp_inv` is the
+/// CURRENT step's sampler temperature divisor (`denoise_block`'s local `temp_inv`, NOT the 4th
+/// arg, which is the PREVIOUS step's self-conditioning divisor) and `u` is `canvas_tokens.len()`
+/// host-drawn uniform `[0,1)` floats (the seeded CDF-inversion draw — see `Rng::next_f32_01`).
+/// CPU/Metal ignore both and always return `DenoiseOutcome::Logits`.
 pub trait DiffusionSession {
     fn prefill(&mut self, model: &SeamModel, tokens: &[u32]) -> Result<()>;
+    #[allow(clippy::too_many_arguments)]
     fn denoise(
         &mut self,
         model: &SeamModel,
         canvas_tokens: &[u32],
         sc_logits: Option<&[f32]>,
         temp_inv: f32,
-    ) -> Result<Vec<f32>>;
+        sample_temp_inv: f32,
+        u: &[f32],
+    ) -> Result<DenoiseOutcome>;
 }
 
 impl DiffusionSession for DiffusionGemmaCpuSession {
@@ -39,8 +50,16 @@ impl DiffusionSession for DiffusionGemmaCpuSession {
         canvas_tokens: &[u32],
         sc_logits: Option<&[f32]>,
         temp_inv: f32,
-    ) -> Result<Vec<f32>> {
-        DiffusionGemmaCpuSession::denoise(self, model, canvas_tokens, sc_logits, temp_inv)
+        _sample_temp_inv: f32,
+        _u: &[f32],
+    ) -> Result<DenoiseOutcome> {
+        Ok(DenoiseOutcome::Logits(DiffusionGemmaCpuSession::denoise(
+            self,
+            model,
+            canvas_tokens,
+            sc_logits,
+            temp_inv,
+        )?))
     }
 }
 
@@ -54,8 +73,18 @@ impl DiffusionSession for DiffusionGemmaVulkanSession {
         canvas_tokens: &[u32],
         sc_logits: Option<&[f32]>,
         temp_inv: f32,
-    ) -> Result<Vec<f32>> {
-        DiffusionGemmaVulkanSession::denoise(self, model, canvas_tokens, sc_logits, temp_inv)
+        sample_temp_inv: f32,
+        u: &[f32],
+    ) -> Result<DenoiseOutcome> {
+        DiffusionGemmaVulkanSession::denoise(
+            self,
+            model,
+            canvas_tokens,
+            sc_logits,
+            temp_inv,
+            sample_temp_inv,
+            Some(u),
+        )
     }
 }
 
@@ -70,14 +99,18 @@ impl DiffusionSession for crate::seam::model::DiffusionGemmaMetalSession {
         canvas_tokens: &[u32],
         sc_logits: Option<&[f32]>,
         temp_inv: f32,
-    ) -> Result<Vec<f32>> {
-        crate::seam::model::DiffusionGemmaMetalSession::denoise(
-            self,
-            model,
-            canvas_tokens,
-            sc_logits,
-            temp_inv,
-        )
+        _sample_temp_inv: f32,
+        _u: &[f32],
+    ) -> Result<DenoiseOutcome> {
+        Ok(DenoiseOutcome::Logits(
+            crate::seam::model::DiffusionGemmaMetalSession::denoise(
+                self,
+                model,
+                canvas_tokens,
+                sc_logits,
+                temp_inv,
+            )?,
+        ))
     }
 }
 
@@ -237,12 +270,12 @@ fn denoise_block(
         let t = eb.t_min + (eb.t_max - eb.t_min) * (cur_step as f32 / s as f32); // line 532
         let temp_inv = 1.0 / t;
 
-        let logits =
-            session.denoise(model, &current_canvas, sc_buffer.as_deref(), prev_temp_inv)?;
-        steps_run += 1;
-
-        // Pre-draw the step's randomness single-threaded BEFORE the parallel reduction, so the
-        // result doesn't depend on thread scheduling (`diffusion.cpp:576-580`).
+        // Pre-draw the step's randomness single-threaded BEFORE the reduction (host or GPU), so
+        // the result doesn't depend on thread scheduling (`diffusion.cpp:576-580`) — moved ahead
+        // of the `denoise` call itself (perf slice 3, docs/DIFFUSIONGEMMA.md): a Vulkan session
+        // needs `u` uploaded ALONGSIDE this step's forward dispatch to run the GPU reducer, but
+        // this is still the exact same RNG draw, in the exact same order, as before the move —
+        // nothing else touches `rng` between the old and new call sites within a step.
         let mut u = vec![0f32; c];
         let mut renoise = vec![0u32; c];
         for pos in 0..c {
@@ -250,64 +283,95 @@ fn denoise_block(
             renoise[pos] = rng.next_token(vocab);
         }
 
-        // Per-position argmax / entropy(softmax(raw*temp_inv)) / one multinomial draw from that
-        // softmax using the pre-drawn `u[pos]` (`diffusion.cpp:583-612`'s `worker`).
-        //
-        // Perf (profiled via samply: this loop's `exp`/`ln` calls — glibc's correctly-rounded
-        // expf/logf helper, `f32subf64x` — were >25% of ALL sampled thread-time on a 256-row
-        // canvas × 262144-vocab step, dwarfing every GPU kernel's share; see docs/PERF.md's class-5
-        // "host-in-the-loop" entry). The original computed `exp(raw*temp_inv - m)` TWICE per vocab
-        // element (once to accumulate `z_sum`, again — bit-for-bit the same value, since `exp` is a
-        // pure function of its input bits — to get `e` for the entropy/cumsum pass). Caching that
-        // first `exp` in a per-thread scratch buffer (`map_init`, reused across this worker's
-        // positions instead of a fresh per-position `Vec`) drops the loop from 2 exp passes + 1 ln
-        // pass to 1 exp pass + 1 ln pass over the row — same values, same order, bit-identical
-        // output, ~1/3 fewer transcendental calls and one fewer full 1 MB/row traversal.
-        let per_pos: Vec<(u32, f32, u32)> = (0..c)
-            .into_par_iter()
-            .map_init(
-                || vec![0f32; vocab],
-                |escratch, pos| {
-                    let row = &logits[pos * vocab..(pos + 1) * vocab];
-                    let mut m = f32::NEG_INFINITY;
-                    let mut amax = 0u32;
-                    for (v, &raw) in row.iter().enumerate() {
-                        let z = raw * temp_inv;
-                        if z > m {
-                            m = z;
-                            amax = v as u32;
-                        }
-                    }
-                    let mut z_sum = 0f32;
-                    for (v, &raw) in row.iter().enumerate() {
-                        let e = (raw * temp_inv - m).exp();
-                        escratch[v] = e;
-                        z_sum += e;
-                    }
-                    let target = u[pos] * z_sum;
-                    let mut cum = 0f32;
-                    let mut h = 0f32;
-                    let mut sampled = (vocab - 1) as u32;
-                    let mut picked = false;
-                    for (v, &e) in escratch.iter().enumerate() {
-                        let p = e / z_sum;
-                        if p > 0.0 {
-                            h -= p * p.ln();
-                        }
-                        cum += e;
-                        if !picked && cum >= target {
-                            sampled = v as u32;
-                            picked = true;
-                        }
-                    }
-                    (amax, h, sampled)
-                },
-            )
-            .collect();
-        for (pos, &(amax, h, sampled)) in per_pos.iter().enumerate() {
-            argmax_canvas[pos] = amax;
-            entropy[pos] = h;
-            denoiser[pos] = sampled;
+        let outcome = session.denoise(
+            model,
+            &current_canvas,
+            sc_buffer.as_deref(),
+            prev_temp_inv,
+            temp_inv,
+            &u,
+        )?;
+        steps_run += 1;
+
+        match outcome {
+            DenoiseOutcome::Logits(logits) => {
+                // Per-position argmax / entropy(softmax(raw*temp_inv)) / one multinomial draw from
+                // that softmax using the pre-drawn `u[pos]` (`diffusion.cpp:583-612`'s `worker`) —
+                // the host fallback path (CPU/Metal always; Vulkan when the GPU reducer declined).
+                //
+                // Perf (profiled via samply: this loop's `exp`/`ln` calls — glibc's correctly-rounded
+                // expf/logf helper, `f32subf64x` — were >25% of ALL sampled thread-time on a 256-row
+                // canvas × 262144-vocab step, dwarfing every GPU kernel's share; see docs/PERF.md's
+                // class-5 "host-in-the-loop" entry — the motivation for slice 3's GPU reducer below).
+                // The original computed `exp(raw*temp_inv - m)` TWICE per vocab element (once to
+                // accumulate `z_sum`, again — bit-for-bit the same value, since `exp` is a pure
+                // function of its input bits — to get `e` for the entropy/cumsum pass). Caching that
+                // first `exp` in a per-thread scratch buffer (`map_init`, reused across this worker's
+                // positions instead of a fresh per-position `Vec`) drops the loop from 2 exp passes +
+                // 1 ln pass to 1 exp pass + 1 ln pass over the row — same values, same order,
+                // bit-identical output, ~1/3 fewer transcendental calls and one fewer full 1 MB/row
+                // traversal.
+                let per_pos: Vec<(u32, f32, u32)> = (0..c)
+                    .into_par_iter()
+                    .map_init(
+                        || vec![0f32; vocab],
+                        |escratch, pos| {
+                            let row = &logits[pos * vocab..(pos + 1) * vocab];
+                            let mut m = f32::NEG_INFINITY;
+                            let mut amax = 0u32;
+                            for (v, &raw) in row.iter().enumerate() {
+                                let z = raw * temp_inv;
+                                if z > m {
+                                    m = z;
+                                    amax = v as u32;
+                                }
+                            }
+                            let mut z_sum = 0f32;
+                            for (v, &raw) in row.iter().enumerate() {
+                                let e = (raw * temp_inv - m).exp();
+                                escratch[v] = e;
+                                z_sum += e;
+                            }
+                            let target = u[pos] * z_sum;
+                            let mut cum = 0f32;
+                            let mut h = 0f32;
+                            let mut sampled = (vocab - 1) as u32;
+                            let mut picked = false;
+                            for (v, &e) in escratch.iter().enumerate() {
+                                let p = e / z_sum;
+                                if p > 0.0 {
+                                    h -= p * p.ln();
+                                }
+                                cum += e;
+                                if !picked && cum >= target {
+                                    sampled = v as u32;
+                                    picked = true;
+                                }
+                            }
+                            (amax, h, sampled)
+                        },
+                    )
+                    .collect();
+                for (pos, &(amax, h, sampled)) in per_pos.iter().enumerate() {
+                    argmax_canvas[pos] = amax;
+                    entropy[pos] = h;
+                    denoiser[pos] = sampled;
+                }
+                sc_buffer = Some(logits); // this step's raw logits self-condition the next
+            }
+            DenoiseOutcome::Reduced(r) => {
+                // Perf slice 3: the GPU already computed exactly what the branch above would have
+                // (see `dg_eb_sample.comp` + its host-reference unit test) — just adopt its output.
+                argmax_canvas = r.argmax;
+                entropy = r.entropy;
+                denoiser = r.sampled;
+                // Presence-only marker for the NEXT call's `sc_on` gate (`Some` = "not the first
+                // step") — the Vulkan `dyn_sc` path this outcome only ever occurs on never reads
+                // the VALUES (the previous step's raw logits are already GPU-resident in
+                // `sc_ping` — see `runner.rs`'s `use_ping`/`dyn_sc` docs), so an empty placeholder
+                // is correct, not just convenient.
+                sc_buffer = Some(Vec::new());
+            }
         }
 
         // Accept the lowest-entropy positions whose STRICTLY-EARLIER cumulative entropy stays
@@ -334,7 +398,6 @@ fn denoise_block(
             };
             entropy_sum += entropy[pos];
         }
-        sc_buffer = Some(logits); // this step's raw logits self-condition the next
 
         if let Some(cb) = on_step.as_deref_mut() {
             cb(StepView {

@@ -239,6 +239,13 @@ pub(crate) fn moe_sample_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// SPIR-V for the DiffusionGemma entropy-bound sampler reduction (perf slice 3): per-canvas-row
+/// argmax/entropy/CDF-sample over `[rows, vocab]` logits — see `shaders/dg_eb_sample.comp`.
+pub(crate) fn dg_eb_sample_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dg_eb_sample.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// Max `top_k` the GPU sampler supports (matches the shader's KMAX); larger falls back to host.
 pub const SAMPLE_KMAX: usize = 64;
 /// SPIR-V for the MoE expert-bucketing passes (count / exclusive-scan / scatter).

@@ -35,12 +35,32 @@ impl crate::diffusion::DiffusionSession for DiffusionSess {
         canvas_tokens: &[u32],
         sc_logits: Option<&[f32]>,
         temp_inv: f32,
-    ) -> Result<Vec<f32>> {
+        sample_temp_inv: f32,
+        u: &[f32],
+    ) -> Result<crate::seam::DenoiseOutcome> {
+        use crate::seam::DenoiseOutcome;
         match self {
-            DiffusionSess::Cpu(s) => s.denoise(model, canvas_tokens, sc_logits, temp_inv),
-            DiffusionSess::Vulkan(s) => s.denoise(model, canvas_tokens, sc_logits, temp_inv),
+            DiffusionSess::Cpu(s) => Ok(DenoiseOutcome::Logits(s.denoise(
+                model,
+                canvas_tokens,
+                sc_logits,
+                temp_inv,
+            )?)),
+            DiffusionSess::Vulkan(s) => s.denoise(
+                model,
+                canvas_tokens,
+                sc_logits,
+                temp_inv,
+                sample_temp_inv,
+                Some(u),
+            ),
             #[cfg(target_os = "macos")]
-            DiffusionSess::Metal(s) => s.denoise(model, canvas_tokens, sc_logits, temp_inv),
+            DiffusionSess::Metal(s) => Ok(DenoiseOutcome::Logits(s.denoise(
+                model,
+                canvas_tokens,
+                sc_logits,
+                temp_inv,
+            )?)),
         }
     }
 }

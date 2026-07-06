@@ -171,4 +171,42 @@ pub trait Backend: Send + Sync {
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>>;
     fn execute(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()>;
     fn sync(&self) -> Result<()>;
+
+    /// Perf (DiffusionGemma denoise, perf slice 3 — docs/DIFFUSIONGEMMA.md): fused per-canvas-row
+    /// entropy-bound sampler reduction over raw `[rows, dim]` logits, avoiding a full `[rows,
+    /// dim]` host download. `u` is `rows` host-drawn uniform `[0,1)` floats (the seeded
+    /// CDF-inversion target draw — reproducibility rides the SAME host RNG as the CPU sampler,
+    /// only the reduction itself moves to the GPU). On success, writes:
+    ///   - `argmax_out[r]` (u32): argmax token id over `raw[r,:] * temp_inv`.
+    ///   - `entropy_out[r]` (f32): entropy of `softmax(raw[r,:] * temp_inv)`.
+    ///   - `sampled_out[r]` (u32): one multinomial draw from that softmax via forward (vocab-
+    ///     order) CDF inversion against `u[r]` — matches the host sampler's algorithm exactly
+    ///     (same order, same target), NOT bit-identical (GPU float reduction order differs).
+    ///
+    /// Returns `Ok(false)` (default: every backend but Vulkan) when unsupported — the caller falls
+    /// back to a full `download` + host reduction. Never partially writes the outputs on `Ok(false)`.
+    #[allow(clippy::too_many_arguments)]
+    fn eb_sample_reduce(
+        &self,
+        logits: &dyn Buffer,
+        u: &dyn Buffer,
+        rows: usize,
+        dim: usize,
+        temp_inv: f32,
+        argmax_out: &dyn Buffer,
+        entropy_out: &dyn Buffer,
+        sampled_out: &dyn Buffer,
+    ) -> Result<bool> {
+        let _ = (
+            logits,
+            u,
+            rows,
+            dim,
+            temp_inv,
+            argmax_out,
+            entropy_out,
+            sampled_out,
+        );
+        Ok(false)
+    }
 }

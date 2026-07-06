@@ -24,6 +24,7 @@ mod weights;
 
 pub(crate) use runner::generate_dense_backend;
 pub(crate) use sc::DenoiseReq;
+pub use sc::{DenoiseOutcome, EbReduced};
 pub(crate) use weights::SeamKv;
 
 // ─── Qwen3 dense CPU decode runner ───────────────────────────────────────────────

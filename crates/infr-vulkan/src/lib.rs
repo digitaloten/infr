@@ -1033,6 +1033,36 @@ impl Backend for VulkanBackend {
         unsafe { self.shared.device.device_wait_idle() }
             .map_err(|e| be(format!("device_wait_idle: {e}")))
     }
+
+    /// DiffusionGemma perf slice 3 (docs/DIFFUSIONGEMMA.md): one eager dispatch of
+    /// `dg_eb_sample` + a synchronous wait (`Recorder::finish`) — this isn't part of a cached
+    /// [`Plan`], it runs once per denoise step right after that step's forward `execute()`, on
+    /// the same `logits` buffer the forward just wrote (still GPU-resident).
+    fn eb_sample_reduce(
+        &self,
+        logits: &dyn Buffer,
+        u: &dyn Buffer,
+        rows: usize,
+        dim: usize,
+        temp_inv: f32,
+        argmax_out: &dyn Buffer,
+        entropy_out: &dyn Buffer,
+        sampled_out: &dyn Buffer,
+    ) -> Result<bool> {
+        let rec = self.recorder()?;
+        rec.dg_eb_sample(
+            logits,
+            u,
+            argmax_out,
+            entropy_out,
+            sampled_out,
+            rows,
+            dim,
+            temp_inv,
+        );
+        rec.finish()?;
+        Ok(true)
+    }
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
