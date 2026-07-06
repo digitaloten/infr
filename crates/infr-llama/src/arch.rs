@@ -27,9 +27,10 @@ pub const GEMMA3: &str = "gemma3";
 /// Gemma 4 (incl. E2B): per-layer heterogeneous dims, V-norm, freq_factors, softcap,
 /// per-layer output scale; E2B adds KV-sharing + per-layer input embeddings.
 pub const GEMMA4: &str = "gemma4";
-/// Qwen3.5/3.6 gated-DeltaNet hybrid — routed to its OWN seam (`crate::qwen35`), never through
-/// `Config::from_gguf`. NOT llama.cpp's `qwen3next` (a sibling arch with a different DeltaNet
-/// V-broadcast pattern) and not `qwen35moe` — both are rejected on purpose.
+/// Qwen3.5/3.6 gated-DeltaNet hybrid — runs through `Config::from_gguf`'s `qwen35` fields +
+/// `MixerW::DeltaNet` (see `crate::qwen35::Cfg` for the raw metadata parse). NOT llama.cpp's
+/// `qwen3next` (a sibling arch with a different DeltaNet V-broadcast pattern) and not
+/// `qwen35moe` — both are rejected on purpose.
 pub const QWEN35: &str = "qwen35";
 /// DiffusionGemma: block text-diffusion MoE on a Gemma-4 backbone (shares gemma4's heterogeneous
 /// per-layer dims, V-norm, freq_factors, softcap, sandwich norms), plus a per-layer DUAL FFN
@@ -37,10 +38,10 @@ pub const QWEN35: &str = "qwen35";
 /// `docs/DIFFUSIONGEMMA.md`.
 pub const DIFFUSION_GEMMA: &str = "diffusion-gemma";
 
-/// What `Config::from_gguf` — the shared TRANSFORMER-skeleton path — accepts. The split is by
-/// code path, not FFN sparsity: this list includes the routed-MoE `qwen3moe` (same attention/KV
-/// machinery, an expert FFN swapped in), and excludes `QWEN35` only because the runners route the
-/// DeltaNet hybrid to `crate::qwen35::SeamModel` before Config is ever built.
+/// What `Config::from_gguf` — the shared TRANSFORMER-skeleton path — accepts, MINUS `QWEN35`
+/// (kept as its own match arm since `is_qwen35` gates a handful of qwen35-only fields — see
+/// `Config::from_gguf`). The split is by code path, not FFN sparsity: this list includes the
+/// routed-MoE `qwen3moe` (same attention/KV machinery, an expert FFN swapped in).
 pub const TRANSFORMER: &[&str] = &[
     LLAMA,
     QWEN2,

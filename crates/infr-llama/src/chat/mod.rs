@@ -30,7 +30,7 @@ pub use cpu::CpuDenseChat;
 pub use diffusion::DiffusionGemmaChat;
 #[cfg(target_os = "macos")]
 pub use metal::{MetalSeamChat, SpecMetalChat};
-pub use vulkan::{DenseSeamChat, Qwen35Chat};
+pub use vulkan::DenseSeamChat;
 
 /// The two arch-specific primitives the shared [`Chat`] drives. Object-safe: no generics, callbacks
 /// are `&mut dyn FnMut`. A stateful backend (dense) may keep a KV cache warm across `generate` calls;
@@ -153,18 +153,6 @@ impl<'a> Chat<'a> {
     pub fn repl_status(&self) -> Option<String> {
         self.model.status()
     }
-}
-
-/// Which compute backend a [`Qwen35Chat`] loads its [`crate::qwen35::SeamModel`] on. All variants
-/// run the SAME agnostic seam graph — only the executor differs.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum SeamBackend {
-    /// Production GPU path (native-dtype weights in VRAM, in-kernel dequant).
-    Vulkan,
-    /// Reference CPU interpreter (`INFR_CPU=1`, zero-copy mmap weights).
-    Cpu,
-    /// Reference Apple-GPU backend (`INFR_METAL=1`, macOS only).
-    Metal,
 }
 
 /// Standalone OpenAI-shaped prompt renderer over a GGUF's own chat template — tool specs and prior

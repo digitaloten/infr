@@ -939,68 +939,26 @@ const QWEN35_GOLDEN: &[(&str, usize, u64)] = &[
 ];
 
 /// CPU-only: qwen35 / Qwen3-Next golden-hash lock (gated-DeltaNet recurrence + conv + gated full
-/// attention). Uses the dedicated `qwen35::generate_cpu` runner.
+/// attention), through the UNIFIED shared-transformer path (`SeamModel::generate_cpu`, i.e.
+/// `seam::generate_dense_cpu` with the `MixerW::DeltaNet` branch) — the same runner every other
+/// arch's `cpu_golden_*` test above locks. (Historically this ran through a bespoke qwen35-only
+/// seam that lived in `qwen35.rs`; that seam was proven token-identical to this unified path
+/// during the cutover and has since been deleted — issue #30.)
 #[test]
 fn cpu_golden_qwen35() {
     let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
-    let bless = std::env::var("INFR_BLESS").is_ok();
-    for (prompt, n, want) in QWEN35_GOLDEN {
-        let rendered = infr_llama::qwen35::render_chat(&path, prompt).expect("render");
-        let mut out = String::new();
-        infr_llama::qwen35::generate_cpu(&path, &rendered, *n, |p| out.push_str(p)).expect("gen");
-        let h = fnv1a(&out);
-        if bless {
-            println!("    ({prompt:?}, {n}, 0x{h:016x}),  // {out:?}");
-        } else {
-            assert_eq!(
-                h, *want,
-                "qwen35 golden changed for {prompt:?}\n  out: {out:?}"
-            );
-        }
-    }
-}
-
-// ─── qwen35 on the UNIFIED shared-transformer path (Phase 2) ──────────────────────
-//
-// `Config::from_gguf` now accepts `arch == "qwen35"` and `seam`'s layer loop has a
-// `MixerW::DeltaNet` branch (see `docs/QWEN35.md`) — so `SeamModel::load` on a qwen35 GGUF drives
-// the SAME shared runner every other arch uses, in parallel with the old hand-written seam above.
-// Phase 3: production routing (`infr run`/`serve`/`bench` in infr-cli) now sends qwen35 through
-// this SAME unified path by default too — the old `qwen35::SeamModel` seam is reachable only via
-// the temporary `INFR_QWEN35_OLD=1` escape hatch. These tests remain the token-identical proof
-// that the two paths agree.
-
-/// The unified CPU path (`SeamModel::generate_cpu`, i.e. `seam::generate_dense_cpu`) must
-/// produce IDENTICAL output to the old hand-written seam (`qwen35::generate_cpu`) for the same
-/// chat-rendered prompt: both run the same op sequence (RmsNorm/Linear/Conv1dSilu/DeltaNet/
-/// QkNorm/GatedAct for the DeltaNet layers; the interleaved-gate split + sigmoid gate for the
-/// attention layers) through the identical f32 CPU kernels, so greedy decode should match
-/// token-for-token, not just golden-hash-coherent.
-#[test]
-fn unified_qwen35_cpu_matches_old_seam() {
-    let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
-    let _tlk = test_serial_lock();
-    std::env::set_var("INFR_TEMP", "0");
-    let prompt =
-        infr_llama::qwen35::render_chat(&path, "The capital of France is").expect("render");
-
-    let mut old_out = String::new();
-    infr_llama::qwen35::generate_cpu(&path, &prompt, 24, |p| old_out.push_str(p))
-        .expect("old seam gen");
-
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
-    let mut new_out = String::new();
-    model
-        .generate_cpu(&prompt, 24, |p| new_out.push_str(p))
-        .expect("unified cpu gen");
-
-    assert_eq!(
-        old_out, new_out,
-        "unified shared-transformer CPU path diverged from the old qwen35 seam"
-    );
+    check_golden(&model, QWEN35_GOLDEN);
 }
+
+// ─── qwen35 on the UNIFIED shared-transformer path ─────────────────────────────────
+//
+// `Config::from_gguf` accepts `arch == "qwen35"` and `seam`'s layer loop has a `MixerW::DeltaNet`
+// branch (see `docs/QWEN35.md`) — so `SeamModel::load` on a qwen35 GGUF drives the SAME shared
+// runner every other arch uses, and production routing (`infr run`/`serve`/`bench` in infr-cli)
+// sends qwen35 through this path unconditionally.
 
 /// The unified Vulkan seam (`SeamModel::generate_dense_vulkan`) must match the unified CPU oracle
 /// (`SeamModel::generate_cpu`) token-for-token — the seam twin of every other arch's

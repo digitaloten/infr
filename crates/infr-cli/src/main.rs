@@ -427,19 +427,14 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
 
     // Build the per-backend generation primitive (`ChatModel`), then wrap it in the ONE shared `Chat`
     // (infr_llama::model) that owns history + `<think>`-stripping and drives the single REPL below:
-    // INFR_CPU (dense/MoE or qwen35 on the agnostic compute graph, no Vulkan/VRAM), qwen35 GPU,
+    // INFR_CPU (dense/MoE/qwen35 on the agnostic compute graph, no Vulkan/VRAM), Vulkan/Metal GPU,
     // qwen3moe, dense Qwen3/Llama/Gemma. Every backend now does history-based multi-turn — no
     // per-arch one-shot special-case. The CLI owns the Llama; the boxed trait object borrows it (so
     // the borrow-based dense `ChatSession` needs no ownership change).
-    // Phase 3 cutover: qwen35 (Qwen3.5) now runs through the SAME standard `ChatModel` structs as
-    // every other arch below — `SeamModel::load` + the CPU/Vulkan/Metal sessions drive any
-    // `Config` arch (including `MixerW::DeltaNet`) since Phase 1+2, so there is no more
-    // qwen35-only branch. Escape hatch: `INFR_QWEN35_OLD=1` still reaches the old hand-written
-    // seam (`Qwen35Chat` / `qwen35::SeamModel`) for one release — Metal hardware validation
-    // happens on another machine, so the hatch is cheap insurance. TEMPORARY: phase 4 removes
-    // this + the old seam entirely.
-    let is_q35 = infr_llama::qwen35::is_qwen35(&gguf);
-    let use_old_seam = is_q35 && std::env::var("INFR_QWEN35_OLD").is_ok();
+    // qwen35 (Qwen3.5) runs through the SAME standard `ChatModel` structs as every other arch below
+    // — `SeamModel::load` + the CPU/Vulkan/Metal sessions drive any `Config` arch (including
+    // `MixerW::DeltaNet`) — so there is no qwen35-only branch (the old bespoke seam and its
+    // env-gated escape hatch were deleted once the unified path was validated; issue #30).
     // Chat-default sampling for every backend (the bespoke branch reads the same envs below).
     set_default_sampling_env();
     let model: Box<dyn infr_llama::chat::ChatModel + '_> = if is_dg {
@@ -469,48 +464,31 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
             infr_llama::chat::DiffusionGemmaChat::new(loaded)
         })
     } else if std::env::var("INFR_METAL").is_ok() {
-        if use_old_seam {
-            eprintln!(
-                "[metal backend — qwen35 (Qwen3.5) on the OLD seam (INFR_QWEN35_OLD=1), Apple GPU (reference)]"
-            );
-            Box::new(infr_llama::chat::Qwen35Chat::new_metal(gguf.clone()))
-        } else {
-            eprintln!(
-                "[metal backend — dense/MoE forward on Apple GPU via the agnostic compute graph, persistent KV session]"
-            );
-            #[cfg(target_os = "macos")]
-            {
-                metal_chat_model(&gguf, tok.as_deref())?
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                Box::new(infr_llama::chat::CpuDenseChat::new_metal(
-                    infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
-                ))
-            }
+        eprintln!(
+            "[metal backend — dense/MoE forward on Apple GPU via the agnostic compute graph, persistent KV session]"
+        );
+        #[cfg(target_os = "macos")]
+        {
+            metal_chat_model(&gguf, tok.as_deref())?
         }
-    } else if std::env::var("INFR_CPU").is_ok() {
-        if use_old_seam {
-            eprintln!(
-                "[cpu backend — qwen35 (Qwen3.5) on the OLD seam (INFR_QWEN35_OLD=1), no GPU]"
-            );
-            Box::new(infr_llama::chat::Qwen35Chat::new_cpu(gguf.clone()))
-        } else {
-            eprintln!(
-                "[cpu backend — dense/MoE forward on CPU via the agnostic compute graph, no GPU]"
-            );
-            Box::new(infr_llama::chat::CpuDenseChat::new(
+        #[cfg(not(target_os = "macos"))]
+        {
+            Box::new(infr_llama::chat::CpuDenseChat::new_metal(
                 infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
             ))
         }
-    } else if use_old_seam {
-        eprintln!("[qwen35 (Qwen3.5) — OLD Vulkan agnostic seam (INFR_QWEN35_OLD=1)]");
-        Box::new(infr_llama::chat::Qwen35Chat::new(gguf.clone()))
+    } else if std::env::var("INFR_CPU").is_ok() {
+        eprintln!(
+            "[cpu backend — dense/MoE forward on CPU via the agnostic compute graph, no GPU]"
+        );
+        Box::new(infr_llama::chat::CpuDenseChat::new(
+            infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
+        ))
     } else {
         // The default: dense/MoE on the VULKAN agnostic seam — persistent multi-slot KV sessions
         // (per-turn suffix-only prefill), record-once decode replay, MoE expert auto-fit. qwen35
-        // (Qwen3.5) lands here too since Phase 3 — same seam, same `Config::from_gguf` +
-        // `MixerW::DeltaNet` unified runner (see `unified_qwen35_*` tests).
+        // (Qwen3.5) lands here too — same seam, same `Config::from_gguf` + `MixerW::DeltaNet`
+        // unified runner (see `unified_qwen35_*` tests).
         eprintln!("[vulkan seam — dense/MoE on the agnostic compute graph, persistent KV session]");
         Box::new(infr_llama::chat::DenseSeamChat::new(
             infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
@@ -783,16 +761,10 @@ fn cmd_bench(
             json,
         );
     }
-    // Phase 3 cutover: qwen35 (Qwen3.5) now benches through the STANDARD arms below
-    // (`cmd_bench_cpu` / the seam's `bench_vulkan` / `cmd_bench_metal`) — `SeamModel::load` drives
-    // it through the unified runner (`Config::from_gguf` + `MixerW::DeltaNet`, Phase 1+2), reusing
-    // the exact same pp/tg/depth methodology every other arch gets. This permanently kills the
-    // class of depth-accounting artifacts the old qwen35-only bench arm (`cmd_bench_qwen35`) had.
-    // Escape hatch: `INFR_QWEN35_OLD=1` still reaches that old hand-written seam bench for one
-    // release. TEMPORARY: phase 4 removes this + `cmd_bench_qwen35`/the old seam entirely.
-    if infr_llama::qwen35::is_qwen35(&gguf) && std::env::var("INFR_QWEN35_OLD").is_ok() {
-        return cmd_bench_qwen35(&gguf, n_prompt, n_gen, depth, pg, reps, ngl == 0, json);
-    }
+    // qwen35 (Qwen3.5) benches through the STANDARD arms below (`cmd_bench_cpu` / the seam's
+    // `bench_vulkan` / `cmd_bench_metal`) — `SeamModel::load` drives it through the unified runner
+    // (`Config::from_gguf` + `MixerW::DeltaNet`), reusing the exact same pp/tg/depth methodology
+    // every other arch gets (no more qwen35-only bench arm or depth-accounting artifacts).
     // -ngl 0: run on the CPU reference backend (no GPU), comparable to `llama-bench -ngl 0`.
     if ngl == 0 {
         return cmd_bench_cpu(
@@ -854,7 +826,7 @@ fn cmd_bench(
 /// The MTP-spec-decode measurement `infr bench` reports alongside the baseline tg rate (issue #33,
 /// phase 4) — for models whose GGUF ships an MTP head. Runs
 /// [`infr_llama::mtp::generate_mtp_spec_vulkan_timed`] on a synthetic text prompt sized to match
-/// `-p`/`-d` (the same "repeat a fixed sentence to ~N tokens" convention `cmd_bench_qwen35` uses —
+/// `-p`/`-d` (the same "repeat a fixed sentence to ~N tokens" convention used below —
 /// the MTP driver takes a rendered PROMPT, not raw token ids, unlike `bench_vulkan`'s dummy-id
 /// arm), once per rep (no persistent MTP session yet — `docs/MTP.md`'s Phase 3 doc on
 /// `generate_mtp_spec_vulkan`'s per-call fresh trunk+head — so each rep re-pays the full weight
@@ -877,7 +849,7 @@ fn bench_mtp_tg(
     reps: usize,
 ) -> anyhow::Result<MtpBenchStats> {
     let head = infr_llama::mtp::load_mtp_head(model.gguf(), model.config())?;
-    let sentence = "The quick brown fox jumps over the lazy dog. "; // ~10 tokens/rep, cmd_bench_qwen35's convention
+    let sentence = "The quick brown fox jumps over the lazy dog. "; // ~10 tokens/rep
     let want = (n_prompt + depth).max(1);
     let prompt = sentence.repeat(want.div_ceil(10));
     let mut samples = Vec::with_capacity(reps.max(1));
@@ -1060,100 +1032,6 @@ fn cmd_bench_cpu(
     Ok(())
 }
 
-/// qwen35 (Qwen3.5) bench: drives the PRODUCTION path through the SAME `ChatModel` structs
-/// `infr run` builds (`Qwen35Chat`, on the Vulkan or CPU seam backend), timing `ChatModel::generate`
-/// itself — bench and run share one engine BY CONSTRUCTION, so a production-path change can never
-/// leave the bench measuring a dead path. The seam ingests a text prompt, so synthesize one near
-/// `n_prompt` tokens and report the actual token counts from its stats. `cpu` selects the CPU seam
-/// backend (`-ngl 0`) vs the Vulkan GPU-resident forward.
-#[allow(clippy::too_many_arguments)]
-fn cmd_bench_qwen35(
-    gguf: &Path,
-    n_prompt: usize,
-    n_gen: usize,
-    depth: usize,
-    pg: Option<(usize, usize)>,
-    reps: usize,
-    cpu: bool,
-    json: bool,
-) -> anyhow::Result<()> {
-    if pg.is_some() {
-        anyhow::bail!(
-            "qwen35 bench does not support -pg (combined prompt+gen); use separate -p/-n"
-        );
-    }
-    use infr_llama::chat::ChatModel;
-    std::env::set_var("INFR_Q35_IGNORE_EOS", "1"); // fixed tg count, no early stop
-    let mut m: Box<dyn ChatModel> = if cpu {
-        Box::new(infr_llama::chat::Qwen35Chat::new_cpu(gguf.to_path_buf()))
-    } else if std::env::var("INFR_METAL").is_ok() {
-        // Metal seam (there is no Vulkan loader on macOS — `new()` would dlopen-fail).
-        Box::new(infr_llama::chat::Qwen35Chat::new_metal(gguf.to_path_buf()))
-    } else {
-        Box::new(infr_llama::chat::Qwen35Chat::new(gguf.to_path_buf()))
-    };
-    let sentence = "The quick brown fox jumps over the lazy dog. "; // ~10 tokens
-                                                                    // Depth rides the PROMPT: `GenStats` splits prompt_secs from decode_secs, so decoding at
-                                                                    // depth d = a ~d-token prompt whose (untimed-for-tg) prefill fills the state, then the
-                                                                    // timed decode runs at that depth.
-    let prompt_toks = n_prompt + depth;
-    let prompt = if prompt_toks > 0 {
-        sentence.repeat(prompt_toks.div_ceil(10))
-    } else {
-        sentence.to_string()
-    };
-    let n = n_gen.max(1);
-    // untimed warmup: loads the model once (weights + pipeline compile stay warm across reps)
-    m.generate(sentence, 1, &mut |_| {})?;
-    let (mut pps, mut tgs) = (Vec::new(), Vec::new());
-    let (mut np, mut ng) = (0usize, 0usize);
-    if n_gen == 0 && depth > 0 {
-        // pp@depth (the SHORT TURN / suffix shape, llama-bench `-p N -d D`): the session reuses
-        // an exactly-EXTENDED cached sequence, so fill the state to ~depth (untimed), then time
-        // the suffix-only prefill of the extension. Without this split, a single deep prompt
-        // reported BULK prefill throughput labeled as the suffix — pp4@d4096 read 13.9k t/s
-        // (≈ this model's pp512 rate) against llama-bench's true 793. Reps re-fill the depth
-        // each round (a shorter re-prompt zero-resets the recurrent state by contract).
-        // Trim the trailing space: "…dog. " + more text BPE-merges the space into the next word,
-        // changing the depth prompt's LAST token when extended — the session sees a non-extension
-        // and zero-resets (recurrent state can't rewind), silently re-prefilling the whole depth.
-        // Ending on "…dog." keeps tokenize(dprompt) a strict prefix of tokenize(full). The suffix
-        // is N repetitions of a single-token word so the measured suffix is ~N tokens (the label
-        // reports the exact prefilled count).
-        let dprompt = sentence.repeat(depth.div_ceil(10)).trim_end().to_string();
-        let full = format!("{dprompt}{}", " fox".repeat(n_prompt.max(1)));
-        for _ in 0..reps.max(1) {
-            m.generate(&dprompt, 1, &mut |_| {})?; // untimed: state to ~depth
-            let st = m.generate(&full, 1, &mut |_| {})?; // timed part: the suffix prefill
-            pps.push(st.n_prompt as f64 / st.prompt_secs.max(1e-9));
-            np = st.n_prompt;
-        }
-    } else {
-        for _ in 0..reps.max(1) {
-            let st = m.generate(&prompt, n, &mut |_| {})?;
-            pps.push(st.n_prompt as f64 / st.prompt_secs.max(1e-9));
-            tgs.push(st.n_gen as f64 / st.decode_secs.max(1e-9));
-            (np, ng) = (st.n_prompt, st.n_gen);
-        }
-    }
-    let avg = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
-    if json {
-        let a = if n_gen > 0 { avg(&tgs) } else { avg(&pps) };
-        println!("[{{\"avg_ts\": {a:.2}}}]");
-    } else if n_gen > 0 && n_prompt > 0 && depth == 0 {
-        println!(
-            "pp{np}: {:.1} t/s | tg{ng}: {:.1} t/s  ({reps} reps)",
-            avg(&pps),
-            avg(&tgs)
-        );
-    } else if n_gen > 0 {
-        println!("tg{ng}: {:.1} t/s  ({reps} reps)", avg(&tgs));
-    } else {
-        println!("pp{np}: {:.1} t/s  ({reps} reps)", avg(&pps));
-    }
-    Ok(())
-}
-
 /// diffusion-gemma bench (Phase 4, `docs/DIFFUSIONGEMMA.md`): llama-bench has no diffusion mode
 /// (no llama.cpp comparison possible — this is infr-only reporting), so this drives
 /// `crate::diffusion::diffusion_generate` directly over a persistent
@@ -1230,7 +1108,7 @@ fn cmd_bench_diffusion_gemma(
     // ACTUAL logits — an out-of-distribution raw-id prompt made the model collapse the whole
     // canvas to one repeated token in 2 steps (`trim_canvas` then cut it to 0 committed tokens),
     // which measures a degenerate path instead of the shape `-n` asks for. Encode a real repeated
-    // sentence instead (same "fixed synthetic prompt" convention `cmd_bench_qwen35` uses) and slice
+    // sentence instead (same "fixed synthetic prompt" convention `bench_mtp_tg` uses) and slice
     // it: `dummy(depth)` is then an exact prefix of `dummy(depth + p_eff)` by construction, so the
     // untimed depth warm + timed suffix prefill still gets the session's prefix-diff reuse.
     let long_text = "The quick brown fox jumps over the lazy dog. ".repeat((depth + p_eff) / 4 + 8);
@@ -1880,12 +1758,9 @@ fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
     // Seam-backed serve — the ONE engine: the SAME ChatModel + multi-slot session `infr run`
     // uses, so serve gets per-request suffix-only prefill and cross-conversation prefix seeding
     // for free. INFR_CPU / INFR_METAL select the reference backends; Vulkan is the default.
-    // Phase 3 cutover: qwen35 shares the SAME selection funnel as every other arch below (no more
-    // standalone `Qwen35Chat` branch) — see the matching comment in `cmd_run`. Escape hatch:
-    // `INFR_QWEN35_OLD=1` still reaches the old seam for one release. TEMPORARY: phase 4 removes
-    // this + the old seam entirely.
-    let is_q35 = infr_llama::qwen35::is_qwen35(&gguf);
-    let use_old_seam = is_q35 && std::env::var("INFR_QWEN35_OLD").is_ok();
+    // qwen35 shares the SAME selection funnel as every other arch below — see the matching
+    // comment in `cmd_run` (the old standalone `Qwen35Chat` branch + its env-gated escape hatch
+    // were deleted once the unified path was validated; issue #30).
     let is_dg = infr_llama::diffusion::is_diffusion_gemma(&gguf);
     let mut m: Box<dyn infr_llama::chat::ChatModel + Send> = if is_dg {
         // diffusion-gemma (Phase 3/D): same selection as `cmd_run` — see its matching comment.
@@ -1898,14 +1773,6 @@ fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
             infr_llama::chat::DiffusionGemmaChat::new_metal(loaded)
         } else {
             infr_llama::chat::DiffusionGemmaChat::new(loaded)
-        })
-    } else if use_old_seam {
-        Box::new(if std::env::var("INFR_METAL").is_ok() {
-            infr_llama::chat::Qwen35Chat::new_metal(gguf.clone())
-        } else if std::env::var("INFR_CPU").is_ok() {
-            infr_llama::chat::Qwen35Chat::new_cpu(gguf.clone())
-        } else {
-            infr_llama::chat::Qwen35Chat::new(gguf.clone())
         })
     } else if std::env::var("INFR_METAL").is_ok() {
         // Metal: the SAME selection funnel as `infr run` — persistent-session seam chat, or

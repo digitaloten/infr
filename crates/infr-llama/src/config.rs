@@ -103,9 +103,8 @@ pub struct Config {
     /// back to 8192 if the GGUF omits it.
     pub n_ctx_train: usize,
     /// qwen35 (Qwen3.5/3.6 gated-DeltaNet hybrid): `true` only for `arch == "qwen35"`. Gates every
-    /// field below plus the DeltaNet mixer branch in `seam`'s layer loop. In production this
-    /// `Config` is never built for a qwen35 GGUF (the runners route it to `crate::qwen35::SeamModel`
-    /// first) — this flag exists so the shared transformer skeleton CAN run it (tests only, so far).
+    /// field below plus the `MixerW::DeltaNet` mixer branch in `seam`'s layer loop — the same
+    /// shared transformer skeleton every other architecture runs through.
     pub qwen35: bool,
     /// qwen35: attention layers sit at `i` where `(i+1) % full_attn_interval == 0`; every other
     /// layer is gated-DeltaNet linear attention. `0` for every non-qwen35 model (never read).
@@ -117,8 +116,8 @@ pub struct Config {
     pub ssm_n_group: usize,
     pub ssm_dt_rank: usize,
     /// qwen35 sectioned RoPE (`rope.dimension_sections`, e.g. `[11,11,10,0]`). Parsed for parity
-    /// with the old seam's `Cfg`, but — like the old seam — NOT applied differently from plain
-    /// NEOX rope: with every section sharing the same 1-D position id, a sectioned rotation over
+    /// with `qwen35::Cfg`, but NOT applied differently from plain NEOX rope: with every section
+    /// sharing the same 1-D position id, a sectioned rotation over
     /// `rope_dim` collapses to the standard `QkNormRope`, so `layer_rope_dim`/`layer_rope_theta`
     /// alone drive qwen35's rope emission. `[0;4]` for non-qwen35 models.
     pub rope_sections: [u32; 4],
@@ -255,14 +254,13 @@ impl Config {
             | crate::arch::GEMMA3
             | crate::arch::GEMMA4
             | crate::arch::DIFFUSION_GEMMA => true,
-            // qwen35's full-attention layers are qk-normed like qwen3/gemma. In PRODUCTION this
-            // Config is never built for a qwen35 GGUF (the runners route it to `qwen35::SeamModel`
-            // first via `is_qwen35`) — accepting it here only lets tests drive the shared skeleton
-            // directly (see `docs/QWEN35.md`, Phase 2). The message renders from `arch::TRANSFORMER`
-            // so the supported list can't drift from the match arms above.
+            // qwen35's full-attention layers are qk-normed like qwen3/gemma (see `docs/QWEN35.md`).
+            // Kept as its own match arm (rather than folded into `arch::TRANSFORMER` above) because
+            // `is_qwen35` gates a handful of qwen35-only fields below it; the error message renders
+            // both lists so the supported set can't drift from the match arms above.
             crate::arch::QWEN35 => true,
             other => bail!(
-                "infr-llama supports architecture={} (plus {} via its own seam), got {other:?}",
+                "infr-llama supports architecture={} (plus {}), got {other:?}",
                 crate::arch::TRANSFORMER.join("|"),
                 crate::arch::QWEN35,
             ),
