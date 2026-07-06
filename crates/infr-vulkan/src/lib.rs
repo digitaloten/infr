@@ -1052,6 +1052,15 @@ impl Backend for VulkanBackend {
         adapter::execute(self, plan, bindings)
     }
 
+    fn execute_chain(
+        &self,
+        plan: &dyn Plan,
+        bindings: &Bindings,
+        n: usize,
+    ) -> Result<Option<Vec<u32>>> {
+        adapter::execute_chain(self, plan, bindings, n)
+    }
+
     fn sync(&self) -> Result<()> {
         unsafe { self.shared.device.device_wait_idle() }
             .map_err(|e| be(format!("device_wait_idle: {e}")))

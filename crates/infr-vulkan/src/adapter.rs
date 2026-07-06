@@ -60,6 +60,11 @@ struct DecodeReplay {
     /// The recording starts with the device-side params increment; `execute` skips the host
     /// `read_pos0` + params upload. INFR_NO_GPU_POS=1 at record time forces the old host path.
     self_advancing: bool,
+    /// Chained-decode id ring (64 × u32, host-visible): the recording's trailing `id_log`
+    /// dispatch writes `ring[pos & 63] = sampled id` each iteration; `execute_chain` reads the
+    /// whole chunk back in one go. `Some` only when the graph ends in Argmax/Sample AND
+    /// `self_advancing`.
+    ring: Option<Box<dyn Buffer>>,
     /// The `positions` Input tensor — `execute` downloads element 0 to learn `pos` for `params`.
     positions: TensorId,
     recorded: RecordedCmd,
@@ -2282,6 +2287,44 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
     Ok(())
 }
 
+/// Chained decode (`Backend::execute_chain`): replay the record-once recording `n` times in ONE
+/// submission — the sampled id flows device-side (the runner bound the sampler output and the
+/// embed-gather ids input to one buffer), params self-advance, and the trailing `id_log` writes
+/// each iteration's id into the ring. Returns the n ids read from the ring, or `None` when the
+/// plan can't chain (ineligible graph, host-pos fallback, no device sampler, or n out of the
+/// ring's range) — the caller falls back to per-token `execute`.
+pub(crate) fn execute_chain(
+    be_: &VulkanBackend,
+    plan: &dyn Plan,
+    bindings: &Bindings,
+    n: usize,
+) -> Result<Option<Vec<u32>>> {
+    let Some(plan) = plan.as_any().downcast_ref::<VkDecodePlan>() else {
+        return Ok(None);
+    };
+    if !plan.eligible || n == 0 || n > 64 {
+        return Ok(None);
+    }
+    let mut guard = plan.replay.lock().unwrap();
+    if guard.is_none() {
+        *guard = Some(record_decode_replay(be_, &plan.graph, bindings)?);
+    }
+    let replay = guard.as_ref().unwrap();
+    let (true, Some(ring)) = (replay.self_advancing, replay.ring.as_ref()) else {
+        return Ok(None);
+    };
+    // The chunk decodes positions p0+1 ..= p0+n (params[0] = the last decoded position).
+    let p0 = read_pos0(be_, replay.params.as_ref())?;
+    replay.recorded.replay_n(n).map_err(|e| be(e.to_string()))?;
+    let mut rbytes = vec![0u8; 64 * 4];
+    be_.download(ring.as_ref(), &mut rbytes)?;
+    let ring_u32: &[u32] = bytemuck::cast_slice(&rbytes);
+    let ids = (1..=n as u32)
+        .map(|i| ring_u32[((p0 + i) & 63) as usize])
+        .collect();
+    Ok(Some(ids))
+}
+
 /// Build the record-once decode replay: persistent scratch + params SSBO, one recording via the
 /// `_dyn` (params-driven) kernels for the pos-dependent ops. Only called for a [`decode_eligible`]
 /// graph. The returned recording is replayed (not submitted here) — the caller updates `params` and
@@ -2322,6 +2365,10 @@ fn record_decode_replay(
         pbytes[0..4].copy_from_slice(&pos0.wrapping_sub(1).to_le_bytes());
         pbytes[4..8].copy_from_slice(&pos0.to_le_bytes());
         be_.upload(params.as_ref(), &pbytes)?;
+        // Cross-iteration fence for the chained decode (replay_n submits this recording n times
+        // back-to-back): orders iteration i's tail writes (sampled id, id_log) before iteration
+        // i+1's head reads (params_advance, EmbedGather). One extra barrier per token — noise.
+        rec.global_barrier();
         rec.params_advance(params.as_ref());
     }
     let mode = RopeMode::Dynamic(params.as_ref());
@@ -2350,6 +2397,29 @@ fn record_decode_replay(
         transient.extend([c.args, c.pm, c.pl, c.pacc]);
     }
     transient.extend(pool.into_values());
+    // Chained decode: when the graph ends in a device-side sampler (Argmax/Sample), log each
+    // iteration's id into a host-visible ring so `execute_chain` reads the whole chunk in one go.
+    let ring = if self_advancing {
+        graph
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                Op::Argmax { dst, .. } | Op::Sample { dst, .. } => Some(*dst),
+                _ => None,
+            })
+            .map(|dst| -> Result<Box<dyn Buffer>> {
+                let rb = be_.alloc(64 * 4, BufferUsage::Readback)?;
+                rec.id_log(
+                    params.as_ref(),
+                    resolve(&scratch, bindings, dst)?,
+                    rb.as_ref(),
+                );
+                Ok(rb)
+            })
+            .transpose()?
+    } else {
+        None
+    };
     let recorded = rec.finish_record().map_err(|e| be(e.to_string()))?;
     // dummy is unused in an eligible decode (m=1 GEMV path), but hold it (and any transient) so the
     // recording can't reference a freed buffer.
@@ -2358,6 +2428,7 @@ fn record_decode_replay(
         scratch,
         params,
         self_advancing,
+        ring,
         positions,
         recorded,
         _transient: transient,

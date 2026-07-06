@@ -451,6 +451,8 @@ fn main() {
         ("embed_gather", "embed_gather_q6k", &["-DFMT_Q6K"]),
         ("embed_gather", "embed_gather_iq4nl", &["-DFMT_IQ4NL"]),
         ("embed_gather", "embed_gather_iq4xs", &["-DFMT_IQ4XS"]),
+        // Chained-decode id ring log (ring[pos & 63] = sampled id) — see id_log.comp.
+        ("id_log", "id_log", &[]),
         // Device-side decode-replay params advance ([pos, kv_len] += 1) — see params_advance.comp.
         ("params_advance", "params_advance", &[]),
         // Two-stage vocab-scale stochastic sampler (Op::Sample): per-slice top-k candidates,

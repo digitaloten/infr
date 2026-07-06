@@ -180,6 +180,21 @@ pub trait Backend: Send + Sync {
     // ---- execution (compile once per shape, execute per token/step) ----
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>>;
     fn execute(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()>;
+    /// Chained decode: run the record-once decode plan `n` times in ONE submission, the sampled
+    /// token id flowing device-side from each iteration's `Op::Argmax`/`Op::Sample` into the next
+    /// iteration's `Op::EmbedGather` — the caller MUST have bound the sampler output and the
+    /// embed-gather ids input to the SAME buffer, seeded with the first token to feed. Returns
+    /// the `n` sampled ids, or `None` when this backend/plan can't chain (the caller falls back
+    /// to per-token `execute`). Positions/params self-advance (a chaining backend implies the
+    /// device-side pos increment).
+    fn execute_chain(
+        &self,
+        _plan: &dyn Plan,
+        _bindings: &Bindings,
+        _n: usize,
+    ) -> Result<Option<Vec<u32>>> {
+        Ok(None)
+    }
     fn sync(&self) -> Result<()>;
 
     /// Perf (DiffusionGemma denoise, perf slice 3 — docs/DIFFUSIONGEMMA.md): fused per-canvas-row

@@ -95,7 +95,10 @@ impl<'a> Recorder<'a> {
         }
         .map_err(|e| be(format!("alloc cmd buffer: {e}")))?[0];
         let begin_flags = if persistent {
-            vk::CommandBufferUsageFlags::empty()
+            // SIMULTANEOUS_USE: the chained decode submits the SAME recorded command buffer n
+            // times in one vkQueueSubmit (see RecordedCmd::replay_n) — the buffer must be legal
+            // in the pending state more than once.
+            vk::CommandBufferUsageFlags::SIMULTANEOUS_USE
         } else {
             vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT
         };
@@ -3324,6 +3327,43 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Emit an UNCONDITIONAL full compute→compute memory barrier. The chained decode replays one
+    /// recording back-to-back in a single submission — commands from consecutive replays may
+    /// otherwise overlap (the hazard tracker only orders dispatches WITHIN a recording), so a
+    /// global barrier at the top of the recording fences iteration i's tail writes (sampled id,
+    /// params) from iteration i+1's head reads.
+    pub fn global_barrier(&self) {
+        let mb = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+        unsafe {
+            self.be.shared.device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[mb],
+                &[],
+                &[],
+            );
+        }
+        *self.barriers.borrow_mut() += 1;
+    }
+
+    /// Log the sampled token id into the chained-decode ring: `ring[params[0] & 63] = id[0]`.
+    /// Recorded LAST in the decode replay (after Argmax/Sample wrote `id`) — the host reads the
+    /// whole chunk's ids from the ring after ONE n-replay submission.
+    pub fn id_log(&self, params: &dyn Buffer, id: &dyn Buffer, ring: &dyn Buffer) {
+        let k = self.be.kernel("id_log", crate::gemm::id_log_spv(), 3, 0);
+        self.dispatch(
+            k,
+            &[Self::vkb(params), Self::vkb(id), Self::vkb(ring)],
+            1,
+            &[],
+            1,
+        );
+    }
+
     /// Advance the decode-replay `params` SSBO on the device: `[pos, kv_len] -> [pos+1, pos+2]`.
     /// Recorded FIRST in the decode replay so the position stream never leaves the GPU.
     pub fn params_advance(&self, params: &dyn Buffer) {
@@ -4208,6 +4248,27 @@ pub struct RecordedCmd {
 }
 
 impl RecordedCmd {
+    /// Resubmit the recorded command buffer `n` times in ONE queue submission (legal via
+    /// SIMULTANEOUS_USE) and wait once — the chained decode's n back-to-back iterations. The
+    /// recording's leading global barrier orders consecutive iterations.
+    pub fn replay_n(&self, n: usize) -> Result<()> {
+        let device = &self.shared.device;
+        let cmds = vec![self.cmd; n];
+        unsafe {
+            device
+                .queue_submit(
+                    self.shared.queue,
+                    &[vk::SubmitInfo::default().command_buffers(&cmds)],
+                    vk::Fence::null(),
+                )
+                .map_err(|e| be(format!("replay_n submit: {e}")))?;
+            device
+                .queue_wait_idle(self.shared.queue)
+                .map_err(|e| be(format!("replay_n wait: {e}")))?;
+        }
+        Ok(())
+    }
+
     /// Resubmit the recorded command buffer and wait for completion.
     pub fn replay(&self) -> Result<()> {
         let device = &self.shared.device;

@@ -2856,6 +2856,16 @@ pub(crate) fn generate_dense_backend(
     let u_buf = be
         .alloc(4, BufferUsage::Staging)
         .map_err(|e| anyhow!("{e}"))?;
+    // Chained decode: when the graph both GATHERS from an id input and SAMPLES an id output,
+    // bind them to the SAME buffer — within one iteration the gather reads before the sampler
+    // writes, and across chained iterations the sampler's id feeds the next gather directly
+    // on-device. Per-token mode is unaffected (the host re-uploads the fed id every step and
+    // reads the sampled one back from the same slot).
+    let id_out: &dyn Buffer = if gpu_embed {
+        dec_ids_buf.as_ref()
+    } else {
+        tok_id_buf.as_ref()
+    };
     let embed_scale = if gemma { (ne as f32).sqrt() } else { 1.0 };
     let mut out = Vec::new();
     let mut cur = prompt.to_vec();
@@ -3104,7 +3114,7 @@ pub(crate) fn generate_dense_backend(
         }
         b.bind(h.logits, logits_buf.as_ref());
         if let Some(tid) = h.tok_id {
-            b.bind(tid, tok_id_buf.as_ref());
+            b.bind(tid, id_out);
         }
         if let Some(uin) = h.u_in {
             b.bind(uin, u_buf.as_ref());
@@ -3118,9 +3128,72 @@ pub(crate) fn generate_dense_backend(
     // instantly on a dummy context (gemma at depth) otherwise "finishes" 64 tokens in one step
     // and the reported tok/s is fiction. llama-bench ignores EOS the same way.
     let ignore_eos = std::env::var("INFR_IGNORE_EOS").is_ok();
-    for pos in decode_start..(prompt.len() + max_new) {
+    // Chained decode (Vulkan): run N decode iterations in ONE submission — the sampled id feeds
+    // the next iteration's embed gather on-device (shared `id_out` slot), params self-advance,
+    // and the N ids come back from the replay's id ring in one readback. Falls back to the
+    // per-token path whenever any step needs host work (grammar, logits_out, temp sampling's
+    // per-step uniform) or the backend declines. INFR_DECODE_CHAIN sets N (default 8, 0/1 off).
+    let chain_n: usize = std::env::var("INFR_DECODE_CHAIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    // gemma4-E2B can't chain: its per-layer token-embedding rows (`ipl_buf`) are host-gathered
+    // per FED token — chained iterations 2..n would read the first token's stale rows. Lifting
+    // this needs the per-layer table resident + gathered on-device (task #28 follow-up).
+    let can_chain = gpu_embed && gpu_argmax && ro.is_some() && chain_n >= 2 && ipl_buf.is_none();
+    let end = prompt.len() + max_new;
+    let mut pos = decode_start;
+    while pos < end {
         if out.len() >= max_new {
             break;
+        }
+        if can_chain && pos + 1 >= prompt.len() && pos + 1 == cur.len() && logits_out.is_none() {
+            let n = chain_n.min(max_new - out.len()).min(64);
+            if n >= 2 {
+                let step_t0 = std::time::Instant::now();
+                // Seed the shared id slot with the token to feed (the previous chunk's last
+                // sampled id is already there device-side, but forced/first tokens aren't) and
+                // the position (read ONCE, at replay-record time — the chain may be the very
+                // first decode step, before the per-token path ever wrote pos_buf).
+                be.upload(
+                    dec_ids_buf.as_ref(),
+                    bytemuck::cast_slice(&[cur[pos] as i32]),
+                )
+                .map_err(|e| anyhow!("{e}"))?;
+                be.upload(pos_buf.as_ref(), bytemuck::cast_slice(&[pos as i32]))
+                    .map_err(|e| anyhow!("{e}"))?;
+                let (plan, b) = ro.as_ref().expect("can_chain implies record-once");
+                if let Some(ids) = be
+                    .execute_chain(plan.as_ref(), b, n)
+                    .map_err(|e| anyhow!("{e}"))?
+                {
+                    let mut stop = false;
+                    let mut fed = 0usize;
+                    for &id in &ids {
+                        out.push(id);
+                        decode_n += 1;
+                        fed += 1;
+                        let is_eos = !ignore_eos && (c.eos_ids.contains(&id) || id == c.eos);
+                        if is_eos {
+                            stop = true;
+                            break;
+                        }
+                        on_token(id);
+                        cur.push(id);
+                        if out.len() >= max_new {
+                            stop = true;
+                            break;
+                        }
+                    }
+                    decode_t += step_t0.elapsed();
+                    if stop {
+                        break;
+                    }
+                    pos += fed;
+                    continue;
+                }
+                // Backend declined (e.g. adapter fell back to static) — per-token path below.
+            }
         }
         let step_t0 = std::time::Instant::now();
         let tok = cur[pos] as usize;
@@ -3212,13 +3285,7 @@ pub(crate) fn generate_dense_backend(
             }
             b.bind(h.logits, logits_buf.as_ref());
             if let Some(tid) = h.tok_id {
-                b.bind(tid, tok_id_buf.as_ref());
-            }
-            if let Some(uin) = h.u_in {
-                b.bind(uin, u_buf.as_ref());
-            }
-            if let Some(tid) = h.tok_id {
-                b.bind(tid, tok_id_buf.as_ref());
+                b.bind(tid, id_out);
             }
             if let Some(uin) = h.u_in {
                 b.bind(uin, u_buf.as_ref());
@@ -3279,8 +3346,7 @@ pub(crate) fn generate_dense_backend(
                 let next = if gpu_argmax || gpu_sample {
                     // Device-side sampling (Op::Argmax / Op::Sample): read back the 4-byte id.
                     let mut idb = [0u8; 4];
-                    be.download(tok_id_buf.as_ref(), &mut idb)
-                        .map_err(|e| anyhow!("{e}"))?;
+                    be.download(id_out, &mut idb).map_err(|e| anyhow!("{e}"))?;
                     u32::from_le_bytes(idb)
                 } else {
                     crate::sampling::sample_logits(&logits, sampler, &mut rng)
@@ -3303,6 +3369,7 @@ pub(crate) fn generate_dense_backend(
         } else {
             prompt_t += step_t0.elapsed();
         }
+        pos += 1;
     }
     if prof {
         let ts = |d: std::time::Duration, n: usize| {
