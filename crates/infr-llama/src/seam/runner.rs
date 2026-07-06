@@ -221,6 +221,17 @@ pub(crate) fn generate_dense_backend(
             .find(|t| t.name == "token_embd.weight")
             .is_some_and(|t| infr_vulkan::linear::embed_gather_supported(t.dtype))
         && std::env::var("INFR_NO_GPU_EMBED").is_err();
+    // gemma4-E2B: gather the per-layer TOKEN embedding rows on-device too (the same
+    // Op::EmbedGather, table = per_layer_token_embd, scale = sqrt(npl)) — the last host-side
+    // per-token gather. Costs the quantized table's on-disk size in VRAM (uploaded once);
+    // unlocks the chained decode for E2B (its host ipl gather was the stale-rows blocker).
+    let gpu_ple = gpu_embed
+        && e2b
+        && (c.n_layer * npl).is_multiple_of(32)
+        && g.tensors()
+            .iter()
+            .find(|t| t.name == "per_layer_token_embd.weight")
+            .is_some_and(|t| infr_vulkan::linear::embed_gather_supported(t.dtype));
 
     // KV cache dtype, chosen PER-SIDE (K and V independent, like llama's --cache-type-k /
     // --cache-type-v). Q8_0 stores 34 bytes / 32 elems — half the f16 footprint and bandwidth.
@@ -506,6 +517,11 @@ pub(crate) fn generate_dense_backend(
         if gpu_embed && untied_lm {
             wload(&["token_embd.weight"])?;
         }
+        // gemma4-E2B on-device per-layer gather: the (large, quantized) per-layer token
+        // embedding table. Mirrors `build`'s `w_ple` wpush.
+        if gpu_ple {
+            wload(&["per_layer_token_embd.weight"])?;
+        }
         // diffusion-gemma: top-level self-conditioning gated MLP. LOADED (occupies a weight-buffer
         // slot like any other tensor) but NOT READ by any Op this phase — Phase 1 is the
         // encoder-only causal prefill, which runs with self-conditioning permanently off (see
@@ -616,7 +632,8 @@ pub(crate) fn generate_dense_backend(
             None => None,
         };
         // gemma4 E2B per-(token,layer) input vector `[n_layer*npl]`, recomputed + re-uploaded each step.
-        let ipl_buf = if e2b {
+        // (Host path only — `gpu_ple` gathers it on-device from the resident table.)
+        let ipl_buf = if e2b && !gpu_ple {
             Some(
                 be.alloc(c.n_layer * npl * 4, BufferUsage::Staging)
                     .map_err(|e| anyhow!("{e}"))?,
@@ -824,8 +841,16 @@ pub(crate) fn generate_dense_backend(
         // + dequanted (the big `per_layer_token_embd` table stays off-VRAM, gathered per token).
         // The full `per_layer_inp` consumed by the layer loop is computed from this on the GPU
         // (model_proj GEMV + RMSNorm), further down, once its weights are declared.
+        // On-device per-layer gather (`gpu_ple` + a token-ids build): the rows become an
+        // Internal filled by an Op::EmbedGather from the resident table — `pl_gathered` marks
+        // that the driver must NOT bind it (DecodeHandles.pl_tok_in goes out as None).
+        let pl_gathered = use_ids && gpu_ple;
         let pl_tok_in = if e2b {
-            Some(g.input(f32d(batch * c.n_layer * npl)))
+            Some(if pl_gathered {
+                g.internal(f32d(batch * c.n_layer * npl))
+            } else {
+                g.input(f32d(batch * c.n_layer * npl))
+            })
         } else {
             None
         };
@@ -1031,12 +1056,19 @@ pub(crate) fn generate_dense_backend(
         let w_lm = wpush(&mut g, &mut weights);
         // GPU embed gather table: tied-lm_head models read the w_lm slot (same tensor); untied
         // models declare the extra upload here (mirrors the wload order).
-        let w_embd = if use_ids {
-            if untied_lm {
-                Some(wpush(&mut g, &mut weights))
-            } else {
-                Some(w_lm)
-            }
+        // Declarations MIRROR THE UPLOADS (generation-gated `gpu_embed`/`gpu_ple`, NOT the
+        // per-build `use_ids`): wpush consumes wspecs sequentially, so a use_ids=false build
+        // (MTP verify, DG denoise) must still declare every uploaded slot or every later
+        // weight handle binds one buffer off.
+        let w_embd = if gpu_embed && untied_lm {
+            Some(wpush(&mut g, &mut weights))
+        } else if gpu_embed {
+            Some(w_lm) // tied: the lm_head slot IS the token_embd table
+        } else {
+            None
+        };
+        let w_ple = if gpu_ple {
+            Some(wpush(&mut g, &mut weights))
         } else {
             None
         };
@@ -1175,6 +1207,20 @@ pub(crate) fn generate_dense_backend(
                 ne: ne as u32,
                 scale: if gemma { (ne as f32).sqrt() } else { 1.0 },
             });
+        }
+        // gemma4-E2B: the per-layer token rows from the resident table — same gather, same ids,
+        // scale = sqrt(npl) (mirrors the host `e2b_ipl_rows`).
+        if pl_gathered {
+            if let (Some(ids), Some(tbl), Some(dst)) = (tok_ids, w_ple, pl_tok_in) {
+                g.push(Op::EmbedGather {
+                    ids,
+                    table: tbl,
+                    dst,
+                    rows: batch as u32,
+                    ne: (c.n_layer * npl) as u32,
+                    scale: (npl as f32).sqrt(),
+                });
+            }
         }
 
         // gemma4 E2B prologue: compute the full per-(token,layer) input vector `per_layer_inp`
@@ -2293,7 +2339,7 @@ pub(crate) fn generate_dense_backend(
                 hidden,
                 positions,
                 rope_freqs,
-                pl_tok_in,
+                pl_tok_in: if pl_gathered { None } else { pl_tok_in },
                 sc_logits: sc_logits_in,
                 sc_embt: sc_embt_id,
                 temp_inv: temp_inv_id,
@@ -2967,7 +3013,7 @@ pub(crate) fn generate_dense_backend(
 
             // gemma4 E2B: the chunk's per-layer TOKEN embedding rows (gather+dequant only — the
             // model_proj GEMV/RMSNorm/combine run as GPU graph ops in the `build` prologue).
-            let pf_ipl_buf = if let Some(ple) = ple {
+            let pf_ipl_buf = if let (Some(ple), false) = (ple, gpu_ple) {
                 let ipl = e2b_ipl_rows(g, ple, &prompt[cstart..cend])?;
                 let b = be
                     .alloc(ipl.len() * 4, BufferUsage::Staging)
@@ -3213,8 +3259,8 @@ pub(crate) fn generate_dense_backend(
         be.upload(pos_buf.as_ref(), bytemuck::cast_slice(&[pos as i32]))
             .map_err(|e| anyhow!("{e}"))?;
 
-        // gemma4 E2B: this token's per-layer TOKEN embedding row (gather+dequant only — the
-        // model_proj GEMV/RMSNorm/combine run as GPU graph ops in the `build` prologue).
+        // gemma4 E2B host ipl path: this token's per-layer TOKEN embedding row (gather+dequant
+        // only). `ipl_buf` is None under `gpu_ple` — the graph gathers on-device.
         if let (Some(ple), Some(ipl_buf)) = (ple, &ipl_buf) {
             let ipl = e2b_ipl_rows(g, ple, &[tok as u32])?;
             be.upload(ipl_buf.as_ref(), bytemuck::cast_slice(&ipl))
