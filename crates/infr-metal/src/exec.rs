@@ -1115,6 +1115,9 @@ impl MetalBackend {
             DType::Iq4Nl => Some("linear_iq4nl"),
             DType::Iq2Xxs => Some("linear_iq2xxs"),
             DType::Iq3Xxs => Some("linear_iq3xxs"),
+            DType::Iq3S => Some("linear_iq3s"),
+            DType::Iq2S => Some("linear_iq2s"),
+            DType::Iq2Xs => Some("linear_iq2xs"),
             _ => None,
         };
         if let Some(kern) = native_kern {
@@ -1378,7 +1381,13 @@ impl MetalBackend {
                 if infr_gguf::dequant::is_quant(wdt)
                     || matches!(
                         wdt,
-                        DType::Iq4Xs | DType::Iq4Nl | DType::Iq2Xxs | DType::Iq3Xxs
+                        DType::Iq4Xs
+                            | DType::Iq4Nl
+                            | DType::Iq2Xxs
+                            | DType::Iq3Xxs
+                            | DType::Iq2Xs
+                            | DType::Iq2S
+                            | DType::Iq3S
                     )
                 {
                     // Native quant: decode the compact factored weight inline — no f32 blow-up.
@@ -1407,6 +1416,9 @@ impl MetalBackend {
                         "linear_iq4xs" => (e / 256 * 136, 0, 0),
                         "linear_iq2xxs" => (e / 256 * 66, 0, 0),
                         "linear_iq3xxs" => (e / 256 * 98, 0, 0),
+                        "linear_iq3s" => (e / 256 * 110, 0, 0),
+                        "linear_iq2s" => (e / 256 * 82, 0, 0),
+                        "linear_iq2xs" => (e / 256 * 74, 0, 0),
                         "linear_iq4nl" => (e / 32 * 18, 0, 0),
                         "linear_quik4" => (e / 2, e / 4, dd_off),
                         "linear_quik6" => (e / 4 * 3, e / 4, dd_off),
@@ -1438,6 +1450,9 @@ impl MetalBackend {
                         "linear_iq4nl" => "linear_iq4nl_hmm",
                         "linear_iq2xxs" => "linear_iq2xxs_hmm",
                         "linear_iq3xxs" => "linear_iq3xxs_hmm",
+                        "linear_iq3s" => "linear_iq3s_hmm",
+                        "linear_iq2s" => "linear_iq2s_hmm",
+                        "linear_iq2xs" => "linear_iq2xs_hmm",
                         _ => "linear_quik8_hmm",
                     };
                     let cmm_kern = match qw.kern {
@@ -1452,6 +1467,9 @@ impl MetalBackend {
                         "linear_iq4nl" => "linear_iq4nl_cmm",
                         "linear_iq2xxs" => "linear_iq2xxs_cmm",
                         "linear_iq3xxs" => "linear_iq3xxs_cmm",
+                        "linear_iq3s" => "linear_iq3s_cmm",
+                        "linear_iq2s" => "linear_iq2s_cmm",
+                        "linear_iq2xs" => "linear_iq2xs_cmm",
                         _ => "linear_quik8_cmm",
                     };
                     // Prefer the cooperative 32x64 threadgroup tile; per-simdgroup HGEMM covers
@@ -1546,6 +1564,9 @@ impl MetalBackend {
                                 "linear_q4_0" => "linear_q4_0_cmm_ks",
                                 "linear_iq2xxs" => "linear_iq2xxs_cmm_ks",
                                 "linear_iq3xxs" => "linear_iq3xxs_cmm_ks",
+                                "linear_iq3s" => "linear_iq3s_cmm_ks",
+                                "linear_iq2s" => "linear_iq2s_cmm_ks",
+                                "linear_iq2xs" => "linear_iq2xs_cmm_ks",
                                 _ => "linear_quik8_cmm_ks",
                             };
                             let kchunk = (in_f / 32 / ks_split).max(1) * 32;
@@ -1653,6 +1674,9 @@ impl MetalBackend {
                                 "linear_iq4nl" => "linear_iq4nl_rt",
                                 "linear_iq2xxs" => "linear_iq2xxs_rt",
                                 "linear_iq3xxs" => "linear_iq3xxs_rt",
+                                "linear_iq3s" => "linear_iq3s_rt",
+                                "linear_iq2s" => "linear_iq2s_rt",
+                                "linear_iq2xs" => "linear_iq2xs_rt",
                                 _ => "linear_quik8_rt",
                             };
                             (rt, m.div_ceil(8) * out_f * 32, 32)

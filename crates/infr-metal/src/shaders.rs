@@ -40,50 +40,32 @@ pub fn msl_source() -> String {
     s
 }
 
+/// Emit an MSL `constant <ty> NAME[N] = { ... };` from a Rust static, `sfx` the integer-literal
+/// suffix that pins the element type (`ul` for ulong/u64, `u` for uint/u32, empty for uchar/u8).
+fn emit_grid<T: std::fmt::Display>(s: &mut String, ty: &str, name: &str, arr: &[T], sfx: &str) {
+    use std::fmt::Write;
+    write!(s, "constant {ty} {name}[{}] = {{", arr.len()).unwrap();
+    for (i, v) in arr.iter().enumerate() {
+        if i % 8 == 0 {
+            s.push('\n');
+        }
+        write!(s, "{v}{sfx},").unwrap();
+    }
+    s.push_str("\n};\n");
+}
+
 /// Emit the IQ codebook grid + sign tables as MSL `constant` arrays, formatted from the Rust
 /// statics in `infr_core::iquant_grids` so there is exactly one copy of each table.
 fn iquant_grids_msl() -> String {
     use infr_core::iquant_grids as ig;
-    use std::fmt::Write;
     let mut s =
         String::from("// Auto-generated from infr_core::iquant_grids (single source of truth).\n");
-    write!(
-        s,
-        "constant ulong IQ2XXS_GRID[{}] = {{",
-        ig::IQ2XXS_GRID.len()
-    )
-    .unwrap();
-    for (i, v) in ig::IQ2XXS_GRID.iter().enumerate() {
-        if i % 8 == 0 {
-            s.push('\n');
-        }
-        write!(s, "{v}ul,").unwrap();
-    }
-    write!(
-        s,
-        "\n}};\nconstant uchar KSIGNS_IQ2XS[{}] = {{",
-        ig::KSIGNS_IQ2XS.len()
-    )
-    .unwrap();
-    for (i, v) in ig::KSIGNS_IQ2XS.iter().enumerate() {
-        if i % 16 == 0 {
-            s.push('\n');
-        }
-        write!(s, "{v},").unwrap();
-    }
-    write!(
-        s,
-        "\n}};\nconstant uint IQ3XXS_GRID[{}] = {{",
-        ig::IQ3XXS_GRID.len()
-    )
-    .unwrap();
-    for (i, v) in ig::IQ3XXS_GRID.iter().enumerate() {
-        if i % 8 == 0 {
-            s.push('\n');
-        }
-        write!(s, "{v}u,").unwrap();
-    }
-    s.push_str("\n};\n");
+    emit_grid(&mut s, "uchar", "KSIGNS_IQ2XS", &ig::KSIGNS_IQ2XS, "");
+    emit_grid(&mut s, "ulong", "IQ2XXS_GRID", &ig::IQ2XXS_GRID, "ul");
+    emit_grid(&mut s, "ulong", "IQ2XS_GRID", &ig::IQ2XS_GRID, "ul");
+    emit_grid(&mut s, "ulong", "IQ2S_GRID", &ig::IQ2S_GRID, "ul");
+    emit_grid(&mut s, "uint", "IQ3XXS_GRID", &ig::IQ3XXS_GRID, "u");
+    emit_grid(&mut s, "uint", "IQ3S_GRID", &ig::IQ3S_GRID, "u");
     s
 }
 
