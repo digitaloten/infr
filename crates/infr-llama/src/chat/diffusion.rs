@@ -5,7 +5,7 @@ use super::ChatModel;
 use crate::{GenStats, SeamModel};
 use anyhow::Result;
 
-/// Either DiffusionGemma session (Phase 2/D, `seam_model.rs`) behind
+/// Either DiffusionGemma session (Phase 2/D, `seam/model.rs`) behind
 /// [`crate::diffusion::DiffusionSession`] — lets [`DiffusionGemmaChat`] hold ONE persistent
 /// session across turns regardless of backend.
 enum DiffusionSess {
@@ -13,11 +13,11 @@ enum DiffusionSess {
     // session structs differ enough in size to trip clippy's `large_enum_variant` (the
     // `#[cfg(macos)]` Metal variant makes the spread, so the check only fires on a macOS build —
     // the Linux clippy CI job never compiles it).
-    Cpu(Box<crate::seam_model::DiffusionGemmaCpuSession>),
-    Vulkan(Box<crate::seam_model::DiffusionGemmaVulkanSession>),
+    Cpu(Box<crate::seam::model::DiffusionGemmaCpuSession>),
+    Vulkan(Box<crate::seam::model::DiffusionGemmaVulkanSession>),
     /// Phase D: the Metal twin, macOS only (see `DiffusionGemmaChat::new_metal`).
     #[cfg(target_os = "macos")]
-    Metal(Box<crate::seam_model::DiffusionGemmaMetalSession>),
+    Metal(Box<crate::seam::model::DiffusionGemmaMetalSession>),
 }
 
 impl crate::diffusion::DiffusionSession for DiffusionSess {

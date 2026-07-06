@@ -131,7 +131,7 @@ impl ChatModel for Qwen35Chat {
 /// same `session` path it always has — zero risk to non-MTP models/GGUFs.
 pub struct DenseSeamChat {
     model: SeamModel,
-    session: Option<crate::seam_model::DenseVulkanSession>,
+    session: Option<crate::seam::model::DenseVulkanSession>,
     mtp_head: Option<crate::mtp::MtpHeadWeights>,
     mtp_checked: bool,
 }

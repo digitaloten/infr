@@ -10,7 +10,7 @@ use super::{
 };
 
 /// The MTP self-speculative generation loop (issue #33, Phase 3 — see `docs/MTP.md`'s driver
-/// section and `crate::seam_model::SeamModel::generate_metal_spec`, whose two-model draft/verify/
+/// section and `crate::seam::model::SeamModel::generate_metal_spec`, whose two-model draft/verify/
 /// commit shape this mirrors for a SINGLE self-speculating trunk on the Vulkan production
 /// backend). **Greedy only** (temp 0) — the commit/accept invariant below only holds at temp 0;
 /// sampling-temperature support is a follow-up phase.
@@ -33,7 +33,7 @@ use super::{
 ///    primes the head over the whole prompt — mirrors `mtp_head_forward_finite`'s `prime_head` test
 ///    helper exactly (`shifted_h[0]` zero, `pending_h` = the last row).
 /// 2. **Cycle**: `draft` up to `n_max` tokens off `(id_last, pending_h)`; one batched VERIFY over
-///    `[committed | drafted]`; `crate::seam_model::spec_accept` picks the longest accepted prefix +
+///    `[committed | drafted]`; `crate::seam::model::spec_accept` picks the longest accepted prefix +
 ///    the target's correction/bonus token — EXACTLY the macOS spec driver's rule, so the same
 ///    "committed stream == target's own greedy argmax stream" invariant holds here.
 ///

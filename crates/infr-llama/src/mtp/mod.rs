@@ -709,7 +709,7 @@ pub struct MtpHeadSession<'a> {
 
 impl<'a> MtpHeadSession<'a> {
     /// Construct over the CPU reference backend (zero-copy mmap weight upload — mirrors
-    /// `seam_model.rs`'s `DiffusionGemmaCpuSession` closures).
+    /// `seam/model.rs`'s `DiffusionGemmaCpuSession` closures).
     pub fn new_cpu(
         cpu_be: &'a infr_cpu::CpuBackend,
         g: &Gguf,
@@ -740,7 +740,7 @@ impl<'a> MtpHeadSession<'a> {
         )
     }
 
-    /// Construct over the Vulkan backend (padded upload — mirrors `seam_model.rs`'s
+    /// Construct over the Vulkan backend (padded upload — mirrors `seam/model.rs`'s
     /// `DiffusionGemmaVulkanSession` closures).
     pub fn new_vulkan(
         vk: &'a infr_vulkan::VulkanBackend,
@@ -1022,7 +1022,7 @@ pub const DEFAULT_N_MAX: usize = 6;
 
 /// One batched VERIFY forward (`seam.rs`'s VERIFY branch) over `tokens`' un-cached suffix,
 /// on a persistent Vulkan session, ALSO capturing `h` for every returned row — the primitive
-/// [`generate_mtp_spec_vulkan`] needs every cycle (`crate::seam_model::SeamModel`'s own
+/// [`generate_mtp_spec_vulkan`] needs every cycle (`crate::seam::model::SeamModel`'s own
 /// `verify_dense_*_with_h` helpers all use a FRESH one-shot session; this one threads `state`
 /// across calls so the trunk's KV/DeltaNet state persists cycle to cycle — the whole point of
 /// self-speculative decoding). Returns `(logits [m*vocab], h [m*n_embd])`, `m = tokens.len() -
@@ -1250,7 +1250,7 @@ fn generate_mtp_spec_core(
                 .collect()
         };
 
-        let (accepted, next_tok) = crate::seam_model::spec_accept(&cand, &varg);
+        let (accepted, next_tok) = crate::seam::model::spec_accept(&cand, &varg);
         total_drafted += cand.len();
         total_accepted += accepted;
 

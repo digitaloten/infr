@@ -14,7 +14,7 @@ use anyhow::Result;
 #[cfg(target_os = "macos")]
 pub struct MetalSeamChat {
     model: SeamModel,
-    session: Option<crate::seam_model::DenseMetalSession>,
+    session: Option<crate::seam::model::DenseMetalSession>,
     mtp_head: Option<crate::mtp::MtpHeadWeights>,
     mtp_checked: bool,
 }
@@ -134,8 +134,8 @@ pub struct SpecMetalChat {
     target: SeamModel,
     draft: SeamModel,
     k: usize,
-    target_session: Option<crate::seam_model::DenseMetalSession>,
-    draft_session: Option<crate::seam_model::DenseMetalSession>,
+    target_session: Option<crate::seam::model::DenseMetalSession>,
+    draft_session: Option<crate::seam::model::DenseMetalSession>,
 }
 
 #[cfg(target_os = "macos")]

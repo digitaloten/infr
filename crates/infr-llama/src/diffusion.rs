@@ -1,5 +1,5 @@
 //! Phase 3: the entropy-bound block-diffusion decode loop (backend-agnostic — drives either
-//! [`crate::seam_model::DiffusionGemmaCpuSession`] or its Vulkan twin through the small
+//! [`crate::seam::model::DiffusionGemmaCpuSession`] or its Vulkan twin through the small
 //! [`DiffusionSession`] trait). Ports `diffusion_generate_entropy_bound` + `run_turn`'s block loop
 //! from the oracle reference (`~/Projects/mxaddict/llama.cpp-dg/examples/diffusion/diffusion.cpp`
 //! and `diffusion-cli.cpp`) — see `docs/DIFFUSIONGEMMA.md`'s "Decode loop" section. Line refs in
@@ -11,12 +11,12 @@
 //! output (a 128-expert top-8 MoE model's CPU/Vulkan routing already diverges legitimately), only
 //! the SAME schedule/acceptance/stop semantics under a fixed seed.
 
-use crate::seam_model::{DiffusionGemmaCpuSession, DiffusionGemmaVulkanSession, SeamModel};
+use crate::seam::model::{DiffusionGemmaCpuSession, DiffusionGemmaVulkanSession, SeamModel};
 use crate::{Config, GenStats};
 use anyhow::Result;
 use rayon::prelude::*;
 
-/// The two DiffusionGemma sessions' shared shape (Phase 2, `seam_model.rs`): causal prefill of the
+/// The two DiffusionGemma sessions' shared shape (Phase 2, `seam/model.rs`): causal prefill of the
 /// committed prefix, then a canvas denoise forward. One decode loop below drives either backend.
 pub trait DiffusionSession {
     fn prefill(&mut self, model: &SeamModel, tokens: &[u32]) -> Result<()>;
@@ -60,9 +60,9 @@ impl DiffusionSession for DiffusionGemmaVulkanSession {
 }
 
 #[cfg(target_os = "macos")]
-impl DiffusionSession for crate::seam_model::DiffusionGemmaMetalSession {
+impl DiffusionSession for crate::seam::model::DiffusionGemmaMetalSession {
     fn prefill(&mut self, model: &SeamModel, tokens: &[u32]) -> Result<()> {
-        crate::seam_model::DiffusionGemmaMetalSession::prefill(self, model, tokens)
+        crate::seam::model::DiffusionGemmaMetalSession::prefill(self, model, tokens)
     }
     fn denoise(
         &mut self,
@@ -71,7 +71,7 @@ impl DiffusionSession for crate::seam_model::DiffusionGemmaMetalSession {
         sc_logits: Option<&[f32]>,
         temp_inv: f32,
     ) -> Result<Vec<f32>> {
-        crate::seam_model::DiffusionGemmaMetalSession::denoise(
+        crate::seam::model::DiffusionGemmaMetalSession::denoise(
             self,
             model,
             canvas_tokens,

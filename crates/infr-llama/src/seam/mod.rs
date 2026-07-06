@@ -17,6 +17,7 @@ use infr_core::WeightSource;
 use infr_cpu::CpuBackend;
 use infr_gguf::{Gguf, TensorBytes};
 
+pub mod model;
 mod runner;
 mod sc;
 mod weights;

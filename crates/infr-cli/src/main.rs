@@ -442,7 +442,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     let use_old_seam = is_q35 && std::env::var("INFR_QWEN35_OLD").is_ok();
     // Chat-default sampling for every backend (the bespoke branch reads the same envs below).
     set_default_sampling_env();
-    let model: Box<dyn infr_llama::model::ChatModel + '_> = if is_dg {
+    let model: Box<dyn infr_llama::chat::ChatModel + '_> = if is_dg {
         // diffusion-gemma (Phase 3/D): the entropy-bound block-diffusion loop
         // (`infr_llama::diffusion`) over a persistent session — Vulkan by default, CPU under
         // INFR_CPU, Metal under INFR_METAL (Phase D added the Metal DG session; macOS only — the
@@ -462,18 +462,18 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         );
         let loaded = infr_llama::SeamModel::load(&gguf, tok.as_deref())?;
         Box::new(if cpu {
-            infr_llama::model::DiffusionGemmaChat::new_cpu(loaded)
+            infr_llama::chat::DiffusionGemmaChat::new_cpu(loaded)
         } else if metal {
-            infr_llama::model::DiffusionGemmaChat::new_metal(loaded)
+            infr_llama::chat::DiffusionGemmaChat::new_metal(loaded)
         } else {
-            infr_llama::model::DiffusionGemmaChat::new(loaded)
+            infr_llama::chat::DiffusionGemmaChat::new(loaded)
         })
     } else if std::env::var("INFR_METAL").is_ok() {
         if use_old_seam {
             eprintln!(
                 "[metal backend — qwen35 (Qwen3.5) on the OLD seam (INFR_QWEN35_OLD=1), Apple GPU (reference)]"
             );
-            Box::new(infr_llama::model::Qwen35Chat::new_metal(gguf.clone()))
+            Box::new(infr_llama::chat::Qwen35Chat::new_metal(gguf.clone()))
         } else {
             eprintln!(
                 "[metal backend — dense/MoE forward on Apple GPU via the agnostic compute graph, persistent KV session]"
@@ -484,7 +484,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
             }
             #[cfg(not(target_os = "macos"))]
             {
-                Box::new(infr_llama::model::CpuDenseChat::new_metal(
+                Box::new(infr_llama::chat::CpuDenseChat::new_metal(
                     infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
                 ))
             }
@@ -494,25 +494,25 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
             eprintln!(
                 "[cpu backend — qwen35 (Qwen3.5) on the OLD seam (INFR_QWEN35_OLD=1), no GPU]"
             );
-            Box::new(infr_llama::model::Qwen35Chat::new_cpu(gguf.clone()))
+            Box::new(infr_llama::chat::Qwen35Chat::new_cpu(gguf.clone()))
         } else {
             eprintln!(
                 "[cpu backend — dense/MoE forward on CPU via the agnostic compute graph, no GPU]"
             );
-            Box::new(infr_llama::model::CpuDenseChat::new(
+            Box::new(infr_llama::chat::CpuDenseChat::new(
                 infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
             ))
         }
     } else if use_old_seam {
         eprintln!("[qwen35 (Qwen3.5) — OLD Vulkan agnostic seam (INFR_QWEN35_OLD=1)]");
-        Box::new(infr_llama::model::Qwen35Chat::new(gguf.clone()))
+        Box::new(infr_llama::chat::Qwen35Chat::new(gguf.clone()))
     } else {
         // The default: dense/MoE on the VULKAN agnostic seam — persistent multi-slot KV sessions
         // (per-turn suffix-only prefill), record-once decode replay, MoE expert auto-fit. qwen35
         // (Qwen3.5) lands here too since Phase 3 — same seam, same `Config::from_gguf` +
         // `MixerW::DeltaNet` unified runner (see `unified_qwen35_*` tests).
         eprintln!("[vulkan seam — dense/MoE on the agnostic compute graph, persistent KV session]");
-        Box::new(infr_llama::model::DenseSeamChat::new(
+        Box::new(infr_llama::chat::DenseSeamChat::new(
             infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
         ))
     };
@@ -521,7 +521,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     // first turn's reported prefill rate measures prefill, not one-time pipeline builds — a cold
     // diffusion-gemma prefill measured 26 t/s vs 1424 t/s warm, all compile.
     model.warmup()?;
-    let mut chat = infr_llama::model::Chat::new(model);
+    let mut chat = infr_llama::chat::Chat::new(model);
 
     // One-shot (a message) or an interactive multi-turn REPL (every backend now supports it).
     if let Some(m) = message {
@@ -556,7 +556,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
 /// Run one chat turn through the shared [`Chat`]: stream pieces via the `<think>` renderer, then
 /// print the prefill/decode stats line.
 fn run_chat_turn(
-    chat: &mut infr_llama::model::Chat,
+    chat: &mut infr_llama::chat::Chat,
     message: &str,
     max_new: usize,
 ) -> anyhow::Result<()> {
@@ -584,7 +584,7 @@ fn run_chat_turn(
 fn metal_chat_model(
     gguf: &Path,
     tok: Option<&Path>,
-) -> anyhow::Result<Box<dyn infr_llama::model::ChatModel + Send>> {
+) -> anyhow::Result<Box<dyn infr_llama::chat::ChatModel + Send>> {
     if let Ok(draft_path) = std::env::var("INFR_SPEC_DRAFT") {
         let target = infr_llama::SeamModel::load(gguf, tok)?;
         let draft = infr_llama::SeamModel::load(std::path::Path::new(&draft_path), None)?;
@@ -607,11 +607,11 @@ fn metal_chat_model(
         }
         std::env::set_var("INFR_TEMP", "0");
         eprintln!("[metal spec — target + {k}-token draft verify, greedy (INFR_TEMP=0)]");
-        Ok(Box::new(infr_llama::model::SpecMetalChat::new(
+        Ok(Box::new(infr_llama::chat::SpecMetalChat::new(
             target, draft, k,
         )))
     } else {
-        Ok(Box::new(infr_llama::model::MetalSeamChat::new(
+        Ok(Box::new(infr_llama::chat::MetalSeamChat::new(
             infr_llama::SeamModel::load(gguf, tok)?,
         )))
     }
@@ -626,18 +626,18 @@ fn metal_chat_model(
 /// Grammar-FORCED tool_choice builds an llguidance constraint and generates through
 /// `generate_constrained` (llama.cpp-parity reliability); auto/none stream through the parser.
 struct SeamGenerator {
-    model: Box<dyn infr_llama::model::ChatModel + Send>,
-    renderer: infr_llama::model::OaiRenderer,
+    model: Box<dyn infr_llama::chat::ChatModel + Send>,
+    renderer: infr_llama::chat::OaiRenderer,
 }
 
 impl SeamGenerator {
     fn new(
         gguf_path: &Path,
-        model: Box<dyn infr_llama::model::ChatModel + Send>,
+        model: Box<dyn infr_llama::chat::ChatModel + Send>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             model,
-            renderer: infr_llama::model::OaiRenderer::open(gguf_path)?,
+            renderer: infr_llama::chat::OaiRenderer::open(gguf_path)?,
         })
     }
 }
@@ -1082,15 +1082,15 @@ fn cmd_bench_qwen35(
             "qwen35 bench does not support -pg (combined prompt+gen); use separate -p/-n"
         );
     }
-    use infr_llama::model::ChatModel;
+    use infr_llama::chat::ChatModel;
     std::env::set_var("INFR_Q35_IGNORE_EOS", "1"); // fixed tg count, no early stop
     let mut m: Box<dyn ChatModel> = if cpu {
-        Box::new(infr_llama::model::Qwen35Chat::new_cpu(gguf.to_path_buf()))
+        Box::new(infr_llama::chat::Qwen35Chat::new_cpu(gguf.to_path_buf()))
     } else if std::env::var("INFR_METAL").is_ok() {
         // Metal seam (there is no Vulkan loader on macOS — `new()` would dlopen-fail).
-        Box::new(infr_llama::model::Qwen35Chat::new_metal(gguf.to_path_buf()))
+        Box::new(infr_llama::chat::Qwen35Chat::new_metal(gguf.to_path_buf()))
     } else {
-        Box::new(infr_llama::model::Qwen35Chat::new(gguf.to_path_buf()))
+        Box::new(infr_llama::chat::Qwen35Chat::new(gguf.to_path_buf()))
     };
     let sentence = "The quick brown fox jumps over the lazy dog. "; // ~10 tokens
                                                                     // Depth rides the PROMPT: `GenStats` splits prompt_secs from decode_secs, so decoding at
@@ -1887,25 +1887,25 @@ fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
     let is_q35 = infr_llama::qwen35::is_qwen35(&gguf);
     let use_old_seam = is_q35 && std::env::var("INFR_QWEN35_OLD").is_ok();
     let is_dg = infr_llama::diffusion::is_diffusion_gemma(&gguf);
-    let mut m: Box<dyn infr_llama::model::ChatModel + Send> = if is_dg {
+    let mut m: Box<dyn infr_llama::chat::ChatModel + Send> = if is_dg {
         // diffusion-gemma (Phase 3/D): same selection as `cmd_run` — see its matching comment.
         let cpu = std::env::var("INFR_CPU").is_ok();
         let metal = std::env::var("INFR_METAL").is_ok();
         let loaded = infr_llama::SeamModel::load(&gguf, tok.as_deref())?;
         Box::new(if cpu {
-            infr_llama::model::DiffusionGemmaChat::new_cpu(loaded)
+            infr_llama::chat::DiffusionGemmaChat::new_cpu(loaded)
         } else if metal {
-            infr_llama::model::DiffusionGemmaChat::new_metal(loaded)
+            infr_llama::chat::DiffusionGemmaChat::new_metal(loaded)
         } else {
-            infr_llama::model::DiffusionGemmaChat::new(loaded)
+            infr_llama::chat::DiffusionGemmaChat::new(loaded)
         })
     } else if use_old_seam {
         Box::new(if std::env::var("INFR_METAL").is_ok() {
-            infr_llama::model::Qwen35Chat::new_metal(gguf.clone())
+            infr_llama::chat::Qwen35Chat::new_metal(gguf.clone())
         } else if std::env::var("INFR_CPU").is_ok() {
-            infr_llama::model::Qwen35Chat::new_cpu(gguf.clone())
+            infr_llama::chat::Qwen35Chat::new_cpu(gguf.clone())
         } else {
-            infr_llama::model::Qwen35Chat::new(gguf.clone())
+            infr_llama::chat::Qwen35Chat::new(gguf.clone())
         })
     } else if std::env::var("INFR_METAL").is_ok() {
         // Metal: the SAME selection funnel as `infr run` — persistent-session seam chat, or
@@ -1918,16 +1918,16 @@ fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            Box::new(infr_llama::model::CpuDenseChat::new_metal(
+            Box::new(infr_llama::chat::CpuDenseChat::new_metal(
                 infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
             ))
         }
     } else if std::env::var("INFR_CPU").is_ok() {
-        Box::new(infr_llama::model::CpuDenseChat::new(
+        Box::new(infr_llama::chat::CpuDenseChat::new(
             infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
         ))
     } else {
-        Box::new(infr_llama::model::DenseSeamChat::new(
+        Box::new(infr_llama::chat::DenseSeamChat::new(
             infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
         ))
     };
