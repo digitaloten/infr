@@ -1023,9 +1023,29 @@ fn bench_mtp_tg(
     let prompt = sentence.repeat(want.div_ceil(10));
     let mut samples = Vec::with_capacity(reps.max(1));
     let mut timing = infr_llama::mtp::MtpTiming::default();
+    // Backend selection mirrors the rest of the CLI: INFR_METAL routes the MTP driver onto the
+    // Apple-GPU trunk+head (issue #39 — measuring Metal's accept rate needs the Metal timed path,
+    // not Vulkan's), everything else stays on Vulkan. The two timed fns share a signature.
+    let use_metal = std::env::var("INFR_METAL").is_ok();
     for _ in 0..reps.max(1) {
-        let (stats, t) =
-            infr_llama::mtp::generate_mtp_spec_vulkan_timed(model, &head, &prompt, n_gen, |_| {})?;
+        let (stats, t) = if use_metal {
+            #[cfg(target_os = "macos")]
+            {
+                infr_llama::mtp::generate_mtp_spec_metal_timed(
+                    model,
+                    &head,
+                    &prompt,
+                    n_gen,
+                    |_| {},
+                )?
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                anyhow::bail!("INFR_METAL MTP bench requires macOS");
+            }
+        } else {
+            infr_llama::mtp::generate_mtp_spec_vulkan_timed(model, &head, &prompt, n_gen, |_| {})?
+        };
         samples.push(stats.n_gen as f64 / stats.decode_secs.max(1e-9));
         timing.add(&t);
     }
@@ -1154,7 +1174,16 @@ fn cmd_bench_metal(
         } else {
             format!("pp{n_prompt}")
         };
-        print_bench_avg(&samples, &label, depth, " [metal]", reps, json);
+        // MTP arm (issue #33/#39): twin of the Vulkan path's arm — a model shipping an MTP head
+        // gets its self-speculative Metal decode (accept rate + phase split) measured alongside the
+        // baseline tg above. `bench_mtp_tg` reads INFR_METAL (set here) to route onto the Metal
+        // timed driver. Models without a head keep `mtp = None` → byte-identical to the old output.
+        let mtp = if pg.is_none() && n_gen > 0 && model.config().n_layer_nextn > 0 {
+            Some(bench_mtp_tg(&model, n_prompt, depth, n_gen, reps)?)
+        } else {
+            None
+        };
+        print_bench_avg_mtp(&samples, &label, depth, reps, json, mtp.as_ref());
         Ok(())
     }
 }
