@@ -175,8 +175,8 @@ pub fn render_chat(path: &std::path::Path, user: &str) -> Result<String> {
 }
 
 /// Render a multi-turn conversation `(role, content)` through the qwen35 GGUF's own jinja chat
-/// template — the [`crate::model::ChatModel::render`] primitive for the qwen35 GPU + CPU paths, so
-/// the shared [`crate::model::Chat`] can drive a history-based REPL. Errors if the GGUF has no usable
+/// template — the [`crate::chat::ChatModel::render`] primitive for the qwen35 GPU + CPU paths, so
+/// the shared [`crate::chat::Chat`] can drive a history-based REPL. Errors if the GGUF has no usable
 /// `tokenizer.chat_template`.
 pub fn render_chat_messages(path: &std::path::Path, messages: &[(&str, &str)]) -> Result<String> {
     let g = Gguf::open(path).map_err(|e| anyhow!("open gguf: {e}"))?;
@@ -202,7 +202,7 @@ pub type BindWeight<'a> = &'a dyn Fn(&dyn Backend, TensorBytes) -> Result<Box<dy
 
 /// Load-once qwen35 (Qwen3.5) seam model: a backend + the model's native-dtype weight buffers +
 /// tokenizer/config, constructed ONCE and reused across `generate` calls. This is the SINGLE
-/// generation engine behind `infr run` (via [`crate::model::Qwen35Chat`] /
+/// generation engine behind `infr run` (via [`crate::chat::Qwen35Chat`] /
 /// on any backend) AND `infr bench` — bench times exactly what run executes, so a
 /// production-path change can never silently leave the bench measuring a dead path again. Only the
 /// per-conversation state (conv history, DeltaNet S, KV cache, sized to prompt+n) is allocated per

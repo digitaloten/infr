@@ -255,7 +255,7 @@ impl SeamModel {
         let mut printed = 0usize;
         let slot = session.pool.pick(&session.vk, &self.cfg, &prompt_tokens)?;
         let max_ctx = session.max_ctx;
-        let (_generated, stats) = crate::seam::generate_dense_gpu_session(
+        let (_generated, stats) = crate::seam::generate_dense_vulkan_session(
             &session.vk,
             &self.gguf,
             &self.cfg,
@@ -451,7 +451,7 @@ impl SeamModel {
             .map_err(|e| anyhow!("encode: {e}"))?;
         let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
         let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
-        let (generated, _stats) = crate::seam::generate_dense_gpu(
+        let (generated, _stats) = crate::seam::generate_dense_vulkan(
             &vk,
             &self.gguf,
             &self.cfg,
@@ -491,7 +491,7 @@ impl SeamModel {
                    gen: usize,
                    state: &mut Option<crate::seam::SeamKv>|
          -> Result<crate::GenStats> {
-            let (_, stats) = crate::seam::generate_dense_gpu_session(
+            let (_, stats) = crate::seam::generate_dense_vulkan_session(
                 &vk,
                 &self.gguf,
                 &self.cfg,
@@ -868,8 +868,8 @@ impl SeamModel {
     }
 
     /// Render a multi-turn conversation `(role, content)` through the model's OWN embedded chat
-    /// template — the [`crate::model::ChatModel::render`] primitive for the CPU dense/MoE path, so the
-    /// shared [`crate::model::Chat`] can drive a history-based REPL. Same template + error contract as
+    /// template — the [`crate::chat::ChatModel::render`] primitive for the CPU dense/MoE path, so the
+    /// shared [`crate::chat::Chat`] can drive a history-based REPL. Same template + error contract as
     /// [`render_chat`](Self::render_chat), generalized past a single user turn.
     pub fn render_chat_messages(&self, messages: &[(&str, &str)]) -> Result<String> {
         render_chat_jinja(&self.gguf, &self.tokenizer, self.cfg.eos, messages, true)
@@ -910,7 +910,7 @@ impl SeamModel {
 /// A persistent CPU-reference session for DiffusionGemma's two-pass forward (Phase 2 — see
 /// docs/DIFFUSIONGEMMA.md and [`SeamModel::diffusion_gemma_cpu_session`]). Model-independent (like
 /// [`DenseVulkanSession`]/[`DenseMetalSession`]) — `prefill`/`denoise` take the `&SeamModel` per
-/// call instead of borrowing it at construction, so a [`crate::model::ChatModel`] can hold both an
+/// call instead of borrowing it at construction, so a [`crate::chat::ChatModel`] can hold both an
 /// owned `SeamModel` and a persistent session side by side (Phase 3 — no self-referential borrow).
 pub struct DiffusionGemmaCpuSession {
     be: CpuBackend,

@@ -1,0 +1,248 @@
+//! [`DiffusionGemmaChat`]: the diffusion-gemma [`ChatModel`], over a persistent per-backend
+//! session ([`DiffusionSess`]) selected by [`DgBackend`] at construction.
+
+use super::ChatModel;
+use crate::{GenStats, SeamModel};
+use anyhow::Result;
+
+/// Either DiffusionGemma session (Phase 2/D, `seam_model.rs`) behind
+/// [`crate::diffusion::DiffusionSession`] — lets [`DiffusionGemmaChat`] hold ONE persistent
+/// session across turns regardless of backend.
+enum DiffusionSess {
+    // Boxed so the enum's size is a pointer regardless of which session it holds — the three
+    // session structs differ enough in size to trip clippy's `large_enum_variant` (the
+    // `#[cfg(macos)]` Metal variant makes the spread, so the check only fires on a macOS build —
+    // the Linux clippy CI job never compiles it).
+    Cpu(Box<crate::seam_model::DiffusionGemmaCpuSession>),
+    Vulkan(Box<crate::seam_model::DiffusionGemmaVulkanSession>),
+    /// Phase D: the Metal twin, macOS only (see `DiffusionGemmaChat::new_metal`).
+    #[cfg(target_os = "macos")]
+    Metal(Box<crate::seam_model::DiffusionGemmaMetalSession>),
+}
+
+impl crate::diffusion::DiffusionSession for DiffusionSess {
+    fn prefill(&mut self, model: &SeamModel, tokens: &[u32]) -> Result<()> {
+        match self {
+            DiffusionSess::Cpu(s) => s.prefill(model, tokens),
+            DiffusionSess::Vulkan(s) => s.prefill(model, tokens),
+            #[cfg(target_os = "macos")]
+            DiffusionSess::Metal(s) => s.prefill(model, tokens),
+        }
+    }
+    fn denoise(
+        &mut self,
+        model: &SeamModel,
+        canvas_tokens: &[u32],
+        sc_logits: Option<&[f32]>,
+        temp_inv: f32,
+    ) -> Result<Vec<f32>> {
+        match self {
+            DiffusionSess::Cpu(s) => s.denoise(model, canvas_tokens, sc_logits, temp_inv),
+            DiffusionSess::Vulkan(s) => s.denoise(model, canvas_tokens, sc_logits, temp_inv),
+            #[cfg(target_os = "macos")]
+            DiffusionSess::Metal(s) => s.denoise(model, canvas_tokens, sc_logits, temp_inv),
+        }
+    }
+}
+
+/// Which backend [`DiffusionGemmaChat`] opens its session on — decided at construction, before a
+/// session is ever opened (mirrors `DiffusionSess`'s three variants).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DgBackend {
+    Vulkan,
+    Cpu,
+    Metal,
+}
+
+/// diffusion-gemma (Phase 3/D — block text-diffusion, see `docs/DIFFUSIONGEMMA.md` and
+/// `crate::diffusion`): the entropy-bound decode loop over a persistent session, Vulkan by
+/// default, or the CPU/Metal reference backends under `INFR_CPU`/`INFR_METAL` (Phase D added the
+/// Metal DG session — macOS only; the non-macOS build still compiles `new_metal`, `generate`
+/// errors clearly at runtime instead, matching every other INFR_METAL backend on this crate). The
+/// session is opened lazily on the first turn (its KV cache is sized once the model's
+/// `n_ctx_train`/`INFR_MAX_CTX` is known) and stays open across turns: multi-turn REPL re-sends
+/// the WHOLE running token stream as the "prefix" each turn, and the session's own prefix-diff
+/// prefill (see `DiffusionGemmaCpuSession::prefill`'s doc) re-sends only the un-cached suffix,
+/// exactly like every other seam session on this crate.
+pub struct DiffusionGemmaChat {
+    model: SeamModel,
+    backend: DgBackend,
+    sess: Option<DiffusionSess>,
+    max_ctx: usize,
+}
+
+impl DiffusionGemmaChat {
+    /// Production Vulkan session.
+    pub fn new(model: SeamModel) -> Self {
+        Self {
+            model,
+            backend: DgBackend::Vulkan,
+            sess: None,
+            max_ctx: 0,
+        }
+    }
+
+    /// Reference CPU session (`INFR_CPU=1`).
+    pub fn new_cpu(model: SeamModel) -> Self {
+        Self {
+            model,
+            backend: DgBackend::Cpu,
+            sess: None,
+            max_ctx: 0,
+        }
+    }
+
+    /// Reference Metal session (`INFR_METAL=1`, Phase D). Compiles on every target (like
+    /// `CpuDenseChat::new_metal`) — the macOS check happens in `generate`, at session-open time.
+    pub fn new_metal(model: SeamModel) -> Self {
+        Self {
+            model,
+            backend: DgBackend::Metal,
+            sess: None,
+            max_ctx: 0,
+        }
+    }
+}
+
+impl DiffusionGemmaChat {
+    /// Open (or grow) the session for a turn needing `needed` KV rows — see the sizing comment at
+    /// the call site in [`generate`](ChatModel::generate).
+    fn ensure_sess(&mut self, needed: usize) -> Result<()> {
+        if self.sess.is_some() && needed <= self.max_ctx {
+            return Ok(());
+        }
+        let cfg = self.model.config();
+        let max_ctx = std::env::var("INFR_MAX_CTX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| cfg.n_ctx_train.min(8192))
+            .max(needed);
+        self.max_ctx = max_ctx;
+        self.sess = Some(match self.backend {
+            DgBackend::Cpu => {
+                DiffusionSess::Cpu(Box::new(self.model.diffusion_gemma_cpu_session(max_ctx)))
+            }
+            DgBackend::Vulkan => DiffusionSess::Vulkan(Box::new(
+                self.model.diffusion_gemma_vulkan_session(max_ctx)?,
+            )),
+            DgBackend::Metal => {
+                #[cfg(target_os = "macos")]
+                {
+                    DiffusionSess::Metal(Box::new(
+                        self.model.diffusion_gemma_metal_session(max_ctx)?,
+                    ))
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    return Err(anyhow::anyhow!(
+                        "the Metal backend is only available on macOS"
+                    ));
+                }
+            }
+        });
+        Ok(())
+    }
+}
+
+impl ChatModel for DiffusionGemmaChat {
+    fn render(&self, messages: &[(&str, &str)]) -> Result<String> {
+        self.model.render_chat_messages(messages)
+    }
+
+    fn warmup(&mut self) -> Result<()> {
+        use crate::diffusion::DiffusionSession;
+        let prof2 = std::env::var_os("INFR_PROF2");
+        if prof2.is_some() {
+            std::env::remove_var("INFR_PROF2");
+        }
+        // A tiny PREFILL-only forward compiles the lazily-built pipelines (GEMM/attention/batched
+        // MoE — a cold DG prefill was measured at 26 t/s vs 1424 t/s warm, ~5s of one-time compile
+        // otherwise billed to the first request). No denoise: the canvas plans build per (cc, p)
+        // anyway, and their couple of extra pipelines (canvas attention, softmax) are cheap next
+        // to the shared set warmed here. The throwaway tokens pollute the session's cached prefix
+        // harmlessly — a real prompt prefix-diffs to 0 and re-prefills from scratch.
+        let r = (|| -> Result<()> {
+            self.ensure_sess(64)?;
+            let enc = self
+                .model
+                .tokenizer()
+                .encode("Hi", false)
+                .map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+            self.sess
+                .as_mut()
+                .unwrap()
+                .prefill(&self.model, enc.get_ids())
+        })();
+        if let Some(v) = prof2 {
+            std::env::set_var("INFR_PROF2", v);
+        }
+        r
+    }
+
+    fn generate(
+        &mut self,
+        prompt: &str,
+        max_new: usize,
+        on_piece: &mut dyn FnMut(&str),
+    ) -> Result<GenStats> {
+        let enc = self
+            .model
+            .tokenizer()
+            .encode(prompt, false)
+            .map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+        let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
+
+        let cfg = self.model.config();
+        let canvas_len = cfg.canvas_length;
+        let vocab = cfg.vocab;
+        let eos_ids = cfg.eos_ids.clone();
+        let eb = crate::diffusion::EbConfig::from_config(cfg);
+        // Seed determinism (see `crate::diffusion::diffusion_generate`'s doc): the reference
+        // reseeds its RNG from a fixed value every block, so a fixed INFR_SEED (default 42,
+        // matching the oracle's `-s 42`) makes every turn reproducible.
+        let seed: u64 = std::env::var("INFR_SEED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(42);
+
+        // Size the session to THIS turn's [prompt | every block's canvas] plus REPL headroom —
+        // NOT n_ctx_train: DG's per-token KV is heavy (hd 256/512 across 30 layers ≈ 225 KB/tok)
+        // and this model trains at 262144 ctx, so the n_ctx_train default every AR chat uses
+        // would ask the backend for a ~59 GB KV cache (observed: radv device-lost at submit).
+        // Default headroom is min(n_ctx_train, 8192) ≈ 1.8 GB — the same clamp the spec-decode
+        // pair uses. A later REPL turn that outgrows the session reopens it bigger (the KV is
+        // rebuilt by a from-scratch prefill; correct, just slower for that one turn).
+        let blocks = max_new.div_ceil(canvas_len.max(1)).max(1);
+        let needed = prompt_tokens.len() + blocks * canvas_len + 64;
+        self.ensure_sess(needed)?;
+
+        let result = crate::diffusion::diffusion_generate(
+            self.sess.as_mut().unwrap(),
+            &self.model,
+            &prompt_tokens,
+            canvas_len,
+            vocab,
+            &eos_ids,
+            &eb,
+            max_new,
+            seed,
+            self.max_ctx,
+        )?;
+
+        // Stream the committed tokens through the shared incremental UTF-8-safe detok — the same
+        // helper every other backend's per-token decode loop uses (`crate::stream_token`), so a
+        // block's text appears exactly like any other backend's piecewise output.
+        let mut acc: Vec<u32> = Vec::new();
+        let mut printed = 0usize;
+        for &id in &result.tokens {
+            crate::stream_token(
+                self.model.tokenizer(),
+                &mut acc,
+                &mut printed,
+                id,
+                &mut |p: &str| on_piece(p),
+            );
+        }
+        Ok(result.stats)
+    }
+}

@@ -9,6 +9,7 @@
 #![allow(clippy::needless_range_loop)]
 
 pub mod arch;
+pub mod chat;
 mod config;
 pub mod seam;
 mod seam_model;

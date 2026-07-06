@@ -86,7 +86,7 @@ pub(crate) fn generate_dense_cpu(
 /// adapter, and its decode tok/s (still recompiling the graph per token) is the baseline
 /// record-once replay must close. Prefill's batched attention is decode-only on the seam, so the
 /// caller may pass short prompts to force the per-token path.
-pub(crate) fn generate_dense_gpu(
+pub(crate) fn generate_dense_vulkan(
     vk: &infr_vulkan::VulkanBackend,
     g: &Gguf,
     cfg: &Config,
@@ -96,7 +96,7 @@ pub(crate) fn generate_dense_gpu(
     max_new: usize,
     on_token: impl FnMut(u32),
 ) -> AResult<(Vec<u32>, GenStats)> {
-    generate_dense_gpu_session(
+    generate_dense_vulkan_session(
         vk,
         g,
         cfg,
@@ -111,11 +111,11 @@ pub(crate) fn generate_dense_gpu(
     )
 }
 
-/// [`generate_dense_gpu`] with a caller-held [`SeamKv`]: hold `state` (+ a `want_ctx` capacity)
+/// [`generate_dense_vulkan`] with a caller-held [`SeamKv`]: hold `state` (+ a `want_ctx` capacity)
 /// across calls and each turn prefills only the suffix that differs from the cached tokens —
 /// ChatSession-style KV reuse on the agnostic seam.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn generate_dense_gpu_session(
+pub(crate) fn generate_dense_vulkan_session(
     vk: &infr_vulkan::VulkanBackend,
     g: &Gguf,
     cfg: &Config,
@@ -252,7 +252,7 @@ pub(crate) fn generate_dense_metal(
     )
 }
 
-/// Persistent-session Metal seam runner — the Metal twin of [`generate_dense_gpu_session`]:
+/// Persistent-session Metal seam runner — the Metal twin of [`generate_dense_vulkan_session`]:
 /// weights upload once into `state`, the KV cache is sized to `want_ctx`, and each call prefills
 /// only the suffix that differs from the tokens already materialized in the cache.
 #[cfg(target_os = "macos")]
