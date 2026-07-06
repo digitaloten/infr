@@ -988,7 +988,7 @@ fn cmd_bench(
     } else {
         None
     };
-    print_bench_avg_mtp(&samples, &label, depth, reps, json, mtp.as_ref());
+    print_bench_avg_mtp(&samples, &label, depth, "", reps, json, mtp.as_ref());
     Ok(())
 }
 
@@ -1069,12 +1069,15 @@ fn print_bench_avg_mtp(
     samples: &[f64],
     label: &str,
     depth: usize,
+    // Backend tag passed through to the no-MTP fallback (" [metal]" / " [cpu]" / "") — PR #42
+    // routed cmd_bench_metal here and the hardcoded "" silently dropped its " [metal]" tag.
+    suffix: &str,
     reps: usize,
     json: bool,
     mtp: Option<&MtpBenchStats>,
 ) {
     let Some(m) = mtp else {
-        print_bench_avg(samples, label, depth, "", reps, json);
+        print_bench_avg(samples, label, depth, suffix, reps, json);
         return;
     };
     let avg = samples.iter().sum::<f64>() / samples.len().max(1) as f64;
@@ -1183,7 +1186,15 @@ fn cmd_bench_metal(
         } else {
             None
         };
-        print_bench_avg_mtp(&samples, &label, depth, reps, json, mtp.as_ref());
+        print_bench_avg_mtp(
+            &samples,
+            &label,
+            depth,
+            " [metal]",
+            reps,
+            json,
+            mtp.as_ref(),
+        );
         Ok(())
     }
 }
