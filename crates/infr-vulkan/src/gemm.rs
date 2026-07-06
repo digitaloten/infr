@@ -472,6 +472,10 @@ pub(crate) fn native_gemm_warp_sk_build_spv(dtype: infr_core::DType) -> Option<&
         }};
     }
     Some(match dtype {
+        // F16 weights are floats, not quants (native_dense_supported is false) — this sk build
+        // exists ONLY for the adapter's targeted deep-k narrow-n F16 route (the DiffusionGemma
+        // SC soft-embedding GEMM); see the matching arm in `matmul_native_splitk`.
+        F16 => v!("native_gemm_warp_f16_sk"),
         Iq4Xs => v!("native_gemm_warp_iq4xs_sk"),
         Q2K => v!("native_gemm_warp_q2k_sk"),
         Q4_0 => v!("native_gemm_warp_q4_0_sk"),

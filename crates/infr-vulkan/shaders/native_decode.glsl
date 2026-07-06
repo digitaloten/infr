@@ -37,6 +37,21 @@ void dqblk(uint gstart, out float v[32]) {
 }
 #endif
 
+#if defined(FMT_F16)
+// F16: contiguous IEEE half (no blocks/scale). y = unpackHalf2x16 — EXACT. Element e lives at
+// byte e*2 (packed 2-per-u32). Serves float weights that are UPLOADED as f16 (e.g. the
+// DiffusionGemma SC soft-embedding, host-built f16 [ne, vocab]) when a warptile shape needs the
+// native GEMM machinery (split-K) that the plain f16 `gemm_proj` kernel lacks.
+float dq(uint g) {
+    return f16tof32(ru16(g * 2u));
+}
+#define HAVE_DQBLK
+void dqblk(uint gstart, out float v[32]) {
+    uint bo = gstart * 2u;
+    for (uint w = 0u; w < 32u; w++) { v[w] = f16tof32(ru16(bo + w * 2u)); }
+}
+#endif
+
 #if defined(FMT_BF16)
 // BF16: contiguous 16-bit truncated-f32 (no blocks/scale). y = bitcast(bits << 16) — EXACT (bf16 is
 // the top 16 bits of an f32). Element e lives at byte e*2 (packed 2-per-u32).

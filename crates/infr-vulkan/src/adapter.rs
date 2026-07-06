@@ -481,6 +481,17 @@ fn lower_op(
                 *out_f as usize,
                 *w_off as usize,
             );
+            // INFR_PROF2 sub-attribution (no-op otherwise): the vocab-sized GEMMs (lm_head
+            // logits, out_f = vocab; DiffusionGemma's SC soft-embedding, in_f = vocab) are 10-100x
+            // the FLOPs of a per-layer projection but land in the same "matmul_proj" bucket,
+            // which made the bucket un-actionable during the DG slice-7 comparative attribution
+            // (llama.cpp's perf logger itemizes per shape; ours didn't). 65536 cleanly separates
+            // every real vocab (gemma 262144, qwen 151936) from every hidden/FFN width.
+            if out_f >= 65536 {
+                rec.label_next("lin_vocab_out");
+            } else if in_f >= 65536 {
+                rec.label_next("lin_vocab_in");
+            }
             let (w, xb, y) = (r(*weight)?, r(*x)?, r(*dst)?);
             let dt = graph.desc(*weight).dtype;
             // `w_off` (fused-QKV slices) only rides the offset-capable native paths — the runner
@@ -651,8 +662,50 @@ fn lower_op(
                         rec.matmul_native_off(dt, xb, w, w_off, out, m, in_f, out_f);
                     }
                 } else {
-                    // f16 coopmat GEMM (dummy scales/mins unused at bits=16).
-                    rec.matmul_proj(xb, w, dummy, dummy, out, m, in_f, out_f, 16, 0);
+                    // F16 deep-k narrow-n → SPLIT-K warptile (DG slice-7 comparative
+                    // attribution): the SC soft-embedding GEMM (m=canvas=256, k=vocab=262144,
+                    // n=ne=2816, f16 weight) measured 58ms/step at ~6.5 TFLOPS on the legacy
+                    // `gemm_proj` BN=64 tile below (28% of the whole denoise step) vs llama.cpp's
+                    // 14.1ms @ 27 TFLOPS for the IDENTICAL shape — the single biggest
+                    // infr-vs-fork per-stage delta. Same narrow-grid split-K policy as the
+                    // native-quant branch above (out_f%128, deep k, grid < 128 wgs); the F16
+                    // decode is exact (see native_decode.glsl FMT_F16), so numerics match the
+                    // f16 coopmat route up to accumulation order. Everything that doesn't hit
+                    // the split-K window keeps the `matmul_proj` route unchanged.
+                    // Same splits policy as the quant branch above. Probed deeper splits at the
+                    // SC shape (splits=4/8/16 via a temporary env override): the op shaved
+                    // 30.0 -> 25.8-28.4ms but dg-step stayed flat (1100-1107, within noise), so
+                    // the shared formula stays — no bespoke tuning knob.
+                    let narrow_grid = m.div_ceil(64) * (out_f / 128).max(1);
+                    let splits = if out_f % 128 == 0 && in_f >= 1024 && narrow_grid < 128 {
+                        (256 / narrow_grid).next_power_of_two().clamp(1, 8)
+                    } else {
+                        1
+                    };
+                    if matches!(dt, infr_core::DType::F16)
+                        && splits > 1
+                        && crate::gemm::native_gemm_warp_sk_build_spv(dt).is_some()
+                        && std::env::var("INFR_NO_GEMM_WARP").is_err()
+                    {
+                        let mpad = m.div_ceil(64) * 64;
+                        let pk = pooled(pool, be_, "splitk_part", splits * mpad * out_f * 4)?;
+                        rec.matmul_native_splitk(
+                            dt,
+                            xb,
+                            w,
+                            w_off,
+                            pool[&pk].as_ref(),
+                            out,
+                            m,
+                            in_f,
+                            out_f,
+                            splits,
+                            false,
+                        );
+                    } else {
+                        // f16 coopmat GEMM (dummy scales/mins unused at bits=16).
+                        rec.matmul_proj(xb, w, dummy, dummy, out, m, in_f, out_f, 16, 0);
+                    }
                 }
                 if let Some(t) = tmp {
                     rec.copy(t.as_ref(), 0, y, 0, m * out_f * eb);
@@ -1250,7 +1303,34 @@ fn lower_op(
                     && ((rows >= 12 && kv_len >= 8192) || std::env::var("INFR_MROWS_ATTN").is_ok());
                 // The batched kernel stages chunk scores in 4KB of LDS → chunk 256; the per-row
                 // grid keeps the adaptive ~32-chunks policy.
-                let chunk = if batched_attn {
+                //
+                // Canvas (DiffusionGemma denoise, slice 7 comparative-attribution against the
+                // fork's fused flash-attn oracle): the ordinary `kv_len/32` policy is tuned for
+                // DEEP decode contexts (splitting a multi-thousand kv_len across ~32 workgroups
+                // keeps each one short); at canvas's shallow kv_len (prompt + canvas, a few
+                // hundred) it still floors to 64, forcing 5 chunks at kv_len=283 —
+                // `attention_kv_split`'s `pm`/`pl`/`pacc` partials are [rows(=canvas), nh,
+                // n_chunks, hd], so every extra chunk is 256(canvas)×nh more partial-softmax
+                // writes AND combine-side reads, pure overhead vs. a genuine single-pass flash
+                // kernel (which the canvas mask shape can't use — see `canvas_lo` above).
+                //
+                // Probed the chunk COUNT directly (`INFR_CANVAS_CHUNK_N`, kv_len=283, Vulkan0):
+                // n=2 (the `split_ok`-minimum, `kv_len>chunk` strictly) REGRESSED — attn_partial
+                // 11.7k->13.8us (occupancy loss: workgroups halve from 5 to 2, so each one's
+                // longer serial K/V loop outweighs the partial-buffer saving) even though
+                // attn_combine dropped (1.36k->0.84k). n=3 was the sweet spot: attn_partial
+                // ~11.2k (flat vs baseline) + attn_combine ~1.0k (-27%) = net -6% on the
+                // attn_partial+combine pair vs the old 64-floor's n=5. n=4 landed between the two
+                // (small net win, less than n=3). Default 3; overridable for future re-tuning at
+                // other canvas lengths.
+                let chunk = if canvas_lo.is_some() && kv_len >= 2 {
+                    let n = std::env::var("INFR_CANVAS_CHUNK_N")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(3)
+                        .max(1);
+                    kv_len.div_ceil(n).min(kv_len - 1).max(1)
+                } else if batched_attn {
                     256
                 } else {
                     (kv_len / 32).clamp(64, 512)

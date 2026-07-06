@@ -741,6 +741,7 @@ impl<'a> Recorder<'a> {
         } else {
             let spv = crate::gemm::native_gemm_warp_sk_build_spv(dtype).expect("split-k spv");
             let name = match dtype {
+                infr_core::DType::F16 => "native_gemm_warp_f16_sk",
                 infr_core::DType::Iq4Xs => "native_gemm_warp_iq4xs_sk",
                 infr_core::DType::Q2K => "native_gemm_warp_q2k_sk",
                 infr_core::DType::Q4_0 => "native_gemm_warp_q4_0_sk",
@@ -5086,6 +5087,60 @@ mod tests {
         }
         println!("matmul_proj quant max_err={e:e}");
         assert!(e < 5e-3, "matmul_proj quant mismatch: {e}");
+    }
+
+    /// The F16-weight SPLIT-K warptile (DG slice-7: the SC soft-embedding GEMM's route — deep k,
+    /// narrow n, m below the wide-warp gate) vs a host reference on the SAME f16-rounded weights.
+    /// m=70 (not %64) exercises the padded-row store; splits=4 exercises the partial planes +
+    /// fixed-order reduce; k=2048 gives each split multiple BK=64 stages.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn matmul_native_splitk_f16_matches_cpu() {
+        let be = VulkanBackend::new().unwrap();
+        let (m, k, n, splits) = (70usize, 2048usize, 256usize, 4usize);
+        let mpad = m.div_ceil(64) * 64;
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
+        let w: Vec<f32> = (0..n * k)
+            .map(|i| half::f16::from_f32(((i * 13 % 23) as f32 - 11.0) * 0.02).to_f32())
+            .collect();
+        let wf16: Vec<u16> = w
+            .iter()
+            .map(|&x| half::f16::from_f32(x).to_bits())
+            .collect();
+        let ba = be.alloc(a.len() * 4, BufferUsage::Staging).unwrap();
+        be.upload(ba.as_ref(), bytemuck::cast_slice(&a)).unwrap();
+        let bw = be.upload_weight_bytes(bytemuck::cast_slice(&wf16)).unwrap();
+        let pk = be
+            .alloc(splits * mpad * n * 4, BufferUsage::Activations)
+            .unwrap();
+        let bc = be.alloc(mpad * n * 4, BufferUsage::Readback).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.matmul_native_splitk(
+            infr_core::DType::F16,
+            ba.as_ref(),
+            bw.as_ref(),
+            0,
+            pk.as_ref(),
+            bc.as_ref(),
+            m,
+            k,
+            n,
+            splits,
+            false,
+        );
+        rec.finish().unwrap();
+        let mut bytes = vec![0u8; mpad * n * 4];
+        be.download(bc.as_ref(), &mut bytes).unwrap();
+        let got: &[f32] = bytemuck::cast_slice(&bytes);
+        let mut e = 0f32;
+        for r in 0..m {
+            for col in 0..n {
+                let want: f32 = (0..k).map(|x| a[r * k + x] * w[col * k + x]).sum();
+                e = e.max((got[r * n + col] - want).abs());
+            }
+        }
+        println!("matmul_native_splitk f16 max_err={e:e}");
+        assert!(e < 5e-2, "matmul_native_splitk f16 mismatch: {e}"); // f16 A rounding at k=2048
     }
 
     #[test]

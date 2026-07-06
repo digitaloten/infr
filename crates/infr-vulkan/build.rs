@@ -516,6 +516,16 @@ fn main() {
             "native_gemm_warp_q8_0_sk_ag",
             &["-DFMT_Q8_0", "-DNARROW_N", "-DSPLIT_K", "-DA_GLOBAL"],
         ),
+        // F16-weight SPLIT-K warptile (DG slice-7): the SC soft-embedding GEMM (m=canvas,
+        // k=vocab=262144, n=ne=2816) sat on the legacy `gemm_proj` BN=64 tile at ~6.5 TFLOPS —
+        // 4x slower than llama.cpp's same-shape f16 GEMM. Only the sk variant is instantiated:
+        // the adapter routes F16 here ONLY when the narrow-grid split-K policy fires (deep-k,
+        // underfilled grid); every other f16 GEMM keeps its existing `matmul_proj` route.
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_f16_sk",
+            &["-DFMT_F16", "-DNARROW_N", "-DSPLIT_K"],
+        ),
         ("native_gemm_warp", "native_gemm_warp_bf16", &["-DFMT_BF16"]),
         (
             "native_gemm_warp",
