@@ -677,6 +677,31 @@ fn main() {
             "native_gemm_warp_q3k_n128",
             &["-DFMT_Q3K", "-DNARROW_N"],
         ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q3k_sk",
+            &["-DFMT_Q3K", "-DNARROW_N", "-DSPLIT_K"],
+        ),
+        (
+            // A_GLOBAL family (occupancy 2→3 wgs/WGP) + split-K (grid-fill for narrow-n
+            // down/o/kv projections). Q3_K was the only warp K-quant missing these, so its GEMMs
+            // ran the plain n128 tile at ~9.6 TF (vs 30-52 TF for the ag siblings) — the dominant
+            // cost in unsloth's Q2_K mixed quant (down/o/kv are Q3_K). NO BK64W: like Q6K, the
+            // heavy Q3_K decoder collides with the doubled k-stage (BK64W is a Q4K-only win).
+            "native_gemm_warp",
+            "native_gemm_warp_q3k_ag",
+            &["-DFMT_Q3K", "-DA_GLOBAL"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q3k_n128_ag",
+            &["-DFMT_Q3K", "-DNARROW_N", "-DA_GLOBAL"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q3k_sk_ag",
+            &["-DFMT_Q3K", "-DNARROW_N", "-DSPLIT_K", "-DA_GLOBAL"],
+        ),
         ("native_gemm_warp", "native_gemm_warp_q5_0", &["-DFMT_Q5_0"]),
         (
             "native_gemm_warp",

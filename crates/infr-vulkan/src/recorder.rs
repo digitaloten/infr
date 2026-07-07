@@ -832,6 +832,7 @@ impl<'a> Recorder<'a> {
                 infr_core::DType::Iq4Xs => "native_gemm_warp_iq4xs_sk",
                 infr_core::DType::Q2K => "native_gemm_warp_q2k_sk",
                 infr_core::DType::Q4_0 => "native_gemm_warp_q4_0_sk",
+                infr_core::DType::Q3K => "native_gemm_warp_q3k_sk",
                 infr_core::DType::Q4K => "native_gemm_warp_q4k_sk",
                 infr_core::DType::Q5K => "native_gemm_warp_q5k_sk",
                 infr_core::DType::Q6K => "native_gemm_warp_q6k_sk",

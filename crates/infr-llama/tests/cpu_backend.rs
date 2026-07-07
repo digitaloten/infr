@@ -369,6 +369,22 @@ fn gpu_seam_matches_cpu_qwen3_iq4xs() {
     seam_vulkan_matches_cpu(&path, "What is the capital of France? Answer briefly.", 16);
 }
 
+/// Q2_K (2-bit quants + 4-bit sub-block scale/min + super-block d/dmin) through the Vulkan seam vs
+/// the CPU oracle. unsloth's Q2_K is a MIXED quant — the down/o/kv projections are Q3_K and the
+/// gate_up/q projections are Q2_K — so this exercises BOTH the Q2_K and Q3_K native-block prefill
+/// GEMMs, including Q3_K's A_GLOBAL / split-K warptile variants (added so Q3_K stops running the
+/// plain n128 tile at ~9.6 TF; see native_gemm_warp_q3k_{ag,n128_ag,sk_ag}). Both decode paths use
+/// the word-parallel `dqblk`; the A_GLOBAL/split-K variants are bit-identical to the f32 staging
+/// path (same dqblk, same MMA order), so this guards that the added pipelines stay token-faithful
+/// to the f32 CPU reference.
+#[test]
+fn gpu_seam_matches_cpu_qwen3_q2k() {
+    let path = need_model!(qwen3_quant("Q2_K"), "Qwen3-0.6B-Q2_K");
+    need_gpu!();
+    let _tlk = test_serial_lock();
+    seam_vulkan_matches_cpu(&path, "What is the capital of France? Answer briefly.", 16);
+}
+
 /// Flash-attention prefill parity: a prompt LONG ENOUGH (>64 tokens) that the seam's batched prefill
 /// takes the FlashAttention-2 path (`attention_prefill_flash`, rows≥64) + the tiled GEMM/mmq Linear,
 /// must generate the SAME greedy continuation as the CPU reference oracle (which uses the naive
