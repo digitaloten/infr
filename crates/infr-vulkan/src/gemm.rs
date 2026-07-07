@@ -958,6 +958,14 @@ pub(crate) fn native_gemm_mmq_q5_0_xp_spv() -> &'static [u32] {
     S.get_or_init(|| spv_words(BYTES))
 }
 
+/// SPIR-V for the tiled Q5_K dp4a (mmq) GEMM, expert-grid variant (unsloth-dynamic Qwen3.6-MoE
+/// quants mix Q5_K into the MoE down-projection banks; carries Q4_K's min term → binds `sact`).
+pub(crate) fn native_gemm_mmq_q5k_xp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q5k_xp.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+
 pub(crate) fn quant_q8_gather_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quant_q8_gather.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();

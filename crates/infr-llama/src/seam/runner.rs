@@ -3083,7 +3083,7 @@ pub(crate) fn generate_dense_backend(
     let mut dec_setup = std::time::Duration::ZERO;
     let mut dec_exec = std::time::Duration::ZERO;
 
-    // ── batched prefill (dense non-MoE non-E2B models only) ──────────────────────────────────
+    // ── batched prefill (dense + adapter-covered MoE; non-E2B models only) ────────────────────
     // Process all-but-the-last prompt tokens in a single graph execution: each Op::Linear runs
     // m=(N-1) activations against every weight row in parallel (O(out_f) rayon tasks, N-1 dots
     // each), reading each weight row ONCE and reusing it across all tokens. This fills the KV
@@ -3091,31 +3091,37 @@ pub(crate) fn generate_dense_backend(
     // that the "decode" stats (tok/s) remain meaningful and the first generated token is sampled
     // in the canonical way.
     //
-    // Guard: MoE uses Op::MoeFfn (per-token expert routing, no batched variant yet); E2B/gemma4
-    // requires a per-(token,layer) host-side input vector that is computed in the per-step loop.
-    // Both fall through to the original token-by-token loop below unchanged.
+    // Guard: E2B/gemma4 requires a per-(token,layer) host-side input vector that is computed in
+    // the per-step loop, so it falls through to the original token-by-token loop below unchanged.
     // Batched MoE prefill needs the adapter's GPU-routed expert path: Q4_K gate/up (split, what
-    // qwen3moe ships) or fused Q4_K gate_up (diffusion-gemma's `ffn_gate_up_exps`) +
-    // Q4_K/Q6_K/Q8_0/Q5_0 down (Q5_0 is what the shipped diffusiongemma-26B-A4B-it-GGUF actually
-    // uses); other stacked formats keep the per-token loop.
+    // qwen3moe/qwen35moe ship) or fused Q4_K gate_up (diffusion-gemma's `ffn_gate_up_exps`) +
+    // Q4_K/Q5_K/Q6_K/Q8_0/Q5_0 down (Q5_0 is what the shipped diffusiongemma-26B-A4B-it-GGUF
+    // actually uses; unsloth-dynamic Qwen3.6-MoE quants mix Q5_K into most layers' down banks);
+    // other stacked formats keep the per-token loop. This set must exactly mirror the Vulkan
+    // adapter's batched `Op::MoeFfn` coverage (its `down_ok`) — a mismatch either silently falls
+    // back to per-token prefill or compiles a graph the adapter rejects.
+    let moe_down_ok = |d: Option<DType>| {
+        matches!(
+            d,
+            Some(DType::Q4K)
+                | Some(DType::Q5K)
+                | Some(DType::Q6K)
+                | Some(DType::Q8_0)
+                | Some(DType::Q5_0)
+        )
+    };
     let moe_batched_ok = c.moe.is_some() && {
         let dt = |n: String| g.tensors().iter().find(|t| t.name == n).map(|t| t.dtype);
         if c.diffusion_gemma {
             (0..c.n_layer).all(|l| {
                 dt(format!("blk.{l}.ffn_gate_up_exps.weight")) == Some(DType::Q4K)
-                    && matches!(
-                        dt(format!("blk.{l}.ffn_down_exps.weight")),
-                        Some(DType::Q4K) | Some(DType::Q6K) | Some(DType::Q8_0) | Some(DType::Q5_0)
-                    )
+                    && moe_down_ok(dt(format!("blk.{l}.ffn_down_exps.weight")))
             })
         } else {
             (0..c.n_layer).all(|l| {
                 dt(format!("blk.{l}.ffn_gate_exps.weight")) == Some(DType::Q4K)
                     && dt(format!("blk.{l}.ffn_up_exps.weight")) == Some(DType::Q4K)
-                    && matches!(
-                        dt(format!("blk.{l}.ffn_down_exps.weight")),
-                        Some(DType::Q4K) | Some(DType::Q6K)
-                    )
+                    && moe_down_ok(dt(format!("blk.{l}.ffn_down_exps.weight")))
             })
         }
     };

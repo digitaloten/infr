@@ -3695,7 +3695,8 @@ impl<'a> Recorder<'a> {
     /// indexed `w_base + e·stride`. Grid x covers the worst-case row tiles (`ceil(rows/64)` — the
     /// whole chunk landing on one expert); tiles past a segment exit immediately, so the empty
     /// launches cost ~nothing while the dispatch count drops from ~n_expert·stages per layer to
-    /// stages. `sact` is Q4_K's min-term row sums (None for Q6_K/Q8_0/Q5_0, which have no min).
+    /// stages. `sact` is Q4_K/Q5_K's min-term row sums (None for Q6_K/Q8_0/Q5_0, which have no
+    /// min).
     ///
     /// `rows` is a GRID-SIZING BOUND ONLY (never read by the shader — the kernel derives every
     /// real row range from `counts`/`offsets`): it must be `>=` the largest possible `counts[e]`
@@ -3752,7 +3753,12 @@ impl<'a> Recorder<'a> {
                 crate::gemm::native_gemm_mmq_q5_0_xp_spv(),
                 6,
             ),
-            _ => unreachable!("batched MoE expert GEMM: Q4_K/Q6_K/Q8_0/Q5_0 only"),
+            infr_core::DType::Q5K => (
+                "native_gemm_mmq_q5k_xp",
+                crate::gemm::native_gemm_mmq_q5k_xp_spv(),
+                7,
+            ),
+            _ => unreachable!("batched MoE expert GEMM: Q4_K/Q5_K/Q6_K/Q8_0/Q5_0 only"),
         };
         let kern = self.be.kernel(name, spv, nb, 16);
         let mut push = [0u8; 16];

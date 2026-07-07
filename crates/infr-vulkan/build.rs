@@ -434,6 +434,11 @@ fn main() {
             "native_gemm_mmq_q5_0_xp",
             &["-DEXPERT_GRID"],
         ),
+        (
+            "native_gemm_mmq_q5k",
+            "native_gemm_mmq_q5k_xp",
+            &["-DEXPERT_GRID"],
+        ),
         ("quant_q8", "quant_q8_gather", &["-DGATHER"]),
         ("moe_scatter_reduce", "moe_scatter_reduce", &[]),
         ("moe_topk", "moe_topk", &[]),

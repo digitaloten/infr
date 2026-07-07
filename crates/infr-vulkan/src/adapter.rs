@@ -1886,9 +1886,10 @@ fn lower_op(
             // on-GPU) + a prologue that writes per-expert INDIRECT dispatch args from the counts —
             // so the whole expert loop records with NO host readback (the bespoke path downloads
             // counts mid-graph to size its GEMMs; indirect dispatch replaces that). Q4_K gate/up
-            // (split OR fused) + Q4_K/Q6_K/Q8_0/Q5_0 down (Q5_0 is what the shipped
-            // diffusiongemma-26B-A4B-it-GGUF actually uses); the runner routes anything narrower
-            // through the per-token path (below).
+            // (split OR fused) + Q4_K/Q5_K/Q6_K/Q8_0/Q5_0 down (Q5_0 is what the shipped
+            // diffusiongemma-26B-A4B-it-GGUF actually uses; Q5_K is what unsloth-dynamic
+            // Qwen3.6-MoE quants mix into most layers' down banks); the runner routes anything
+            // narrower through the per-token path (below).
             //
             // Fused gate_up (diffusion-gemma): native block formats can't be split at an
             // arbitrary row offset without block-alignment gymnastics (Q4_K's superblocks straddle
@@ -1901,8 +1902,8 @@ fn lower_op(
             // Gated on `rows > moe_small_m_threshold()` (not `rows > 1`): tiny prefill chunks (e.g.
             // `pp4`) take the small-m fast path below instead — see its doc for why.
             if rows > moe_small_m_threshold() {
-                use infr_core::DType::{Q4K, Q5_0, Q6K, Q8_0};
-                let down_ok = matches!(ddt, Q4K | Q6K | Q8_0 | Q5_0);
+                use infr_core::DType::{Q4K, Q5K, Q5_0, Q6K, Q8_0};
+                let down_ok = matches!(ddt, Q4K | Q5K | Q6K | Q8_0 | Q5_0);
                 let act_ok = if *fused_gate_up {
                     matches!(act, Activation::Silu | Activation::Gelu)
                 } else {
@@ -1913,7 +1914,7 @@ fn lower_op(
                 if !(matches!(gdt, Q4K) && matches!(udt, Q4K) && down_ok && act_ok) {
                     return Err(be(format!(
                         "vulkan adapter: batched MoeFfn needs Q4_K gate/up + \
-                         Q4_K/Q6_K/Q8_0/Q5_0 down (+ SiLU, or GELU when fused_gate_up) \
+                         Q4_K/Q5_K/Q6_K/Q8_0/Q5_0 down (+ SiLU, or GELU when fused_gate_up) \
                          (got gate={gdt:?} up={udt:?} \
                          down={ddt:?} act={act:?} fused={fused_gate_up})"
                     )));
@@ -2097,9 +2098,9 @@ fn lower_op(
                     n_pairs,
                     nff,
                 );
-                // Only Q4_K's down format carries a min term (`sact`) — Q6_K and Q8_0 are
-                // symmetric (no min), same as the per-token path's dtype-gated `sact` use.
-                let down_needs_sact = matches!(ddt, Q4K);
+                // Only the K-quant min-carrying down formats (Q4_K/Q5_K) bind `sact` — Q6_K and
+                // Q8_0 are symmetric (no min), same as the per-token path's dtype-gated `sact` use.
+                let down_needs_sact = matches!(ddt, Q4K | Q5K);
                 rec.matmul_mmq_experts(
                     ddt,
                     "expert_down",
@@ -3778,6 +3779,114 @@ mod tests {
         }
     }
 
+    // ---- Q5_K helpers (block=256: Q4_K's f16 d + f16 dmin + 12-byte packed 6-bit scale/min plus
+    // a 32-byte qh high-bit plane + 128 nibbles = 176 bytes) — mirrors `native_gemm_mmq_q5k`'s
+    // decode exactly (qh bit `sub` of byte `l` supplies quant bit 4), so the batched split-gate
+    // isolation test below can synthesize a real Q5_K down bank and have the host reference
+    // dequant the SAME rounded values the GPU shader reads. Same internal-round-trip-only caveat
+    // as the Q4_K helpers above.
+    fn q5k(x: &[f32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(x.len() / 256 * 176);
+        for blk in x.chunks(256) {
+            let mut sc = [0u32; 8];
+            let mut mn = [0u32; 8];
+            let mut sub_lo = [0f32; 8]; // per-sub-block min
+            let mut sub_sc = [0f32; 8]; // per-sub-block (max-min)/31
+            for (j, sub) in blk.chunks(32).enumerate() {
+                let lo = sub.iter().cloned().fold(f32::INFINITY, f32::min);
+                let hi = sub.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                sub_lo[j] = lo;
+                sub_sc[j] = ((hi - lo) / 31.0).max(1e-8);
+            }
+            let d = sub_sc.iter().cloned().fold(0f32, f32::max) / 63.0;
+            let dmin = sub_lo
+                .iter()
+                .cloned()
+                .fold(0f32, |m, v| m.max(v.abs()))
+                .max(1e-8)
+                / 63.0;
+            let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+            let idmin = if dmin > 0.0 { 1.0 / dmin } else { 0.0 };
+            for j in 0..8 {
+                sc[j] = ((sub_sc[j] * id).round() as i32).clamp(0, 63) as u32;
+                mn[j] = ((sub_lo[j].abs() * idmin).round() as i32).clamp(0, 63) as u32;
+            }
+            out.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+            out.extend_from_slice(&half::f16::from_f32(dmin).to_le_bytes());
+            // Pack the 8 (sc,mn) pairs into 12 bytes (get_scale_min_k4 convention).
+            let mut scales = [0u8; 12];
+            for k in 0..4 {
+                scales[k] = (sc[k] & 0x3F) as u8 | (((sc[4 + k] >> 4) & 0x3) as u8) << 6;
+                scales[4 + k] = (mn[k] & 0x3F) as u8 | (((mn[4 + k] >> 4) & 0x3) as u8) << 6;
+                scales[8 + k] = (sc[4 + k] & 0xF) as u8 | (((mn[4 + k] & 0xF) as u8) << 4);
+            }
+            out.extend_from_slice(&scales);
+            // Quantize to 5 bits against the recovered (d*sc, dmin*mn); low nibble → qs (sub_even
+            // low, sub_odd high per 32-byte pair-region), bit 4 → qh bit `sub`.
+            let mut q = [[0u8; 32]; 8];
+            for j in 0..8 {
+                let scale = d * sc[j] as f32;
+                let min = dmin * mn[j] as f32;
+                let iscale = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+                for (l, &v) in blk[j * 32..j * 32 + 32].iter().enumerate() {
+                    q[j][l] = (((v - min) * iscale).round() as i32).clamp(0, 31) as u8;
+                }
+            }
+            let mut qh = [0u8; 32];
+            for (j, qj) in q.iter().enumerate() {
+                for (l, &qv) in qj.iter().enumerate() {
+                    qh[l] |= ((qv >> 4) & 1) << j;
+                }
+            }
+            out.extend_from_slice(&qh);
+            let mut qs = [0u8; 128];
+            for pair in 0..4 {
+                let (lo, hi) = (&q[2 * pair], &q[2 * pair + 1]);
+                for l in 0..32 {
+                    qs[pair * 32 + l] = (lo[l] & 0xF) | ((hi[l] & 0xF) << 4);
+                }
+            }
+            out.extend_from_slice(&qs);
+        }
+        out
+    }
+    fn deq_q5k(bytes: &[u8]) -> Vec<f32> {
+        let mut out = Vec::with_capacity(bytes.len() / 176 * 256);
+        for blk in bytes.chunks(176) {
+            let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
+            let dmin = half::f16::from_le_bytes([blk[2], blk[3]]).to_f32();
+            let scales = &blk[4..16];
+            let qh = &blk[16..48];
+            let qs = &blk[48..176];
+            for j in 0..8u32 {
+                let (sc, mn) = if j < 4 {
+                    (
+                        (scales[j as usize] & 0x3F) as u32,
+                        (scales[j as usize + 4] & 0x3F) as u32,
+                    )
+                } else {
+                    let i2 = j as usize - 4;
+                    (
+                        (scales[j as usize + 4] as u32 & 0xF) | (((scales[i2] as u32) >> 6) << 4),
+                        (scales[j as usize + 4] as u32 >> 4)
+                            | (((scales[i2 + 4] as u32) >> 6) << 4),
+                    )
+                };
+                let scale = d * sc as f32;
+                let min = dmin * mn as f32;
+                let pair = (j / 2) as usize;
+                let lo = (j % 2) == 0;
+                for l in 0..32 {
+                    let byte = qs[pair * 32 + l];
+                    let nib = if lo { byte & 0xF } else { byte >> 4 };
+                    let hb = (qh[l] >> j) & 1;
+                    out.push(scale * (nib | (hb << 4)) as f32 - min);
+                }
+            }
+        }
+        out
+    }
+
     /// The `rows>moe_small_m_threshold()` (batched, GPU-resident routing) twin of
     /// `moe_ffn_fused_scaled_matches_host`: diffusion-gemma's ACTUAL production dtypes (fused Q4_K
     /// gate_up, not Q8_0 — exercises `matmul_mmq_experts`'s Q4_K path with `gu_width = 2*nff`) +
@@ -3927,6 +4036,140 @@ mod tests {
                 assert!(
                     (got[i] - want[i]).abs() < 2e-2,
                     "batched fused-scaled moe_ffn mismatch rows={rows} at {i}: got {} want {}",
+                    got[i],
+                    want[i]
+                );
+            }
+        }
+    }
+
+    /// Batched split-gate MoeFfn with a Q5_K down bank — qwen35moe's unsloth-dynamic (UD) quant
+    /// shape (Q4_K gate/up + Q5_K down on most layers, SiLU, router_x == x, no down_scale).
+    /// Exercises the `native_gemm_mmq_q5k_xp` kernel (min-carrying like Q4_K → binds `sact`)
+    /// through the full GPU-resident routing pipeline at rows=9 (ragged, non-64-aligned row
+    /// tiles) and rows=256. Host reference structure and int8-activation rounding follow
+    /// `moe_ffn_batched_fused_scaled_matches_host` (see its tolerance rationale).
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn moe_ffn_batched_split_q5k_down_matches_host() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        let (ne, n_expert, n_used, nff) = (256usize, 4usize, 2usize, 256usize);
+        let scale = 1.0f32;
+        let f = |i: usize, s: f32| (i as f32 * s).sin() * 0.5;
+        let silu = |z: f32| z / (1.0 + (-z).exp());
+        let dot = |w: &[f32], v: &[f32]| w.iter().zip(v).map(|(a, b)| a * b).sum::<f32>();
+        let router: Vec<f32> = (0..n_expert * ne)
+            .map(|i| f(i, 0.037) + (i / ne) as f32 * 0.15)
+            .collect();
+        // 0.3x weight amplitude vs the precedent tests: this shape's dots run over 256 terms at
+        // BOTH stages (Q5_K's 256-element superblock forces nff=256, vs the fused test's nff=32),
+        // and full-amplitude weights push SwiGLU activations into a dynamic range where the
+        // per-32-block int8 activation quant (f16-rounded scale + f16-rounded `sact` block sums —
+        // neither modeled by the host reference) costs ~0.05-0.19 absolute; damped, both stages
+        // stay well-conditioned and the shared 2e-2 tolerance holds with margin.
+        let gate: Vec<f32> = (0..n_expert * nff * ne)
+            .map(|i| f(i, 0.017) * 0.3)
+            .collect();
+        let up: Vec<f32> = (0..n_expert * nff * ne)
+            .map(|i| f(i, 0.023) * 0.3)
+            .collect();
+        let down: Vec<f32> = (0..n_expert * ne * nff)
+            .map(|i| f(i, 0.029) * 0.3)
+            .collect();
+        let (rq, gq, uq, dq) = (q8_0(&router), q4k(&gate), q4k(&up), q5k(&down));
+        let (rd, gd, ud, dd) = (deq_q8(&rq), deq_q4k(&gq), deq_q4k(&uq), deq_q5k(&dq));
+
+        for &rows in &[9usize, 256usize] {
+            let x: Vec<f32> = (0..rows * ne).map(|i| f(i, 0.11) + 0.05).collect();
+            let mut want = vec![0f32; rows * ne];
+            for t in 0..rows {
+                let xr = &x[t * ne..(t + 1) * ne];
+                let logits: Vec<f32> = (0..n_expert)
+                    .map(|e| dot(&rd[e * ne..(e + 1) * ne], xr))
+                    .collect();
+                let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut probs: Vec<f32> = logits.iter().map(|&v| (v - maxl).exp()).collect();
+                let psum: f32 = probs.iter().sum();
+                probs.iter_mut().for_each(|p| *p /= psum);
+                let mut idx: Vec<usize> = (0..n_expert).collect();
+                idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+                idx.truncate(n_used);
+                let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
+                // The batched path reads int8-quantized activations (quant_q8_gather for gate/up,
+                // quant_q8 for the down input) — round-trip both so the reference matches.
+                let xrq = deq_q8(&q8_0(xr));
+                for &e in &idx {
+                    let gs = e * nff * ne;
+                    let ds = e * ne * nff;
+                    let actv: Vec<f32> = (0..nff)
+                        .map(|j| {
+                            let g = dot(&gd[gs + j * ne..gs + (j + 1) * ne], &xrq);
+                            let u = dot(&ud[gs + j * ne..gs + (j + 1) * ne], &xrq);
+                            silu(g) * u
+                        })
+                        .collect();
+                    let actvq = deq_q8(&q8_0(&actv));
+                    let w_e = probs[e] / wsum * scale;
+                    for i in 0..ne {
+                        want[t * ne + i] +=
+                            w_e * dot(&dd[ds + i * nff..ds + (i + 1) * nff], &actvq);
+                    }
+                }
+            }
+            // graph
+            let mut g = Graph::new();
+            let xi = g.input(TensorDesc::new(vec![rows, ne], DType::F32));
+            let ri = g.weight(TensorDesc::new(vec![n_expert, ne], DType::Q8_0));
+            let gi = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::Q4K));
+            let ui = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::Q4K));
+            let di = g.weight(TensorDesc::new(vec![n_expert, ne, nff], DType::Q5K));
+            let yi = g.output(TensorDesc::new(vec![rows, ne], DType::F32));
+            g.push(Op::MoeFfn {
+                x: xi,
+                router_x: xi,
+                router: ri,
+                gate_exps: gi,
+                up_exps: ui,
+                down_exps: di,
+                down_scale: None,
+                fused_gate_up: false,
+                dst: yi,
+                ne: ne as u32,
+                n_expert: n_expert as u32,
+                n_used: n_used as u32,
+                n_ff_exp: nff as u32,
+                scale,
+                act: Activation::Silu,
+            });
+            let mk = |bytes: &[u8], usage| {
+                let b = be_.alloc(bytes.len(), usage).unwrap();
+                be_.upload(b.as_ref(), bytes).unwrap();
+                b
+            };
+            let xb = mk(bytemuck::cast_slice(&x), BufferUsage::Activations);
+            let rb = mk(&rq, BufferUsage::Weights);
+            let gb = mk(&gq, BufferUsage::Weights);
+            let ub = mk(&uq, BufferUsage::Weights);
+            let db = mk(&dq, BufferUsage::Weights);
+            let yb = be_.alloc(rows * ne * 4, BufferUsage::Activations).unwrap();
+            let plan = be_.compile(&g).unwrap();
+            let mut bind = Bindings::new();
+            bind.bind(xi, xb.as_ref());
+            bind.bind(ri, rb.as_ref());
+            bind.bind(gi, gb.as_ref());
+            bind.bind(ui, ub.as_ref());
+            bind.bind(di, db.as_ref());
+            bind.bind(yi, yb.as_ref());
+            be_.execute(plan.as_ref(), &bind).unwrap();
+            let mut got = vec![0f32; rows * ne];
+            be_.download(yb.as_ref(), bytemuck::cast_slice_mut(&mut got))
+                .unwrap();
+            for i in 0..rows * ne {
+                assert!(
+                    (got[i] - want[i]).abs() < 2e-2,
+                    "batched split q5k-down moe_ffn mismatch rows={rows} at {i}: got {} want {}",
                     got[i],
                     want[i]
                 );
