@@ -262,6 +262,172 @@ fn qwen3_8b_gemm_shapes_bench() {
     }
 }
 
+/// Wide-square occupancy sweep: the n=4096 Q4_K prefill shapes (o-proj 4096x4096, down
+/// 12288x4096) land on the WIDE ag tile at exactly ceil(m/64)·(n/256) = 8·16 = 128 workgroups —
+/// underfilling a 48-WGP part (144 slots at occ 3) → ~36 TF vs ~48-50 for the well-filled shapes.
+/// Sweeps: wide ag (old default, via INFR_GEMM_WIDE_TILE), n128 ag (new default), and split-K
+/// at splits 2/3/4 (2×/3×/4× workgroups + a reduce). Run:
+/// cargo test -p infr-vulkan --test gemm_bench wide_square -- --ignored --nocapture
+#[test]
+#[ignore = "requires a Vulkan GPU (perf micro-bench)"]
+fn wide_square_occupancy_sweep() {
+    let be = VulkanBackend::new().unwrap();
+    let m = 512usize;
+    let dt = infr_core::DType::Q4K;
+    let shapes = [
+        (4096usize, 4096usize, "o"),
+        (12288, 4096, "down"),
+        (4096, 6144, "qkv"),
+        (4096, 24576, "gate+up"),
+    ];
+    let a = be.alloc(m * 12288 * 4, BufferUsage::Activations).unwrap();
+    let a16 = be.alloc(m * 12288 * 2, BufferUsage::Activations).unwrap();
+    let c = be.alloc(m * 24576 * 4, BufferUsage::Activations).unwrap();
+    let reps = 30usize;
+    let tf = |us: f64, k: usize, n: usize| (2.0 * m as f64 * k as f64 * n as f64) / us / 1e6;
+
+    for (k, n, label) in shapes {
+        let w = be.alloc(n * k / 256 * 144, BufferUsage::Weights).unwrap();
+        let mpad = m.div_ceil(64) * 64;
+        let time = |f: &dyn Fn(&infr_vulkan::Recorder)| -> f64 {
+            let rec = be.recorder().unwrap();
+            f(&rec);
+            rec.finish().unwrap(); // warmup (pipeline compile)
+            let t0 = std::time::Instant::now();
+            let rec = be.recorder().unwrap();
+            for _ in 0..reps {
+                f(&rec);
+            }
+            rec.finish().unwrap();
+            t0.elapsed().as_micros() as f64 / reps as f64
+        };
+
+        // wide ag (old BN=256 tile, restored via INFR_GEMM_WIDE_TILE)
+        std::env::set_var("INFR_GEMM_WIDE_TILE", "1");
+        let us = time(&|rec| {
+            rec.store_f16(a.as_ref(), a16.as_ref(), m * k, 0);
+            rec.matmul_native_f16a(dt, a16.as_ref(), w.as_ref(), 0, c.as_ref(), m, k, n);
+        });
+        std::env::remove_var("INFR_GEMM_WIDE_TILE");
+        println!(
+            "[{label:>5}] [{k}x{n}] wide_ag      {us:7.1} us  {:5.1} TF",
+            tf(us, k, n)
+        );
+
+        // n128 ag (BN=128 → 2× workgroups) — the new default
+        let us = time(&|rec| {
+            rec.store_f16(a.as_ref(), a16.as_ref(), m * k, 0);
+            rec.matmul_native_f16a(dt, a16.as_ref(), w.as_ref(), 0, c.as_ref(), m, k, n);
+        });
+        println!(
+            "[{label:>5}] [{k}x{n}] n128_ag      {us:7.1} us  {:5.1} TF",
+            tf(us, k, n)
+        );
+
+        // narrow split-K, splits 2/3/4
+        for splits in [2usize, 3, 4] {
+            let pk = be
+                .alloc(splits * mpad * n * 4, BufferUsage::Activations)
+                .unwrap();
+            let us = time(&|rec| {
+                rec.store_f16(a.as_ref(), a16.as_ref(), m * k, 0);
+                rec.matmul_native_splitk(
+                    dt,
+                    a16.as_ref(),
+                    w.as_ref(),
+                    0,
+                    pk.as_ref(),
+                    c.as_ref(),
+                    m,
+                    k,
+                    n,
+                    splits,
+                    true,
+                );
+            });
+            println!(
+                "[{label:>5}] [{k}x{n}] sk_ag x{splits}     {us:7.1} us  {:5.1} TF",
+                tf(us, k, n)
+            );
+        }
+    }
+}
+
+/// Crossover characterization: wide (BN=256) vs n128 (BN=128) ag tile across a grid of (m, k, n)
+/// that spans the small-model regime (shallow k 1024-1152, small n) and the 8B regime (deep k,
+/// large n). Finds whether the wide tile EVER beats n128 (→ a shape-gated selection), or n128 wins
+/// throughout (→ the flat flip is safe). Run:
+/// cargo test -p infr-vulkan --test gemm_bench crossover -- --ignored --nocapture
+#[test]
+#[ignore = "requires a Vulkan GPU (perf micro-bench)"]
+fn wide_n128_crossover_sweep() {
+    let be = VulkanBackend::new().unwrap();
+    let dt = infr_core::DType::Q4K;
+    // (m, k, n): only n%256==0 (wide-eligible). Covers qwen3-0.6b (k=1024, n up to 6144),
+    // gemma-3-1b-shaped (k=1152), and the 8B shapes; plus small-m (last prefill chunk) rows.
+    let grid = [
+        (512usize, 1024usize, 2048usize),
+        (512, 1024, 6144),
+        (512, 1152, 6912),
+        (512, 1152, 13824),
+        (512, 2048, 1024),
+        (512, 3072, 1024),
+        (512, 4096, 4096),
+        (512, 4096, 6144),
+        (512, 4096, 24576),
+        (512, 12288, 4096),
+        (256, 1024, 6144),
+        (128, 1024, 6144),
+        (64, 4096, 4096),
+        (256, 4096, 4096),
+    ];
+    let amax = 12288usize;
+    let nmax = 24576usize;
+    let a16 = be.alloc(512 * amax * 2, BufferUsage::Activations).unwrap();
+    let c = be.alloc(512 * nmax * 4, BufferUsage::Activations).unwrap();
+    let reps = 40usize;
+    println!(
+        "{:>4} {:>6} {:>6} | {:>8} {:>8} | {:>8} {:>8} | winner",
+        "m", "k", "n", "wide us", "wideTF", "n128 us", "n128TF"
+    );
+    for (m, k, n) in grid {
+        let w = be.alloc(n * k / 256 * 144, BufferUsage::Weights).unwrap();
+        let tf = |us: f64| (2.0 * m as f64 * k as f64 * n as f64) / us / 1e6;
+        let time = |wide: bool| -> f64 {
+            if wide {
+                std::env::set_var("INFR_GEMM_WIDE_TILE", "1");
+            }
+            let f = |rec: &infr_vulkan::Recorder| {
+                rec.matmul_native_f16a(dt, a16.as_ref(), w.as_ref(), 0, c.as_ref(), m, k, n);
+            };
+            let rec = be.recorder().unwrap();
+            f(&rec);
+            rec.finish().unwrap(); // warmup
+            let t0 = std::time::Instant::now();
+            let rec = be.recorder().unwrap();
+            for _ in 0..reps {
+                f(&rec);
+            }
+            rec.finish().unwrap();
+            std::env::remove_var("INFR_GEMM_WIDE_TILE");
+            t0.elapsed().as_micros() as f64 / reps as f64
+        };
+        // interleave wide/n128 twice, take the min of each (thermal-robust)
+        let (mut uw, mut un) = (f64::MAX, f64::MAX);
+        for _ in 0..2 {
+            uw = uw.min(time(true));
+            un = un.min(time(false));
+        }
+        let win = if un < uw { "n128" } else { "WIDE" };
+        let wide_grid = m.div_ceil(64) * (n / 256).max(1);
+        println!(
+            "{m:>4} {k:>6} {n:>6} | {uw:8.1} {:8.1} | {un:8.1} {:8.1} | {win}  (wg={wide_grid})",
+            tf(uw),
+            tf(un)
+        );
+    }
+}
+
 /// Per-op serialization floor: a chain of small hazard-dependent dispatches (each reads the
 /// previous one's output → global barrier each). wall/ops ≈ the fixed bubble every seam op pays
 /// on top of its kernel time — the number that says how much op-count reduction / overlap is worth.

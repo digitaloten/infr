@@ -886,8 +886,27 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
+        // The BN=128 (n128) ag tile beats the BN=256 (wide) ag tile on EVERY shape this decision
+        // can reach, measured on RDNA3 (7900 XTX): the wide tile's WN=64 → 2×4 = 8 accumulator
+        // coopmat frags per warp cost enough VGPRs to drop occupancy, and the wide-square n=4096
+        // shapes (o-proj, down) land at exactly ceil(m/64)·(n/256) = 128 workgroups — one
+        // under-filled wave on the 48-WGP part. Halving the N tile doubles the workgroups AND
+        // halves the accumulator footprint.
+        //
+        // The old gate `use_wide = wide_grid >= 128` had the crossover BACKWARDS: the
+        // `wide_n128_crossover_sweep` bench shows n128 wins across the whole wide_grid >= 128
+        // regime (the ONLY regime the old gate picked wide) — 8B o 40→70 TF, gate+up 53→77 TF,
+        // down 42→73 TF, and the shallow-k small-model shapes too (1152×13824 43→68 TF,
+        // 1024×6144 53→69 TF). The wide tile only edges n128 on wide_grid < 128 (small-N) shapes,
+        // which the old code ALREADY routed to n128 and which production sends to split-K anyway —
+        // so no shape reachable here prefers wide. In-model pp512: 8B +27%, qwen35-4B +10%,
+        // gemma-4-E2B +10%; gemma-3-1b/qwen3-0.6b flat (their hot GEMMs are Q5_0 off this path /
+        // split-K). Bit-identical to the wide tile (both BK=64, same k-accumulation order).
+        // INFR_GEMM_WIDE_TILE restores the old BN=256 tile for A/B.
         let wide_grid = m.div_ceil(64) * (n / 256).max(1);
-        let use_wide = n.is_multiple_of(256) && wide_grid >= 128;
+        let use_wide = n.is_multiple_of(256)
+            && wide_grid >= 128
+            && std::env::var("INFR_GEMM_WIDE_TILE").is_ok();
         let ((name, spv), bn) = if use_wide {
             (
                 crate::gemm::native_gemm_warp_ag_build_spv(dtype).expect("ag spv"),
