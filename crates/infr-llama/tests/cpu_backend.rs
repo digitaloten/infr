@@ -1641,7 +1641,10 @@ fn cpu_qwen35moe_prefill_finite() {
     let _tlk = test_serial_lock();
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let cfg = model.config();
-    assert!(cfg.qwen35, "qwen35moe must set Config::qwen35 (shared skeleton)");
+    assert!(
+        cfg.qwen35,
+        "qwen35moe must set Config::qwen35 (shared skeleton)"
+    );
     let mc = cfg.moe.expect("qwen35moe must populate Config::moe");
     assert_eq!(mc.n_expert, 256);
     assert_eq!(mc.n_used, 8);
@@ -1721,7 +1724,10 @@ fn cpu_qwen35_dense_unaffected_by_moe_fields() {
     let cfg = model.config();
     assert!(cfg.qwen35);
     assert!(cfg.moe.is_none(), "dense qwen35 must not get an MoE config");
-    assert_eq!(cfg.shexp_ff, 0, "dense qwen35 must not get a shared-expert width");
+    assert_eq!(
+        cfg.shexp_ff, 0,
+        "dense qwen35 must not get a shared-expert width"
+    );
 }
 
 // ─── Gemma 4 12b (dense) ────────────────────────────────────────────────────────
