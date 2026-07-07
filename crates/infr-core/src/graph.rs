@@ -280,6 +280,35 @@ pub enum Op {
         n: u32,
         rows: u32,
     },
+    /// Fused single-row argmax + softmax top-1 probability (MTP draft-loop accept, issue #33
+    /// follow-up to `Op::Argmax`'s VERIFY-side fusion, de35727): `dst_id[0] = argmax(x[0..n])`
+    /// (u32 bit-pattern, strict `>` lowest-index tie-break — identical rule to [`Op::Argmax`]) and
+    /// `dst_prob[0] = softmax(x[0..n])[dst_id[0]] = 1 / sum_j exp(x[j] - x[dst_id[0]])`. Replaces
+    /// the MTP self-chaining draft loop's per-step full `[vocab]` logits download + host
+    /// `argmax`/`exp`-sum scan with an 8-byte readback — the host scan (not the download bytes)
+    /// was the measured dominant cost (~650-700us/step on a 151936-vocab head, vs ~25-50us for the
+    /// download itself). Single row only (the draft loop self-chains one token at a time; unlike
+    /// `Op::Argmax` there's no multi-row MTP-verify use case here — verify's accept is `Op::Argmax`
+    /// with `rows = m`, a DIFFERENT accept rule that doesn't need a probability at all). Backends
+    /// implement this as a two-stage reduction (256-way slice-parallel partials -> one-workgroup
+    /// merge), the SAME shape `Op::Argmax` uses and for the SAME reason (a single-workgroup
+    /// whole-vocab scan measured slower than the download it replaces — see that op's doc); the
+    /// merge combines each stage's `(max, argmax, sum_exp)` triple via the standard online-softmax
+    /// rule (`new_sum = a.sum*exp(a.max-new_max) + b.sum*exp(b.max-new_max)`), which is NOT
+    /// guaranteed bit-identical to the host's strictly-sequential `sum_j exp(x[j]-max)` (parallel
+    /// reduction reorders the float additions) — harmless in practice because
+    /// `mtp::DEFAULT_P_MIN == 0.0` and a softmax top-1 probability is always `> 0.0`, so the
+    /// `prob < p_min` accept/reject decision the caller makes from `dst_prob` can never flip on
+    /// the default path regardless of reduction order; a future non-zero `p_min` near a genuine
+    /// `prob` value would need the caller to tolerate the same ULP-level slack the two-stage
+    /// `Op::Argmax` already accepts for ties. Backends without a device kernel advertise
+    /// `Capabilities::argmax_prob == false`; the caller keeps the host logits-download path.
+    ArgmaxProb {
+        x: TensorId,
+        dst_id: TensorId,
+        dst_prob: TensorId,
+        n: u32,
+    },
     /// Device-side stochastic sampling: `dst[0] = sample(x[0..n])` (u32 id bit-pattern in the f32
     /// slot) via temperature + top-k + top-p, inverse-CDF'd with the uniform draw read from the
     /// 1-float `u` Input — the host draws u (4 bytes/token) and reads back only the id, the
@@ -451,6 +480,7 @@ impl Op {
             Op::MulVec { .. } => "MulVec",
             Op::Softcap { .. } => "Softcap",
             Op::Argmax { .. } => "Argmax",
+            Op::ArgmaxProb { .. } => "ArgmaxProb",
             Op::Sample { .. } => "Sample",
             Op::EmbedGather { .. } => "EmbedGather",
             Op::Copy { .. } => "Copy",

@@ -270,8 +270,15 @@ struct MtpHandles {
     /// The 16 weight handles, in [`upload_mtp_head_bufs`]'s push order (index-parallel with
     /// `MtpHeadSession::wbufs`).
     weights: Vec<TensorId>,
+    /// The lm_head GEMM's output. An `Output` (host-downloadable) tensor when `fuse_prob` was
+    /// `false`; an `Internal` (device-only scratch, never bound) tensor when `fuse_prob` was `true`
+    /// — the fused variant reads it straight into `Op::ArgmaxProb` and never sends the row to the
+    /// host at all (see [`build_mtp_graph`]'s doc).
     logits: TensorId,
     h_mtp: TensorId,
+    /// `Some((id, prob))` only when built with `fuse_prob == true` — the two 1-element `Output`s
+    /// `Op::ArgmaxProb` writes (issue #33 follow-up: 8 bytes instead of the `[vocab]` logits row).
+    id_prob: Option<(TensorId, TensorId)>,
 }
 
 /// Build the MTP head's 1-layer forward graph for `rows` `(token, h_target)` pairs starting at
@@ -304,6 +311,13 @@ struct MtpHandles {
 /// `mtp_head_forward_finite`'s finite-logits check plus `h_tap_matches_lm_head`-style consistency
 /// implicit in the parity test (a layout bug here would show up as garbage/NaN logits or gross
 /// CPU/Vulkan disagreement, not a subtle numeric drift).
+/// `fuse_prob` (issue #33 follow-up, de35727's deferred DRAFT-side twin): when `true`, appends
+/// `Op::ArgmaxProb` reading the lm_head output straight off the device and returns its two 1-element
+/// `Output`s as `MtpHandles::id_prob` instead of exposing the full `[rows*vocab]` logits row as an
+/// `Output` — the caller downloads 8 bytes instead of the whole row (and skips the host
+/// argmax/softmax scan that used to consume it). Requires `rows == 1` (the draft loop's own shape;
+/// `Op::ArgmaxProb` is single-row only, see its doc) — callers with `rows > 1` (catch_up, verify
+/// priming) must pass `fuse_prob = false`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn build_mtp_graph(
     cfg: &crate::Config,
@@ -311,7 +325,12 @@ fn build_mtp_graph(
     max_ctx: usize,
     rows: usize,
     start_pos: usize,
+    fuse_prob: bool,
 ) -> (Graph, MtpHandles) {
+    debug_assert!(
+        !fuse_prob || rows == 1,
+        "build_mtp_graph: fuse_prob requires rows == 1 (Op::ArgmaxProb is single-row only)"
+    );
     let ne = cfg.n_embd;
     let nh = cfg.n_head;
     let nkv = cfg.n_kv;
@@ -378,8 +397,15 @@ fn build_mtp_graph(
         w_lm_head,
     ];
 
-    let logits = g.output(f32d(rows * cfg.vocab));
+    // Fused variant: `logits` never leaves the device (Internal scratch, read straight into
+    // Op::ArgmaxProb below) — see this fn's doc on `fuse_prob`.
+    let logits = if fuse_prob {
+        g.internal(f32d(rows * cfg.vocab))
+    } else {
+        g.output(f32d(rows * cfg.vocab))
+    };
     let h_mtp = g.output(f32d(rows * ne));
+    let id_prob = fuse_prob.then(|| (g.output(f32d(1)), g.output(f32d(1))));
 
     // scratch
     let e_norm = g.internal(f32d(rows * ne));
@@ -668,6 +694,18 @@ fn build_mtp_graph(
         out_f: cfg.vocab as u32,
         w_off: 0,
     });
+    // Fused draft-loop accept (issue #33 follow-up, de35727's deferred DRAFT-side twin): argmax +
+    // softmax top-1 probability computed on-device, straight off the Internal `logits` this
+    // Linear just wrote — 8 bytes cross the bus instead of the whole `[vocab]` row. See
+    // `Op::ArgmaxProb`'s doc for the tie-break/numerics contract.
+    if let Some((id_out, prob_out)) = id_prob {
+        g.push(Op::ArgmaxProb {
+            x: logits,
+            dst_id: id_out,
+            dst_prob: prob_out,
+            n: cfg.vocab as u32,
+        });
+    }
 
     (
         g,
@@ -680,6 +718,7 @@ fn build_mtp_graph(
             weights,
             logits,
             h_mtp,
+            id_prob,
         },
     )
 }
@@ -882,7 +921,14 @@ impl<'a> MtpHeadSession<'a> {
         let positions: Vec<i32> = (start_pos as i32..(start_pos + rows) as i32).collect();
 
         let t_build = std::time::Instant::now();
-        let (graph, h) = build_mtp_graph(&self.cfg, &self.wspecs, self.max_ctx, rows, start_pos);
+        let (graph, h) = build_mtp_graph(
+            &self.cfg,
+            &self.wspecs,
+            self.max_ctx,
+            rows,
+            start_pos,
+            false,
+        );
         let plan = self.be.compile(&graph).map_err(|e| anyhow!("{e}"))?;
         self.build_secs += t_build.elapsed().as_secs_f64();
 
@@ -945,6 +991,140 @@ impl<'a> MtpHeadSession<'a> {
         self.exec_secs += t_exec.elapsed().as_secs_f64();
         Ok((logits, h_mtp))
     }
+
+    /// One SELF-CHAINING draft step (`draft`'s inner loop body): forward `tok`/`h_row` at `pos`
+    /// and return `(id, prob, h_mtp)` — the drafted token id, its softmax top-1 probability, and
+    /// the head's own hidden output to feed the NEXT step. Issue #33 follow-up to de35727's
+    /// GPU-resident VERIFY accept: when the backend advertises `Capabilities::argmax_prob` (and
+    /// `INFR_NO_GPU_DRAFT_PROB` isn't set), builds the FUSED graph (`build_mtp_graph`'s
+    /// `fuse_prob`) so only 8 bytes read back instead of the whole `[vocab]` logits row — the
+    /// profiler-measured dominant per-step draft cost was the host `top1_softmax` scan this
+    /// replaces (~650-700us on a 151936-token vocab), not the download bytes themselves
+    /// (~25-50us), so the fused reduce kills both in one pass. Falls back to
+    /// [`forward`](Self::forward) + [`top1_softmax`] otherwise (Metal, or the A/B escape) —
+    /// bit-identical results either way (both compute the SAME argmax; `DEFAULT_P_MIN == 0.0`
+    /// means the `prob` value alone can never flip a `prob < p_min` decision, so the two paths'
+    /// accept/reject/token stream is provably identical on the shipped default — see
+    /// `Op::ArgmaxProb`'s doc on the reduction-order caveat for a future nonzero `p_min`).
+    fn forward_draft(
+        &mut self,
+        tok: u32,
+        h_row: &[f32],
+        pos: usize,
+    ) -> Result<(u32, f32, Vec<f32>)> {
+        if !self.gpu_draft_prob_enabled() {
+            let (logits, h_mtp) = self.forward(&[tok], h_row, pos)?;
+            let (id, p) = top1_softmax(&logits);
+            return Ok((id, p, h_mtp));
+        }
+
+        let ne = self.cfg.n_embd;
+        anyhow::ensure!(
+            h_row.len() == ne,
+            "MTP head forward_draft: h_row length {} != ne {ne}",
+            h_row.len()
+        );
+        anyhow::ensure!(
+            pos < self.max_ctx,
+            "MTP head forward_draft: KV overflow ({pos}+1 > max_ctx {})",
+            self.max_ctx
+        );
+
+        let base = tok as usize * ne;
+        let e_raw = &self.embed_table[base..base + ne];
+        let positions = [pos as i32];
+
+        let t_build = std::time::Instant::now();
+        let (graph, h) = build_mtp_graph(&self.cfg, &self.wspecs, self.max_ctx, 1, pos, true);
+        let plan = self.be.compile(&graph).map_err(|e| anyhow!("{e}"))?;
+        self.build_secs += t_build.elapsed().as_secs_f64();
+
+        let t_exec = std::time::Instant::now();
+        let e_buf = self
+            .be
+            .alloc(ne * 4, BufferUsage::Staging)
+            .map_err(|e| anyhow!("{e}"))?;
+        let h_buf = self
+            .be
+            .alloc(ne * 4, BufferUsage::Staging)
+            .map_err(|e| anyhow!("{e}"))?;
+        let pos_buf = self
+            .be
+            .alloc(4, BufferUsage::Staging)
+            .map_err(|e| anyhow!("{e}"))?;
+        let hmtp_buf = self
+            .be
+            .alloc(ne * 4, BufferUsage::Readback)
+            .map_err(|e| anyhow!("{e}"))?;
+        let id_buf = self
+            .be
+            .alloc(4, BufferUsage::Readback)
+            .map_err(|e| anyhow!("{e}"))?;
+        let prob_buf = self
+            .be
+            .alloc(4, BufferUsage::Readback)
+            .map_err(|e| anyhow!("{e}"))?;
+
+        self.be
+            .upload(e_buf.as_ref(), bytemuck::cast_slice(e_raw))
+            .map_err(|e| anyhow!("{e}"))?;
+        self.be
+            .upload(h_buf.as_ref(), bytemuck::cast_slice(h_row))
+            .map_err(|e| anyhow!("{e}"))?;
+        self.be
+            .upload(pos_buf.as_ref(), bytemuck::cast_slice(&positions))
+            .map_err(|e| anyhow!("{e}"))?;
+
+        let (id_out, prob_out) = h
+            .id_prob
+            .expect("build_mtp_graph(fuse_prob=true) always sets id_prob");
+
+        let mut b = Bindings::new();
+        b.bind(h.e_raw, e_buf.as_ref());
+        b.bind(h.h_in, h_buf.as_ref());
+        b.bind(h.positions, pos_buf.as_ref());
+        b.bind(h.k_cache, self.k_cache.as_ref());
+        b.bind(h.v_cache, self.v_cache.as_ref());
+        for (i, wid) in h.weights.iter().enumerate() {
+            b.bind(*wid, self.wbufs[i].as_ref());
+        }
+        // NOTE: `h.logits` is Internal in the fused graph (never bound — see build_mtp_graph's
+        // doc); only h_mtp + the two 8-byte accept outputs cross the bus.
+        b.bind(h.h_mtp, hmtp_buf.as_ref());
+        b.bind(id_out, id_buf.as_ref());
+        b.bind(prob_out, prob_buf.as_ref());
+
+        self.be
+            .execute(plan.as_ref(), &b)
+            .map_err(|e| anyhow!("{e}"))?;
+
+        let mut h_mtp = vec![0f32; ne];
+        self.be
+            .download(hmtp_buf.as_ref(), bytemuck::cast_slice_mut(&mut h_mtp))
+            .map_err(|e| anyhow!("{e}"))?;
+        // Device-side accept ids/probs (mirrors the decode loop's Op::Argmax/Op::Sample readback
+        // in seam/runner.rs): raw 4-byte little-endian id, plain f32 prob.
+        let mut idb = [0u8; 4];
+        self.be
+            .download(id_buf.as_ref(), &mut idb)
+            .map_err(|e| anyhow!("{e}"))?;
+        let id = u32::from_le_bytes(idb);
+        let mut pb = [0u8; 4];
+        self.be
+            .download(prob_buf.as_ref(), &mut pb)
+            .map_err(|e| anyhow!("{e}"))?;
+        let prob = f32::from_le_bytes(pb);
+        self.exec_secs += t_exec.elapsed().as_secs_f64();
+
+        Ok((id, prob, h_mtp))
+    }
+
+    /// Whether [`forward_draft`](Self::forward_draft) should build the fused `Op::ArgmaxProb`
+    /// graph: the backend must advertise the capability, and the `INFR_NO_GPU_DRAFT_PROB` A/B
+    /// escape (byte-identity verification against the host `top1_softmax` path) must be unset.
+    fn gpu_draft_prob_enabled(&self) -> bool {
+        self.be.capabilities().argmax_prob && std::env::var("INFR_NO_GPU_DRAFT_PROB").is_err()
+    }
 }
 
 /// llama.cpp's default `--spec-draft-p-min` (`common/common.h:329`'s
@@ -998,8 +1178,11 @@ pub fn draft(
     let mut tok = id_last;
     let mut h = pending_h.to_vec();
     for pos in n_past..n_past + n_max {
-        let (logits, h_mtp) = sess.forward(&[tok], &h, pos)?;
-        let (id, p) = top1_softmax(&logits);
+        // Issue #33 follow-up (de35727's deferred DRAFT-side twin): `forward_draft` builds the
+        // fused `Op::ArgmaxProb` graph when the backend supports it (8-byte readback instead of
+        // the whole `[vocab]` logits row + a host argmax/softmax scan), falling back to `forward`
+        // + `top1_softmax` otherwise — same `(id, p)` either way, see that method's doc.
+        let (id, p, h_mtp) = sess.forward_draft(tok, &h, pos)?;
         if p < p_min {
             break;
         }

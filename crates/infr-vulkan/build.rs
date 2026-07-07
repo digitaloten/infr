@@ -647,6 +647,10 @@ fn main() {
         // Two-stage greedy argmax (Op::Argmax): slice partials, then a one-workgroup reduce.
         ("argmax", "argmax_part", &[]),
         ("argmax", "argmax", &["-DPASS2"]),
+        // Two-stage fused argmax+top1-prob (Op::ArgmaxProb, MTP draft-loop accept): same shape as
+        // argmax, plus an online-softmax sum_exp carried alongside the (max, idx) reduction.
+        ("argmax_prob", "argmax_prob_part", &[]),
+        ("argmax_prob", "argmax_prob", &["-DPASS2"]),
         ("moe_sample", "moe_sample", &[]),
         // DiffusionGemma perf slice 3 (docs/DIFFUSIONGEMMA.md): fused per-row entropy-bound
         // sampler reduction — argmax/entropy/CDF-sample over [rows, vocab] logits on-GPU.

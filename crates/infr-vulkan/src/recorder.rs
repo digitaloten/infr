@@ -3619,6 +3619,43 @@ impl<'a> Recorder<'a> {
         }
     }
 
+    /// Fused single-row argmax + softmax top-1 probability (`Op::ArgmaxProb`) — the MTP
+    /// draft-loop accept (issue #33 follow-up to [`Recorder::argmax`]'s VERIFY-side fusion,
+    /// de35727): `out_id[0]`/`out_prob[0]` read back 8 bytes total instead of the `[n]` logits row
+    /// plus the host argmax + `sum exp` scan it replaces (measured the dominant per-step draft
+    /// cost, not the download itself — see `Op::ArgmaxProb`'s doc). Two-stage, the SAME
+    /// 256-workgroup-partials -> 1-workgroup-merge shape as `argmax`, with an online-softmax
+    /// `sum_exp` carried alongside the (max, idx) reduction (see argmax_prob.comp). Single row
+    /// only — the draft loop self-chains one token at a time.
+    pub fn argmax_prob(
+        &self,
+        logits: &dyn Buffer,
+        part: &dyn Buffer,
+        out_id: &dyn Buffer,
+        out_prob: &dyn Buffer,
+        n: usize,
+    ) {
+        let k1 = self.be.kernel(
+            "argmax_prob_part",
+            crate::gemm::argmax_prob_part_spv(),
+            2,
+            4,
+        );
+        let k2 = self
+            .be
+            .kernel("argmax_prob", crate::gemm::argmax_prob_spv(), 3, 4);
+        let p1 = (n as u32).to_ne_bytes();
+        self.dispatch(k1, &[Self::vkb(logits), Self::vkb(part)], 1, &p1, 256);
+        let p2 = 256u32.to_ne_bytes();
+        self.dispatch(
+            k2,
+            &[Self::vkb(part), Self::vkb(out_id), Self::vkb(out_prob)],
+            1,
+            &p2,
+            1,
+        );
+    }
+
     /// Emit an UNCONDITIONAL full compute→compute memory barrier. The chained decode replays one
     /// recording back-to-back in a single submission — commands from consecutive replays may
     /// otherwise overlap (the hazard tracker only orders dispatches WITHIN a recording), so a

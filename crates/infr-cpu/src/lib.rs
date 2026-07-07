@@ -308,6 +308,7 @@ impl Backend for CpuBackend {
             embed_gather: true,
             gpu_sample: true,
             argmax_rows: true,
+            argmax_prob: true,
         }
     }
 
@@ -1294,6 +1295,30 @@ impl Backend for CpuBackend {
                         out.push(f32::from_bits(bi));
                     }
                     vals[dst.0 as usize] = out;
+                }
+                Op::ArgmaxProb {
+                    x,
+                    dst_id,
+                    dst_prob,
+                    n,
+                } => {
+                    // Exact reference: this MUST match `infr_llama::mtp::top1_softmax` bit-for-bit
+                    // (same strict-`>` argmax scan, then the SAME left-to-right `sum_j
+                    // exp(x[j]-max)` accumulation order) — the CPU backend is the golden oracle the
+                    // GPU two-stage reduction is checked against (`mtp_head_cpu_vulkan_parity`).
+                    let n = n as usize;
+                    let xs = &vals[x.0 as usize][0..n];
+                    let mut best = f32::NEG_INFINITY;
+                    let mut bi = 0u32;
+                    for (i, &v) in xs.iter().enumerate() {
+                        if v > best {
+                            best = v;
+                            bi = i as u32;
+                        }
+                    }
+                    let z: f32 = xs.iter().map(|&v| (v - best).exp()).sum();
+                    vals[dst_id.0 as usize] = vec![f32::from_bits(bi)];
+                    vals[dst_prob.0 as usize] = vec![1.0 / z];
                 }
                 Op::Copy {
                     src,

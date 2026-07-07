@@ -55,6 +55,11 @@ pub struct Capabilities {
     /// backends whose kernel is single-row-only (Metal) leave this false and the runner keeps
     /// the host-logits accept path there.
     pub argmax_rows: bool,
+    /// The backend executes [`crate::Op::ArgmaxProb`] (fused single-row argmax + softmax top-1
+    /// probability — the MTP draft-loop accept, issue #33 follow-up: only 8 bytes read back
+    /// instead of the `[vocab]` logits + host argmax/softmax scan). Backends without the kernel
+    /// leave this false and the MTP driver keeps the host-logits `top1_softmax` path.
+    pub argmax_prob: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -571,6 +571,21 @@ pub(crate) fn argmax_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// SPIR-V for the fused argmax+top1-prob slice pass (256 workgroups → 256 (max, idx, sum_exp)
+/// partials) — `Op::ArgmaxProb`, the MTP draft-loop accept.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn argmax_prob_part_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/argmax_prob_part.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+/// SPIR-V for the fused argmax+top1-prob reduce pass (256 partials → token id + top1 probability).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn argmax_prob_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/argmax_prob.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for GPU stochastic sampling (radix top-k + temp + top-p → token id).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn moe_sample_spv() -> &'static [u32] {

@@ -2017,6 +2017,22 @@ fn lower_op(
                 *rows as usize,
             );
         }
+        Op::ArgmaxProb {
+            x,
+            dst_id,
+            dst_prob,
+            n,
+        } => {
+            // 3*256 f32 scratch: (max, idx-bits, sum_exp) triples — see argmax_prob.comp.
+            let part = pooled(pool, be_, "argmax_prob_part", 768 * 4)?;
+            rec.argmax_prob(
+                r(*x)?,
+                pool[&part].as_ref(),
+                r(*dst_id)?,
+                r(*dst_prob)?,
+                *n as usize,
+            );
+        }
         // MoE FFN (single token): router GEMV → GPU-resident top-k (softmax-renorm, ×scale) →
         // fused multi-slot expert SwiGLU (gate/up share the row, down reads each slot's act) →
         // weighted accumulate. Mirrors the production GPU-resident decode path (transformer.rs)

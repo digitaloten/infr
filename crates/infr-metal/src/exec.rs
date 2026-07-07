@@ -342,6 +342,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::MulVec { .. } => "MulVec",
         Op::Softcap { .. } => "Softcap",
         Op::Argmax { .. } => "Argmax",
+        Op::ArgmaxProb { .. } => "ArgmaxProb",
         Op::Sample { .. } => "Sample",
         Op::EmbedGather { .. } => "EmbedGather",
         Op::Copy { .. } => "Copy",
@@ -2103,6 +2104,18 @@ impl MetalBackend {
                 let p = n.to_ne_bytes().to_vec();
                 self.encode_tg(r, &pso, &[bx.as_ref(), bd.as_ref()], &p, 256, 256);
                 r.loc[dst.0 as usize] = Loc::Device;
+            }
+            Op::ArgmaxProb { .. } => {
+                // No fused argmax+prob kernel on Metal yet (issue #33 follow-up, Vulkan-only so
+                // far — `Capabilities::argmax_prob` is false, so the MTP driver never builds this
+                // op for the Metal backend and keeps the host logits-download + `top1_softmax`
+                // path there instead). Kept as an explicit Unsupported arm (not silently missing)
+                // so a future caller that ignores the capability fails loudly.
+                return Err(Error::Unsupported(
+                    "metal backend: Op::ArgmaxProb not implemented (argmax_prob capability is \
+                     false; MTP draft loop uses the host logits path on Metal)"
+                        .into(),
+                ));
             }
             Op::GatedAct {
                 gate,
