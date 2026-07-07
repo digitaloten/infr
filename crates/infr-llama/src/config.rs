@@ -133,6 +133,13 @@ pub struct Config {
     /// `blk.{n_layer}` — Phase 1 only parses this; the head weights load separately (see
     /// `crate::mtp`) and Phase 2 emits its forward.
     pub n_layer_nextn: usize,
+    /// qwen35moe (Qwen3.6 MoE) shared-expert FFN inner width (`expert_shared_feed_forward_length`)
+    /// — a Qwen2-MoE-style DENSE SwiGLU branch run on the same per-layer input as the routed MoE
+    /// bank, gated by a per-token sigmoid (`ffn_gate_inp_shexp`) and summed with the routed
+    /// output (see `FfnW::Moe`'s `shexp` field in `seam::weights` and its graph wiring in
+    /// `seam::runner`). `0` = no shared expert — every non-qwen35moe model, and any qwen35moe
+    /// model without `ffn_*_shexp` tensors.
+    pub shexp_ff: usize,
 }
 
 impl Config {
@@ -257,12 +264,15 @@ impl Config {
             // qwen35's full-attention layers are qk-normed like qwen3/gemma (see `docs/QWEN35.md`).
             // Kept as its own match arm (rather than folded into `arch::TRANSFORMER` above) because
             // `is_qwen35` gates a handful of qwen35-only fields below it; the error message renders
-            // both lists so the supported set can't drift from the match arms above.
-            crate::arch::QWEN35 => true,
+            // both lists so the supported set can't drift from the match arms above. `QWEN35_MOE`
+            // (Qwen3.6 MoE) shares the exact same attention/qk-norm shape as dense `QWEN35` — only
+            // its FFN differs (see the `moe`/`shexp_ff` parses below).
+            crate::arch::QWEN35 | crate::arch::QWEN35_MOE => true,
             other => bail!(
-                "infr-llama supports architecture={} (plus {}), got {other:?}",
+                "infr-llama supports architecture={} (plus {}|{}), got {other:?}",
                 crate::arch::TRANSFORMER.join("|"),
                 crate::arch::QWEN35,
+                crate::arch::QWEN35_MOE,
             ),
         };
         // Qwen2/2.5 bias their q/k/v projections (Qwen3 removed them); every other supported arch is
@@ -277,7 +287,11 @@ impl Config {
         // actually different (dual FFN, canvas/mask fields, encoder-scalar tensor name).
         let gemma4 = arch == crate::arch::GEMMA4 || diffusion_gemma;
         let gemma = arch == crate::arch::GEMMA3 || gemma4;
-        let qwen35 = arch == crate::arch::QWEN35;
+        // qwen35moe (Qwen3.6 MoE) runs the identical DeltaNet/full-attention skeleton as dense
+        // qwen35 — `qwen35` gates every shared field below; `qwen35_moe` alone gates the FFN
+        // shape (routed-expert bank + shared expert vs plain dense).
+        let qwen35_moe = arch == crate::arch::QWEN35_MOE;
+        let qwen35 = arch == crate::arch::QWEN35 || qwen35_moe;
         let mk = |k: &str| format!("{arch}.{k}");
         let n_layer_all = meta_u64(g, &mk("block_count")).context("block_count")? as usize;
         // MTP/NextN (Qwen3.5/3.6, issue #33 — see docs/MTP.md): `{arch}.nextn_predict_layers`
@@ -289,11 +303,12 @@ impl Config {
         // loop (`seam.rs`'s `wload`) would misclassify `blk.32` as a gated-DeltaNet layer
         // (`(32+1) % full_attn_interval != 0`) and fail on missing `ssm_*` tensors.
         let n_layer_nextn = meta_u64(g, &mk("nextn_predict_layers")).unwrap_or(0) as usize;
-        if n_layer_nextn > 0 && arch != crate::arch::QWEN35 {
+        if n_layer_nextn > 0 && arch != crate::arch::QWEN35 && arch != crate::arch::QWEN35_MOE {
             bail!(
-                "{arch}.nextn_predict_layers is only supported on arch={} (MTP/NextN); got \
+                "{arch}.nextn_predict_layers is only supported on arch={}|{} (MTP/NextN); got \
                  nextn_predict_layers={n_layer_nextn} on arch={arch:?}",
                 crate::arch::QWEN35,
+                crate::arch::QWEN35_MOE,
             );
         }
         // The reference caps qwen35 at a single MTP block (`GGML_ASSERT(hparams.n_layer_nextn ==
@@ -323,16 +338,31 @@ impl Config {
                 .filter_map(MetaValue::as_u64)
                 .map(|v| v as usize)
                 .collect()
+        } else if let Some(ff) = meta_u64(g, &mk("feed_forward_length")) {
+            vec![ff as usize; n_layer]
+        } else if qwen35_moe {
+            // qwen35moe (Qwen3.6 MoE, routed-expert FFN on every layer) carries NO top-level
+            // `feed_forward_length` — there's no dense `ffn_*` tensor anywhere in the GGUF, only
+            // the routed bank (`ffn_*_exps`, sized by `expert_feed_forward_length` — parsed into
+            // `MoeConfig` below) and the optional Qwen2-MoE-style shared expert (`ffn_*_shexp`,
+            // sized by `expert_shared_feed_forward_length` — see `shexp_ff`). `n_ff`/`n_ff_layers`
+            // only size the shared dense-FFN-SHAPED scratch (`gbuf`/`ubuf`/`actbuf` in
+            // `seam::runner`), which the shared-expert branch reuses at ITS width; 0 (no scratch
+            // needed) if the model has no shared expert either.
+            let shexp = meta_u64(g, &mk("expert_shared_feed_forward_length")).unwrap_or(0) as usize;
+            vec![shexp; n_layer]
         } else {
-            let ff =
-                meta_u64(g, &mk("feed_forward_length")).context("feed_forward_length")? as usize;
-            vec![ff; n_layer]
+            bail!("{arch}.feed_forward_length missing (and not an array)");
         };
         let n_ff = n_ff_layers.iter().copied().max().unwrap_or(0);
         // diffusion-gemma's MoE shape (128 experts / 8 used, softmax gating, no extra routed-weight
         // scale) is parsed identically to qwen3moe's — only the FFN it feeds differs (dual FFN:
         // dense ∥ MoE, summed, vs qwen3moe's MoE-only), which is a `seam` graph-build detail.
-        let moe = if arch == crate::arch::QWEN3_MOE || diffusion_gemma {
+        // qwen35moe's routed bank is parsed the SAME way too (same softmax + top-k-renormalize
+        // gating, confirmed against llama.cpp's `qwen35moe.cpp::build_layer_ffn` — hardcoded
+        // `LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX`/`norm_w=true`, identical to qwen3moe); only its
+        // Qwen2-MoE-style SHARED expert (`shexp_ff` below) is genuinely new.
+        let moe = if arch == crate::arch::QWEN3_MOE || diffusion_gemma || qwen35_moe {
             let n_expert = meta_u64(g, &mk("expert_count")).context("expert_count")? as usize;
             let n_used =
                 meta_u64(g, &mk("expert_used_count")).context("expert_used_count")? as usize;
@@ -496,6 +526,13 @@ impl Config {
             [0u32; 4]
         };
         let attn_out_gate = qwen35;
+        // qwen35moe shared expert (Qwen2-MoE-style) — see the `shexp_ff` field doc. `0` (no
+        // shared expert) when the key is absent, e.g. a future qwen35moe checkpoint without one.
+        let shexp_ff = if qwen35_moe {
+            meta_u64(g, &mk("expert_shared_feed_forward_length")).unwrap_or(0) as usize
+        } else {
+            0
+        };
         // diffusion-gemma's canvas/mask keys sit at the TOP level (`diffusion.*` /
         // `tokenizer.ggml.*`), not namespaced under `{arch}.*` like everything else above —
         // matches the reference loader (`diffusion-gemma.cpp: load_arch_hparams`) verbatim.
@@ -584,6 +621,7 @@ impl Config {
             rope_sections,
             attn_out_gate,
             n_layer_nextn,
+            shexp_ff,
         })
     }
 }

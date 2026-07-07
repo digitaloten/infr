@@ -5,7 +5,7 @@
 use super::sc::{
     build_sc_embt, diffusion_self_cond, DenoiseCache, DenoiseReq, EbReduced, SelfCondWeights,
 };
-use super::weights::{AttnW, DeltaW, FfnW, LayerW, MixerW, SeamKv, SeamWeights};
+use super::weights::{AttnW, DeltaW, FfnW, LayerW, MixerW, MoeSharedW, SeamKv, SeamWeights};
 use super::{common_prefix_len, e2b_ipl_rows, kv_fmt_bytes, kv_forces_static, BindWeight, WBytes};
 use crate::{Config, GenStats, PerLayerEmbd};
 use anyhow::{anyhow, Result as AResult};
@@ -479,11 +479,19 @@ pub(crate) fn generate_dense_backend(
                 wload(&[&p("ffn_down_exps.scale")])?;
                 wload(&[&p("post_ffw_norm_2.weight")])?;
             } else if c.moe.is_some() {
-                // qwen3moe: router + stacked per-expert gate/up/down banks.
+                // qwen3moe / qwen35moe: router + stacked per-expert gate/up/down banks.
                 wload(&[&p("ffn_gate_inp.weight")])?;
                 wload(&[&p("ffn_gate_exps.weight")])?;
                 wload(&[&p("ffn_up_exps.weight")])?;
                 wload(&[&p("ffn_down_exps.weight")])?;
+                if c.shexp_ff > 0 {
+                    // qwen35moe Qwen2-MoE-style shared expert: a dense SwiGLU FFN alongside the
+                    // routed bank, gated by a per-token sigmoid — see `FfnW::Moe`'s `shexp` field.
+                    wload(&[&p("ffn_gate_inp_shexp.weight")])?;
+                    wload(&[&p("ffn_gate_shexp.weight")])?;
+                    wload(&[&p("ffn_up_shexp.weight")])?;
+                    wload(&[&p("ffn_down_shexp.weight")])?;
+                }
             } else if fuse_gu {
                 wload(&[&p("ffn_gate.weight"), &p("ffn_up.weight")])?;
                 wload(&[&p("ffn_down.weight")])?;
@@ -1013,6 +1021,16 @@ pub(crate) fn generate_dense_backend(
                     gate_exps: wpush(&mut g, &mut weights),
                     up_exps: wpush(&mut g, &mut weights),
                     down_exps: wpush(&mut g, &mut weights),
+                    shexp: if c.shexp_ff > 0 {
+                        Some(MoeSharedW {
+                            gate_inp: wpush(&mut g, &mut weights),
+                            wgate: wpush(&mut g, &mut weights),
+                            wup: wpush(&mut g, &mut weights),
+                            wdown: wpush(&mut g, &mut weights),
+                        })
+                    } else {
+                        None
+                    },
                 }
             } else if fuse_gu {
                 FfnW::DenseFused {
@@ -1164,6 +1182,10 @@ pub(crate) fn generate_dense_backend(
         let router_tmp = g.internal(f32d(batch * ne));
         let moe_in = g.internal(f32d(batch * ne));
         let moe_out = g.internal(f32d(batch * ne));
+        // qwen35moe shared-expert gate scratch: one raw (pre-sigmoid) logit per token, the
+        // `Op::Linear(out_f=1)` output that `Op::MoeSharedExpertAdd` sigmoids — see its doc.
+        // Harmlessly allocated (but unused) on every other arch, like the scratch above.
+        let shexp_gate = g.internal(f32d(batch));
 
         // qwen35 attention out-gate scratch (the interleaved q+gate trap — see docs/QWEN35.md):
         // `qg` holds the RAW `attn_q` projection (`[batch, nh*2*hd]`, q and gate interleaved per
@@ -1974,25 +1996,98 @@ pub(crate) fn generate_dense_backend(
                     gate_exps,
                     up_exps,
                     down_exps,
+                    shexp,
                 } => {
                     let mc = c.moe.expect("moe layer without MoeConfig");
+                    // With a shared expert, the routed branch lands in `moe_out` and
+                    // `Op::MoeSharedExpertAdd` combines it into `sub` below; with none (qwen3moe)
+                    // it writes `sub` directly, unchanged from before this arm grew a `shexp` field.
+                    let moe_dst = if shexp.is_some() { moe_out } else { sub };
                     g.push(Op::MoeFfn {
                         x: hn,
-                        router_x: hn, // qwen3moe: router reads the SAME normed input as the experts
+                        router_x: hn, // qwen3moe/qwen35moe: router reads the SAME normed input as the experts
                         router,
                         gate_exps,
                         up_exps,
                         down_exps,
                         down_scale: None,
                         fused_gate_up: false,
-                        dst: sub,
+                        dst: moe_dst,
                         ne: ne as u32,
                         n_expert: mc.n_expert as u32,
                         n_used: mc.n_used as u32,
                         n_ff_exp: mc.n_ff_exp as u32,
                         scale: mc.scale,
-                        act, // qwen3moe: SwiGLU (act == Silu)
+                        act, // qwen3moe/qwen35moe: SwiGLU (act == Silu)
                     });
+                    if let Some(MoeSharedW {
+                        gate_inp,
+                        wgate,
+                        wup,
+                        wdown,
+                    }) = shexp
+                    {
+                        // qwen35moe Qwen2-MoE-style shared expert: a plain dense SwiGLU FFN on the
+                        // SAME input (`hn`) as the routed bank, gated by a per-token sigmoid and
+                        // summed with the routed output. `nff_l` here holds `shexp_ff` (see
+                        // `Config::n_ff_layers`'s qwen35moe fallback in `config.rs`) — `fuse_gu` is
+                        // always false for qwen35moe (no dense `ffn_gate.weight` tensors to fuse;
+                        // see `fuse_gu`'s definition), so `gbuf`/`ubuf`/`actbuf` are the plain
+                        // separate-tensor scratch, exactly like `FfnW::Dense` above.
+                        g.push(Op::Linear {
+                            x: hn,
+                            weight: gate_inp,
+                            dst: shexp_gate,
+                            m: batch as u32,
+                            in_f: ne as u32,
+                            out_f: 1,
+                            w_off: 0,
+                        });
+                        g.push(Op::Linear {
+                            x: hn,
+                            weight: wgate,
+                            dst: gbuf,
+                            m: batch as u32,
+                            in_f: ne as u32,
+                            out_f: nff_l as u32,
+                            w_off: 0,
+                        });
+                        g.push(Op::Linear {
+                            x: hn,
+                            weight: wup,
+                            dst: ubuf,
+                            m: batch as u32,
+                            in_f: ne as u32,
+                            out_f: nff_l as u32,
+                            w_off: 0,
+                        });
+                        g.push(Op::GatedAct {
+                            gate: gbuf,
+                            up: ubuf,
+                            dst: actbuf,
+                            rows: batch as u32,
+                            nff: nff_l as u32,
+                            act,
+                            up_off: 0,
+                        });
+                        g.push(Op::Linear {
+                            x: actbuf,
+                            weight: wdown,
+                            dst: d_out,
+                            m: batch as u32,
+                            in_f: nff_l as u32,
+                            out_f: ne as u32,
+                            w_off: 0,
+                        });
+                        g.push(Op::MoeSharedExpertAdd {
+                            moe: moe_out,
+                            shexp: d_out,
+                            gate: shexp_gate,
+                            dst: sub,
+                            rows: batch as u32,
+                            n: ne as u32,
+                        });
+                    }
                 }
                 FfnW::DiffusionMoe {
                     d_gate,

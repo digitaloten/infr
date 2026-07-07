@@ -27,11 +27,16 @@ pub const GEMMA3: &str = "gemma3";
 /// Gemma 4 (incl. E2B): per-layer heterogeneous dims, V-norm, freq_factors, softcap,
 /// per-layer output scale; E2B adds KV-sharing + per-layer input embeddings.
 pub const GEMMA4: &str = "gemma4";
-/// Qwen3.5/3.6 gated-DeltaNet hybrid — runs through `Config::from_gguf`'s `qwen35` fields +
-/// `MixerW::DeltaNet` (see `crate::qwen35::Cfg` for the raw metadata parse). NOT llama.cpp's
-/// `qwen3next` (a sibling arch with a different DeltaNet V-broadcast pattern) and not
-/// `qwen35moe` — both are rejected on purpose.
+/// Qwen3.5/3.6 gated-DeltaNet hybrid (DENSE FFN) — runs through `Config::from_gguf`'s `qwen35`
+/// fields + `MixerW::DeltaNet` (see `crate::qwen35::Cfg` for the raw metadata parse). NOT
+/// llama.cpp's `qwen3next` (a sibling arch with a different DeltaNet V-broadcast pattern) — that
+/// one is still rejected on purpose. `QWEN35_MOE` below is the routed-expert sibling.
 pub const QWEN35: &str = "qwen35";
+/// Qwen3.6 MoE (35B-A3B etc. — same gated-DeltaNet hybrid as `QWEN35`, but a routed-expert MoE
+/// FFN on EVERY layer, delta or full-attention, plus a Qwen2-MoE-style shared expert gated by a
+/// per-token sigmoid). Shares every `qwen35` field (`Config::from_gguf`'s `qwen35` gate,
+/// `MixerW::DeltaNet`); only the FFN differs (`FfnW::Moe`'s `shexp` branch — see `seam::weights`).
+pub const QWEN35_MOE: &str = "qwen35moe";
 /// DiffusionGemma: block text-diffusion MoE on a Gemma-4 backbone (shares gemma4's heterogeneous
 /// per-layer dims, V-norm, freq_factors, softcap, sandwich norms), plus a per-layer DUAL FFN
 /// (dense GeGLU ∥ 128-expert MoE, summed) and encoder/decoder per-layer output scalars. See
@@ -62,4 +67,5 @@ pub const ALL: &[&str] = &[
     GEMMA4,
     DIFFUSION_GEMMA,
     QWEN35,
+    QWEN35_MOE,
 ];

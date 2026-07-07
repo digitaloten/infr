@@ -1138,6 +1138,31 @@ impl Backend for CpuBackend {
                     });
                     vals[dst.0 as usize] = out;
                 }
+                // qwen35moe shared-expert combine: `moe` (routed-MoE output) + sigmoid(`gate[r]`) *
+                // `shexp` (the shared expert's own dense FFN output), row-broadcast — see the
+                // `Op::MoeSharedExpertAdd` doc. Rows independent — spin-pool over rows, mirrors
+                // `Op::MulVec` above (bit-identical, no whole-input clone).
+                Op::MoeSharedExpertAdd {
+                    moe,
+                    shexp,
+                    gate,
+                    dst,
+                    rows,
+                    n,
+                } => {
+                    let (rows, n) = (rows as usize, n as usize);
+                    let mv = &vals[moe.0 as usize];
+                    let sv = &vals[shexp.0 as usize];
+                    let gv = &vals[gate.0 as usize]; // [rows] raw pre-sigmoid logits
+                    let mut out = vec![0f32; rows * n];
+                    self.pool().for_chunks_mut(&mut out, n, 1, &|r, orow| {
+                        let g = 1.0 / (1.0 + (-gv[r]).exp());
+                        for (c, o) in orow.iter_mut().enumerate() {
+                            *o = mv[r * n + c] + g * sv[r * n + c];
+                        }
+                    });
+                    vals[dst.0 as usize] = out;
+                }
                 Op::Softcap { x, dst, cap, n } => {
                     let n = n as usize;
                     let xs = &vals[x.0 as usize];

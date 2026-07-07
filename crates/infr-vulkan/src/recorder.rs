@@ -4120,6 +4120,44 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// qwen35moe shared-expert combine: `dst[r,c] = moe[r,c] + sigmoid(gate[r]) * shexp[r,c]` over
+    /// `total = rows*n` elements — `gate` is a length-`rows` buffer (one raw pre-sigmoid logit per
+    /// row), broadcast across each row's `n` columns (the row-broadcast twin of `mul_vec`'s
+    /// column broadcast). See `Op::MoeSharedExpertAdd`'s doc.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_shared_expert_add(
+        &self,
+        moe: &dyn Buffer,
+        shexp: &dyn Buffer,
+        gate: &dyn Buffer,
+        dst: &dyn Buffer,
+        rows: usize,
+        n: usize,
+    ) {
+        self.stamp("moe_shared_expert_add");
+        let total = (rows * n) as u32;
+        let k = self.be.kernel(
+            "moe_shared_expert_add",
+            crate::gemm::moe_shared_expert_add_spv(),
+            4,
+            8,
+        );
+        let mut pc = (n as u32).to_ne_bytes().to_vec();
+        pc.extend_from_slice(&total.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[
+                Self::vkb(moe),
+                Self::vkb(shexp),
+                Self::vkb(gate),
+                Self::vkb(dst),
+            ],
+            1,
+            &pc,
+            total.div_ceil(64),
+        );
+    }
+
     /// Like [`Self::moe_accumulate`], but scales each selected expert's down output by a per-expert
     /// weight BEFORE the weighted sum: `hidden[row*ne+i] += sum_slot wts[row*n_used+slot] *
     /// dscale[ids[row*n_used+slot]] * down[(row*n_used+slot)*ne+i]` (diffusion-gemma

@@ -403,6 +403,21 @@ pub enum Op {
         head_v: u32,
         eps: f32,
     },
+    /// qwen35moe Qwen2-MoE-style shared-expert combine: `dst[r,c] = moe[r,c] + sigmoid(gate[r]) *
+    /// shexp[r,c]` for `rows` rows of `n` elements. `moe` is the routed-MoE branch's output
+    /// (`Op::MoeFfn`'s `dst`); `shexp` is the shared expert's own dense SwiGLU FFN output (a
+    /// plain `Linear`→`GatedAct`→`Linear` on the SAME input, run alongside the routed branch);
+    /// `gate` holds ONE raw (pre-sigmoid) logit per row — the output of a `Linear` with
+    /// `out_f=1` against `ffn_gate_inp_shexp`. Fuses the per-token sigmoid gate + broadcast
+    /// multiply + residual add into one op (the shared-expert twin of `GatedActFused`).
+    MoeSharedExpertAdd {
+        moe: TensorId,
+        shexp: TensorId,
+        gate: TensorId,
+        dst: TensorId,
+        rows: u32,
+        n: u32,
+    },
 }
 
 impl Op {
@@ -433,6 +448,7 @@ impl Op {
             Op::MoeFfn { .. } => "MoeFfn",
             Op::Conv1dSilu { .. } => "Conv1dSilu",
             Op::DeltaNet { .. } => "DeltaNet",
+            Op::MoeSharedExpertAdd { .. } => "MoeSharedExpertAdd",
         }
     }
 }

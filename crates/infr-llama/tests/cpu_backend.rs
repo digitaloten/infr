@@ -1611,6 +1611,119 @@ fn cpu_golden_gemma4_e2b() {
     check_golden(&model, GEMMA4_E2B_GOLDEN);
 }
 
+// ─── Qwen3.6 MoE (qwen35moe: gated-DeltaNet hybrid + routed MoE FFN + Qwen2-MoE-style shared
+// expert on EVERY layer) ──────────────────────────────────────────────────────────────────────
+//
+// `general.architecture == "qwen35moe"` — the routed-expert sibling of dense `qwen35` (see
+// `docs/QWEN35.md` + `arch::QWEN35_MOE`'s doc). 256 experts / 8 used / 512-wide, plus a
+// Qwen2-MoE-style shared expert (`ffn_*_shexp`, sigmoid-gated via `ffn_gate_inp_shexp`) — both on
+// EVERY layer (DeltaNet and full-attention alike, confirmed against the actual GGUF tensor list
+// and llama.cpp's `qwen35moe.cpp::build_layer_ffn`). UD-Q4_K_M chosen over the smaller UD-IQ*
+// quants because the routed/shared expert banks there are Q4_K/Q5_K/Q8_0 — id-native quant
+// formats the Vulkan `Op::MoeFfn` id-indexed kernel supports (`native_id_kernel_name`); the
+// smaller IQ2_S/IQ3_S UD quants aren't (`vulkan adapter: MoeFfn expert banks need an id-native
+// quant format`), a pre-existing Vulkan MoE-kernel gap unrelated to this arch's wiring.
+
+fn qwen35moe_35b_a3b() -> Option<PathBuf> {
+    find_gguf(
+        "unsloth--Qwen3.6-35B-A3B-GGUF",
+        "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+    )
+}
+
+/// CPU-only: qwen35moe's causal prompt prefill (routed MoE + shared expert FFN on every layer)
+/// produces finite logits over a short prompt, and the config parses as expected (MoE present,
+/// shared-expert width present, still gated through the `qwen35` DeltaNet/rope/attn-out-gate
+/// fields dense qwen35 uses).
+#[test]
+fn cpu_qwen35moe_prefill_finite() {
+    let path = need_model!(qwen35moe_35b_a3b(), "Qwen3.6-35B-A3B");
+    let _tlk = test_serial_lock();
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
+    let cfg = model.config();
+    assert!(cfg.qwen35, "qwen35moe must set Config::qwen35 (shared skeleton)");
+    let mc = cfg.moe.expect("qwen35moe must populate Config::moe");
+    assert_eq!(mc.n_expert, 256);
+    assert_eq!(mc.n_used, 8);
+    assert_eq!(mc.n_ff_exp, 512);
+    assert_eq!(cfg.shexp_ff, 512, "shared-expert width not parsed");
+    let tokens = model
+        .encode("What is the capital of France? Answer briefly.")
+        .expect("encode");
+    assert!(!tokens.is_empty(), "empty prompt");
+    let vocab = cfg.vocab;
+    let t0 = std::time::Instant::now();
+    let last_row = model.prefill_logits_cpu(&tokens).expect("cpu prefill");
+    eprintln!(
+        "cpu_qwen35moe_prefill_finite: {} tokens, prefill {:.1}s",
+        tokens.len(),
+        t0.elapsed().as_secs_f64()
+    );
+    assert_eq!(last_row.len(), vocab, "logits shape");
+    assert!(
+        last_row.iter().all(|v| v.is_finite()),
+        "non-finite logit in the prefill output"
+    );
+    println!("top-5 last-row tokens: {:?}", top_k(&last_row, 5));
+}
+
+/// qwen35moe's causal prompt prefill through the Vulkan seam vs the CPU oracle — a top-8-of-256
+/// MoE router (plus the shared expert) is a discrete-selection step, so this follows the
+/// diffusion-gemma precedent (`gpu_seam_matches_cpu_diffusion_gemma`'s doc) rather than a strict
+/// token/logit compare: top-5 overlap (either side's #1 token appears in the other's top-5) AND a
+/// cosine floor on the whole-vocab last-row logits, NOT bit-identical (CPU f32 vs Vulkan f16-native
+/// routing legitimately flips near-tie expert selection).
+#[test]
+fn gpu_seam_matches_cpu_qwen35moe() {
+    let path = need_model!(qwen35moe_35b_a3b(), "Qwen3.6-35B-A3B");
+    need_gpu!();
+    let _tlk = test_serial_lock();
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
+    let tokens = model
+        .encode("What is the capital of France? Answer briefly.")
+        .expect("encode");
+    let vocab = model.config().vocab;
+    let cpu_last = model.prefill_logits_cpu(&tokens).expect("cpu prefill");
+    let gpu_last = model
+        .prefill_logits_vulkan(&tokens)
+        .expect("vulkan prefill");
+    assert_eq!(cpu_last.len(), vocab, "cpu logits shape");
+    assert_eq!(gpu_last.len(), vocab, "gpu logits shape");
+    assert!(
+        gpu_last.iter().all(|v| v.is_finite()),
+        "non-finite logit in the Vulkan prefill output"
+    );
+    let (cpu_top, gpu_top) = (top_k(&cpu_last, 20), top_k(&gpu_last, 20));
+    println!("cpu    top-5: {:?}", &cpu_top[..5]);
+    println!("vulkan top-5: {:?}", &gpu_top[..5]);
+    assert!(
+        cpu_top[..5].iter().any(|&(id, _)| id == gpu_top[0].0)
+            || gpu_top[..5].iter().any(|&(id, _)| id == cpu_top[0].0),
+        "CPU/Vulkan top tokens don't even overlap in each other's top-5: cpu={:?} vulkan={:?}",
+        cpu_top[0],
+        gpu_top[0]
+    );
+    let cos = cosine(&cpu_last, &gpu_last);
+    println!("cpu/vulkan whole-vocab cosine similarity: {cos}");
+    assert!(
+        cos > 0.5,
+        "CPU/Vulkan last-row logits diverged too far: cosine={cos}"
+    );
+}
+
+/// Dense qwen35 (no expert tensors) must still take the plain dense-FFN path — the `Config::moe`/
+/// `shexp_ff` additions for qwen35moe must NOT leak onto its dense sibling.
+#[test]
+fn cpu_qwen35_dense_unaffected_by_moe_fields() {
+    let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
+    let _tlk = test_serial_lock();
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
+    let cfg = model.config();
+    assert!(cfg.qwen35);
+    assert!(cfg.moe.is_none(), "dense qwen35 must not get an MoE config");
+    assert_eq!(cfg.shexp_ff, 0, "dense qwen35 must not get a shared-expert width");
+}
+
 // ─── Gemma 4 12b (dense) ────────────────────────────────────────────────────────
 
 fn gemma4_12b() -> Option<PathBuf> {

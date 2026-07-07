@@ -818,6 +818,21 @@ fn lower_op(
             rows,
             n,
         } => rec.mul_vec(r(*x)?, r(*vec)?, r(*dst)?, *rows as usize, *n as usize),
+        Op::MoeSharedExpertAdd {
+            moe,
+            shexp,
+            gate,
+            dst,
+            rows,
+            n,
+        } => rec.moe_shared_expert_add(
+            r(*moe)?,
+            r(*shexp)?,
+            r(*gate)?,
+            r(*dst)?,
+            *rows as usize,
+            *n as usize,
+        ),
         Op::Scale { x, dst, s, n } => {
             let n = *n as usize;
             // recorder `scale` is in place on its buffer; copy x→dst first if they differ.

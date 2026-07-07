@@ -87,6 +87,7 @@ fn main() {
         ("add", "add", &[]),
         ("add_bias", "add_bias", &[]),
         ("mul_vec", "mul_vec", &[]),
+        ("moe_shared_expert_add", "moe_shared_expert_add", &[]),
         ("add_scaled", "add_scaled", &[]),
         ("scale", "scale", &[]),
         ("softcap", "softcap", &[]),

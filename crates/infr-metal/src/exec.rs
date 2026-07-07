@@ -349,6 +349,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::MoeFfn { .. } => "MoeFfn",
         Op::Conv1dSilu { .. } => "Conv1dSilu",
         Op::DeltaNet { .. } => "DeltaNet",
+        Op::MoeSharedExpertAdd { .. } => "MoeSharedExpertAdd",
     }
 }
 
@@ -3486,6 +3487,15 @@ impl MetalBackend {
                     rows as usize * n as usize,
                 );
                 r.loc[dst.0 as usize] = Loc::Device;
+            }
+            Op::MoeSharedExpertAdd { .. } => {
+                // qwen35moe (Qwen3.6 MoE) shared expert — landed on CPU + Vulkan only so far (see
+                // `Op::MoeSharedExpertAdd`'s doc); no Metal kernel yet. Fails loudly instead of a
+                // silent wrong-output run rather than pretending to support it blind.
+                return Err(Error::Unsupported(
+                    "Metal Op::MoeSharedExpertAdd (qwen35moe shared expert) not yet implemented"
+                        .into(),
+                ));
             }
         }
         Ok(())

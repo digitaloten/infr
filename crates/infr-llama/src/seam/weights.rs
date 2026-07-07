@@ -22,6 +22,12 @@ pub(super) enum FfnW {
         gate_exps: TensorId,
         up_exps: TensorId,
         down_exps: TensorId,
+        /// qwen35moe (Qwen3.6 MoE) Qwen2-MoE-style shared expert: `Some` when the model carries
+        /// `ffn_*_shexp`/`ffn_gate_inp_shexp` tensors (`Config::shexp_ff > 0`) — a dense SwiGLU
+        /// branch run on the SAME input as the routed bank, gated by a per-token sigmoid and
+        /// summed with the routed-MoE output (`Op::MoeSharedExpertAdd`). `None` for qwen3moe
+        /// (no shared expert).
+        shexp: Option<MoeSharedW>,
     },
     /// diffusion-gemma's per-layer dual FFN: a dense GeGLU branch (the "shared expert") ∥ a
     /// 128-expert MoE branch (fused `gate_up_exps` + per-expert `down_exps` scale), summed and
@@ -59,6 +65,20 @@ pub(super) enum FfnW {
         /// `post_ffw_norm_2`: MoE branch output norm (before summing with the dense branch).
         m_post_norm: TensorId,
     },
+}
+
+/// qwen35moe (Qwen3.6 MoE) Qwen2-MoE-style shared-expert weights (see `FfnW::Moe`'s `shexp`
+/// field): a dense SwiGLU FFN run on the same input as the routed bank, gated by a per-token
+/// sigmoid on `gate_inp`'s (scalar) output. `Copy` (all `TensorId` fields) so `FfnW::Moe` stays
+/// matchable-by-value through a `&LayerW`, exactly like every other all-`TensorId` `FfnW` variant.
+#[derive(Clone, Copy)]
+pub(super) struct MoeSharedW {
+    /// `ffn_gate_inp_shexp.weight` `[ne]`: projects the FFN input to ONE raw (pre-sigmoid) gate
+    /// logit per token (`Op::Linear` with `out_f=1`).
+    pub(super) gate_inp: TensorId,
+    pub(super) wgate: TensorId,
+    pub(super) wup: TensorId,
+    pub(super) wdown: TensorId,
 }
 
 /// Attention-mixer weights (the classic transformer token mixer: QKV projections + output;

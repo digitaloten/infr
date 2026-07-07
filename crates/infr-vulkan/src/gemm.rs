@@ -911,6 +911,13 @@ pub(crate) fn mul_vec_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// SPIR-V for the qwen35moe shared-expert combine (`dst[r,c] = moe[r,c] + sigmoid(gate[r]) *
+/// shexp[r,c]`; row-broadcast gate — the shared-expert twin of `mul_vec`'s column broadcast).
+pub(crate) fn moe_shared_expert_add_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_shared_expert_add.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for the in-place scalar multiply (`y *= scale`). gemma4 per-layer output scale.
 pub(crate) fn scale_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/scale.spv"));
