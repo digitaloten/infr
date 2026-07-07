@@ -350,6 +350,57 @@ fn pooled(
     Ok(key)
 }
 
+/// Small-m MoE scratch handle: a pooled `(tag, bytes)` key (the default — rides the per-execute
+/// `pool`, so ALL MoE layers share one buffer per tag and the alloc happens at most once), or an
+/// owned per-layer zero-filled `Backend::alloc` under the `INFR_NO_MOE_SM_POOL=1` escape. Resolve
+/// with [`SmB::get`] at each use site (immutable pool indexing, same discipline as the batched
+/// arm's `pool[&k]`); the owned variant is drained into `transient` via [`SmB::into_transient`] so
+/// it outlives `rec.finish()` (pooled buffers are moved into `transient` at the end of the loop).
+enum SmB {
+    Pool((&'static str, usize)),
+    Own(Box<dyn Buffer>),
+}
+
+impl SmB {
+    fn get<'a>(&'a self, pool: &'a ScratchPool) -> &'a dyn Buffer {
+        match self {
+            SmB::Pool(k) => pool[k].as_ref(),
+            SmB::Own(b) => b.as_ref(),
+        }
+    }
+
+    /// Move an owned (escape-path) buffer into `transient` so the recording can't reference a freed
+    /// buffer. Pooled buffers are owned by `pool` (drained into `transient` at the end of the loop),
+    /// so `Pool` is a no-op here.
+    fn into_transient(self, transient: &mut Vec<Box<dyn Buffer>>) {
+        if let SmB::Own(b) = self {
+            transient.push(b);
+        }
+    }
+}
+
+/// Allocate one small-m MoE scratch buffer of `elems` f32/u32 elements: pooled uninit by default
+/// (every buffer is fully written before it is read within the op — see the small-m arm's scratch
+/// doc for the per-buffer argument), or a fresh calloc-contract `Backend::alloc` when `no_pool`
+/// (the `INFR_NO_MOE_SM_POOL=1` A/B escape — each device-local zero-fill costs a one-shot submit +
+/// queue_wait_idle, the exact per-layer overhead pooling kills).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+fn sm_buf(
+    pool: &mut ScratchPool,
+    be_: &VulkanBackend,
+    no_pool: bool,
+    tag: &'static str,
+    elems: usize,
+) -> Result<SmB> {
+    if no_pool {
+        Ok(SmB::Own(
+            be_.alloc((elems * 4).max(4), BufferUsage::Activations)?,
+        ))
+    } else {
+        Ok(SmB::Pool(pooled(pool, be_, tag, elems * 4)?))
+    }
+}
+
 /// Per-execute Dynamic-attention shared state: ONE attn_live prologue + ONE pm/pl/pacc split
 /// scratch set per distinct (nh, hd, chunk, n_chunks, window) attention shape (see `lower_op`'s
 /// `dyn_args`). Uniform models (qwen3) have exactly one; gemma alternates SWA/global layers (and
@@ -2274,33 +2325,50 @@ fn lower_op(
             // expert used by more than one of the `rows` tokens gets its weight bank re-read once
             // per occurrence (no shared BM=64-row-tile reuse like the batched path gets), so this
             // loses once `rows` grows enough for cross-token expert overlap to matter — hence the
-            // threshold (measured; see `moe_small_m_threshold`'s doc). Local boxes used via
-            // `.as_ref()`, then moved into `transient` at the end of the arm so they outlive
-            // `rec.finish()`.
-            let al = |n: usize| be_.alloc((n * 4).max(4), BufferUsage::Activations);
+            // threshold (measured; see `moe_small_m_threshold`'s doc).
+            //
+            // Per-layer scratch rides the per-execute `pool` (same (tag, bytes) key across layers
+            // → same buffer; the recorder's hazard tracking serializes the reuse, exactly like the
+            // batched arm's packed scratch above), resolved at each use site via `SmB::get(pool)`.
+            // Every one of these 7 buffers is FULLY WRITTEN before it is read within this op, so
+            // `pooled`'s alloc_uninit is safe (no zero-init needed): the router GEMV writes all
+            // `rows*n_expert` logits; `moe_topk` writes all `n_slots = rows*n_used` ids/wts
+            // (n_slots is EXACT — every top-k slot is a real assignment, no padding/unrouted rows
+            // like the batched path's `npad`); the id-GEMVs write every `n_slots` row of gate/up,
+            // act, and y; and `dst` (a separate scratch tensor, not one of these) is explicitly
+            // `rec.zero`'d before the accumulate. The previous shape alloc'd 7 FRESH zero-filled
+            // buffers per MoE layer per execute — `Backend::alloc`'s calloc contract fills each
+            // device-local buffer through a one-shot submit + queue_wait_idle (~27us each), and at
+            // qwen3moe's 48 MoE layers that was ~340 fence-waited submits of pure host stall
+            // (decode never sees this — record-once replay allocs the pool once).
+            // `INFR_NO_MOE_SM_POOL=1` restores the per-layer zeroed allocs (A/B correctness oracle).
+            let no_pool = std::env::var_os("INFR_NO_MOE_SM_POOL").is_some();
             let n_slots = rows * n_used;
-            let logits = al(rows * n_expert)?;
-            let ids = al(n_slots)?;
-            let wts = al(n_slots)?;
+            let logits = sm_buf(pool, be_, no_pool, "moe_sm_logits", rows * n_expert)?;
+            let ids = sm_buf(pool, be_, no_pool, "moe_sm_ids", n_slots)?;
+            let wts = sm_buf(pool, be_, no_pool, "moe_sm_wts", n_slots)?;
             // Fused: one [n_slots, 2*nff] gate|up buffer (gate half first, up half second per row —
             // `Op::GatedActFused`'s convention); split: separate [n_slots, nff] gate/up buffers.
             let gubuf = if *fused_gate_up {
-                Some(al(n_slots * 2 * nff)?)
+                Some(sm_buf(pool, be_, no_pool, "moe_sm_gu", n_slots * 2 * nff)?)
             } else {
                 None
             };
             let gbuf = if *fused_gate_up {
                 None
             } else {
-                Some(al(n_slots * nff)?)
+                Some(sm_buf(pool, be_, no_pool, "moe_sm_g", n_slots * nff)?)
             };
             let ubuf = if *fused_gate_up {
                 None
             } else {
-                Some(al(n_slots * nff)?)
+                Some(sm_buf(pool, be_, no_pool, "moe_sm_u", n_slots * nff)?)
             };
-            let abuf = al(n_slots * nff)?;
-            let ybuf = al(n_slots * ne)?;
+            let abuf = sm_buf(pool, be_, no_pool, "moe_sm_a", n_slots * nff)?;
+            let ybuf = sm_buf(pool, be_, no_pool, "moe_sm_y", n_slots * ne)?;
+            // All `sm_buf` allocations are done — from here `pool` is only indexed immutably (via
+            // `SmB::get`), so multiple pooled buffers can be resolved at once (the batched arm's
+            // `pool[&k]` discipline).
             let xb = r(*x)?;
             // diffusion-gemma's router reads a DIFFERENTLY normalized/scaled row than the experts
             // (see the `Op::MoeFfn` doc); qwen3moe binds the same handle as `x`.
@@ -2310,19 +2378,19 @@ fn lower_op(
             let rdt = graph.desc(*router).dtype;
             let rw = r(*router)?;
             if native_dense_supported(rdt) {
-                rec.linear_native(rdt, rw, rxb, logits.as_ref(), rows, ne, n_expert);
+                rec.linear_native(rdt, rw, rxb, logits.get(pool), rows, ne, n_expert);
             } else if matches!(rdt, infr_core::DType::F32) {
                 // qwen3moe ships the router (ffn_gate_inp) as F32 — the f16 GEMV would read its
                 // bytes as f16 garbage and route to arbitrary experts.
-                rec.linear_f32(rw, rxb, logits.as_ref(), rows, ne, n_expert);
+                rec.linear_f32(rw, rxb, logits.get(pool), rows, ne, n_expert);
             } else {
-                rec.linear(rw, rxb, logits.as_ref(), rows, ne, n_expert);
+                rec.linear(rw, rxb, logits.get(pool), rows, ne, n_expert);
             }
             // Softmax-renormalized top-`n_used` per token, weights pre-scaled by `scale`.
             rec.moe_topk(
-                logits.as_ref(),
-                ids.as_ref(),
-                wts.as_ref(),
+                logits.get(pool),
+                ids.get(pool),
+                wts.get(pool),
                 rows,
                 n_expert,
                 n_used,
@@ -2334,22 +2402,22 @@ fn lower_op(
                 rec.linear_native_id_multi(
                     gdt,
                     r(*gate_exps)?,
-                    ids.as_ref(),
+                    ids.get(pool),
                     n_used,
                     stride,
                     xb,
                     false,
-                    gubuf.as_ref(),
+                    gubuf.get(pool),
                     ne,
                     2 * nff,
                     rows,
                 );
                 match act {
                     Activation::Silu => {
-                        rec.silu_mul_fused(gubuf.as_ref(), abuf.as_ref(), n_slots, nff)
+                        rec.silu_mul_fused(gubuf.get(pool), abuf.get(pool), n_slots, nff)
                     }
                     Activation::Gelu => {
-                        rec.gelu_mul_fused(gubuf.as_ref(), abuf.as_ref(), n_slots, nff)
+                        rec.gelu_mul_fused(gubuf.get(pool), abuf.get(pool), n_slots, nff)
                     }
                     Activation::Sigmoid => {
                         return Err(be(
@@ -2363,12 +2431,12 @@ fn lower_op(
                 rec.linear_native_id_multi(
                     gdt,
                     r(*gate_exps)?,
-                    ids.as_ref(),
+                    ids.get(pool),
                     n_used,
                     stride,
                     xb,
                     false,
-                    gbuf.as_ref(),
+                    gbuf.get(pool),
                     ne,
                     nff,
                     rows,
@@ -2376,37 +2444,37 @@ fn lower_op(
                 rec.linear_native_id_multi(
                     udt,
                     r(*up_exps)?,
-                    ids.as_ref(),
+                    ids.get(pool),
                     n_used,
                     stride,
                     xb,
                     false,
-                    ubuf.as_ref(),
+                    ubuf.get(pool),
                     ne,
                     nff,
                     rows,
                 );
                 match act {
                     Activation::Silu => {
-                        rec.silu_mul(gbuf.as_ref(), ubuf.as_ref(), abuf.as_ref(), n_act)
+                        rec.silu_mul(gbuf.get(pool), ubuf.get(pool), abuf.get(pool), n_act)
                     }
                     Activation::Sigmoid => {
-                        rec.mul_sigmoid(gbuf.as_ref(), ubuf.as_ref(), abuf.as_ref(), n_act)
+                        rec.mul_sigmoid(gbuf.get(pool), ubuf.get(pool), abuf.get(pool), n_act)
                     }
                     Activation::Gelu => {
-                        rec.gelu_mul_off(gbuf.as_ref(), ubuf.as_ref(), 0, abuf.as_ref(), n_act)
+                        rec.gelu_mul_off(gbuf.get(pool), ubuf.get(pool), 0, abuf.get(pool), n_act)
                     }
                 }
             }
             rec.linear_native_id_multi(
                 ddt,
                 r(*down_exps)?,
-                ids.as_ref(),
+                ids.get(pool),
                 n_used,
                 down_stride,
-                abuf.as_ref(),
+                abuf.get(pool),
                 true,
-                ybuf.as_ref(),
+                ybuf.get(pool),
                 nff,
                 ne,
                 rows,
@@ -2417,21 +2485,26 @@ fn lower_op(
             rec.zero(dstb, rows * ne);
             match down_scale {
                 Some(ds) => rec.moe_accumulate_scaled(
-                    ybuf.as_ref(),
-                    wts.as_ref(),
-                    ids.as_ref(),
+                    ybuf.get(pool),
+                    wts.get(pool),
+                    ids.get(pool),
                     r(*ds)?,
                     dstb,
                     ne,
                     n_used,
                     rows,
                 ),
-                None => rec.moe_accumulate(ybuf.as_ref(), wts.as_ref(), dstb, ne, n_used, rows),
+                None => rec.moe_accumulate(ybuf.get(pool), wts.get(pool), dstb, ne, n_used, rows),
             }
-            transient.extend([logits, ids, wts, abuf, ybuf]);
-            transient.extend(gubuf);
-            transient.extend(gbuf);
-            transient.extend(ubuf);
+            // Under the `no_pool` escape these are owned per-layer boxes — drain them into
+            // `transient` so the recording outlives them; pooled buffers are no-ops here (owned by
+            // `pool`, itself drained into `transient` at the end of the op loop).
+            for b in [logits, ids, wts, abuf, ybuf] {
+                b.into_transient(transient);
+            }
+            for b in [gubuf, gbuf, ubuf].into_iter().flatten() {
+                b.into_transient(transient);
+            }
         }
     }
     Ok(())
