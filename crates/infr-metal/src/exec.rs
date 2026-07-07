@@ -1996,12 +1996,35 @@ impl MetalBackend {
                 self.encode(r, &pso, &[bx.as_ref(), bd.as_ref()], &p, n);
                 r.loc[dst.0 as usize] = Loc::Device;
             }
-            Op::Sample { .. } => {
-                // Capability-gated off (Capabilities::gpu_sample = false): the runner samples on
-                // the host on Metal, so this is unreachable.
-                return Err(Error::Unsupported(
-                    "Metal Op::Sample: gpu_sample capability is false".into(),
-                ));
+            Op::Sample {
+                x,
+                u,
+                dst,
+                n,
+                top_k,
+                temp,
+                top_p,
+            } => {
+                // Device-side stochastic sampling: only the 4-byte token id reads back, not the
+                // `[vocab]` logits. See `sample_f32` in elementwise_norms.metal for the algorithm
+                // (mirrors the host `sample_logits` order of operations exactly).
+                let bx = self.ensure_device(r, x);
+                let bu = self.ensure_device(r, u);
+                let bd = self.dev_dst(r, dst, 1);
+                let pso = self.pipelines.get("sample_f32")?;
+                let mut p = n.to_ne_bytes().to_vec();
+                p.extend_from_slice(&top_k.to_ne_bytes());
+                p.extend_from_slice(&temp.to_ne_bytes());
+                p.extend_from_slice(&top_p.to_ne_bytes());
+                self.encode_tg(
+                    r,
+                    &pso,
+                    &[bx.as_ref(), bu.as_ref(), bd.as_ref()],
+                    &p,
+                    256,
+                    256,
+                );
+                r.loc[dst.0 as usize] = Loc::Device;
             }
             Op::EmbedGather { .. } => {
                 // Capability-gated off (Capabilities::embed_gather = false): the runner keeps the

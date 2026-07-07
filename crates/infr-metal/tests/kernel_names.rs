@@ -33,6 +33,7 @@ const KERNEL_PREFIXES: &[&str] = &[
     "qknorm",
     "rmsnorm",
     "rope_",
+    "sample_f32",
     "scale_f32",
     "softcap",
     "writekv_",

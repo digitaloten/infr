@@ -186,3 +186,86 @@ kernel void argmax_f32(device const float* logits [[buffer(0)]],
     }
     if (t == 0u) { out_id[0] = sidx[0]; }
 }
+
+// GPU stochastic sampling over VOCAB-scale logits (Op::Sample): temperature + top-k + top-p,
+// IDENTICAL order of operations to the host `sample_logits` (infr-cpu's Op::Sample arm) given the
+// same uniform draw `u`, so the same `u` picks the same token (modulo exact-tie order — ties are
+// legitimately unspecified, same caveat as the Vulkan sample_topk.comp reference).
+//
+// Correctness-first single-threadgroup version (this is the reference backend): `top_k` (bounded
+// 2..=64 by the caller) selection is done via `top_k` sequential parallel-max reductions (each an
+// argmax_f32-shaped strided-scan + threadgroup tree-reduce), skipping indices already selected in
+// earlier rounds — descending order falls out for free since round `j` finds the (j+1)-th largest.
+// This re-scans the `n` logits `top_k` times instead of Vulkan's one-pass radix select; fine for a
+// per-token decode op where correctness, not throughput, is the bar. Phase 2 (single lane) mirrors
+// the host: softmax(temp) over the selected set, nucleus (top-p) cutoff, inverse-CDF walk with `u`.
+#define SAMPLE_KMAX 64u
+struct SampleParams { uint n; uint top_k; float temp; float top_p; };
+kernel void sample_f32(device const float* logits [[buffer(0)]],
+                       device const float* u_buf  [[buffer(1)]],
+                       device uint*        out_id [[buffer(2)]],
+                       constant SampleParams& p    [[buffer(3)]],
+                       uint t [[thread_position_in_threadgroup]]) {
+    threadgroup float sval[256];
+    threadgroup uint  sidx[256];
+    threadgroup float gval[SAMPLE_KMAX];
+    threadgroup uint  gidx[SAMPLE_KMAX];
+    // Clamp like the host (`k = top_k.min(logits.len())`) — defensive against a vocab smaller
+    // than top_k; never triggers in practice (vocab >> 64).
+    uint k = min(p.top_k, p.n);
+    k = min(k, SAMPLE_KMAX);
+    for (uint iter = 0u; iter < k; iter++) {
+        float best = -1e30f;
+        uint bi = 0u;
+        for (uint i = t; i < p.n; i += 256u) {
+            bool used = false;
+            for (uint j = 0u; j < iter; j++) {
+                if (gidx[j] == i) { used = true; break; }
+            }
+            if (!used && logits[i] > best) { best = logits[i]; bi = i; }
+        }
+        sval[t] = best;
+        sidx[t] = bi;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = 128u; s > 0u; s /= 2u) {
+            if (t < s && sval[t + s] > sval[t]) {
+                sval[t] = sval[t + s];
+                sidx[t] = sidx[t + s];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (t == 0u) {
+            gval[iter] = sval[0];
+            gidx[iter] = sidx[0];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // Phase 2 (single lane): softmax(temp), nucleus cutoff, inverse-CDF sample — same two-pass
+    // structure (cutoff scan, then an independent re-summed `total`) as the host reference.
+    if (t == 0u) {
+        float maxl = gval[0];
+        float sum = 0.0f;
+        for (uint j = 0u; j < k; j++) {
+            float pr = exp((gval[j] - maxl) / p.temp);
+            gval[j] = pr; // reuse gval to hold probabilities
+            sum += pr;
+        }
+        for (uint j = 0u; j < k; j++) { gval[j] /= sum; }
+        float cum = 0.0f;
+        uint cutoff = k;
+        for (uint j = 0u; j < k; j++) {
+            cum += gval[j];
+            if (cum >= p.top_p) { cutoff = j + 1u; break; }
+        }
+        float total = 0.0f;
+        for (uint j = 0u; j < cutoff; j++) { total += gval[j]; }
+        float r = u_buf[0] * total;
+        uint tok = gidx[cutoff - 1u];
+        float acc = 0.0f;
+        for (uint j = 0u; j < cutoff; j++) {
+            acc += gval[j];
+            if (r <= acc) { tok = gidx[j]; break; }
+        }
+        out_id[0] = tok;
+    }
+}
