@@ -209,16 +209,21 @@ dequant).
 ## Scope
 
 - **Format:** GGUF
-- **Models:** Llama / Qwen3 / Gemma 3 / Gemma 4 (dense + E2B) (GPU); Qwen3.5/3.6
-  (CPU ref); DiffusionGemma (block text-diffusion, CPU + GPU)
+- **Models:** Llama, Qwen2/2.5, Qwen3 (dense + MoE), Gemma 3, Gemma 4 (dense +
+  E2B), Qwen3.5/3.6 (dense + MoE) — all on GPU **and** the CPU reference;
+  DiffusionGemma (block text-diffusion, CPU + GPU)
 - **GPU:** AMD / NVIDIA / Intel via Vulkan (cooperative-matrix matmul); Apple
   via a native **Metal backend** (`INFR_METAL=1`) covering every op the CPU
   reference does — dense, MoE (`qwen3moe`) and Qwen3.5 (`qwen35`). Dense is
   optimized (simdgroup-matrix GEMM + flash attention, raw-block quant decode;
   within ~1.3-1.5× of llama.cpp Metal on M3 Pro — architecture and numbers in
   [`docs/METAL.md`](docs/METAL.md))
-- **Store:** own cache at `$XDG_CACHE_HOME/infr/models` (standalone HF + Ollama
-  HTTP pulls)
+- **Store:** the shared **HuggingFace Hub cache** — located via `$HF_HUB_CACHE`,
+  else `$HF_HOME/hub`, else `~/.cache/huggingface/hub`, in HF's own
+  `models--<org>--<repo>/{blobs,snapshots,refs}` layout. A model pulled by
+  `infr`, `llama.cpp`, or `huggingface_hub` is shared — downloaded once.
+  `infr pull` fetches from `huggingface.co` over resumable HTTP Range with a
+  progress bar; gated repos authenticate with `HF_TOKEN`.
 - **API:** OpenAI-compatible HTTP (streaming) — works with opencode / Claude
   Code CLI
 
