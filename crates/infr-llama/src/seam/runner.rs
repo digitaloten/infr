@@ -3353,7 +3353,14 @@ pub(crate) fn generate_dense_backend(
     let end = prompt.len() + max_new;
     let mut pos = decode_start;
     while pos < end {
-        if out.len() >= max_new {
+        // `max_new == 0` (prefill-only: bench pp, session cache warming) must still FEED the
+        // prompt: models without a batched-prefill path (MoE with non-Q4_K expert banks, E2B
+        // short suffixes) do their entire prefill in this loop — breaking before the prompt is
+        // consumed skips their KV fill and reports a zero prompt time (bench pp printed 512e9
+        // t/s for qwen35moe UD quants). Only break once every prompt position but the frontier
+        // has been processed (the frontier token stays un-fed at max_new == 0, matching the
+        // batched-prefill path's plen-1 contract).
+        if out.len() >= max_new && pos + 1 >= prompt.len() {
             break;
         }
         if can_chain && pos + 1 >= prompt.len() && pos + 1 == cur.len() && logits_out.is_none() {
