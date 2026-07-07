@@ -199,7 +199,12 @@ pub(crate) fn generate_dense_backend(
     // count is unchanged. Needs every layer to own all three projections in ONE native-supported
     // dtype (gemma4's V-less full layers keep the split form), uniform dims (the offsets are
     // baked once), and a backend that opted into combined weights.
+    // NOTE: llama.cpp's Q4_K_M etc. bump attn_v to Q6_K on alternating layers, so mixed-precision
+    // GGUFs (e.g. Qwen3-8B Q4_K_M: v = 18×Q4K + 18×Q6K) fail the uniform-dtype gate and keep the
+    // split form. INFR_NO_QKV_FUSE forces the split form for A/B (default unset = fuse; the split
+    // form is bit-identical — same dots, same fixed-order sums).
     let fuse_qkv = be.capabilities().combined_gu
+        && std::env::var("INFR_NO_QKV_FUSE").is_err()
         && (0..c.n_layer).all(|l| {
             let dt = |s: &str| {
                 let name = format!("blk.{l}.{s}");
