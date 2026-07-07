@@ -3318,11 +3318,16 @@ impl<'a> Recorder<'a> {
         eps: f32,
     ) {
         debug_assert!(kd <= 128, "deltanet split assumes kd ≤ 128, got {kd}");
+        debug_assert!(
+            kd.is_multiple_of(16),
+            "deltanet_prep's coopmat D/Dq tiles assume kd a multiple of 16, got {kd}"
+        );
         let nchunk = rows.div_ceil(32);
-        // pass 1: prep — (chunk, k-head) grid
+        // pass 1: prep — (chunk, k-head) grid. kernel_sg: the D/Dq dot matrices are computed via
+        // coopmat (RDNA3 needs requiredSubgroupSize=32 pinned for coopmat correctness).
         let kp = self
             .be
-            .kernel("deltanet_prep", crate::gemm::deltanet_prep_spv(), 6, 20);
+            .kernel_sg("deltanet_prep", crate::gemm::deltanet_prep_spv(), 6, 20, 32);
         let mut p1 = [0u8; 20];
         p1[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         p1[4..8].copy_from_slice(&(nk as u32).to_ne_bytes());
