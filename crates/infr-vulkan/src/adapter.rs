@@ -270,10 +270,19 @@ fn resolve<'a>(
 /// multiple of 64 so the prefill GEMM / flash kernels — which write ceil(rows/64)*64 output rows —
 /// write DIRECTLY into these buffers (no padded temp + copy). Padding rows are never read (downstream
 /// ops touch only the real `rows`, and row-major layout keeps element (r<rows, c) at the same index).
+/// [`alloc_scratch`]'s result: the per-tensor `Internal` scratch (indexed by `TensorId`) plus the
+/// shared 16-byte `dummy` buffer (bound as the unused scales/mins args of the f16 GEMM).
+type ScratchSet = (Vec<Option<Box<dyn Buffer>>>, Box<dyn Buffer>);
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-fn alloc_scratch(be_: &VulkanBackend, graph: &Graph) -> Result<Vec<Option<Box<dyn Buffer>>>> {
+fn alloc_scratch(be_: &VulkanBackend, graph: &Graph) -> Result<ScratchSet> {
     let mut scratch: Vec<Option<Box<dyn Buffer>>> =
         (0..graph.tensors.len()).map(|_| None).collect();
+    // Batch the whole scratch set into ONE zero-init submit (`alloc_zeroed_batch`): the naive
+    // per-tensor `alloc` pays a one-shot submit + queue_wait_idle per Internal (~70 x ~35us =
+    // ~2.5ms per execute on a 7900 XTX) — the dominant HOST cost of a small-m prefill step.
+    let mut idx: Vec<usize> = Vec::new();
+    let mut sizes: Vec<usize> = Vec::new();
     for (i, decl) in graph.tensors.iter().enumerate() {
         if matches!(decl.kind, TensorKind::Internal) {
             let numel = decl.desc.numel();
@@ -286,10 +295,19 @@ fn alloc_scratch(be_: &VulkanBackend, graph: &Graph) -> Result<Vec<Option<Box<dy
                 .dtype
                 .dense_bytes(padded)
                 .ok_or_else(|| be("vulkan adapter: internal tensor must be a dense dtype"))?;
-            scratch[i] = Some(be_.alloc(bytes.max(4), BufferUsage::Activations)?);
+            idx.push(i);
+            sizes.push(bytes.max(4));
         }
     }
-    Ok(scratch)
+    // The 16-byte `dummy` (bound as the unused scales/mins args of the f16 `matmul_proj` GEMM)
+    // rides the same batch — its own `alloc` would pay one more per-execute fill submit.
+    sizes.push(16);
+    let mut bufs = be_.alloc_zeroed_batch(&sizes, BufferUsage::Activations)?;
+    let dummy = bufs.pop().expect("alloc_zeroed_batch returned sizes.len()");
+    for (i, buf) in idx.into_iter().zip(bufs) {
+        scratch[i] = Some(buf);
+    }
+    Ok((scratch, dummy))
 }
 
 /// Peephole: fuse `QkNormRope(k → k16)` + `WriteKv(k16 → cache, pos)` into a single Qk-norm+RoPE that
@@ -2499,7 +2517,7 @@ fn record_decode_replay(
     graph: &Graph,
     bindings: &Bindings,
 ) -> Result<DecodeReplay> {
-    let scratch = alloc_scratch(be_, graph)?;
+    let (scratch, dummy) = alloc_scratch(be_, graph)?;
     // `[pos, kv_len]` — Staging (host-visible mapped) so per-token `upload` is a plain memcpy.
     let params = be_.alloc(8, BufferUsage::Staging)?;
     let positions = graph
@@ -2517,7 +2535,6 @@ fn record_decode_replay(
     let mut transient: Vec<Box<dyn Buffer>> = Vec::new();
     let mut dyn_args: Vec<DynAttnCtx> = Vec::new();
     let mut pool: ScratchPool = HashMap::new();
-    let dummy = be_.alloc(16, BufferUsage::Activations)?;
     let rec = be_.recorder_persistent()?;
     // Device-side position stream: seed params to [pos0-1, pos0] and record a one-thread
     // increment FIRST — every replay self-advances and the host never writes pos/params again
@@ -2607,11 +2624,15 @@ fn record_decode_replay(
 /// batches and every ineligible decode (gemma/E2B/MoE/qwen35).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Result<()> {
-    let scratch = alloc_scratch(be_, graph)?;
+    // `dummy`: a tiny unused buffer bound as the (scales, mins) args of the f16 `matmul_proj`
+    // GEMM — allocated inside `alloc_scratch`'s single zero-init batch.
+    let (scratch, dummy) = alloc_scratch(be_, graph)?;
 
     // RoPE position: the static `qk_norm_rope`/`rope` kernels take a scalar `rope_pos`, but the IR
     // carries a `positions` i32 tensor. Read `positions[0]` (decode rows=1, or the start of a
-    // consecutive-prefill run) up front — `download` syncs, so it must precede the recorder.
+    // consecutive-prefill run) up front — `read_pos0` reads host-visible (mapped) positions
+    // directly (the seam always binds Staging there) and only falls back to the syncing
+    // `download` (a one-shot submit + wait) for a device-local buffer.
     let mut rope_pos: HashMap<u32, usize> = HashMap::new();
     for op in &graph.ops {
         let pid = match op {
@@ -2620,9 +2641,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         };
         if let Some(pid) = pid {
             if let std::collections::hash_map::Entry::Vacant(e) = rope_pos.entry(pid.0) {
-                let mut b = [0u8; 4];
-                be_.download(resolve(&scratch, bindings, pid)?, &mut b)?;
-                e.insert(i32::from_le_bytes(b) as usize);
+                e.insert(read_pos0(be_, resolve(&scratch, bindings, pid)?)? as usize);
             }
         }
     }
@@ -2634,8 +2653,6 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     // Transient buffers allocated inside the op loop (GEMM/attention/MoE scratch) must outlive the
     // recorder — hold them here so they drop only after `rec.finish()` submits.
     let mut transient: Vec<Box<dyn Buffer>> = Vec::new();
-    // A tiny unused buffer bound as the (scales, mins) args of the f16 `matmul_proj` GEMM.
-    let dummy = be_.alloc(16, BufferUsage::Activations)?;
 
     let rec = be_.recorder()?;
     let mode = RopeMode::Static(&rope_pos);

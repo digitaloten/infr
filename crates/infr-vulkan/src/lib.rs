@@ -948,6 +948,46 @@ impl VulkanBackend {
         Ok(())
     }
 
+    /// Allocate `sizes.len()` buffers and zero-init them with (at most) ONE submit — the batched
+    /// twin of [`Backend::alloc`], same calloc contract. `alloc`'s per-buffer `fill_buf` costs a
+    /// one-shot submit + `queue_wait_idle` per device-local buffer; a graph execute's scratch set
+    /// (~70 Internal tensors) paid ~2.5ms of pure submit overhead per call on a 7900 XTX. Here
+    /// host-visible buffers are memset through their mapped pointer and every device-local fill is
+    /// recorded into a single one-shot command buffer.
+    pub(crate) fn alloc_zeroed_batch(
+        &self,
+        sizes: &[usize],
+        usage: BufferUsage,
+    ) -> Result<Vec<Box<dyn Buffer>>> {
+        let bufs: Vec<VkBuffer> = sizes
+            .iter()
+            .map(|&b| self.make_alloc(b, usage))
+            .collect::<Result<_>>()?;
+        let mut dev: Vec<(vk::Buffer, u64)> = Vec::new();
+        for buf in &bufs {
+            if let Some(ptr) = buf.mapped_ptr() {
+                unsafe { std::ptr::write_bytes(ptr, 0u8, buf.size) };
+            } else {
+                let size = (buf.size / 4 * 4) as u64; // vkCmdFillBuffer requires a 4-byte multiple
+                if size > 0 {
+                    dev.push((buf.buffer, size));
+                }
+            }
+        }
+        if !dev.is_empty() {
+            let shared = Arc::clone(&self.shared);
+            self.one_shot(move |cmd| unsafe {
+                for (b, size) in dev {
+                    shared.device.cmd_fill_buffer(cmd, b, 0, size, 0);
+                }
+            })?;
+        }
+        Ok(bufs
+            .into_iter()
+            .map(|b| Box::new(b) as Box<dyn Buffer>)
+            .collect())
+    }
+
     /// The shared body of `alloc`/`alloc_uninit`: pick the memory location + tick the weight-load
     /// progress bar. Zero/poison filling is applied by the callers.
     fn make_alloc(&self, bytes: usize, usage: BufferUsage) -> Result<VkBuffer> {
