@@ -1,0 +1,5 @@
+# GitHub Linguist overrides.
+# `.comp` is our Vulkan compute-shader source (the bulk of the GPU kernels), but
+# Linguist doesn't classify it, so ~312 KB of shader code fell out of the language
+# stats — making Metal look larger than the Vulkan shaders when the reverse is true.
+*.comp linguist-language=GLSL
