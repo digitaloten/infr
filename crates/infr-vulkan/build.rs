@@ -642,6 +642,18 @@ fn main() {
             "native_gemm_f8cm_q8_0_prepack_n128",
             &["-DPREPACK", "-DNARROW_N"],
         ),
+        // NATIVE bf16 cooperative-matrix (WMMA) prefill GEMM — gated behind INFR_BF16_COOPMAT=1 +
+        // caps.bf16_coopmat (RDNA4 native bf16 WMMA; see adapter.rs `bf16cm_ok` / the .comp file's
+        // design doc). Default-off; correctness UNVALIDATED on this box (no bf16 coopmat hardware
+        // here — compile-checked only), pending an RDNA4 run. Same 256-thread/8-warp warptile as
+        // native_gemm_warp (BM=64xBN=256 wide); -DNARROW_N mirrors native_gemm_warp's n%128
+        // occupancy-fix variant (BN=128/BK=64). No scaling/descale (bf16 has full f32-like range).
+        ("native_gemm_bf16cm", "native_gemm_bf16cm", &[]),
+        (
+            "native_gemm_bf16cm",
+            "native_gemm_bf16cm_n128",
+            &["-DNARROW_N"],
+        ),
         // Bakes each Q8_0 32-block's scale into an E4M3 output (decode-once via dqblk), producing
         // the pre-packed weight buffer the PREPACK GEMM variants above read directly. Gated by the
         // same INFR_F8_COOPMAT=1 + INFR_F8_PREPACK=1.

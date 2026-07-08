@@ -1316,6 +1316,59 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// NATIVE bf16 cooperative-matrix (WMMA) prefill GEMM: `c = a · Wᵀ`, `a` f32 activations, `w`
+    /// raw bf16 weight (native_decode.glsl FMT_BF16), gated by the adapter behind
+    /// `INFR_BF16_COOPMAT=1` + `caps.bf16_coopmat` (see `native_gemm_bf16cm.comp` for the design
+    /// doc: the SAME 256-thread/8-warp warptile as `native_gemm_warp`'s f16 GEMM, bf16-typed — a
+    /// DIRECT matmul, f32 accumulate, no scaling/descale epilogue since bf16 shares f32's exponent
+    /// range). `c` is `ceil(m/64)*64` rows (same padding convention as `matmul_native`). Picks the
+    /// WIDE (BN=256, BK=32) tile when `n%256==0`, else the NARROW_N (BN=128, BK=64) tile — mirrors
+    /// `matmul_f8cm_q8_0`'s wide/narrow pick; the caller (adapter.rs `bf16cm_ok`) already checked
+    /// shape eligibility for one of these before calling in. Requires `k%32==0` (wide) or
+    /// `k%64==0` (narrow). Correctness UNVALIDATED on hardware without bf16 coopmat.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_bf16cm(
+        &self,
+        a: &dyn Buffer,
+        w: &dyn Buffer,
+        w_base: usize,
+        c: &dyn Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        let wide = n.is_multiple_of(256);
+        let (name, spv, bn) = if wide {
+            (
+                "native_gemm_bf16cm",
+                crate::gemm::native_gemm_bf16cm_spv(),
+                256,
+            )
+        } else {
+            (
+                "native_gemm_bf16cm_n128",
+                crate::gemm::native_gemm_bf16cm_n128_spv(),
+                128,
+            )
+        };
+        self.label_gemm(name, m, k, n);
+        let kern = self.be.kernel_sg(name, spv, 3, 16, 32);
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        // BM=64 (both tiles): one workgroup covers 64 rows x `bn` cols.
+        let groups = (m.div_ceil(64) * (n / bn)) as u32;
+        self.dispatch(
+            kern,
+            &[Self::vkb(a), Self::vkb(w), Self::vkb(c)],
+            1,
+            &push,
+            groups,
+        );
+    }
+
     /// `-DPREPACK` measurement variant of `matmul_f8cm_q8_0`: `w8` is a PRE-PACKED E4M3 weight
     /// buffer (from `repack_q8_to_f8`, block scale already baked in) instead of raw Q8_0 blocks —
     /// the Bs staging in `native_gemm_f8cm_q8_0.comp` reads it DIRECTLY, no in-shader dqblk. Tests

@@ -845,6 +845,24 @@ fn lower_op(
                 let i8cm_ok = matches!(dt, infr_core::DType::Q8_0)
                     && be_.caps().i8_coopmat
                     && std::env::var("INFR_I8_COOPMAT").is_ok();
+                // NATIVE bf16 cooperative-matrix (WMMA) prefill GEMM
+                // (crates/infr-vulkan/shaders/native_gemm_bf16cm.comp). `caps.bf16_coopmat` is
+                // hardware enumeration only (RDNA4/Navi44 confirmed, see lib.rs
+                // `has_bf16_coopmat`); this dispatch ALSO requires `INFR_BF16_COOPMAT=1` (default
+                // off) because this kernel hasn't been run/measured on real bf16-coopmat hardware
+                // at all yet (this dev box has none), so the opt-in stays until an RDNA4 pass
+                // validates correctness. Default behavior (unset) is completely unaffected: Bf16
+                // keeps routing through the existing `native_dense_supported` arm below
+                // (`native_gemm_warp_bf16`, the f16-clamped path), byte-identical to before this
+                // branch existed. Shape gate mirrors `f8_wide`/`f8_narrow`: WIDE (BN=256, BK=32)
+                // needs out_f%256==0 && in_f%32==0; NARROW_N (BN=128, BK=64) needs out_f%128==0 &&
+                // in_f%64==0.
+                let bf16cm_wide = out_f % 256 == 0 && in_f % 32 == 0;
+                let bf16cm_narrow = !bf16cm_wide && out_f % 128 == 0 && in_f % 64 == 0;
+                let bf16cm_ok = matches!(dt, infr_core::DType::Bf16)
+                    && be_.caps().bf16_coopmat
+                    && (bf16cm_wide || bf16cm_narrow)
+                    && std::env::var("INFR_BF16_COOPMAT").is_ok();
                 if f8cm_ok {
                     // E4M3's range is tiny (max normal 448) — unscaled f32 activations overflow to
                     // inf/NaN on cast, which is what produced garbage output on the first RDNA4
@@ -936,6 +954,8 @@ fn lower_op(
                             out_f,
                         );
                     }
+                } else if bf16cm_ok {
+                    rec.matmul_bf16cm(xb, w, w_off, out, m, in_f, out_f);
                 } else if matches!(dt, infr_core::DType::Q4K)
                     && !warp_ok
                     && be_.caps().i8_dot
