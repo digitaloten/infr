@@ -289,6 +289,39 @@ diffusion decode loop is still future work. Status as of 2026-06-29:
 
 ---
 
+## Candidate models (next)
+
+New model families to support, ≤30B, ranked by ROI for infr's current
+architecture. First step for any of them is the same: pull the GGUF and diff its
+arch string + tensor names against the backbone infr already runs — that tells
+us "config tweak" vs "new op". Currently supported: llama, qwen2/2.5, qwen3,
+qwen3moe, qwen35 (DeltaNet-hybrid), qwen35moe, gemma3, gemma4/E2B,
+DiffusionGemma; MTP for qwen35.
+
+1. **Ornith-1.0** (DeepReinforce.AI, MIT — 9B/31B dense, 35B MoE). Built on the
+   **Gemma 4 + Qwen 3.5 backbones infr already runs**, so likely just config +
+   tensor-name + chat-template work, no new kernels. Agentic-coding model →
+   on-mission for the coding-agent north star. **Lowest effort, do first** (also
+   validates the "our backbone just eats a fine-tune" hypothesis).
+2. **DeepSeek-V2-Lite / DeepSeek-Coder-V2-Lite** (16B, 2.4B active MoE). Adds
+   **MLA (Multi-head Latent Attention)** — the missing attention family behind
+   the entire DeepSeek V2/V3/V4 line. New attention op (medium effort); the
+   op-list seam is built for exactly this. Has a llama.cpp GGUF oracle for
+   validation. **Highest strategic value.**
+3. **GLM-4.7-Flash** (~30B MoE) or **Ernie 4.5 21B-A3B** (MoE). Mostly standard
+   MoE FFN (infr's batched-expert path covers it) + minor arch quirks (GLM
+   post-norm / partial RoPE). Config + loader effort. Both hyped, both ≤30B;
+   some GLM variants ship native MTP heads.
+4. **Nemotron-Nano / Nemotron-H** (Mamba2-Transformer hybrid MoE). Adds **Mamba2
+   SSM**, extending infr's existing `Conv1dSilu` + `DeltaNet` linear-attention
+   machinery — a real differentiator (llama.cpp's Mamba-hybrid GGUF path is
+   weak). Med-high effort + a weaker oracle → do after MLA.
+
+MTP extension that unlocks several of the above (esp. Ornith's Gemma4 variants):
+gemma4 mem-shared MTP mode (see [`MTP.md`](MTP.md) "Later").
+
+---
+
 ## Risks / open questions
 
 - **Reusing ggml SPIR-V**: licensing (MIT — compatible) and binding layout/ABI
