@@ -85,8 +85,9 @@ simply overwritten at the same positions).
   existing spec tests pin), INFR toggles, bench acceptance-rate + tok/s vs
   non-spec, docs + this file's status.
 
-Later: gemma4 mem-shared mode (no separate KV, one graph), qwen35moe (arch not
-yet in infr), chained-head models (step35).
+Later: gemma4 mem-shared mode (no separate KV, one graph), a qwen35moe MTP head
+(the arch itself has since landed; the MTP head for it has not), chained-head
+models (step35).
 
 ## Oracle commands (llama.cpp master, Vulkan build at
 

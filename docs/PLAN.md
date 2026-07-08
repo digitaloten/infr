@@ -275,8 +275,9 @@ diffusion decode loop is still future work. Status as of 2026-06-29:
 5. ✅ **GGUF loader** — parse + upload; tokenizer + embedded chat template.
 6. ✅ **Forward pass** — full stack, validated vs llama.cpp (agreement harness).
 7. ✅ **Attention + MoE** — GQA + SWA + full-attn; qwen3moe routing/gather.
-8. ⬜ **Diffusion decode** — canvas denoise loop (the original DiffusionGemma
-   target; not started).
+8. ✅ **Diffusion decode** — canvas denoise loop (DiffusionGemma). CPU + Vulkan
+   shipped; Metal code-complete but hardware-unvalidated. See
+   [`docs/DIFFUSIONGEMMA.md`](DIFFUSIONGEMMA.md).
 9. ✅ **`infr run`** — terminal chat (streaming, reasoning split).
 10. ✅ **`infr serve`** — axum OpenAI server (streaming, tool-call bridge).
 11. 🔄 **Perf pass** — ongoing (coopmat/dp4a tuning, record-once decode, KV
