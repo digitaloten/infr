@@ -388,3 +388,44 @@ gemma3-1b's narrow-shape GEMM efficiency (pp 0.66x); the warptile's ~36 TF
 ceiling vs llama's ~45-50 on wide shapes (class-6, dense pp tails); and Metal
 parity for everything above (most fast paths are Vulkan-only; Metal states its
 own capabilities, so it degrades gracefully but slowly).
+
+## Coopmat operand tiers (fp8 / int8 / bf16) — a measured dead end vs f16
+
+The Vulkan backend enumerates which cooperative-matrix component types the
+device accepts and reports them in the startup banner
+(`f16cm / bf16cm / f8cm / i8cm`). On RDNA4 (RX 9060 XT / Navi 44, Mesa 26.1.4)
+all four are present; on RDNA3 (7900 XTX) only f16 + int8. It's tempting to
+route quantized-weight GEMMs through the "faster" 8-bit units. **We built and
+measured all of them on real hardware — none beat the f16 coopmat GEMM. Do not
+re-open without a native-low-bit model.**
+
+- **fp8 (E4M3) coopmat GEMM** — full path built + validated on RDNA4 (per-row
+  activation range-scaling into E4M3's ±448, warp-tiled to match
+  `native_gemm_warp`, per-row descale). Gated opt-in `INFR_F8_COOPMAT=1` (+
+  `INFR_F8_PREPACK=1` for the Q8_0→E4M3 prepack path), default-off. Result:
+  - fp8-with-in-shader-dequant = **0.73×** f16 (pays the SAME Q8_0 dequant f16
+    pays, then adds an activation-scale pass + a descale epilogue).
+  - fp8-with-prepacked-E4M3-weights (dequant removed) ties f16 **exactly**
+    per-op (1024×6144 @ m512: f16 **364.3µs** vs fp8 **364.5µs**), loses on
+    narrow shapes (no split-K/A_GLOBAL variant). So even fully WMMA-bound, RDNA4
+    fp8 gives **no speedup** — these GEMMs measure ~17.6 TF/s
+    (latency/occupancy- bound, well under peak), so a faster MAC can't help, and
+    the identical wide- shape time argues fp8 WMMA ≈ f16 rate here anyway.
+- **int8 coopmat GEMM** — also built (`INFR_I8_COOPMAT=1`, default-off):
+  4.8-5.6× slower raw, amortized to ~0.73× after a store-to-shared per-block
+  rescale epilogue, still loses. Coopmat v1 has no in-flight per-element scale,
+  so block-quant integer matmul pays a rescale tax f16-dequant doesn't. **The
+  principled integer path is dp4a `mmq`** (each thread owns its accumulator →
+  scale-after for free), which is what infr's Q4_K mmq + llama.cpp both use.
+- **Why no 8-bit operand swap wins:** on Vulkan/AMD, low-bit-float weights have
+  no native matmul — you always dequant/convert to the WMMA operand type first,
+  and RDNA4's fp8/int8 WMMA doesn't out-rate f16 on inference-shaped GEMMs.
+  **ggml- vulkan does the same thing**: it has no fp8/fp4 weight matmul —
+  MXFP4/NVFP4 dequant to f16 (`ue4m3_to_fp32` scale × `kvalues_mxfp4` codebook)
+  then run the normal f16 coopmat. The only genuine low-bit-float _compute_ win
+  is NVIDIA **Blackwell's block-scaled fp4 MMA**
+  (`mma…kind::mxf4nvf4.block_scale…e2m1.e2m1 …ue4m3` — fp4 operands, fp8 scale
+  applied in the tensor core), which RDNA4 does not expose (no `e2m1` coopmat
+  config). fp8/int8 coopmat stay as gated-off measurement paths; the win, if a
+  low-bit-float model ever needs it, is a native weight format, not an
+  operand-type swap on a dequant-bound GEMM.
