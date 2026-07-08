@@ -33,6 +33,13 @@ pub struct Capabilities {
     //                         config list); `i8_dot` = packed dp4a integer dot.
     // infr's coopmat GEMM dequants any on-disk weight dtype to f16 IN-SHADER before the multiply,
     // so today's GEMM keys off `f16_coopmat` specifically; `f8_coopmat` is the (pending) fp8 tier.
+    /// f32 scalar/vector ALU — universally available on any compute device (the baseline float).
+    pub f32: bool,
+    /// The cooperative-matrix unit accepts f32 **operand** components (f32×f32→f32). NOTE: distinct
+    /// from f16×f16→f32 *accumulation* (there the operands are still f16 → `f16_coopmat`); this is
+    /// f32 A and B. Absent on many matrix units (RDNA3 WMMA takes f16/bf16/i8 inputs only). infr has
+    /// no f32 coopmat GEMM path today; detected for completeness / future use.
+    pub f32_coopmat: bool,
     /// f16 (== fp16) scalar/vector ALU (`shaderFloat16`) — the non-coopmat f16 warp/GEMV fallback.
     pub f16: bool,
     /// The cooperative-matrix unit accepts f16 components (f16×f16→f16/f32) — the current production

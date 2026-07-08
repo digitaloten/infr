@@ -507,29 +507,51 @@ impl VulkanBackend {
         let has_int8 = f16_feat.shader_int8 != 0;
         // Extension presence alone doesn't guarantee the FEATURE bit (a driver may advertise
         // VK_KHR_cooperative_matrix with cooperativeMatrix=false — enabling it then fails
-        // create_device, the same failure class #32 fixed for memmodel/sgsize). Everything
-        // downstream (the ext push, the feature chain, caps.f16_coopmat → the coopmat GEMM tier)
-        // keys off ext AND feature. Drivers zero-fill unrecognized feature structs, so the probe is
-        // safe when the extension is absent.
-        let has_coop_matrix = has_coop_matrix && coopmat_feat.cooperative_matrix != 0;
+        // create_device, the same failure class #32 fixed for memmodel/sgsize). This is the
+        // PREREQUISITE (unit exists + usable); which COMPONENT TYPES it accepts is a separate
+        // enumeration below — the ext bit does NOT imply f16 support (the spec only promises a unit
+        // exists, not that it does f16), so we don't assume it.
+        let has_coop_ext_feat = has_coop_matrix && coopmat_feat.cooperative_matrix != 0;
 
-        // f8 cooperative-matrix components: ENUMERATE the device's coopmat configs and look for a
-        // component type in the extension-added range (`as_raw() >= 1e9` — all CORE ComponentTypeKHR
-        // values are 0..=10: FLOAT16/FLOAT32/SINT8/…). fp8 (E4M3/E5M2) and any newer matrix type
-        // live in that range. This avoids hardcoding a specific fp8 enum value (ash 0.38 predates
-        // the fp8 ComponentTypeKHR variants) — a false negative (fp8 HW we fail to detect) is the
-        // safe failure mode; the fp8 GEMM tier simply stays unselected. NEVER true on RDNA3 (its
-        // only configs are FLOAT16/FLOAT32/SINT8). Also requires the float8 ext for storage.
-        let has_f8_coopmat = has_coop_matrix && has_f8_ext && {
-            let cm = ash::khr::cooperative_matrix::Instance::new(&entry, &instance);
-            unsafe { cm.get_physical_device_cooperative_matrix_properties(physical_device) }
-                .map(|configs| {
-                    configs.iter().any(|p| {
-                        p.a_type.as_raw() >= 1_000_000_000 || p.b_type.as_raw() >= 1_000_000_000
-                    })
-                })
-                .unwrap_or(false)
-        };
+        // Enumerate the device's cooperative-matrix configs ONCE — the AUTHORITATIVE source for
+        // which component types the matrix unit accepts. Each config lists a/b/c/result types; the
+        // ext's presence alone tells us nothing about them. Empty when the ext/feature is absent.
+        // Extract just the (a_type, b_type) pairs (Copy) — the returned structs borrow the loader
+        // `cm`, so we can't let them outlive this block.
+        let coopmat_configs: Vec<(vk::ComponentTypeKHR, vk::ComponentTypeKHR)> =
+            if has_coop_ext_feat {
+                let cm = ash::khr::cooperative_matrix::Instance::new(&entry, &instance);
+                unsafe { cm.get_physical_device_cooperative_matrix_properties(physical_device) }
+                    .map(|v| v.iter().map(|p| (p.a_type, p.b_type)).collect())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+        // f16 coopmat: a config with f16 A AND B operands (result f16 or f32). THE gate for the
+        // current production GEMM (any weight dtype dequants to f16 in-shader before the multiply).
+        // Derived from the enumeration, not assumed from the ext bit — every real coopmat impl ships
+        // f16, but check it. `has_coop_matrix` keeps its downstream name (ext-enable, feature chain,
+        // caps.f16_coopmat).
+        let f16c = vk::ComponentTypeKHR::FLOAT16;
+        let has_coop_matrix =
+            has_coop_ext_feat && coopmat_configs.iter().any(|&(a, b)| a == f16c && b == f16c);
+        // f32 coopmat: a config with f32 A AND B operands (f32×f32→f32) — NOT the common
+        // f16×f16→f32 accumulate (operands f16 there). Often absent (RDNA3 takes f16/bf16/i8
+        // inputs). infr has no f32 coopmat GEMM path; detected for completeness.
+        let f32c = vk::ComponentTypeKHR::FLOAT32;
+        let has_f32_coopmat =
+            has_coop_ext_feat && coopmat_configs.iter().any(|&(a, b)| a == f32c && b == f32c);
+        // f8 coopmat components: any config with an operand in the extension-added ComponentTypeKHR
+        // range (`as_raw() >= 1e9` — all CORE types are 0..=10: FLOAT16/FLOAT32/SINT8/…). fp8
+        // (E4M3/E5M2) and any newer matrix type live there. Avoids hardcoding a specific fp8 enum
+        // value (ash 0.38 predates the fp8 ComponentTypeKHR variants) — a false negative (fp8 HW we
+        // miss) is the safe mode; the fp8 GEMM tier just stays unselected. NEVER true on RDNA3.
+        // Also requires the float8 storage ext.
+        let has_f8_coopmat = has_coop_ext_feat
+            && has_f8_ext
+            && coopmat_configs
+                .iter()
+                .any(|&(a, b)| a.as_raw() >= 1_000_000_000 || b.as_raw() >= 1_000_000_000);
 
         // ── force-disable capabilities for fallback-path testing on capable HW ──
         // These env knobs drop a DETECTED capability so the next kernel tier down is exercised on a
@@ -648,6 +670,8 @@ impl VulkanBackend {
 
         let caps = Capabilities {
             name: device_name,
+            f32: true, // universally available
+            f32_coopmat: has_f32_coopmat,
             f16: has_f16,
             f16_coopmat: has_coop_matrix,
             f8: has_f8_ext,
@@ -677,9 +701,11 @@ impl VulkanBackend {
         if banner_seen().lock().unwrap().insert(caps.name.clone()) {
             let yn = |b: bool| if b { "y" } else { "n" };
             eprintln!(
-                "[infr] GPU: {} | f16:{} f16cm:{} f8:{} f8cm:{} i8:{} i8dot:{} \
+                "[infr] GPU: {} | f32:{} f32cm:{} f16:{} f16cm:{} f8:{} f8cm:{} i8:{} i8dot:{} \
                  subgroup:{}-{} shared:{}KB",
                 caps.name,
+                yn(caps.f32),
+                yn(caps.f32_coopmat),
                 yn(caps.f16),
                 yn(caps.f16_coopmat),
                 yn(caps.f8),
