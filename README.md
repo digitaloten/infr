@@ -57,6 +57,11 @@ system prompt) is read from the GGUF's own `tokenizer.chat_template`.
 | Qwen3.6 MoE       | `qwen35moe`       | `qwen35` skeleton + routed experts + shared expert     |
 | DiffusionGemma    | `diffusion-gemma` | block text-diffusion MoE, entropy-bound denoise decode |
 
+Fine-tunes on any of these backbones run unchanged. **Ornith-1.0**
+(DeepReinforce.AI agentic-coding) validated 2026-07-09 — the 9B rides `qwen35`
+and the 35B rides `qwen35moe` with no code changes
+(`infr run deepreinforce-ai/Ornith-1.0-9B-GGUF:Q4_K_M "..."`).
+
 ```bash
 # Qwen3 dense
 infr run unsloth/Qwen3-1.7B-GGUF:Q4_K_M "What is the capital of France?"
