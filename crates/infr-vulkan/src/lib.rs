@@ -442,6 +442,11 @@ impl VulkanBackend {
         let has_coop_matrix = has_ext(c"VK_KHR_cooperative_matrix");
         let has_16bit_storage = has_ext(c"VK_KHR_16bit_storage");
         let has_8bit_storage = has_ext(c"VK_KHR_8bit_storage");
+        // Packed i8 (int8) dot (dp4a) — the decode i8 `mmv` accumulate. Promoted to core in Vulkan
+        // 1.3; probed via the KHR ext for pre-1.3 drivers. Detection-only here (caps.i8_dot); the
+        // adapter's i8-mmv gate consults it so a device without packed dot routes to the scalar
+        // dequant GEMV instead of dispatching a dp4a kernel it can't run.
+        let has_i8_dot_ext = has_ext(c"VK_KHR_shader_integer_dot_product");
         let has_subgroup_ext = has_ext(c"VK_KHR_shader_subgroup_extended_types");
         let has_mem_budget = has_ext(c"VK_EXT_memory_budget");
         // Lets every dispatch bind its buffers with one `cmd_push_descriptor_set` recorded
@@ -461,17 +466,24 @@ impl VulkanBackend {
         let mut memmodel_feat = vk::PhysicalDeviceVulkanMemoryModelFeatures::default();
         let mut sgsize_feat = vk::PhysicalDeviceSubgroupSizeControlFeatures::default();
         let mut coopmat_feat = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
+        let mut intdot_feat = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default();
         let mut feat2 = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut f16_feat)
             .push_next(&mut memmodel_feat)
             .push_next(&mut sgsize_feat)
-            .push_next(&mut coopmat_feat);
+            .push_next(&mut coopmat_feat)
+            .push_next(&mut intdot_feat);
         unsafe { instance.get_physical_device_features2(physical_device, &mut feat2) };
         let has_f16 = f16_feat.shader_float16 != 0;
         let has_memmodel = memmodel_feat.vulkan_memory_model != 0;
         let has_memmodel_dev = memmodel_feat.vulkan_memory_model_device_scope != 0;
         let has_sgsize = sgsize_feat.subgroup_size_control != 0;
         let has_full_sg = sgsize_feat.compute_full_subgroups != 0;
+        // Packed i8 dot: ext advertised AND the feature bit set (same ext-AND-feature discipline as
+        // coopmat). Detection-only — the current i8 mmv is DEFAULT-OFF at m=1 (scalar wins), and no
+        // shader here uses the ext builtin yet, so we don't add it to the enabled feature chain; the
+        // adapter's i8-mmv gate reads `caps.i8_dot` before ever dispatching a dp4a kernel.
+        let has_i8_dot = has_i8_dot_ext && intdot_feat.shader_integer_dot_product != 0;
         // Extension presence alone doesn't guarantee the FEATURE bit (a driver may advertise
         // VK_KHR_cooperative_matrix with cooperativeMatrix=false — enabling it then fails
         // create_device, the same failure class #32 fixed for memmodel/sgsize). Everything
@@ -479,6 +491,17 @@ impl VulkanBackend {
         // tier) keys off ext AND feature. Drivers zero-fill unrecognized feature structs, so the
         // probe is safe when the extension is absent.
         let has_coop_matrix = has_coop_matrix && coopmat_feat.cooperative_matrix != 0;
+
+        // ── force-disable capabilities for fallback-path testing on capable HW ──
+        // These env knobs drop a DETECTED capability so the next kernel tier down is exercised on a
+        // device that actually has the feature — otherwise the portability fallbacks are only
+        // reachable on hardware we may not own. Applied before the ext list / feature chain so a
+        // forced-off feature is genuinely NOT enabled on the device (a faithful simulation, not just
+        // a caps flag flip). f16 is a coopmat prerequisite, so INFR_NO_F16 ⇒ NO coopmat too.
+        let has_f16 = has_f16 && std::env::var("INFR_NO_F16").is_err();
+        let has_coop_matrix =
+            has_coop_matrix && has_f16 && std::env::var("INFR_NO_COOPMAT").is_err();
+        let has_i8_dot = has_i8_dot && std::env::var("INFR_NO_I8DOT").is_err();
 
         // ── build extension name list (only available ones) ────────────────────
         let mut ext_ptrs: Vec<*const i8> = Vec::new();
@@ -562,15 +585,36 @@ impl VulkanBackend {
         .map_err(|e| be(format!("create_command_pool: {e}")))?;
 
         // ── capabilities ───────────────────────────────────────────────────────
-        let props = unsafe { instance.get_physical_device_properties(physical_device) };
+        // Query base limits + the subgroup-size range together via properties2 (the coopmat GEMM
+        // pins requiredSubgroupSize=32, so the fallback ladder needs to know whether 32 is in range).
+        let mut sgsize_props = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
+        let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sgsize_props);
+        unsafe { instance.get_physical_device_properties2(physical_device, &mut props2) };
+        let props = props2.properties;
         let device_name = unsafe { CStr::from_ptr(props.device_name.as_ptr()) }
             .to_string_lossy()
             .into_owned();
+        // (0,0) when subgroup-size-control is unsupported: can't pin any size — the adapter treats
+        // that as "no 32-pin available" and uses the driver's default subgroup for the fallback.
+        let (subgroup_min, subgroup_max) = if has_sgsize {
+            (
+                sgsize_props.min_subgroup_size,
+                sgsize_props.max_subgroup_size,
+            )
+        } else {
+            (0, 0)
+        };
 
         let caps = Capabilities {
             name: device_name,
             f16: has_f16,
             cooperative_matrix: has_coop_matrix,
+            i8_dot: has_i8_dot,
+            // f8 coopmat: wired by the f8 GEMM slice (enumerate VkCooperativeMatrixPropertiesKHR
+            // for an E4M3/E5M2 component-type config). Never true on this RDNA3 card.
+            f8_coopmat: false,
+            subgroup_min,
+            subgroup_max,
             max_buffer_bytes: props.limits.max_storage_buffer_range as u64,
             max_shared_memory_bytes: props.limits.max_compute_shared_memory_size,
             unified_memory: false, // discrete GPU
@@ -583,6 +627,22 @@ impl VulkanBackend {
             argmax_rows: true,
             argmax_prob: true,
         };
+
+        // One-line device banner (stderr) — the first thing to check on a portability bug report:
+        // which GPU was picked and which kernel tiers are live. `y`/`n` per capability + the
+        // subgroup range + shared-mem budget.
+        let yn = |b: bool| if b { "y" } else { "n" };
+        eprintln!(
+            "[infr] GPU: {} | coopmat:{} f16:{} i8dot:{} f8:{} subgroup:{}-{} shared:{}KB",
+            caps.name,
+            yn(caps.cooperative_matrix),
+            yn(caps.f16),
+            yn(caps.i8_dot),
+            yn(caps.f8_coopmat),
+            caps.subgroup_min,
+            caps.subgroup_max,
+            caps.max_shared_memory_bytes / 1024,
+        );
 
         // ── gpu-allocator ──────────────────────────────────────────────────────
         let allocator = Allocator::new(&AllocatorCreateDesc {

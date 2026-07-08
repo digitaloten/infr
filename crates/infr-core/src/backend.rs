@@ -21,8 +21,37 @@ use std::collections::HashMap;
 #[derive(Clone, Debug, Default)]
 pub struct Capabilities {
     pub name: String,
+    // ── float-precision capabilities ────────────────────────────────────────────────────────────
+    // Naming: `f16`/`f8` are the infr spelling for IEEE half / 8-bit float — SAME things as
+    // "fp16"/"fp8" elsewhere; we use `f<N>` uniformly. Two independent axes are modeled:
+    //   • ALU precision — can the device do scalar/vector math at this width? (`f16` below.)
+    //   • matrix unit    — is there a cooperative-matrix (tensor-core) unit, and which component
+    //                      types does it accept? (`cooperative_matrix` = present with the baseline
+    //                      f16 component type; `f8_coopmat` = it ALSO accepts f8 components.)
+    // f8 has NO scalar-ALU path in infr (it's a matrix-only format), so there is deliberately no
+    // bare `f8` ALU flag — the only f8 capability that matters is the coopmat one.
+    /// f16 (== fp16) scalar/vector ALU (`shaderFloat16`). Used by the non-coopmat f16 warp-tile GEMM
+    /// fallback and f16 math generally. Independent of `cooperative_matrix`.
     pub f16: bool,
+    /// A cooperative-matrix (tensor-core) unit is present, with the baseline f16 component type —
+    /// the current production GEMM primitive. Independent of the `f16` ALU flag above.
     pub cooperative_matrix: bool,
+    /// The cooperative-matrix unit ALSO accepts f8 (== fp8, E4M3/E5M2) component types — enables the
+    /// f8 coopmat GEMM tier (f8×f8→f16 accumulate). A strict superset of `cooperative_matrix`; a
+    /// device can have coopmat (f16 components) WITHOUT f8 components, so this is its own flag rather
+    /// than `cooperative_matrix && f8`. False on all pre-RDNA4 / pre-Ada hardware (RX 7900 XTX incl.).
+    pub f8_coopmat: bool,
+    /// The device advertises packed i8 (== int8) dot-product (`VK_KHR_shader_integer_dot_product` /
+    /// `dotPacked4x8AccSat`, core in Vulkan 1.3) — the decode i8 `mmv` path's dp4a accumulate.
+    /// False = no packed dot; the i8 mmv must NOT be dispatched (route to the scalar dequant
+    /// GEMV, which needs no extension). Independent of `f16`/`cooperative_matrix`.
+    pub i8_dot: bool,
+    /// Supported subgroup-size range (`VkPhysicalDeviceSubgroupSizeControlProperties`). The coopmat
+    /// GEMM pins `requiredSubgroupSize = 32` (RDNA3 wave32); a device whose range excludes 32 can't
+    /// run the pinned kernel and must fall back to a non-pinned variant. `(0, 0)` =
+    /// subgroup-size-control unsupported (can't pin at all — use the driver's default subgroup).
+    pub subgroup_min: u32,
+    pub subgroup_max: u32,
     pub max_buffer_bytes: u64,
     /// `maxComputeSharedMemorySize` — the per-workgroup shared-memory budget. Vulkan only guarantees
     /// 16 KB; RADV gives 64 KB, NVIDIA 48 KB, MoltenVK/mobile often 32 KB. The flash-attention tile

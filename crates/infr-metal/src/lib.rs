@@ -204,6 +204,12 @@ impl Backend for MetalBackend {
             name: self.device.name().to_string(),
             f16: true,
             cooperative_matrix: false,
+            // Metal simdgroup_matrix / dp4a tiers aren't wired through these Vulkan-oriented flags
+            // yet; the Metal exec arms select their own kernels. Leave off/N-A here.
+            i8_dot: false,
+            f8_coopmat: false,
+            subgroup_min: 0,
+            subgroup_max: 0,
             max_buffer_bytes: self.device.max_buffer_length(),
             // Metal's per-threadgroup memory limit (MTLDevice.maxThreadgroupMemoryLength) — the
             // analogue of Vulkan's maxComputeSharedMemorySize (typically 32 KB, 64 KB on Apple GPUs).

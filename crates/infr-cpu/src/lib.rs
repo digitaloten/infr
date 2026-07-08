@@ -298,6 +298,12 @@ impl Backend for CpuBackend {
             name: "cpu-reference".into(),
             f16: true,
             cooperative_matrix: false,
+            // The scalar interpreter has no GPU-kernel tier choice; these device-feature flags don't
+            // gate any CPU op handler (they select Vulkan/Metal shaders), so leave them off/N-A.
+            i8_dot: false,
+            f8_coopmat: false,
+            subgroup_min: 0,
+            subgroup_max: 0,
             max_buffer_bytes: u64::MAX,
             max_shared_memory_bytes: u32::MAX, // scalar interpreter: no shared-memory tiling
             unified_memory: true,
