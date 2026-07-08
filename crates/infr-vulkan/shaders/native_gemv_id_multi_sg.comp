@@ -17,7 +17,11 @@
 #extension GL_EXT_control_flow_attributes : require
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
-layout(push_constant) uniform PC { uint in_f; uint out_f; uint n_used; uint stride; uint x_per_slot; } pc;
+// `rows`: total dispatched-should-be workgroup count is rows*n_used*ceil(out_f/NR) — needed ONLY
+// to bound-check the flat index against a padding workgroup from a possibly-2-D dispatch grid.
+layout(push_constant) uniform PC {
+    uint in_f; uint out_f; uint n_used; uint stride; uint x_per_slot; uint rows;
+} pc;
 layout(binding = 0) readonly buffer WB { uint nw[]; };
 layout(binding = 1) readonly buffer XB { float x_buf[]; };
 layout(binding = 2) readonly buffer IDB { uint ids[]; };
@@ -41,7 +45,11 @@ float dqsub(uint gstart, uint xoff) {
 void main() {
     uint lane = gl_SubgroupInvocationID; // 0..31
     uint og = (pc.out_f + uint(NR) - 1u) / uint(NR); // output-row groups per (row, slot)
-    uint unit = gl_WorkGroupID.x;
+    // Flat-index recovery for a possibly-2-D dispatch grid — see linear_f16.comp's main() for why.
+    // `slot_global` drives an UNGUARDED `ids[]` read below, so this needs an explicit bound (the
+    // per-lane `o < pc.out_f` checks further down don't protect that read).
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (unit >= pc.rows * pc.n_used * og) { return; }
     uint slot_global = unit / og;                    // (row, slot) flattened — see native_gemv_id_multi
     uint o0 = (unit - slot_global * og) * uint(NR);  // first output row this workgroup owns
     uint row = slot_global / pc.n_used;

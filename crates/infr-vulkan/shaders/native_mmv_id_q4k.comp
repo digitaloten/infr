@@ -32,7 +32,11 @@ uvec2 k4(uint i, uint sb) {
 }
 
 void main() {
-    uint unit = gl_WorkGroupID.x;
+    // Flat-index recovery for a possibly-2-D dispatch grid — see linear_f16.comp's main() for why.
+    // Total dispatched-should-be count is n_used*out_f (no `rows` here — decode-only caller); a
+    // padding workgroup's `slot` would otherwise OOB-read `ids[]` and OOB-write `y_buf[]`.
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (unit >= pc.n_used * pc.out_f) { return; }
     uint slot = unit / pc.out_f;
     uint o = unit - slot * pc.out_f;
     uint t = gl_LocalInvocationID.x;

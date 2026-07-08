@@ -13,7 +13,13 @@ layout(binding = 2) buffer YB { float y[]; };              // [rows, out]
 shared float red[64];
 
 void main() {
-    uint unit = gl_WorkGroupID.x;       // = r * out_f + o
+    // Recovers the flat index from a possibly-2-D dispatch grid — the host splits into (x,y) when
+    // rows*out_f exceeds maxComputeWorkGroupCount[0] (see Recorder::dispatch_wide); this reduces
+    // to gl_WorkGroupID.x when the grid stayed 1-D. Padding workgroups from an uneven split return
+    // before `barrier()`; the guard is workgroup-uniform (unit depends only on gl_WorkGroupID), so
+    // that's safe.
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x; // = r * out_f + o
+    if (unit >= pc.rows * pc.out_f) { return; }
     uint o = unit % pc.out_f;
     uint r = unit / pc.out_f;
     uint t = gl_LocalInvocationID.x;

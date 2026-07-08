@@ -44,7 +44,12 @@ const uint EPW = 4u;
 void main() {
     uint lane = gl_SubgroupInvocationID;            // 0..31
     uint groups_per_row = (pc.out_f + NUM_ROWS - 1u) / NUM_ROWS;
-    uint unit = gl_WorkGroupID.x;
+    // Flat-index recovery for a possibly-2-D dispatch grid — see linear_f16.comp's main() for why.
+    // Unlike the `o < pc.out_f` guard already present below, a padding workgroup's ROW `r` (not
+    // just its output offset) can be out of range here, and `r` is used unguarded in the final
+    // `y_buf[r*pc.out_f+o]` index — needs an explicit check.
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (unit >= pc.rows * groups_per_row) { return; }
     uint r = unit / groups_per_row;                 // input row
     uint o0 = (unit % groups_per_row) * NUM_ROWS;   // first output row of this group
     uint xbase = r * pc.in_f;

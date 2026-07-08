@@ -44,7 +44,10 @@ float dqsub(uint gstart, uint xoff) {
 
 void main() {
     uint lane = gl_SubgroupInvocationID; // 0..31
-    uint o0 = gl_WorkGroupID.x * uint(NR);
+    // Flat-index recovery for a possibly-2-D dispatch grid — see native_gemv_rm.comp's main() for
+    // why no extra bounds check is needed here (the existing `o < pc.out_f` guards already cover
+    // a padding workgroup's out-of-range o0).
+    uint o0 = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * uint(NR);
     uint nsub = pc.in_f / 32u;
     float acc[NR];
     [[unroll]] for (uint rr = 0u; rr < uint(NR); rr++) { acc[rr] = 0.0; }

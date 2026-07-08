@@ -13,7 +13,9 @@ layout(binding = 3) buffer YB { float y[]; };              // [rows, out]
 shared float red[64];
 
 void main() {
-    uint unit = gl_WorkGroupID.x;
+    // Flat-index recovery for a possibly-2-D dispatch grid — see linear_f16.comp's main() for why.
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (unit >= pc.rows * pc.out_f) { return; }
     uint o = unit % pc.out_f;
     uint r = unit / pc.out_f;
     uint t = gl_LocalInvocationID.x;
