@@ -545,12 +545,6 @@ impl VulkanBackend {
         let f16c = vk::ComponentTypeKHR::FLOAT16;
         let has_coop_matrix =
             has_coop_ext_feat && coopmat_configs.iter().any(|&(a, b)| a == f16c && b == f16c);
-        // f32 coopmat: a config with f32 A AND B operands (f32×f32→f32) — NOT the common
-        // f16×f16→f32 accumulate (operands f16 there). Often absent (RDNA3 takes f16/bf16/i8
-        // inputs). infr has no f32 coopmat GEMM path; detected for completeness.
-        let f32c = vk::ComponentTypeKHR::FLOAT32;
-        let has_f32_coopmat =
-            has_coop_ext_feat && coopmat_configs.iter().any(|&(a, b)| a == f32c && b == f32c);
         // f8 coopmat components: any config with an operand in the extension-added ComponentTypeKHR
         // range (`as_raw() >= 1e9` — all CORE types are 0..=10: FLOAT16/FLOAT32/SINT8/…). fp8
         // (E4M3/E5M2) and any newer matrix type live there. Avoids hardcoding a specific fp8 enum
@@ -680,8 +674,6 @@ impl VulkanBackend {
 
         let caps = Capabilities {
             name: device_name,
-            f32: true, // universally available
-            f32_coopmat: has_f32_coopmat,
             f16: has_f16,
             f16_coopmat: has_coop_matrix,
             f8: has_f8_ext,
@@ -711,11 +703,9 @@ impl VulkanBackend {
         if banner_seen().lock().unwrap().insert(caps.name.clone()) {
             let yn = |b: bool| if b { "y" } else { "n" };
             eprintln!(
-                "[infr] GPU: {} | f32:{} f32cm:{} f16:{} f16cm:{} f8:{} f8cm:{} i8:{} i8dot:{} \
+                "[infr] GPU: {} | f16:{} f16cm:{} f8:{} f8cm:{} i8:{} i8dot:{} \
                  subgroup:{}-{} shared:{}KB",
                 caps.name,
-                yn(caps.f32),
-                yn(caps.f32_coopmat),
                 yn(caps.f16),
                 yn(caps.f16_coopmat),
                 yn(caps.f8),

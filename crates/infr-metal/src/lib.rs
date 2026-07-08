@@ -203,10 +203,8 @@ impl Backend for MetalBackend {
         Capabilities {
             name: self.device.name().to_string(),
             // Metal simdgroup_matrix / dp4a tiers aren't wired through these Vulkan-oriented flags
-            // yet; the Metal exec arms select their own kernels. f32/f16/i8 math is available; the
+            // yet; the Metal exec arms select their own kernels. f16/i8 math is available; the
             // matrix/dot-primitive flags are N-A → off.
-            f32: true,
-            f32_coopmat: false,
             f16: true,
             f16_coopmat: false,
             f8: false,
