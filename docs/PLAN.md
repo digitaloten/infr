@@ -329,23 +329,24 @@ Mesa 26.1.4). Context on what's already been ruled out: `docs/PERF.md` "Coopmat
 operand tiers" — on coopmat **v1**, no operand swap (fp8/bf16/int8) beats f16
 for these GEMMs. The items below are NOT yet tried.
 
-1. **`VK_NV_cooperative_matrix2` (coopmat2) — the promising one.** Verified
-   present on the RDNA4 box, but gated OFF by default (RADV driconf
-   `radv_cooperative_matrix2_nv=true` exposes it; `VK_KHR_cooperative_matrix` is
-   all that's exposed by default). Its `coopMatPerElementNV` gives each fragment
-   element WITH its (row,col) index → apply a per-block rank-1 (row·col) scale
-   **directly in-fragment**, removing the store-to-shared "rescale tax" that
-   dragged int8 coopmat from its ~2× raw rate to 0.73× vs f16 (v1 has no
-   per-element access). **Payoff:** int8 WMMA could finally beat f16 for
-   quantized-weight prefill — the win that eluded the v1 experiments, and the
-   reason llama.cpp uses dp4a instead of int8-coopmat-v1. **Before building,
-   verify tooling:** does `glslc` (shaderc 2026.2) compile
-   `GL_NV_cooperative_matrix2` / `coopMatPerElementNV`, and does `ash` expose
-   the coopmat2 device API (0.38 likely predates it — may need a newer ash or
-   hand-rolled bindings). **Caveats:** NV extension, RADV-experimental (users
-   must enable the driconf flag), NV+RADV-only → a gated fast-tier, not a
-   default. Then: retry the int8 coopmat GEMM with a coopmat2 per-element
-   descale, measure on the RDNA4 box. See [[int8-coopmat-status]].
+1. **`VK_NV_cooperative_matrix2` (coopmat2) — TESTED, negative (2026-07-09).**
+   Was the promising lead: its `coopMatPerElementNV` applies a per-block rank-1
+   (row·col) scale **in-fragment**, which should remove the store-to-shared
+   "rescale tax" that dragged int8 coopmat to 0.73× vs f16 (v1 has no
+   per-element access). Toolchain confirmed (glslc compiles
+   `GL_NV_cooperative_matrix2`; correct signature
+   `void coopMatPerElementNV(out coopmat r, coopmat m, T fn)`), feature present
+   on RDNA4 via `radv_cooperative_matrix2_nv=true`. But the probe
+   `crates/infr-vulkan/examples/coopmat2_test.rs` (per-element vs the v1
+   store-to-shared round trip) measured **coopmat2 1.96µs vs v1 1.76µs = 0.9×
+   (coopmat2 SLOWER)** on RDNA4. The rescale tax is CHEAP on this hardware (fast
+   LDS + cheap workgroup barrier — same reason removing 18 decode barriers
+   bought only ~0.4%), so per-element access doesn't help, and RADV's newer
+   coopmat2 path has its own overhead. Caveat: microbench is a single small tile
+   (~1.8µs, dispatch-heavy); a full multi-K-block int8 GEMM might differ, but
+   the signal is discouraging → NOT worth building the full GEMM unless a future
+   RADV optimizes the per-element path. Example kept as the diagnostic. See
+   [[kernel-capability-tiering]], [[int8-coopmat-status]].
 2. **`VK_NV_cooperative_vector`** — matrix×**vector** (i.e. decode / GEMV,
    infr's current perf frontier). **NOT exposed by RADV yet** (checked both
    default and driconf modes on Mesa 26.1.4). Watch for it in a future Mesa — if
