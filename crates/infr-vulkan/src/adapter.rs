@@ -819,10 +819,28 @@ fn lower_op(
                 // behavior (unset) is completely unaffected: this is a new, additive branch ahead
                 // of the existing Q4_K-mmq / warp-coopmat / off-tier arms below, which are
                 // untouched.
+                // fp8 (E4M3) cooperative-matrix (WMMA) prefill GEMM — Q8_0 only
+                // (crates/infr-vulkan/shaders/native_gemm_f8cm_q8_0.comp). `caps.f8_coopmat` is
+                // hardware enumeration only (RDNA4/Navi44 confirmed, see lib.rs `has_f8_coopmat`);
+                // this dispatch ALSO requires `INFR_F8_COOPMAT=1` (default off) because — unlike
+                // `i8cm_ok` below — this kernel hasn't been run/measured on real fp8-coopmat
+                // hardware at all yet (this dev box has none), so the opt-in stays until an RDNA4
+                // pass validates correctness. Checked AHEAD of `i8cm_ok`: both are Q8_0-only
+                // measurement tiers, so when a caller opts into fp8 it takes priority. Default
+                // behavior (unset) is completely unaffected — new, additive branch ahead of the
+                // i8cm / Q4_K-mmq / warp-coopmat / off-tier arms below, which are untouched.
+                let f8cm_ok = matches!(dt, infr_core::DType::Q8_0)
+                    && be_.caps().f8_coopmat
+                    && std::env::var("INFR_F8_COOPMAT").is_ok();
                 let i8cm_ok = matches!(dt, infr_core::DType::Q8_0)
                     && be_.caps().i8_coopmat
                     && std::env::var("INFR_I8_COOPMAT").is_ok();
-                if i8cm_ok {
+                if f8cm_ok {
+                    // fp8 conversion happens in-shader during staging — no separate quantize pass
+                    // needed (unlike i8cm's `quant_q8`), the f32 activations feed straight in, same
+                    // as the plain f16-coopmat GEMM (`native_dense_supported` arm below) does.
+                    rec.matmul_f8cm_q8_0(xb, w, w_off, out, m, in_f, out_f);
+                } else if i8cm_ok {
                     // "Idea 2" measurement (INFR_I8_ROW_SCALE=1, requires INFR_I8_COOPMAT=1 too):
                     // whole-row (block-invariant) activation scale instead of quant_q8's
                     // per-32-block scale — see native_gemm_i8cm_q8_0.comp #ifdef ROW_SCALE /

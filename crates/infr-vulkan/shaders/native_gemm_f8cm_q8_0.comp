@@ -1,0 +1,118 @@
+#version 460
+// fp8 (E4M3) cooperative-matrix (WMMA) prefill GEMM for Q8_0 weights — gated opt-in behind
+// INFR_F8_COOPMAT=1 + caps.f8_coopmat (see adapter.rs `f8cm_ok`). RDNA4 (Navi 44 / RX 9060 XT)
+// natively enumerates E4M3×E4M3 -> FLOAT32 cooperative-matrix configs at 16x16x16 (component raw
+// E4M3=1000491002, see lib.rs `CT_E4M3` / `has_f8_coopmat`). This kernel targets that config.
+// UNVALIDATED on RDNA3 (this dev box has no fp8 coopmat hardware — `caps.f8_coopmat` is false
+// here, so the gate never dispatches this kernel locally): compile-checked via glslc only, exercise
+// on RDNA4 for correctness/perf.
+//
+// Structurally this is native_gemm.comp (the f16-coopmat prefill GEMM), with `floate4m3_t`
+// operands in place of `float16_t` — NOT the int8-coopmat kernel's shape. fp8 (E4M3) is a FLOAT
+// type, so fp8×fp8 -> f32 coopmat accumulate is a DIRECT matmul: no per-block scale/rescale round
+// trip, unlike `native_gemm_i8cm_q8_0.comp`'s int8 path, which needs the `dact`/`sact`/`Ws`
+// machinery to undo int8's fixed-point per-block scale after each raw-int accumulate. Here the
+// whole K dimension accumulates straight into ONE persistent f32 coopmat accumulator per 16x16
+// sub-tile and is stored once at the end via `coopMatStore` — no manual in-fragment epilogue or
+// per-row store guard needed (unlike the int8 kernel): BM=64 matches the `mpad = ceil(m/64)*64`
+// padding convention every GEMM tier in adapter.rs already allocates for `c`, so a full-tile
+// `coopMatStore` never writes past the buffer even when `m` isn't a multiple of 64.
+//
+// Q8_0 weight elements are dequantized to f32 during shared staging via `dqblk()`
+// (native_decode.glsl, FMT_Q8_0 — decode-once-per-32-block, reused across the BM=64 row tile, the
+// same amortization native_gemm.comp already relies on for its other formats) and converted to
+// `floate4m3_t`. f32 activations (arrive as-is, no separate quantize pass — unlike the int8-coopmat
+// path's `quant_q8`) convert to `floate4m3_t` the same way during staging.
+//
+// E4M3 precision tradeoff: 3 mantissa bits (vs f16's 10) — expected to be lossy. Whether prefill
+// output stays coherent under this precision is the open question an RDNA4 run answers; this kernel
+// is deliberately correctness-first / not perf-tuned (no wide warptile, no split-K, no shared-scale
+// hoisting) so a first measurement isolates the precision question from any staging/tiling changes.
+//
+// Requires n%64==0, k%32==0. requiredSubgroupSize=32 (set at pipeline-creation time, `kernel_sg`).
+// Weight format: Q8_0 only (raw signed int8 + per-32-block f16 scale, native_decode.glsl FMT_Q8_0).
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_float_e4m3 : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+const uint BM = 64u;
+const uint BN = 64u;
+const uint BK = 32u;
+
+// w_base: element offset into the weight grid (for stacked MoE experts: expert_id * out_f * in_f).
+layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; } pc;
+layout(binding = 0) readonly buffer XBuf { float x[]; };   // [M, K] f32 activations
+layout(binding = 1) readonly buffer WBuf { uint nw[]; };   // Q8_0 weight: raw GGUF blocks (native)
+layout(binding = 2) writeonly buffer CBuf { float c[]; };
+
+shared floate4m3_t As[BM * BK];
+shared floate4m3_t Bs[BK * BN];
+
+#define FMT_Q8_0
+#include "native_decode.glsl"
+
+void main() {
+    uint tilesN = pc.n / BN;
+    uint wgRow = (gl_WorkGroupID.x / tilesN) * BM;
+    uint wgCol = (gl_WorkGroupID.x % tilesN) * BN;
+    uint sgid = gl_SubgroupID;
+    uint sgRow = (sgid / 2u) * 32u;
+    uint sgCol = (sgid % 2u) * 32u;
+    uint li = gl_LocalInvocationIndex;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc00 =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc01 = acc00;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc10 = acc00;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc11 = acc00;
+
+    for (uint k0 = 0u; k0 < pc.k; k0 += BK) {
+        // Stage BM=64 rows x BK=32 f32 activations, converted to fp8 in-place — whole workgroup
+        // (128 threads) cooperates. Zero-padded past pc.m (padding rows are never read back).
+        for (uint idx = li; idx < BM * BK; idx += 128u) {
+            uint r = idx / BK;
+            uint cc = idx % BK;
+            uint gr = wgRow + r;
+            As[idx] = (gr < pc.m) ? floate4m3_t(x[gr * pc.k + k0 + cc]) : floate4m3_t(0.0);
+        }
+        // Each thread decodes one output column's BK=32 contiguous K elements as one Q8_0 sub-block
+        // (k0 % 32 == 0 ⇒ aligned) via dqblk (dequant to f32, ONE block-scale fetch), then converts
+        // to fp8 and scatters column-major into Bs. Decode-once per column, reused by every subtile.
+        for (uint cc = li; cc < BN; cc += 128u) {
+            float v[32];
+            dqblk(pc.w_base + (wgCol + cc) * pc.k + k0, v);
+            for (uint r = 0u; r < BK; r++) { Bs[r * BN + cc] = floate4m3_t(v[r]); }
+        }
+        barrier();
+
+        for (uint kf = 0u; kf < BK; kf += 16u) {
+            coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a0;
+            coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a1;
+            coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b0;
+            coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b1;
+            coopMatLoad(a0, As, (sgRow + 0u) * BK + kf, BK, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(a1, As, (sgRow + 16u) * BK + kf, BK, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b0, Bs, kf * BN + (sgCol + 0u), BN, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b1, Bs, kf * BN + (sgCol + 16u), BN, gl_CooperativeMatrixLayoutRowMajor);
+            // Direct fp8 matmul — no per-block rescale: this accumulator carries the running sum
+            // across the WHOLE k dimension (every k0 iteration), unlike the int8 kernel's csub
+            // (which is reset every Q8_0 block because its raw int32 dot still needs a per-block
+            // float scale applied before it can be summed into the real accumulator).
+            acc00 = coopMatMulAdd(a0, b0, acc00);
+            acc01 = coopMatMulAdd(a0, b1, acc01);
+            acc10 = coopMatMulAdd(a1, b0, acc10);
+            acc11 = coopMatMulAdd(a1, b1, acc11);
+        }
+        barrier();
+    }
+
+    uint cr = wgRow + sgRow;
+    uint ccol = wgCol + sgCol;
+    coopMatStore(acc00, c, (cr + 0u) * pc.n + (ccol + 0u), pc.n, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(acc01, c, (cr + 0u) * pc.n + (ccol + 16u), pc.n, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(acc10, c, (cr + 16u) * pc.n + (ccol + 0u), pc.n, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(acc11, c, (cr + 16u) * pc.n + (ccol + 16u), pc.n, gl_CooperativeMatrixLayoutRowMajor);
+}

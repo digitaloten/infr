@@ -1260,6 +1260,47 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// fp8 (E4M3) cooperative-matrix (WMMA) prefill GEMM for Q8_0 weights — gated by the adapter
+    /// behind `INFR_F8_COOPMAT=1` + `caps.f8_coopmat` (see `native_gemm_f8cm_q8_0.comp` for the
+    /// design doc: this is structurally `matmul_native`'s 64x64/2x2-tile f16-coopmat GEMM with fp8
+    /// operands — a DIRECT matmul, no per-block rescale like `matmul_i8cm_q8_0` needs). `x` is the
+    /// f32 activation buffer as-is (no separate quantize pass — fp8 conversion happens in-shader
+    /// during staging). `c` is `ceil(m/64)*64` rows (same padding convention as `matmul_native`).
+    /// Requires `n%64==0`, `k%32==0`. Correctness UNVALIDATED on hardware without fp8 coopmat.
+    pub fn matmul_f8cm_q8_0(
+        &self,
+        x: &dyn Buffer,
+        w: &dyn Buffer,
+        w_base: usize,
+        c: &dyn Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        self.label_gemm("native_gemm_f8cm_q8_0", m, k, n);
+        let kern = self.be.kernel_sg(
+            "native_gemm_f8cm_q8_0",
+            crate::gemm::native_gemm_f8cm_q8_0_spv(),
+            3,
+            16,
+            32,
+        );
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        // BM=64/BN=64 (see the shader header): one workgroup covers 64 rows x 64 cols.
+        let groups = (m.div_ceil(64) * (n / 64)) as u32;
+        self.dispatch(
+            kern,
+            &[Self::vkb(x), Self::vkb(w), Self::vkb(c)],
+            1,
+            &push,
+            groups,
+        );
+    }
+
     /// Row-wise (whole-K) int8 activation quantize pass — int8-coopmat GEMM "Idea 2" measurement
     /// variant (see `quant_q8_row.comp` / `native_gemm_i8cm_q8_0.comp`): ONE f16 scale per row
     /// (`dact_row[m]`) instead of `quant_q8`'s per-32-block scale, coarser but block-invariant so

@@ -611,6 +611,11 @@ fn main() {
         // Row-wise activation quant for the int8-coopmat GEMM's "Idea 2" measurement (whole-K
         // scale instead of per-32-block; see quant_q8_row.comp). Gated by INFR_I8_ROW_SCALE=1.
         ("quant_q8_row", "quant_q8_row", &[]),
+        // fp8 (E4M3) coopmat prefill GEMM, Q8_0 only — gated behind INFR_F8_COOPMAT=1 +
+        // caps.f8_coopmat (RDNA4 native fp8 WMMA; see adapter.rs `f8cm_ok` / the .comp file's
+        // design doc). Default-off; correctness UNVALIDATED on this box (no fp8 coopmat hardware
+        // here — compile-checked only), pending an RDNA4 run.
+        ("native_gemm_f8cm_q8_0", "native_gemm_f8cm_q8_0", &[]),
         (
             "native_gemm_mmq_q4k",
             "native_gemm_mmq_q4k_xp",
