@@ -63,6 +63,13 @@ pub struct Capabilities {
     /// ADDITIONAL opt-in gate on top of this flag: the adapter only dispatches it when
     /// `INFR_I8_COOPMAT=1` is also set (default off) — see adapter.rs's `Op::Linear` GEMM branch.
     pub i8_coopmat: bool,
+    /// bf16 (bfloat16) scalar storage/convert support (`VK_KHR_shader_bfloat16`-class). Distinct
+    /// from `f16` (IEEE half): same 16 bits but 8 exponent / 7 mantissa. False on RDNA3.
+    pub bf16: bool,
+    /// The cooperative-matrix unit accepts bf16 components (bf16×bf16→bf16/f32) at 16x16x16.
+    /// Enumerated from the device's coopmat config list (raw `VK_COMPONENT_TYPE_BFLOAT16_KHR`,
+    /// confirmed on RDNA4/Navi44). NOT a subset of `f16_coopmat`. False on all pre-RDNA4 HW.
+    pub bf16_coopmat: bool,
     /// Supported subgroup-size range (`VkPhysicalDeviceSubgroupSizeControlProperties`). The coopmat
     /// GEMM pins `requiredSubgroupSize = 32` (RDNA3 wave32); a device whose range excludes 32 can't
     /// run the pinned kernel and must fall back to a non-pinned variant. `(0, 0)` =

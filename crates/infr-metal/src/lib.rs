@@ -212,6 +212,8 @@ impl Backend for MetalBackend {
             i8: true,
             i8_dot: false,
             i8_coopmat: false,
+            bf16: false,
+            bf16_coopmat: false,
             subgroup_min: 0,
             subgroup_max: 0,
             max_buffer_bytes: self.device.max_buffer_length(),

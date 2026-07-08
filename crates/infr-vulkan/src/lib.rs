@@ -457,6 +457,9 @@ impl VulkanBackend {
         // f8 (== fp8, E4M3/E5M2) storage/convert support. ash 0.38 has no constant for the ext, so
         // match the raw name. Absent on RDNA3 → caps.f8 false.
         let has_f8_ext = has_ext(c"VK_EXT_shader_float8");
+        // bf16 (bfloat16) storage/convert. ash 0.38 has no constant for the ext → match the raw
+        // name. Absent on RDNA3 → caps.bf16 false; present on RDNA4/Navi44.
+        let has_bf16_ext = has_ext(c"VK_KHR_shader_bfloat16");
         let has_subgroup_ext = has_ext(c"VK_KHR_shader_subgroup_extended_types");
         let has_mem_budget = has_ext(c"VK_EXT_memory_budget");
         // Lets every dispatch bind its buffers with one `cmd_push_descriptor_set` recorded
@@ -572,16 +575,28 @@ impl VulkanBackend {
             && coopmat_configs
                 .iter()
                 .any(|&(m, n, k, a, b, _, _)| (m, n, k) == CMS_TILE && a == f16c && b == f16c);
-        // f8 coopmat components: any config with an operand in the extension-added ComponentTypeKHR
-        // range (`as_raw() >= 1e9` — all CORE types are 0..=10: FLOAT16/FLOAT32/SINT8/…). fp8
-        // (E4M3/E5M2) and any newer matrix type live there. Avoids hardcoding a specific fp8 enum
-        // value (ash 0.38 predates the fp8 ComponentTypeKHR variants) — a false negative (fp8 HW we
-        // miss) is the safe mode; the fp8 GEMM tier just stays unselected. NEVER true on RDNA3.
-        // Also requires the float8 storage ext.
+        // Extension-added ComponentTypeKHR raw values (ash 0.38 predates these variants, so match by
+        // raw i32). CONFIRMED on RDNA4/Navi44 via INFR_DEBUG_COOPMAT — all CORE types are 0..=10
+        // (FLOAT16=0/FLOAT32=1/SINT8=3/UINT8=7/…), these are the KHR-standard ext values:
+        const CT_E4M3: i32 = 1_000_491_002; // VK_COMPONENT_TYPE_FLOAT_E4M3_KHR
+        const CT_E5M2: i32 = 1_000_491_003; // VK_COMPONENT_TYPE_FLOAT_E5M2_KHR
+        const CT_BF16: i32 = 1_000_141_000; // VK_COMPONENT_TYPE_BFLOAT16_KHR
+        let is_f8 = |t: i32| t == CT_E4M3 || t == CT_E5M2;
+        // f8 coopmat: a config with fp8 (E4M3/E5M2) A AND B operands at the exact 16x16x16 tile our
+        // shaders use. Uses the KHR-standard fp8 raw values (confirmed on RDNA4) rather than the
+        // older `>= 1e9` heuristic, which also matched bf16 (`CT_BF16` is ext-range too) and would
+        // false-positive f8 on a bf16-only unit. Also requires the float8 storage ext. NEVER true on
+        // RDNA3 (enumerates no fp8 config).
         let has_f8_coopmat = has_coop_ext_feat
             && has_f8_ext
-            && coopmat_configs.iter().any(|&(_, _, _, a, b, _, _)| {
-                a.as_raw() >= 1_000_000_000 || b.as_raw() >= 1_000_000_000
+            && coopmat_configs.iter().any(|&(m, n, k, a, b, _, _)| {
+                (m, n, k) == CMS_TILE && is_f8(a.as_raw()) && is_f8(b.as_raw())
+            });
+        // bf16 coopmat: BFLOAT16 A AND B operands at the 16x16x16 tile. Confirmed on RDNA4/Navi44
+        // (bf16×bf16→bf16 and →f32); RDNA3 enumerates none. Same discipline as f8/f16 above.
+        let has_bf16_coopmat = has_coop_ext_feat
+            && coopmat_configs.iter().any(|&(m, n, k, a, b, _, _)| {
+                (m, n, k) == CMS_TILE && a.as_raw() == CT_BF16 && b.as_raw() == CT_BF16
             });
         // i8 coopmat: a config with SINT8 A AND B operands and a SINT32 result, at the exact
         // 16x16x16 tile every int8 coopmat shader here uses — same discipline as `f16_coopmat`'s
@@ -610,6 +625,8 @@ impl VulkanBackend {
             has_coop_matrix && has_f16 && std::env::var("INFR_NO_COOPMAT").is_err();
         // f8 coopmat is a coopmat sub-tier, so dropping coopmat drops it too.
         let has_f8_coopmat = has_f8_coopmat && has_coop_matrix;
+        // bf16 coopmat: same coopmat sub-tier dependency (rides the coopmat device-feature enable).
+        let has_bf16_coopmat = has_bf16_coopmat && has_coop_matrix;
         // i8 coopmat rides the SAME device feature enable (coopmat_ci is only chained into
         // device_ci below when `has_coop_matrix`) — without it the extension isn't enabled on the
         // logical device even if int8 configs were enumerated, so this is a real dependency, not
@@ -765,6 +782,8 @@ impl VulkanBackend {
             i8: has_int8,
             i8_dot: has_i8_dot,
             i8_coopmat: has_i8_coopmat,
+            bf16: has_bf16_ext,
+            bf16_coopmat: has_bf16_coopmat,
             subgroup_min,
             subgroup_max,
             max_buffer_bytes: props.limits.max_storage_buffer_range as u64,
@@ -795,11 +814,13 @@ impl VulkanBackend {
         // `INFR_MTP=1` run prints exactly one banner again without needing this dedup.
         let yn = |b: bool| if b { "y" } else { "n" };
         eprintln!(
-            "[infr] GPU: {} | f16:{} f16cm:{} f8:{} f8cm:{} i8:{} i8dot:{} i8cm:{} \
+            "[infr] GPU: {} | f16:{} f16cm:{} bf16:{} bf16cm:{} f8:{} f8cm:{} i8:{} i8dot:{} i8cm:{} \
              subgroup:{}-{} shared:{}KB",
             caps.name,
             yn(caps.f16),
             yn(caps.f16_coopmat),
+            yn(caps.bf16),
+            yn(caps.bf16_coopmat),
             yn(caps.f8),
             yn(caps.f8_coopmat),
             yn(caps.i8),
