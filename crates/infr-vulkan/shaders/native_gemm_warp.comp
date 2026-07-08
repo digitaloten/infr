@@ -11,6 +11,22 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_EXT_control_flow_attributes : require
+// -DBF16CM (opt-in, RDNA4 bf16 WMMA; see adapter.rs `bf16cm_ok`): swaps the coopmat A/B operand
+// type float16_t -> bfloat16_t and drops the f16 clamp on FMT_BF16 weights — bf16 keeps its full
+// 8-bit exponent range end to end (no value narrowed to f16's tighter max-normal 65504) since the
+// weight bits (already bf16-truncated f32, an exact decode) and f32 activations both cast
+// straight to bfloat16_t instead of routing through float16_t. Every OTHER structural choice
+// (staging, tiling, A_GLOBAL, dqblk, epilogue) is untouched: CMTYPE is a pure token substitution
+// for the coopmat operand type, so the default (non-BF16CM) build is byte-identical to before
+// this existed. Replaces the old standalone native_gemm_bf16cm.comp measurement kernel (retired —
+// this is the SAME tuned production warptile as the f16-clamped native_gemm_warp_bf16, so it
+// should match that kernel's speed while keeping bf16's accuracy).
+#ifdef BF16CM
+#extension GL_EXT_bfloat16 : require
+#define CMTYPE bfloat16_t
+#else
+#define CMTYPE float16_t
+#endif
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -70,7 +86,7 @@ layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; } pc;
 // A pre-converted to f16 by the caller (one store_f16 pass, padded to the row tile): A fragments
 // coopMatLoad straight from global — no As staging, no As LDS. LDS shrinks to Bs-only
 // (~20 KB → 3 workgroups/WGP instead of 2), which is the occupancy the f32-staging tile lacks.
-layout(binding = 0) readonly buffer ABuf { float16_t a[]; }; // [Mpad, K] f16 activations
+layout(binding = 0) readonly buffer ABuf { CMTYPE a[]; }; // [Mpad, K] f16 (or bf16 under BF16CM) activations
 #else
 layout(binding = 0) readonly buffer ABuf { float a[]; };   // [M, K] f32 activations
 #endif
@@ -78,9 +94,9 @@ layout(binding = 1) readonly buffer WBuf { uint nw[]; };   // weights: raw GGUF 
 layout(binding = 2) writeonly buffer CBuf { float c[]; };
 
 #ifndef A_GLOBAL
-shared float16_t As[BM * SAK];
+shared CMTYPE As[BM * SAK];
 #endif
-shared float16_t Bs[BN * SBK];
+shared CMTYPE Bs[BN * SBK];
 
 #include "native_decode.glsl"
 
@@ -122,7 +138,7 @@ void main() {
             uint r = idx / BK;
             uint cc = idx % BK;
             uint gr = wgRow + r;
-            As[r * SAK + cc] = (gr < pc.m) ? float16_t(a[gr * pc.k + k0 + cc]) : float16_t(0.0);
+            As[r * SAK + cc] = (gr < pc.m) ? CMTYPE(a[gr * pc.k + k0 + cc]) : CMTYPE(0.0);
         }
 #endif
         // one thread per (column, 32-elem k-block) per iteration — BN·(BK/32) decode slots per
@@ -133,12 +149,12 @@ void main() {
             float v[32];
             dqblk(pc.w_base + (wgCol + cc) * pc.k + k0 + kb, v);
             [[unroll]] for (uint kk = 0u; kk < 32u; kk++) {
-                Bs[cc * SBK + kb + kk] = float16_t(v[kk]);
+                Bs[cc * SBK + kb + kk] = CMTYPE(v[kk]);
             }
         }
         barrier();
         [[unroll]] for (uint kf = 0u; kf < BK; kf += 16u) {
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> af[CMS_M];
+            coopmat<CMTYPE, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> af[CMS_M];
             [[unroll]] for (uint i = 0u; i < CMS_M; i++) {
 #ifdef A_GLOBAL
                 coopMatLoad(af[i], a, (wgRow + warp_r * WM + i * 16u) * pc.k + k0 + kf, pc.k,
@@ -149,7 +165,7 @@ void main() {
 #endif
             }
             [[unroll]] for (uint j = 0u; j < CMS_N; j++) {
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bf;
+                coopmat<CMTYPE, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bf;
                 coopMatLoad(bf, Bs, (warp_c * WN + j * 16u) * SBK + kf, SBK,
                             gl_CooperativeMatrixLayoutColumnMajor);
                 [[unroll]] for (uint i = 0u; i < CMS_M; i++) {

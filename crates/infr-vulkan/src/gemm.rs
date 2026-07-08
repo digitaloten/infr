@@ -512,20 +512,25 @@ pub(crate) fn native_gemm_f8cm_q8_0_prepack_n128_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
-/// SPIR-V for the NATIVE bf16 cooperative-matrix (WMMA) prefill GEMM, WIDE tile (BM=64xBN=256,
-/// same warptile shape as `native_gemm_warp`) — gated behind `INFR_BF16_COOPMAT=1` +
-/// `caps.bf16_coopmat` (see `native_gemm_bf16cm.comp` for the design doc).
+/// SPIR-V for the NATIVE bf16 cooperative-matrix (WMMA) variant of the production
+/// `native_gemm_warp` kernel, WIDE tile (BM=64xBN=256) — `-DFMT_BF16 -DBF16CM`, gated behind
+/// `INFR_BF16_COOPMAT=1` + `caps.bf16_coopmat` (see `native_gemm_warp.comp`'s BF16CM doc). Same
+/// tuned warptile as `native_gemm_warp_bf16_spv`'s f16-clamped path, just bf16-typed coopmat
+/// operands — replaces the old standalone `native_gemm_bf16cm.comp` measurement kernel.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_bf16cm_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_bf16cm.spv"));
+pub(crate) fn native_gemm_warp_bf16cm_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_warp_bf16cm.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
-/// SPIR-V for the bf16-coopmat GEMM's NARROW_N tile (BM=64xBN=128, BK=64) — the occupancy fix for
-/// n%128 (not n%256) shapes, mirroring `native_gemm_bf16cm_spv`.
+/// SPIR-V for the bf16-coopmat warptile's NARROW_N tile (BM=64xBN=128, BK=64) — the occupancy fix
+/// for n%128 (not n%256) shapes, mirroring `native_gemm_warp_bf16cm_spv`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_bf16cm_n128_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_bf16cm_n128.spv"));
+pub(crate) fn native_gemm_warp_bf16cm_n128_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_warp_bf16cm_n128.spv"
+    ));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }

@@ -845,18 +845,20 @@ fn lower_op(
                 let i8cm_ok = matches!(dt, infr_core::DType::Q8_0)
                     && be_.caps().i8_coopmat
                     && std::env::var("INFR_I8_COOPMAT").is_ok();
-                // NATIVE bf16 cooperative-matrix (WMMA) prefill GEMM
-                // (crates/infr-vulkan/shaders/native_gemm_bf16cm.comp). `caps.bf16_coopmat` is
-                // hardware enumeration only (RDNA4/Navi44 confirmed, see lib.rs
-                // `has_bf16_coopmat`); this dispatch ALSO requires `INFR_BF16_COOPMAT=1` (default
-                // off) because this kernel hasn't been run/measured on real bf16-coopmat hardware
-                // at all yet (this dev box has none), so the opt-in stays until an RDNA4 pass
-                // validates correctness. Default behavior (unset) is completely unaffected: Bf16
-                // keeps routing through the existing `native_dense_supported` arm below
-                // (`native_gemm_warp_bf16`, the f16-clamped path), byte-identical to before this
-                // branch existed. Shape gate mirrors `f8_wide`/`f8_narrow`: WIDE (BN=256, BK=32)
-                // needs out_f%256==0 && in_f%32==0; NARROW_N (BN=128, BK=64) needs out_f%128==0 &&
-                // in_f%64==0.
+                // NATIVE bf16 cooperative-matrix (WMMA) prefill GEMM — the `-DBF16CM` build of the
+                // SAME production kernel (crates/infr-vulkan/shaders/native_gemm_warp.comp) that
+                // `native_gemm_warp_bf16` (the f16-clamped path below) already uses; only the
+                // coopmat A/B operand type differs, so it should match that kernel's speed while
+                // keeping bf16's full exponent range. `caps.bf16_coopmat` is hardware enumeration
+                // only (RDNA4/Navi44 confirmed, see lib.rs `has_bf16_coopmat`); this dispatch ALSO
+                // requires `INFR_BF16_COOPMAT=1` (default off) because this variant hasn't been
+                // run/measured on real bf16-coopmat hardware at all yet (this dev box has none), so
+                // the opt-in stays until an RDNA4 pass validates correctness. Default behavior
+                // (unset) is completely unaffected: Bf16 keeps routing through the existing
+                // `native_dense_supported` arm below (`native_gemm_warp_bf16`, the f16-clamped
+                // path), byte-identical to before this branch existed. Shape gate mirrors
+                // `f8_wide`/`f8_narrow`: WIDE (BN=256, BK=32) needs out_f%256==0 && in_f%32==0;
+                // NARROW_N (BN=128, BK=64) needs out_f%128==0 && in_f%64==0.
                 let bf16cm_wide = out_f % 256 == 0 && in_f % 32 == 0;
                 let bf16cm_narrow = !bf16cm_wide && out_f % 128 == 0 && in_f % 64 == 0;
                 let bf16cm_ok = matches!(dt, infr_core::DType::Bf16)

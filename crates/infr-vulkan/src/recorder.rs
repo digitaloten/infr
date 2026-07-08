@@ -1318,14 +1318,18 @@ impl<'a> Recorder<'a> {
 
     /// NATIVE bf16 cooperative-matrix (WMMA) prefill GEMM: `c = a · Wᵀ`, `a` f32 activations, `w`
     /// raw bf16 weight (native_decode.glsl FMT_BF16), gated by the adapter behind
-    /// `INFR_BF16_COOPMAT=1` + `caps.bf16_coopmat` (see `native_gemm_bf16cm.comp` for the design
-    /// doc: the SAME 256-thread/8-warp warptile as `native_gemm_warp`'s f16 GEMM, bf16-typed — a
-    /// DIRECT matmul, f32 accumulate, no scaling/descale epilogue since bf16 shares f32's exponent
-    /// range). `c` is `ceil(m/64)*64` rows (same padding convention as `matmul_native`). Picks the
-    /// WIDE (BN=256, BK=32) tile when `n%256==0`, else the NARROW_N (BN=128, BK=64) tile — mirrors
-    /// `matmul_f8cm_q8_0`'s wide/narrow pick; the caller (adapter.rs `bf16cm_ok`) already checked
-    /// shape eligibility for one of these before calling in. Requires `k%32==0` (wide) or
-    /// `k%64==0` (narrow). Correctness UNVALIDATED on hardware without bf16 coopmat.
+    /// `INFR_BF16_COOPMAT=1` + `caps.bf16_coopmat`. This is the `-DBF16CM` build of the SAME
+    /// production `native_gemm_warp.comp` kernel `native_gemm_warp_bf16` (the f16-clamped path)
+    /// uses — only the coopmat A/B operand type differs (bfloat16_t, no f16 clamp on FMT_BF16
+    /// weights); staging/tiling/epilogue are byte-for-byte the same tuned warptile, so this should
+    /// match `native_gemm_warp_bf16`'s speed while keeping bf16's full exponent range (see
+    /// `native_gemm_warp.comp`'s BF16CM doc). `c` is `ceil(m/64)*64` rows (same padding convention
+    /// as `matmul_native`). Picks the WIDE (BN=256, BK=32) tile when `n%256==0`, else the NARROW_N
+    /// (BN=128, BK=64) tile — mirrors `matmul_f8cm_q8_0`'s wide/narrow pick; the caller
+    /// (adapter.rs `bf16cm_ok`) already checked shape eligibility for one of these before calling
+    /// in. Requires `k%32==0` (wide) or `k%64==0` (narrow). No A_GLOBAL variant (mirrors
+    /// `native_gemm_warp_bf16`, which also has none). Correctness UNVALIDATED on hardware without
+    /// bf16 coopmat.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_bf16cm(
         &self,
@@ -1340,14 +1344,14 @@ impl<'a> Recorder<'a> {
         let wide = n.is_multiple_of(256);
         let (name, spv, bn) = if wide {
             (
-                "native_gemm_bf16cm",
-                crate::gemm::native_gemm_bf16cm_spv(),
+                "native_gemm_warp_bf16cm",
+                crate::gemm::native_gemm_warp_bf16cm_spv(),
                 256,
             )
         } else {
             (
-                "native_gemm_bf16cm_n128",
-                crate::gemm::native_gemm_bf16cm_n128_spv(),
+                "native_gemm_warp_bf16cm_n128",
+                crate::gemm::native_gemm_warp_bf16cm_n128_spv(),
                 128,
             )
         };
