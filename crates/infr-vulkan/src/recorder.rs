@@ -1248,7 +1248,12 @@ impl<'a> Recorder<'a> {
         let groups = (m.div_ceil(128) * (n / 16)) as u32;
         self.dispatch(
             kern,
-            &[Self::vkb(qa), Self::vkb(dact_row), Self::vkb(w), Self::vkb(c)],
+            &[
+                Self::vkb(qa),
+                Self::vkb(dact_row),
+                Self::vkb(w),
+                Self::vkb(c),
+            ],
             1,
             &push,
             groups,
@@ -1260,7 +1265,14 @@ impl<'a> Recorder<'a> {
     /// (`dact_row[m]`) instead of `quant_q8`'s per-32-block scale, coarser but block-invariant so
     /// the i8cm kernel can pull it out of its per-block sum. Gated by `INFR_I8_ROW_SCALE=1`; used
     /// only by the int8-coopmat GEMM path, `quant_q8` (every other int8 kernel) is untouched.
-    pub fn quant_q8_row(&self, a: &dyn Buffer, qa: &dyn Buffer, dact_row: &dyn Buffer, m: usize, k: usize) {
+    pub fn quant_q8_row(
+        &self,
+        a: &dyn Buffer,
+        qa: &dyn Buffer,
+        dact_row: &dyn Buffer,
+        m: usize,
+        k: usize,
+    ) {
         let kq = self
             .be
             .kernel_sg("quant_q8_row", crate::gemm::quant_q8_row_spv(), 3, 8, 32);
