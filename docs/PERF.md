@@ -426,7 +426,13 @@ re-open without a native-low-bit model.**
   it preserves bf16's exponent range instead of clamping to f16 (max 65504),
   which matters only for bf16 models with out-of-f16-range values; in-range
   models already run fine on the default f16-clamp path (which even has more
-  mantissa). Kept as an opt-in faithful path.
+  mantissa). Kept as an opt-in faithful path. **Memory-access gotcha
+  (measured):** reading the bf16 weights as a native `bfloat16_t[]` SSBO (16-bit
+  loads, "no conversion") ran **~27% SLOWER** (pp512 6109→4448) than staging
+  them via the `dqblk` path that reads 32-bit words (`uint nw[]`, 2 bf16/word)
+  and does the bitcast in ALU — narrow 16-bit loads don't coalesce on RADV. Read
+  packed 16-bit weights as 32-bit words + ALU-extract, never as a native 16-bit
+  array (same reason the f16 GEMM reads `uint nw[]`).
 - **Why no 8-bit operand swap wins:** on Vulkan/AMD, low-bit-float weights have
   no native matmul — you always dequant/convert to the WMMA operand type first,
   and RDNA4's fp8/int8 WMMA doesn't out-rate f16 on inference-shaped GEMMs.
