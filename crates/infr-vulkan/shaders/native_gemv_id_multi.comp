@@ -9,10 +9,11 @@
 // Small-batch MoE fast path (Vulkan pp4@d4096 perf slice): the caller can widen this to `rows`
 // tokens in ONE dispatch by treating `ids`/`wts`/`y` as `[rows, n_used, ...]` flat and dispatching
 // `rows*n_used*out_f` workgroups — `slot` below is really a flat `(row, slot)` index (`slot_global`)
-// and gets split back into `row`/`slot` using `pc.n_used` (the per-row expert count); no separate
-// `rows` push constant is needed since the shader never needs the row COUNT, only the per-row
-// stride (`pc.n_used`). `rows == 1` (decode) reduces to the original single-token addressing exactly
-// (row is always 0). See `Op::MoeFfn`'s small-m branch in `adapter.rs`.
+// and gets split back into `row`/`slot` using `pc.n_used` (the per-row expert count). `pc.rows`
+// itself is used ONLY to bound-check the flat index against the possibly-2-D dispatch grid's
+// padding workgroups (see main()) — the addressing math still never needs the row count.
+// `rows == 1` (decode) reduces to the original single-token addressing exactly (row is always 0).
+// See `Op::MoeFfn`'s small-m branch in `adapter.rs`.
 // Reduction: subgroupAdd within each wave + one shared combine across the gl_NumSubgroups waves,
 // one barrier total, wave-size-agnostic (no pinned subgroup size) — same pattern as rmsnorm.comp /
 // mul_mat_vec_q.comp; see native_gemv_mrow.comp for why the m=1 native_gemv keeps its tree.
@@ -20,7 +21,11 @@
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
-layout(push_constant) uniform PC { uint in_f; uint out_f; uint n_used; uint stride; uint x_per_slot; } pc;
+// `rows`: total dispatched-should-be workgroup count is rows*n_used*out_f — needed ONLY to bound-
+// check the flat index against a padding workgroup from a possibly-2-D dispatch grid (see main()).
+layout(push_constant) uniform PC {
+    uint in_f; uint out_f; uint n_used; uint stride; uint x_per_slot; uint rows;
+} pc;
 layout(binding = 0) readonly buffer WB { uint nw[]; };
 layout(binding = 1) readonly buffer XB { float x_buf[]; };
 layout(binding = 2) readonly buffer IDB { uint ids[]; };
@@ -39,7 +44,11 @@ float dqsub(uint gstart, uint xoff) {
 }
 
 void main() {
-    uint unit = gl_WorkGroupID.x;
+    // Flat-index recovery for a possibly-2-D dispatch grid — see linear_f16.comp's main() for why.
+    // `slot_global` (and the `ids[]` read it drives) can go out of range for a padding workgroup,
+    // so this needs an explicit bound (unlike native_gemv_rm/sg's per-output-only guard).
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (unit >= pc.rows * pc.n_used * pc.out_f) { return; }
     uint slot_global = unit / pc.out_f; // (row, slot) flattened — see the small-batch note above
     uint o = unit - slot_global * pc.out_f;
     uint row = slot_global / pc.n_used;

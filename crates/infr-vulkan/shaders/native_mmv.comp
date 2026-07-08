@@ -142,7 +142,15 @@ float dpsub(uint gelem, uint qaw[8], float da, float sa) {
 #endif
 
 void main() {
-    uint o0 = gl_WorkGroupID.x * 2u;
+    // Flat-index recovery for a possibly-2-D dispatch grid (host splits into (x,y) when
+    // ceil(out_f/2) exceeds maxComputeWorkGroupCount[0] — see Recorder::dispatch_wide); reduces to
+    // gl_WorkGroupID.x when 1-D. Unlike native_gemv_rm/sg, this kernel's `y_buf[o0]` write below is
+    // NOT individually guarded (only the tail `o0+1` is, via `has1`) — the host previously
+    // guaranteed o0 < out_f by dispatching exactly ceil(out_f/2) groups, so a padding workgroup
+    // from an uneven 2-D split needs an explicit early return here (workgroup-uniform, safe before
+    // the barrier() below).
+    uint o0 = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * 2u;
+    if (o0 >= pc.out_f) { return; }
     uint t = gl_LocalInvocationID.x;
     uint nsub = pc.in_f / 32u;
     uint wb0 = pc.w_base + o0 * pc.in_f;

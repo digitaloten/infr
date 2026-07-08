@@ -36,7 +36,11 @@ shared float part[MR * MAX_SG];     // one partial per (row, subgroup)
 #include "native_decode.glsl"
 
 void main() {
-    uint o = gl_WorkGroupID.x; // grid = out_f: one workgroup per output, ALL rows
+    // Flat-index recovery for a possibly-2-D dispatch grid — see native_mmv.comp's main() for why
+    // an explicit early return is needed (the final `y_buf[...+o]` write below is unconditional on
+    // o, unlike native_gemv_rm/sg's per-output-guarded writes).
+    uint o = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x; // grid = out_f: one wg/output
+    if (o >= pc.out_f) { return; }
     uint t = gl_LocalInvocationID.x;
     uint wbase = pc.w_base + o * pc.in_f;
     uint nsub = pc.in_f / 32u;

@@ -25,9 +25,15 @@ layout(binding = 2) buffer YB { float y[]; };              // [rows, out]
 shared float red[64 * MROW];
 
 void main() {
+    // Flat-index recovery for a possibly-2-D dispatch grid — see linear_f16.comp's main() for why.
+    // Grid = out_f * ceil(rows/MROW): a padding workgroup from an uneven split has unit >=
+    // out_f*ceil(rows/MROW), which is caught below.
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint row_groups = (pc.rows + uint(MROW) - 1u) / uint(MROW);
+    if (unit >= pc.out_f * row_groups) { return; }
     uint nv = pc.in_f / 4u;
-    uint o = gl_WorkGroupID.x % pc.out_f;
-    uint r0 = (gl_WorkGroupID.x / pc.out_f) * uint(MROW);
+    uint o = unit % pc.out_f;
+    uint r0 = (unit / pc.out_f) * uint(MROW);
     uint t = gl_LocalInvocationID.x;
     uint wbase = o * nv;
     vec4 acc[MROW];
@@ -65,8 +71,12 @@ void main() {
 shared float red[64 * MROW];
 
 void main() {
-    uint o = gl_WorkGroupID.x % pc.out_f;
-    uint r0 = (gl_WorkGroupID.x / pc.out_f) * uint(MROW);
+    // Flat-index recovery for a possibly-2-D dispatch grid — see linear_f16.comp's main() for why.
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint row_groups = (pc.rows + uint(MROW) - 1u) / uint(MROW);
+    if (unit >= pc.out_f * row_groups) { return; }
+    uint o = unit % pc.out_f;
+    uint r0 = (unit / pc.out_f) * uint(MROW);
     uint t = gl_LocalInvocationID.x;
     uint wbase = o * pc.in_f;
     float acc[MROW];
@@ -97,7 +107,9 @@ void main() {
 shared float red[64];
 
 void main() {
-    uint unit = gl_WorkGroupID.x;       // = r * out_f + o
+    // Flat-index recovery for a possibly-2-D dispatch grid — see linear_f16.comp's main() for why.
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x; // = r * out_f + o
+    if (unit >= pc.rows * pc.out_f) { return; }
     uint o = unit % pc.out_f;
     uint r = unit / pc.out_f;
     uint t = gl_LocalInvocationID.x;

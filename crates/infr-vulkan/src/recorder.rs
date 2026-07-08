@@ -450,30 +450,35 @@ impl<'a> Recorder<'a> {
         drop(dw);
         drop(dr);
         if raw || waw || war {
-            let mb = vk::MemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(
-                    vk::AccessFlags::SHADER_READ
-                        | vk::AccessFlags::SHADER_WRITE
-                        | vk::AccessFlags::TRANSFER_READ
-                        | vk::AccessFlags::TRANSFER_WRITE,
-                );
-            // Only widen the (expensive) stage mask to TRANSFER when a copy is actually on the
-            // producing or consuming side — most barriers are pure compute→compute.
+            // Access flags must only name flags supported by a stage present in the paired stage
+            // mask (VUID-vkCmdPipelineBarrier-srcAccessMask-02815 / -dstAccessMask-02816) — e.g.
+            // TRANSFER_WRITE/TRANSFER_READ are only valid alongside PipelineStageFlags::TRANSFER.
+            // The old code set the access masks unconditionally (always including the TRANSFER
+            // bits) while only conditionally widening the STAGE masks, so a pure compute→compute
+            // barrier (the common case) claimed TRANSFER_WRITE/TRANSFER_READ access against a
+            // COMPUTE_SHADER-only stage mask — a real spec violation RADV tolerates but Intel's
+            // Mesa ANV validation layer (and, per spec, any conformant driver) rejects. Build both
+            // masks from the SAME conditions so they can never drift apart again.
             let mut src = vk::PipelineStageFlags::COMPUTE_SHADER;
+            let mut src_access = vk::AccessFlags::SHADER_WRITE;
             if self.dirty_transfer.get() {
                 src |= vk::PipelineStageFlags::TRANSFER;
+                src_access |= vk::AccessFlags::TRANSFER_WRITE;
             }
             let mut dst = vk::PipelineStageFlags::COMPUTE_SHADER;
+            let mut dst_access = vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE;
             if dst_transfer {
                 dst |= vk::PipelineStageFlags::TRANSFER;
+                dst_access |= vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE;
             }
-            let mut mb = mb;
             if self.indirect_pending.get() {
                 // The consumer reads GPU-written dispatch args: cover the indirect-command read.
                 dst |= vk::PipelineStageFlags::DRAW_INDIRECT;
-                mb.dst_access_mask |= vk::AccessFlags::INDIRECT_COMMAND_READ;
+                dst_access |= vk::AccessFlags::INDIRECT_COMMAND_READ;
             }
+            let mb = vk::MemoryBarrier::default()
+                .src_access_mask(src_access)
+                .dst_access_mask(dst_access);
             unsafe {
                 self.be.shared.device.cmd_pipeline_barrier(
                     self.cmd,
@@ -505,6 +510,46 @@ impl<'a> Recorder<'a> {
         groups: u32,
     ) {
         self.dispatch3(k, buffers, n_out, push, groups, 1, 1);
+    }
+
+    /// The spec-guaranteed-minimum `VkPhysicalDeviceLimits::maxComputeWorkGroupCount[0]` (every
+    /// conformant Vulkan implementation supports at least this many workgroups in dimension 0).
+    /// Used as the safe split point below rather than threading the ACTUAL queried device limit
+    /// through every GEMV call site — RDNA3/most desktop GPUs report a much larger x-limit, but an
+    /// Intel A770 (Mesa ANV) enforces exactly the guaranteed minimum, and a wide GEMV (a
+    /// ~150k-vocab lm_head, or `rows * gate_up_intermediate` at multi-row prefill) can dispatch
+    /// past it in one dimension — the segfault-adjacent bug this splits around.
+    const MAX_GROUP_COUNT_X: u32 = 65_535;
+
+    /// Dispatch a FLAT `n`-workgroup 1-D grid, splitting into a safe 2-D grid
+    /// (`MAX_GROUP_COUNT_X` × `ceil(n / MAX_GROUP_COUNT_X)`) whenever `n` would otherwise exceed
+    /// the guaranteed limit. Every paired shader recovers the flat index as
+    /// `gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x` (identical to `gl_WorkGroupID.x`
+    /// when `gy == 1`, i.e. a total no-op for every dispatch that already fit in one dimension —
+    /// which is every dispatch on hardware/models exercised so far) and bounds-checks it against
+    /// the true element count, since `gx * gy` can overshoot `n` when `n` isn't a multiple of
+    /// `gx` — those padding workgroups must return immediately without touching any buffer.
+    fn dispatch_wide(
+        &self,
+        k: ComputeKernel,
+        buffers: &[vk::Buffer],
+        n_out: usize,
+        push: &[u8],
+        n: u32,
+    ) {
+        if n <= Self::MAX_GROUP_COUNT_X {
+            self.dispatch3(k, buffers, n_out, push, n, 1, 1);
+        } else {
+            let gy = n.div_ceil(Self::MAX_GROUP_COUNT_X);
+            if std::env::var("INFR_DEBUG_WIDE_DISPATCH").is_ok() {
+                eprintln!(
+                    "[infr] dispatch_wide SPLIT kernel={:?} n={n} -> gx={} gy={gy}",
+                    k.name,
+                    Self::MAX_GROUP_COUNT_X
+                );
+            }
+            self.dispatch3(k, buffers, n_out, push, Self::MAX_GROUP_COUNT_X, gy, 1);
+        }
     }
 
     /// Bind `k`'s pipeline and all of `buffers` to descriptor set 0. `VK_KHR_push_descriptor`
@@ -667,7 +712,7 @@ impl<'a> Recorder<'a> {
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(w), Self::vkb(x), Self::vkb(y)],
             1,
@@ -700,7 +745,7 @@ impl<'a> Recorder<'a> {
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(w), Self::vkb(x), Self::vkb(y)],
             1,
@@ -765,7 +810,7 @@ impl<'a> Recorder<'a> {
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(w), Self::vkb(x), Self::vkb(y)],
             1,
@@ -1277,14 +1322,14 @@ impl<'a> Recorder<'a> {
                     self.be
                         .kernel_sg(name, crate::gemm::mul_mat_vec_q_spv(bits, false), 5, 20, 32);
                 let groups = (out_f as u32).div_ceil(MMV_NUM_ROWS);
-                self.dispatch(k, &bufs, 1, &push, rows as u32 * groups);
+                self.dispatch_wide(k, &bufs, 1, &push, rows as u32 * groups);
                 return;
             }
         }
         let k = self
             .be
             .kernel("linear_q", crate::gemm::linear_q_spv(), 5, 20);
-        self.dispatch(k, &bufs, 1, &push, (rows * out_f) as u32);
+        self.dispatch_wide(k, &bufs, 1, &push, (rows * out_f) as u32);
     }
 
     /// Native-block dequant GEMV `y = x·Wᵀ`. Raw GGUF block bytes in `w` (padded
@@ -1329,7 +1374,7 @@ impl<'a> Recorder<'a> {
                     push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
                     push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
                     push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
-                    self.dispatch(
+                    self.dispatch_wide(
                         k,
                         &[Self::vkb(w), Self::vkb(x), Self::vkb(y)],
                         1,
@@ -1351,7 +1396,7 @@ impl<'a> Recorder<'a> {
                     push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
                     push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
                     push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
-                    self.dispatch(
+                    self.dispatch_wide(
                         k,
                         &[Self::vkb(w), Self::vkb(x), Self::vkb(y)],
                         1,
@@ -1371,7 +1416,7 @@ impl<'a> Recorder<'a> {
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(w), Self::vkb(x), Self::vkb(y)],
             1,
@@ -1408,7 +1453,7 @@ impl<'a> Recorder<'a> {
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(w), Self::vkb(x), Self::vkb(y)],
             1,
@@ -1459,7 +1504,7 @@ impl<'a> Recorder<'a> {
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[
                 Self::vkb(w),
@@ -1503,7 +1548,7 @@ impl<'a> Recorder<'a> {
             if let Some(nr) = native_sg_choice(dtype, in_f, out_f) {
                 if let Some((name, spv)) = crate::gemm::native_sg_build_spv(dtype, true, nr) {
                     let k = self.be.kernel_sg(name, spv, 4, 16, 32);
-                    self.dispatch(k, &bufs, 1, &push, (out_f as u32).div_ceil(nr));
+                    self.dispatch_wide(k, &bufs, 1, &push, (out_f as u32).div_ceil(nr));
                     return;
                 }
             }
@@ -1513,7 +1558,7 @@ impl<'a> Recorder<'a> {
             if let Some(rm) = native_rm_choice(dtype, out_f) {
                 if let Some((name, spv)) = crate::gemm::native_rm_build_spv(dtype, true, rm) {
                     let k = self.be.kernel(name, spv, 4, 16);
-                    self.dispatch(k, &bufs, 1, &push, (out_f as u32).div_ceil(rm));
+                    self.dispatch_wide(k, &bufs, 1, &push, (out_f as u32).div_ceil(rm));
                     return;
                 }
             }
@@ -1521,7 +1566,7 @@ impl<'a> Recorder<'a> {
         let name = crate::linear::native_kernel_name(dtype, true);
         let spv = crate::gemm::native_build_spv(dtype, true).expect("native GEMV spv");
         let k = self.be.kernel(name, spv, 4, 16);
-        self.dispatch(k, &bufs, 1, &push, (rows * out_f) as u32);
+        self.dispatch_wide(k, &bufs, 1, &push, (rows * out_f) as u32);
     }
 
     /// Gather + dequantize embedding rows (`Op::EmbedGather`): `dst[r,:] = table[ids[r],:] *
@@ -1580,7 +1625,7 @@ impl<'a> Recorder<'a> {
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[
                 Self::vkb(w),
@@ -1618,7 +1663,7 @@ impl<'a> Recorder<'a> {
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
         // push[12..16] = w_base, 0 (the residual GEMV never reads stacked experts).
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[
                 Self::vkb(w),
@@ -1675,14 +1720,14 @@ impl<'a> Recorder<'a> {
                     self.be
                         .kernel_sg(name, crate::gemm::mul_mat_vec_q_spv(bits, true), 6, 20, 32);
                 let groups = (out_f as u32).div_ceil(MMV_NUM_ROWS);
-                self.dispatch(k, &bufs, 1, &push, rows as u32 * groups);
+                self.dispatch_wide(k, &bufs, 1, &push, rows as u32 * groups);
                 return;
             }
         }
         let k = self
             .be
             .kernel("linear_res_q", crate::gemm::linear_res_q_spv(), 6, 20);
-        self.dispatch(k, &bufs, 1, &push, (rows * out_f) as u32);
+        self.dispatch_wide(k, &bufs, 1, &push, (rows * out_f) as u32);
     }
 
     /// `y = residual + x·Wᵀ` (fused residual add). `residual` and `y` may be the same buffer.
@@ -1704,7 +1749,7 @@ impl<'a> Recorder<'a> {
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[
                 Self::vkb(w),
@@ -2999,8 +3044,17 @@ impl<'a> Recorder<'a> {
         } else {
             ("attn_partial_dynac", crate::gemm::attn_partial_dynac_spv())
         };
-        let k1 = self.be.kernel_sg(p1name, p1spv, 7, 36, 32);
-        let mut p1 = [0u8; 36];
+        // attn_partial.comp's `layout(push_constant) uniform PC {...}` block is declared
+        // UNCONDITIONALLY (11 x 4-byte members = 44 bytes) — `pos`/`rows` (offsets 36..44) are
+        // dead code under `-DUSE_PARAMS` (never read in the compiled SPIR-V for this variant, see
+        // the shader's `#ifdef USE_PARAMS` guard), so a range of 36 looked sufficient. It isn't:
+        // vkCreateComputePipelines validates the pipeline layout's range against the shader's
+        // declared Block SIZE, not per-member static use (VUID-VkComputePipelineCreateInfo-layout-
+        // 10069 — confirmed firing on the 7900 XTX under validation layers: "push constant buffer
+        // Block with range [0, 44] which is outside the VkPushConstantRange of [0, 36]"). The
+        // range must cover the full declared block; the trailing 8 bytes stay zero and unread.
+        let k1 = self.be.kernel_sg(p1name, p1spv, 7, 44, 32);
+        let mut p1 = [0u8; 44];
         p1[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
         p1[8..12].copy_from_slice(&(nkv as u32).to_ne_bytes());
         p1[12..16].copy_from_slice(&(hd as u32).to_ne_bytes());
@@ -3081,8 +3135,12 @@ impl<'a> Recorder<'a> {
         } else {
             ("attn_partial_dyn", crate::gemm::attn_partial_dyn_spv())
         };
-        let k1 = self.be.kernel_sg(p1name, p1spv, 7, 32, 32);
-        let mut p1 = [0u8; 32];
+        // Same fix as `attention_kv_split_dynac` above: attn_partial.comp's PC block is always 44
+        // bytes; a shorter declared range (32, here) fails
+        // VUID-VkComputePipelineCreateInfo-layout-10069 even though `cap`/`pos`/`rows` are dead
+        // code in this (`-DUSE_PARAMS`, no `-DSELF_CHUNK`) variant.
+        let k1 = self.be.kernel_sg(p1name, p1spv, 7, 44, 32);
+        let mut p1 = [0u8; 44];
         // [0..4] kv_len: unused (from params)
         p1[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
         p1[8..12].copy_from_slice(&(nkv as u32).to_ne_bytes());
@@ -4283,7 +4341,7 @@ impl<'a> Recorder<'a> {
         push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(slot as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(stride as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(w), Self::vkb(x), Self::vkb(ids), Self::vkb(y)],
             1,
@@ -4317,12 +4375,17 @@ impl<'a> Recorder<'a> {
         out_f: usize,
         rows: usize,
     ) {
-        let mut push = [0u8; 20];
+        // `rows` (push[20..24]) is used by the shader ONLY to bound-check the flat workgroup index
+        // against the padding workgroups a possibly-2-D dispatch grid can add (see
+        // native_gemv_id_multi.comp/native_gemv_id_multi_sg.comp's main()) — the addressing math
+        // itself never needed the row count, only `n_used` (see the shaders' doc comments).
+        let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(in_f as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(out_f as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(n_used as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(stride as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(x_per_slot as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&(rows as u32).to_ne_bytes());
         let bufs = [Self::vkb(w), Self::vkb(x), Self::vkb(ids), Self::vkb(y)];
         // Reassociation-tolerant subgroup route (m=1 decode, Q6_K/Q5_K expert down-projection band) —
         // takes precedence over the tree id kernel where it saturates DRAM better. Decode only
@@ -4330,19 +4393,19 @@ impl<'a> Recorder<'a> {
         if rows == 1 {
             if let Some(nr) = native_id_sg_choice(dtype, in_f, out_f) {
                 if let Some((name, spv)) = crate::gemm::native_idm_sg_build_spv(dtype, nr) {
-                    let k = self.be.kernel_sg(name, spv, 4, 20, 32);
+                    let k = self.be.kernel_sg(name, spv, 4, 24, 32);
                     // grid = n_used slots × ceil(out_f/NR) output-groups per slot (the shader splits
                     // its flat workgroup id back into slot / o0 using this same per-slot group count).
                     let groups = (n_used * out_f.div_ceil(nr as usize)) as u32;
-                    self.dispatch(k, &bufs, 1, &push, groups);
+                    self.dispatch_wide(k, &bufs, 1, &push, groups);
                     return;
                 }
             }
         }
         let name = crate::linear::native_idm_kernel_name(dtype).expect("native idm kernel");
         let spv = crate::gemm::native_idm_build_spv(dtype).expect("native idm spv");
-        let k = self.be.kernel(name, spv, 4, 20);
-        self.dispatch(k, &bufs, 1, &push, (rows * n_used * out_f) as u32);
+        let k = self.be.kernel(name, spv, 4, 24);
+        self.dispatch_wide(k, &bufs, 1, &push, (rows * n_used * out_f) as u32);
     }
 
     /// Quantize f32 activations `a` [m,k] → int8 `qa` [m,k] + per-32-block f16 `dact`/`sact`
@@ -4405,7 +4468,7 @@ impl<'a> Recorder<'a> {
         push[4..8].copy_from_slice(&(out_f as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(n_used as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(stride as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[
                 Self::vkb(w),

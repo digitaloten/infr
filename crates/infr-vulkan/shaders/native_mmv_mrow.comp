@@ -152,7 +152,10 @@ void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
 shared float part4[4u * MR * 16u];   // [out, row, lane]
 
 void main() {
-    uint o0 = gl_WorkGroupID.x * 4u;
+    // Flat-index recovery for a possibly-2-D dispatch grid — see native_gemv_rm.comp's main() for
+    // why no extra bounds check is needed here (the existing `live` guard below already covers a
+    // padding workgroup's out-of-range o0 for every lane).
+    uint o0 = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * 4u;
     uint t = gl_LocalInvocationID.x;
     uint ot = t >> 4u;               // which of the 4 outputs this lane serves
     uint sl = t & 15u;               // K sub-lane within the output's 16
@@ -219,7 +222,11 @@ void main() {
 }
 #else
 void main() {
-    uint o0 = gl_WorkGroupID.x * 2u;
+    // Flat-index recovery for a possibly-2-D dispatch grid — see native_mmv.comp's main() for why
+    // an explicit early return is needed here (the final `y_buf[t*pc.out_f + o0]` write below is
+    // unconditional on o0, unlike the OUTS4 variant above).
+    uint o0 = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * 2u;
+    if (o0 >= pc.out_f) { return; }
     uint t = gl_LocalInvocationID.x;
     uint nsub = pc.in_f / 32u;
     uint in_fq = pc.in_f >> 4u;      // activation row stride in packed uvec4s
