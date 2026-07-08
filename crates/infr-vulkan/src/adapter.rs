@@ -771,14 +771,14 @@ fn lower_op(
             // GEMM) dispatches ONLY coopmat SPIR-V — RADV still executes it on hardware without
             // the feature (silent, no fault), so gating is required, not optional (issue: coopmat
             // dispatch on a device that lacks VK_KHR_cooperative_matrix segfaults on some
-            // drivers). `!caps.cooperative_matrix` routes to the `else` arms below instead
+            // drivers). `!caps.f16_coopmat` routes to the `else` arms below instead
             // (`linear_native_off`/`linear`/`linear_f32` — the SAME scalar dequant-in-shader
             // kernels the m==1 decode GEMV already uses, generalized to `rows=m`; they dispatch
             // `rows*out_f` (or row-tiled) workgroups with no upper bound on `rows`, so they are a
             // drop-in, just without the coopmat tile's weight-reuse-across-64-rows win). This is
             // the coopmat->scalar fallback tier; bit-identical to before when caps are all true.
             let is_gemm = gemm_ok
-                && be_.caps().cooperative_matrix
+                && be_.caps().f16_coopmat
                 && (native_dense_supported(dt) || matches!(dt, infr_core::DType::F16));
             if is_gemm {
                 // GEMM writes ceil(m/64)*64 rows. Internal `dst` is row-padded → write direct;
@@ -1552,7 +1552,7 @@ fn lower_op(
                     .unwrap_or(24);
                 // attn_flash*/attn_qk*/attn_pv* are ALL coopmat SPIR-V (see the module doc / audit
                 // for this fallback ladder) — `flash_ok`/`nonfa_ok` additionally require
-                // `caps.cooperative_matrix` so a device without the feature never gets one
+                // `caps.f16_coopmat` so a device without the feature never gets one
                 // dispatched (RADV silently executes coopmat SPIR-V even with the feature bit
                 // off, so "it ran" isn't proof; other drivers fault). Gated false, both fall
                 // through to `split_ok`/the final `else` — `attention_kv_split`/`attention_kv`,
@@ -1563,7 +1563,7 @@ fn lower_op(
                     && matches!(mask, AttnMask::Causal)
                     && (*scale - 1.0 / (hd as f32).sqrt()).abs() < 1e-6
                     && !(k_q8_eff || v_q8_eff)
-                    && be_.caps().cooperative_matrix
+                    && be_.caps().f16_coopmat
                     && matches!(graph.tensors[q.0 as usize].kind, TensorKind::Internal)
                     && matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal);
                 // Prefill at hd≠128 (qwen35/gemma hd=256): the non-FA coopmat pipeline
@@ -1586,7 +1586,7 @@ fn lower_op(
                     && hd % 64 == 0
                     && hd <= 512
                     && !(k_q8_eff || v_q8_eff)
-                    && be_.caps().cooperative_matrix
+                    && be_.caps().f16_coopmat
                     && matches!(graph.tensors[q.0 as usize].kind, TensorKind::Internal)
                     && matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal);
                 // Decode (rows==1) AND small-m suffix prefill (rows 2..63, below the flash/nonfa
@@ -1911,14 +1911,11 @@ fn lower_op(
             let chunked = rows_ >= 32 && std::env::var("INFR_NO_DN_CHUNK").is_err();
             // deltanet_chunked_split's prep pass (deltanet_prep.comp) is the ONLY DeltaNet shader
             // using coopmat (the D/Dq dot matrices); deltanet_chunked (monolithic) and deltanet
-            // (sequential) are both scalar. `!caps.cooperative_matrix` routes to the still-chunked
+            // (sequential) are both scalar. `!caps.f16_coopmat` routes to the still-chunked
             // (still fast, just not split-prep) `deltanet_chunked` kernel below instead of the
             // sequential one — chunked math doesn't require coopmat, only this particular prep
             // kernel's implementation does.
-            if chunked
-                && be_.caps().cooperative_matrix
-                && std::env::var("INFR_NO_DN_SPLIT").is_err()
-            {
+            if chunked && be_.caps().f16_coopmat && std::env::var("INFR_NO_DN_SPLIT").is_err() {
                 let nchunk = rows_.div_ceil(32);
                 // alloc_uninit: every slot the scan reads is written by prep/gates first.
                 let kn =

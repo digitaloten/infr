@@ -371,7 +371,7 @@ impl VulkanBackend {
         self.shared.caps.max_shared_memory_bytes
     }
 
-    /// Borrowed capabilities — the kernel-tier fallback ladder's gate (`caps.cooperative_matrix`,
+    /// Borrowed capabilities — the kernel-tier fallback ladder's gate (`caps.f16_coopmat`,
     /// `caps.f16`, `caps.i8_dot`). Cheap: a reference, not the [`Backend::capabilities`] clone (which
     /// copies the `name: String`) — safe to call per-op inside the adapter's hot lowering loop.
     pub(crate) fn caps(&self) -> &Capabilities {
@@ -463,6 +463,9 @@ impl VulkanBackend {
         // adapter's i8-mmv gate consults it so a device without packed dot routes to the scalar
         // dequant GEMV instead of dispatching a dp4a kernel it can't run.
         let has_i8_dot_ext = has_ext(c"VK_KHR_shader_integer_dot_product");
+        // f8 (== fp8, E4M3/E5M2) storage/convert support. ash 0.38 has no constant for the ext, so
+        // match the raw name. Absent on RDNA3 → caps.f8 false.
+        let has_f8_ext = has_ext(c"VK_EXT_shader_float8");
         let has_subgroup_ext = has_ext(c"VK_KHR_shader_subgroup_extended_types");
         let has_mem_budget = has_ext(c"VK_EXT_memory_budget");
         // Lets every dispatch bind its buffers with one `cmd_push_descriptor_set` recorded
@@ -500,13 +503,33 @@ impl VulkanBackend {
         // shader here uses the ext builtin yet, so we don't add it to the enabled feature chain; the
         // adapter's i8-mmv gate reads `caps.i8_dot` before ever dispatching a dp4a kernel.
         let has_i8_dot = has_i8_dot_ext && intdot_feat.shader_integer_dot_product != 0;
+        // i8 (int8) shader storage/math — the same `shaderFloat16Int8` feature struct carries it.
+        let has_int8 = f16_feat.shader_int8 != 0;
         // Extension presence alone doesn't guarantee the FEATURE bit (a driver may advertise
         // VK_KHR_cooperative_matrix with cooperativeMatrix=false — enabling it then fails
         // create_device, the same failure class #32 fixed for memmodel/sgsize). Everything
-        // downstream (the ext push, the feature chain, caps.cooperative_matrix → the coopmat GEMM
-        // tier) keys off ext AND feature. Drivers zero-fill unrecognized feature structs, so the
-        // probe is safe when the extension is absent.
+        // downstream (the ext push, the feature chain, caps.f16_coopmat → the coopmat GEMM tier)
+        // keys off ext AND feature. Drivers zero-fill unrecognized feature structs, so the probe is
+        // safe when the extension is absent.
         let has_coop_matrix = has_coop_matrix && coopmat_feat.cooperative_matrix != 0;
+
+        // f8 cooperative-matrix components: ENUMERATE the device's coopmat configs and look for a
+        // component type in the extension-added range (`as_raw() >= 1e9` — all CORE ComponentTypeKHR
+        // values are 0..=10: FLOAT16/FLOAT32/SINT8/…). fp8 (E4M3/E5M2) and any newer matrix type
+        // live in that range. This avoids hardcoding a specific fp8 enum value (ash 0.38 predates
+        // the fp8 ComponentTypeKHR variants) — a false negative (fp8 HW we fail to detect) is the
+        // safe failure mode; the fp8 GEMM tier simply stays unselected. NEVER true on RDNA3 (its
+        // only configs are FLOAT16/FLOAT32/SINT8). Also requires the float8 ext for storage.
+        let has_f8_coopmat = has_coop_matrix && has_f8_ext && {
+            let cm = ash::khr::cooperative_matrix::Instance::new(&entry, &instance);
+            unsafe { cm.get_physical_device_cooperative_matrix_properties(physical_device) }
+                .map(|configs| {
+                    configs.iter().any(|p| {
+                        p.a_type.as_raw() >= 1_000_000_000 || p.b_type.as_raw() >= 1_000_000_000
+                    })
+                })
+                .unwrap_or(false)
+        };
 
         // ── force-disable capabilities for fallback-path testing on capable HW ──
         // These env knobs drop a DETECTED capability so the next kernel tier down is exercised on a
@@ -517,6 +540,8 @@ impl VulkanBackend {
         let has_f16 = has_f16 && std::env::var("INFR_NO_F16").is_err();
         let has_coop_matrix =
             has_coop_matrix && has_f16 && std::env::var("INFR_NO_COOPMAT").is_err();
+        // f8 coopmat is a coopmat sub-tier, so dropping coopmat drops it too.
+        let has_f8_coopmat = has_f8_coopmat && has_coop_matrix;
         let has_i8_dot = has_i8_dot && std::env::var("INFR_NO_I8DOT").is_err();
 
         // ── build extension name list (only available ones) ────────────────────
@@ -624,11 +649,11 @@ impl VulkanBackend {
         let caps = Capabilities {
             name: device_name,
             f16: has_f16,
-            cooperative_matrix: has_coop_matrix,
+            f16_coopmat: has_coop_matrix,
+            f8: has_f8_ext,
+            f8_coopmat: has_f8_coopmat,
+            i8: has_int8,
             i8_dot: has_i8_dot,
-            // f8 coopmat: wired by the f8 GEMM slice (enumerate VkCooperativeMatrixPropertiesKHR
-            // for an E4M3/E5M2 component-type config). Never true on this RDNA3 card.
-            f8_coopmat: false,
             subgroup_min,
             subgroup_max,
             max_buffer_bytes: props.limits.max_storage_buffer_range as u64,
@@ -652,12 +677,15 @@ impl VulkanBackend {
         if banner_seen().lock().unwrap().insert(caps.name.clone()) {
             let yn = |b: bool| if b { "y" } else { "n" };
             eprintln!(
-                "[infr] GPU: {} | coopmat:{} f16:{} i8dot:{} f8:{} subgroup:{}-{} shared:{}KB",
+                "[infr] GPU: {} | f16:{} f16cm:{} f8:{} f8cm:{} i8:{} i8dot:{} \
+                 subgroup:{}-{} shared:{}KB",
                 caps.name,
-                yn(caps.cooperative_matrix),
                 yn(caps.f16),
-                yn(caps.i8_dot),
+                yn(caps.f16_coopmat),
+                yn(caps.f8),
                 yn(caps.f8_coopmat),
+                yn(caps.i8),
+                yn(caps.i8_dot),
                 caps.subgroup_min,
                 caps.subgroup_max,
                 caps.max_shared_memory_bytes / 1024,

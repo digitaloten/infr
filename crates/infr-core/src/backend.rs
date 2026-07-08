@@ -21,30 +21,36 @@ use std::collections::HashMap;
 #[derive(Clone, Debug, Default)]
 pub struct Capabilities {
     pub name: String,
-    // ── float-precision capabilities ────────────────────────────────────────────────────────────
-    // Naming: `f16`/`f8` are the infr spelling for IEEE half / 8-bit float — SAME things as
-    // "fp16"/"fp8" elsewhere; we use `f<N>` uniformly. Two independent axes are modeled:
-    //   • ALU precision — can the device do scalar/vector math at this width? (`f16` below.)
-    //   • matrix unit    — is there a cooperative-matrix (tensor-core) unit, and which component
-    //                      types does it accept? (`cooperative_matrix` = present with the baseline
-    //                      f16 component type; `f8_coopmat` = it ALSO accepts f8 components.)
-    // f8 has NO scalar-ALU path in infr (it's a matrix-only format), so there is deliberately no
-    // bare `f8` ALU flag — the only f8 capability that matters is the coopmat one.
-    /// f16 (== fp16) scalar/vector ALU (`shaderFloat16`). Used by the non-coopmat f16 warp-tile GEMM
-    /// fallback and f16 math generally. Independent of `cooperative_matrix`.
+    // ── per-type compute capabilities ───────────────────────────────────────────────────────────
+    // Naming: `f16`/`f8`/`i8` are the infr spelling for the numeric types (== fp16/fp8/int8). Two
+    // ORTHOGONAL axes, expressed as flat `<type>` + `<type>_<primitive>` bools (a device can have
+    // one without the other — e.g. coopmat with only f16 components, or f16 ALU without coopmat):
+    //   • `<type>`          — the device supports this type for scalar/vector storage & math
+    //                         (f16 = shaderFloat16, f8 = the float8 storage/convert ext,
+    //                         i8 = shaderInt8). Drives the scalar / non-coopmat fallback kernels.
+    //   • `<type>_<prim>`   — the type is usable by a matrix/dot PRIMITIVE: `_coopmat` = accepted as
+    //                         a cooperative-matrix component (enumerated from the device's coopmat
+    //                         config list); `i8_dot` = packed dp4a integer dot.
+    // infr's coopmat GEMM dequants any on-disk weight dtype to f16 IN-SHADER before the multiply,
+    // so today's GEMM keys off `f16_coopmat` specifically; `f8_coopmat` is the (pending) fp8 tier.
+    /// f16 (== fp16) scalar/vector ALU (`shaderFloat16`) — the non-coopmat f16 warp/GEMV fallback.
     pub f16: bool,
-    /// A cooperative-matrix (tensor-core) unit is present, with the baseline f16 component type —
-    /// the current production GEMM primitive. Independent of the `f16` ALU flag above.
-    pub cooperative_matrix: bool,
-    /// The cooperative-matrix unit ALSO accepts f8 (== fp8, E4M3/E5M2) component types — enables the
-    /// f8 coopmat GEMM tier (f8×f8→f16 accumulate). A strict superset of `cooperative_matrix`; a
-    /// device can have coopmat (f16 components) WITHOUT f8 components, so this is its own flag rather
-    /// than `cooperative_matrix && f8`. False on all pre-RDNA4 / pre-Ada hardware (RX 7900 XTX incl.).
+    /// The cooperative-matrix unit accepts f16 components (f16×f16→f16/f32) — the current production
+    /// GEMM primitive. Was `cooperative_matrix`. Independent of the `f16` ALU flag above.
+    pub f16_coopmat: bool,
+    /// f8 (== fp8, E4M3/E5M2) storage/convert support (`VK_EXT_shader_float8`-class). infr has no
+    /// scalar f8 math path today; this exists for symmetry / future use. False on RDNA3.
+    pub f8: bool,
+    /// The cooperative-matrix unit accepts f8 (E4M3/E5M2) components (f8×f8→f16 accumulate) — the
+    /// fp8 coopmat GEMM tier. Detected by enumerating the device's coopmat configs; NOT a subset of
+    /// `f16_coopmat` (a unit can do f16 components but not f8). False on all pre-RDNA4/pre-Ada HW.
     pub f8_coopmat: bool,
-    /// The device advertises packed i8 (== int8) dot-product (`VK_KHR_shader_integer_dot_product` /
-    /// `dotPacked4x8AccSat`, core in Vulkan 1.3) — the decode i8 `mmv` path's dp4a accumulate.
-    /// False = no packed dot; the i8 mmv must NOT be dispatched (route to the scalar dequant
-    /// GEMV, which needs no extension). Independent of `f16`/`cooperative_matrix`.
+    /// i8 (== int8) storage & math in shaders (`shaderInt8`) — the scalar integer path.
+    pub i8: bool,
+    /// The device advertises packed i8 dot-product (`VK_KHR_shader_integer_dot_product` /
+    /// `dotPacked4x8AccSat`, core in Vulkan 1.3) — the decode i8 `mmv` path's dp4a accumulate. A
+    /// SEPARATE primitive from coopmat (hence not `i8_coopmat`). False = route to the scalar dequant
+    /// GEMV (needs no extension). Independent of `f16`/`f16_coopmat`.
     pub i8_dot: bool,
     /// Supported subgroup-size range (`VkPhysicalDeviceSubgroupSizeControlProperties`). The coopmat
     /// GEMM pins `requiredSubgroupSize = 32` (RDNA3 wave32); a device whose range excludes 32 can't

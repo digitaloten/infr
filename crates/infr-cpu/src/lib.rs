@@ -296,12 +296,15 @@ impl Backend for CpuBackend {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             name: "cpu-reference".into(),
+            // The scalar interpreter has no GPU-kernel tier choice; these per-type feature flags
+            // don't gate any CPU op handler (they select Vulkan/Metal shaders). f16/i8 math is
+            // available in the interpreter; the matrix/dot-primitive flags are N-A → off.
             f16: true,
-            cooperative_matrix: false,
-            // The scalar interpreter has no GPU-kernel tier choice; these device-feature flags don't
-            // gate any CPU op handler (they select Vulkan/Metal shaders), so leave them off/N-A.
-            i8_dot: false,
+            f16_coopmat: false,
+            f8: false,
             f8_coopmat: false,
+            i8: true,
+            i8_dot: false,
             subgroup_min: 0,
             subgroup_max: 0,
             max_buffer_bytes: u64::MAX,

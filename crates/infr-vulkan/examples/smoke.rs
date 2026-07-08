@@ -33,7 +33,7 @@ fn main() -> infr_core::Result<()> {
     println!(
         "    f16={} coop_matrix={} max_buf={}MiB",
         caps.f16,
-        caps.cooperative_matrix,
+        caps.f16_coopmat,
         caps.max_buffer_bytes / (1024 * 1024)
     );
     println!();
@@ -85,7 +85,7 @@ fn main() -> infr_core::Result<()> {
     println!();
     println!("SMOKE OK");
 
-    // TODO(sonnet): coop-matrix f16 matmul variant gated on caps.cooperative_matrix
+    // TODO(sonnet): coop-matrix f16 matmul variant gated on caps.f16_coopmat
     // Leave as stretch goal once the naive f32 path is verified.
 
     Ok(())
