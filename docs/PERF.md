@@ -417,22 +417,27 @@ re-open without a native-low-bit model.**
   so block-quant integer matmul pays a rescale tax f16-dequant doesn't. **The
   principled integer path is dp4a `mmq`** (each thread owns its accumulator →
   scale-after for free), which is what infr's Q4_K mmq + llama.cpp both use.
-- **bf16 coopmat GEMM** — built (`native_gemm_bf16cm.comp`,
-  `INFR_BF16_COOPMAT=1`, default-off): `bfloat16_t` operands + f32 accumulate,
-  reads bf16 weights exactly (no f16 clamp), no scaling. RDNA4 Qwen3-0.6B-BF16
-  pp512: **~6109 t/s vs the existing f16-clamp `native_gemm_warp_bf16` ~6575 = a
-  TIE** (marginally slower). bf16 WMMA runs at the f16 rate and both stage
-  through f32, so no speed win. Its only value is **precision faithfulness** —
-  it preserves bf16's exponent range instead of clamping to f16 (max 65504),
-  which matters only for bf16 models with out-of-f16-range values; in-range
-  models already run fine on the default f16-clamp path (which even has more
-  mantissa). Kept as an opt-in faithful path. **Memory-access gotcha
-  (measured):** reading the bf16 weights as a native `bfloat16_t[]` SSBO (16-bit
-  loads, "no conversion") ran **~27% SLOWER** (pp512 6109→4448) than staging
-  them via the `dqblk` path that reads 32-bit words (`uint nw[]`, 2 bf16/word)
-  and does the bitcast in ALU — narrow 16-bit loads don't coalesce on RADV. Read
-  packed 16-bit weights as 32-bit words + ALU-extract, never as a native 16-bit
-  array (same reason the f16 GEMM reads `uint nw[]`).
+- **bf16 coopmat GEMM** — `native_gemm_warp.comp` `-DBF16CM` variant
+  (`INFR_BF16_COOPMAT=1`, default-off): the PRODUCTION warptile with
+  `bfloat16_t` operands instead of `float16_t` (a `CMTYPE` macro; default build
+  byte-identical, verified via .spv md5), reading bf16 weights exactly (no f16
+  clamp). Its value is **precision faithfulness** — preserves bf16's exponent
+  range instead of clamping to f16 (max 65504). **But it is ~12-27% SLOWER than
+  the f16-clamp path, and that gap is the bf16 WMMA itself, not a missing
+  optimization.** Per-op profiling (RDNA4 Qwen3-0.6B-BF16, pp512, SAME shape +
+  SAME non-A_GLOBAL variant): `native_gemm_warp_bf16` (f16) 769.9µs vs
+  `native_gemm_warp_bf16cm` (bf16) 865.1µs @ 1024×6144 (+12%; +27% on narrow).
+  Identical kernel/staging/ tiling — only the coopmat operand type differs →
+  **RDNA4's `bfloat16_t` coopMatMulAdd runs slower than `float16_t`'s** (likely
+  RADV codegen immaturity for the newer bf16-coopmat path — re-check on a future
+  Mesa — or a real HW rate gap). So bf16-at-f16-speed is NOT achievable here;
+  kept opt-in faithful path, ~12-27% slower. (Retired the standalone
+  `native_gemm_bf16cm.comp`.) **Memory-access gotcha (measured on the
+  standalone):** reading bf16 weights as a native `bfloat16_t[]` SSBO (16-bit
+  loads, "no conversion") ran **~27% SLOWER** than the `dqblk` path that reads
+  32-bit words (`uint nw[]`, 2 bf16/word) + ALU bitcast — narrow 16-bit loads
+  don't coalesce on RADV. Read packed 16-bit weights as 32-bit words, never as a
+  native 16-bit array (same reason the f16 GEMM reads `uint nw[]`).
 - **Why no 8-bit operand swap wins:** on Vulkan/AMD, low-bit-float weights have
   no native matmul — you always dequant/convert to the WMMA operand type first,
   and RDNA4's fp8/int8 WMMA doesn't out-rate f16 on inference-shaped GEMMs.
