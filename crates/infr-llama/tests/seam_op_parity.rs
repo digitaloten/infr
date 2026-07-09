@@ -257,6 +257,7 @@ fn qknorm_parity() {
         n_head: n_head as u32,
         head_dim: head_dim as u32,
         eps: 1e-6,
+        x_stride: 0,
     });
     let xi = gen(rows * n_head * head_dim, 4);
     let wi = gen(head_dim, 5).iter().map(|v| v + 1.0).collect::<Vec<_>>();
@@ -484,6 +485,7 @@ fn qwen35_attn_core_writekv() {
         theta: 1e7,
         eps: 1e-6,
         freq_factors: None,
+        x_stride: 0,
     };
     g.push(qknr(qx, qw, qa, nh as u32));
     g.push(qknr(kx, kw, ka, nkv as u32)); // fused with the next WriteKv by the peephole
