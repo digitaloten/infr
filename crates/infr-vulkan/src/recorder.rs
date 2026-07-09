@@ -4032,6 +4032,64 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Strided DeltaNet: q/k/v read from same source buffer at offsets 0, nk*kd, 2*nk*kd.
+    /// Env-gated via INFR_DELTA_STRIDED=1. Push constants 32B (adds src_stride to standard).
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_strided(
+        &self,
+        q: &dyn Buffer, // all three are the same convout buffer when strided
+        k: &dyn Buffer,
+        v: &dyn Buffer,
+        blog: &dyn Buffer,
+        alpha: &dyn Buffer,
+        acoef: &dyn Buffer,
+        dtbias: &dyn Buffer,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        rows: usize,
+        nv: usize,
+        nk: usize,
+        kd: usize,
+        vd: usize,
+        eps: f32,
+        src_stride: usize,
+    ) {
+        debug_assert!(kd <= 128);
+        let kern = self.be.kernel(
+            "deltanet_strided",
+            crate::gemm::deltanet_strided_spv(),
+            9,
+            32,
+        );
+        let mut push = [0u8; 32];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(nv as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(nk as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(kd as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(vd as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&eps.to_ne_bytes());
+        push[24..28].copy_from_slice(&(1.0f32 / (kd as f32).sqrt()).to_ne_bytes());
+        push[28..32].copy_from_slice(&(src_stride as u32).to_ne_bytes());
+        let n_blk = vd.div_ceil(32);
+        self.dispatch(
+            kern,
+            &[
+                Self::vkb(q),
+                Self::vkb(k),
+                Self::vkb(v),
+                Self::vkb(blog),
+                Self::vkb(alpha),
+                Self::vkb(acoef),
+                Self::vkb(dtbias),
+                Self::vkb(state),
+                Self::vkb(out),
+            ],
+            2,
+            &push,
+            (nv * n_blk) as u32,
+        );
+    }
+
     /// CHUNKED gated-DeltaNet (chunkwise delta rule, C=32, one chunk when rows < 32): per 32-token
     /// chunk the recurrence collapses to dense matmuls + one unit-lower-triangular solve, so the
     /// state is traversed ⌈rows/32⌉ times instead of `rows`. Same signature/bindings as `deltanet`;

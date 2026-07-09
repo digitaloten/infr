@@ -2336,29 +2336,54 @@ fn lower_op(
                 );
                 transient.extend([kn, qn, dk, dq, bg, gg]);
             } else {
-                let dn = if chunked {
-                    Recorder::deltanet_chunked
+                // Strided DeltaNet (env-gated): when q==k==v (all same source buffer), derive
+                // stride from dimensions: 2*nk*kd + nv*vd.
+                let strided = *q == *k && *k == *v && std::env::var("INFR_DELTA_STRIDED").is_ok();
+                if strided {
+                    let stride = 2 * nk_ * kd_ + nv_ * vd_;
+                    rec.deltanet_strided(
+                        r(*q)?,
+                        r(*k)?,
+                        r(*v)?,
+                        r(*b)?,
+                        r(*a)?,
+                        r(*a_coef)?,
+                        r(*dt_bias)?,
+                        r(*state)?,
+                        r(*dst)?,
+                        rows_,
+                        nv_,
+                        nk_,
+                        kd_,
+                        vd_,
+                        *eps,
+                        stride,
+                    );
                 } else {
-                    Recorder::deltanet
-                };
-                dn(
-                    rec,
-                    r(*q)?,
-                    r(*k)?,
-                    r(*v)?,
-                    r(*b)?,
-                    r(*a)?,
-                    r(*a_coef)?,
-                    r(*dt_bias)?,
-                    r(*state)?,
-                    r(*dst)?,
-                    rows_,
-                    nv_,
-                    nk_,
-                    kd_,
-                    vd_,
-                    *eps,
-                );
+                    let dn = if chunked {
+                        Recorder::deltanet_chunked
+                    } else {
+                        Recorder::deltanet
+                    };
+                    dn(
+                        rec,
+                        r(*q)?,
+                        r(*k)?,
+                        r(*v)?,
+                        r(*b)?,
+                        r(*a)?,
+                        r(*a_coef)?,
+                        r(*dt_bias)?,
+                        r(*state)?,
+                        r(*dst)?,
+                        rows_,
+                        nv_,
+                        nk_,
+                        kd_,
+                        vd_,
+                        *eps,
+                    );
+                } // if *src_stride > 0
             }
         }
         // Elementwise gemma logit softcap `y = cap·tanh(x/cap)` (in-place safe).

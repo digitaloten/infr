@@ -1530,7 +1530,42 @@ pub(crate) fn generate_dense_backend(
                     channels: q35_cc as u32,
                     kernel: c.ssm_d_conv as u32,
                 });
-                // q/k/v read from conv_out via src_stride in DeltaNet op — no CopyStrided needed.
+                // Strided DeltaNet: when INFR_DELTA_STRIDED=1 and batch==1 (decode only —
+                // the chunked prefill path doesn't support stride), q/k/v read from conv_out,
+                // skipping 3 CopyStrided dispatches per layer.
+                let delta_strided = batch == 1 && std::env::var("INFR_DELTA_STRIDED").is_ok();
+                if !delta_strided {
+                    g.push(Op::CopyStrided {
+                        src: dn_convout,
+                        src_off: 0,
+                        src_stride: q35_cc as u32,
+                        dst: dn_qbuf,
+                        dst_off: 0,
+                        dst_stride: q35_keydim as u32,
+                        rows: batch as u32,
+                        n: q35_keydim as u32,
+                    });
+                    g.push(Op::CopyStrided {
+                        src: dn_convout,
+                        src_off: q35_keydim as u32,
+                        src_stride: q35_cc as u32,
+                        dst: dn_kbuf,
+                        dst_off: 0,
+                        dst_stride: q35_keydim as u32,
+                        rows: batch as u32,
+                        n: q35_keydim as u32,
+                    });
+                    g.push(Op::CopyStrided {
+                        src: dn_convout,
+                        src_off: (2 * q35_keydim) as u32,
+                        src_stride: q35_cc as u32,
+                        dst: dn_vbuf,
+                        dst_off: 0,
+                        dst_stride: (q35_nv * q35_vd) as u32,
+                        rows: batch as u32,
+                        n: (q35_nv * q35_vd) as u32,
+                    });
+                }
                 g.push(Op::Linear {
                     x: hn,
                     weight: dw.beta,
@@ -1549,60 +1584,15 @@ pub(crate) fn generate_dense_backend(
                     out_f: q35_nv as u32,
                     w_off: 0,
                 });
-                // split conv_out [batch, cc=q|k|v] → packed [batch, *] q / k / v (strided/token).
-                // TODO: DeltaNet src_stride wiring → skip these 3 CopyStrided per layer.
-                g.push(Op::CopyStrided {
-                    src: dn_convout,
-                    src_off: 0,
-                    src_stride: q35_cc as u32,
-                    dst: dn_qbuf,
-                    dst_off: 0,
-                    dst_stride: q35_keydim as u32,
-                    rows: batch as u32,
-                    n: q35_keydim as u32,
-                });
-                g.push(Op::CopyStrided {
-                    src: dn_convout,
-                    src_off: q35_keydim as u32,
-                    src_stride: q35_cc as u32,
-                    dst: dn_kbuf,
-                    dst_off: 0,
-                    dst_stride: q35_keydim as u32,
-                    rows: batch as u32,
-                    n: q35_keydim as u32,
-                });
-                g.push(Op::CopyStrided {
-                    src: dn_convout,
-                    src_off: (2 * q35_keydim) as u32,
-                    src_stride: q35_cc as u32,
-                    dst: dn_vbuf,
-                    dst_off: 0,
-                    dst_stride: (q35_nv * q35_vd) as u32,
-                    rows: batch as u32,
-                    n: (q35_nv * q35_vd) as u32,
-                });
-                g.push(Op::Linear {
-                    x: hn,
-                    weight: dw.beta,
-                    dst: dn_bbuf,
-                    m: batch as u32,
-                    in_f: ne as u32,
-                    out_f: q35_nv as u32,
-                    w_off: 0,
-                });
-                g.push(Op::Linear {
-                    x: hn,
-                    weight: dw.alpha,
-                    dst: dn_abuf,
-                    m: batch as u32,
-                    in_f: ne as u32,
-                    out_f: q35_nv as u32,
-                    w_off: 0,
-                });
+                let (q_src, k_src, v_src) = if delta_strided {
+                    (dn_convout, dn_convout, dn_convout)
+                } else {
+                    (dn_qbuf, dn_kbuf, dn_vbuf)
+                };
                 g.push(Op::DeltaNet {
-                    q: dn_qbuf,
-                    k: dn_kbuf,
-                    v: dn_vbuf,
+                    q: q_src,
+                    k: k_src,
+                    v: v_src,
                     b: dn_bbuf,
                     a: dn_abuf,
                     a_coef: dw.ssm_a,

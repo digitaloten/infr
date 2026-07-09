@@ -100,6 +100,8 @@ fn main() {
         // of a push constant (see `Op::Softmax::scale_buf`'s doc + `Recorder::softmax_dyn`).
         ("softmax", "softmax_dyn", &["-DUSE_SCALE_BUF"]),
         ("deltanet", "deltanet", &[]),
+        // Strided variant: q/k/v read from single convout buffer with offsets (env-gated).
+        ("deltanet_strided", "deltanet_strided", &[]),
         ("deltanet_chunked", "deltanet_chunked", &[]),
         ("deltanet_prep", "deltanet_prep", &[]),
         ("deltanet_gates", "deltanet_gates", &[]),

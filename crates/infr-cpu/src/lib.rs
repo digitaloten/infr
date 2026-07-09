@@ -2077,9 +2077,30 @@ impl Backend for CpuBackend {
                         head_k as usize,
                         head_v as usize,
                     );
-                    let qf = vals[q.0 as usize].clone(); // [rows, nk*kd]
-                    let kf = vals[k.0 as usize].clone();
-                    let vf = vals[v.0 as usize].clone(); // [rows, nv*vd]
+                    let qf_raw = vals[q.0 as usize].clone();
+                    let kf_raw = vals[k.0 as usize].clone();
+                    let vf_raw = vals[v.0 as usize].clone();
+                    let src_stride = src_stride as usize;
+                    // For strided DeltaNet, q/k/v share one buffer; extract packed arrays.
+                    let (qf, kf, vf) = if src_stride > 0 {
+                        let mut qv = vec![0f32; rr * nk * kd];
+                        let mut kv = vec![0f32; rr * nk * kd];
+                        let mut vv = vec![0f32; rr * nv * vd];
+                        for t in 0..rr {
+                            let row = t * src_stride;
+                            qv[t * nk * kd..(t + 1) * nk * kd]
+                                .copy_from_slice(&qf_raw[row..row + nk * kd]);
+                            kv[t * nk * kd..(t + 1) * nk * kd]
+                                .copy_from_slice(&qf_raw[row + nk * kd..row + 2 * nk * kd]);
+                            vv[t * nv * vd..(t + 1) * nv * vd].copy_from_slice(
+                                &qf_raw[row + 2 * nk * kd..row + 2 * nk * kd + nv * vd],
+                            );
+                        }
+                        (qv, kv, vv)
+                    } else {
+                        (qf_raw, kf_raw, vf_raw)
+                    };
+                    // [rows, nk*kd], [rows, nk*kd], [rows, nv*vd]
                     let bf = vals[b.0 as usize].clone(); // [rows, nv]
                     let af = vals[a.0 as usize].clone();
                     let acoef = weight(a_coef);
