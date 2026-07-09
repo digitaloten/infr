@@ -1409,19 +1409,26 @@ impl Backend for VulkanBackend {
 
     /// Copy `src` (device buffer) into `dst` (host slice).
     ///
-    /// If `src` is host-visible (`GpuToCpu`), reads directly from the mapped
-    /// pointer.  Otherwise, copies via a temporary readback staging buffer.
+    /// If `src` is host-visible (persistently mapped — `Readback`/`GpuToCpu` OR `Staging`/CpuToGpu),
+    /// reads STRAIGHT from the mapped pointer: zero submit/sync. Only a truly device-local
+    /// (`GpuOnly`, unmapped) source copies via a temporary readback staging buffer + submit + wait.
+    ///
+    /// Covering CpuToGpu here matters on the hot decode loop: the record-once replay binds the
+    /// device sampler's id output to a `Staging` buffer (`dec_ids_buf`, dual-purposed as the next
+    /// iteration's on-device embed-gather input), and the per-token fallback / E2B path reads that
+    /// id back every step. The old `GpuToCpu`-only check bounced it through a staging alloc +
+    /// one_shot copy + `queue_wait_idle` PER TOKEN — the exact per-token full-sync cost `read_pos0`
+    /// already dodges for `positions`. The mapped read carries the same contract the `GpuToCpu`
+    /// path always had: the caller must have completed the GPU work that wrote `src` (every decode
+    /// site does — `execute`/`replay` end in `queue_wait_idle`; the buffers are HOST_COHERENT so
+    /// the write is visible with no explicit invalidate).
     fn download(&self, src: &dyn Buffer, dst: &mut [u8]) -> Result<()> {
         // Safety: every buffer from this backend is a VkBuffer.
         let vk_src = unsafe { as_vk_buf(src) };
 
-        if vk_src.location == MemoryLocation::GpuToCpu {
-            // Direct read from the persistently-mapped pointer.
-            let ptr = vk_src
-                .mapped_ptr()
-                .ok_or_else(|| be("GpuToCpu buffer is not persistently mapped"))?
-                as *const u8;
-            unsafe { std::ptr::copy_nonoverlapping(ptr, dst.as_mut_ptr(), dst.len()) };
+        if let Some(ptr) = vk_src.mapped_ptr() {
+            // Host-visible (Readback or Staging): direct read from the persistently-mapped pointer.
+            unsafe { std::ptr::copy_nonoverlapping(ptr as *const u8, dst.as_mut_ptr(), dst.len()) };
         } else {
             // Readback path: device-local → staging → host.
             let staging = self.make_buf(dst.len(), MemoryLocation::GpuToCpu, "download_staging")?;
