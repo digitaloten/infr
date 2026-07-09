@@ -3504,6 +3504,7 @@ mod tests {
             nff: nff as u32,
             act: Activation::Silu,
             up_off: 0,
+            gate_stride: 0,
             up_stride: 0,
         });
         let gb = be_.alloc(nff * 4, BufferUsage::Activations).unwrap();
@@ -4012,6 +4013,7 @@ mod tests {
             nff: nff as u32,
             act: Activation::Gelu,
             up_off: 0,
+            gate_stride: 0,
             up_stride: 0,
         });
         g.push(Op::Linear {
