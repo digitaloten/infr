@@ -3252,6 +3252,49 @@ impl<'a> Recorder<'a> {
         }
     }
 
+    /// Fused QkNormRope reading from an INTERLEAVED q+g buffer (stride = nh*2*hd per row,
+    /// query for head h at offset h*2*hd). Eliminates per-head CopyStrided dispatches for
+    /// qwen35 attention layers (768 dispatches on 27B, 204 on 4B).
+    pub fn qk_norm_rope_interleaved(
+        &self,
+        qg: &dyn Buffer, // interleaved q+g [rows, nh*2*hd]
+        nw: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        nheads: usize,
+        hd: usize,
+        rope_dim: usize,
+        theta: f32,
+        rope_pos: usize,
+        out_base: usize,
+        eps: f32,
+        src_stride: usize, // per-row stride in the qg buffer = nh*2*hd
+    ) {
+        let k = self.be.kernel(
+            "qk_norm_rope_interleaved",
+            crate::gemm::qk_norm_rope_interleaved_spv(),
+            3,
+            36,
+        );
+        let mut push = [0u8; 36];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(nheads as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(hd as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(rope_dim as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&theta.to_ne_bytes());
+        push[20..24].copy_from_slice(&(rope_pos as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&(out_base as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&eps.to_ne_bytes());
+        push[32..36].copy_from_slice(&(src_stride as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(qg), Self::vkb(nw), Self::vkb(y)],
+            1,
+            &push,
+            (rows * nheads) as u32,
+        );
+    }
+
     /// Flash-decoding attention (q_len==1): split the KV range into `n_chunks` chunks of `chunk`,
     /// compute per-chunk softmax partials in parallel (`pm`/`pl`/`pacc`), then combine into `o`.
     /// Parallelizes attention across `nh*n_chunks` workgroups so it stays fast at long context.
