@@ -3041,6 +3041,56 @@ fn record_decode_replay(
         if skip_op.contains(&op_idx) {
             continue;
         }
+        // Peephole: fuse Op::Linear (f32, m<=4) + Op::GatedAct (Gelu, strided up) into one
+        // e2b_gate dispatch for E2B per-layer inp_gate projections.
+        if let Op::Linear {
+            x,
+            weight,
+            dst,
+            m,
+            in_f,
+            out_f,
+            ..
+        } = op
+        {
+            if graph.desc(*weight).dtype == infr_core::DType::F32
+                && *m <= 4
+                && op_idx + 1 < graph.ops.len()
+            {
+                if let Op::GatedAct {
+                    gate: g_gate,
+                    up: g_up,
+                    dst: g_dst,
+                    act: Activation::Gelu,
+                    up_off: g_off,
+                    up_stride: g_stride,
+                    ..
+                } = &graph.ops[op_idx + 1]
+                {
+                    if *g_gate == *dst && *g_dst == *dst && *g_stride > 0 {
+                        let (w_, x_, up_, y_) = (
+                            resolve(&scratch, bindings, *weight)?,
+                            resolve(&scratch, bindings, *x)?,
+                            resolve(&scratch, bindings, *g_up)?,
+                            resolve(&scratch, bindings, *dst)?,
+                        );
+                        rec.e2b_gate(
+                            w_,
+                            x_,
+                            up_,
+                            *g_off as usize,
+                            *g_stride as usize,
+                            y_,
+                            *m as usize,
+                            *in_f as usize,
+                            *out_f as usize,
+                        );
+                        skip_op.insert(op_idx + 1);
+                        continue;
+                    }
+                }
+            }
+        }
         lower_op(
             be_,
             graph,

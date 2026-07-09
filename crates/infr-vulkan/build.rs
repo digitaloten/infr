@@ -229,6 +229,7 @@ fn main() {
             "linear_f32r_mrow8_v4",
             &["-DMROW=8", "-DVEC4"],
         ),
+        ("e2b_gate", "e2b_gate", &[]),
         ("matmul_f32", "matmul_f32", &[]),
         ("linear_q", "linear_q", &[]),
         ("linear_res", "linear_res", &[]),

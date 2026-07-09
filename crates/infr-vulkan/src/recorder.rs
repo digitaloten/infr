@@ -843,6 +843,40 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// E2B per-layer inp_gate: fused f32 GEMV + GELU activation * strided up-read.
+    /// `dst[r,o] = gelu(sum_k x[r,k] * w[o,k]) * up[up_off + r*up_stride + o]`.
+    /// Scalar MROW=4 kernel, bit-identical to separate Linear(f32) + GatedAct(gelu, stride).
+    pub fn e2b_gate(
+        &self,
+        w: &dyn Buffer,
+        x: &dyn Buffer,
+        up: &dyn Buffer,
+        up_off: usize,
+        up_stride: usize,
+        y: &dyn Buffer,
+        m: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        let k = self
+            .be
+            .kernel("e2b_gate", crate::gemm::e2b_gate_spv(), 4, 20);
+        let mut push = [0u8; 20];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(up_off as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(up_stride as u32).to_ne_bytes());
+        let groups = out_f as u32 * (m as u32).div_ceil(4);
+        self.dispatch_wide(
+            k,
+            &[Self::vkb(w), Self::vkb(x), Self::vkb(up), Self::vkb(y)],
+            1,
+            &push,
+            groups,
+        );
+    }
+
     /// Prefill projection GEMM: `c[m,n] = a[m,k] · Wᵀ` on the matrix cores (coopmat). `a` is f32;
     /// `wq` is the weight (f16 packed 2/u32 with bits=16, or quant idx with bits=4|8 + scales/mins).
     /// `c` MUST be allocated `ceil(m/64)*64` rows (the kernel writes padded rows as 0). `n%64==0`,
