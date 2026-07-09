@@ -306,6 +306,7 @@ fn qknormrope_parity_qwen35_dims() {
         theta: 1e7,
         eps: 1e-6,
         freq_factors: None,
+        x_stride: 0,
     });
     let xi = gen(rows * nh * hd, 4);
     let wi = gen(hd, 5).iter().map(|v| v + 1.0).collect::<Vec<_>>();
@@ -378,6 +379,7 @@ fn qknormrope_attn_chain() {
         theta: 1e7,
         eps: 1e-6,
         freq_factors: None,
+        x_stride: 0,
     });
     g.push(Op::Attention {
         q: qa,
