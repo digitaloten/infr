@@ -163,6 +163,13 @@ fn decode_eligible(graph: &Graph) -> bool {
     }
     let mut has_rope = false;
     let mut has_attn = false;
+    // Record-once replay drives ALL pos-dependent ops (QkNormRope/WriteKv/Attention) from ONE shared
+    // `params` position (a single-token decode: every layer sits at the same absolute position). A
+    // graph whose attention ops sit at DIFFERENT positions (e.g. the MTP self-chaining draft, which
+    // unrolls n_steps single-token forwards at consecutive positions p, p+1, … into one graph) is
+    // NOT a single-token decode — replaying it would collapse every step onto the same KV row + RoPE
+    // angle + kv_len. Force those onto the static per-op-position path.
+    let mut attn_kv_len: Option<u32> = None;
     for op in &graph.ops {
         match op {
             // Any mask (SWA windows ride push constants + the window-aware prologue) and any
@@ -174,11 +181,18 @@ fn decode_eligible(graph: &Graph) -> bool {
                 head_dim,
                 k_cache,
                 v_cache,
+                kv_len,
                 ..
             } => {
                 has_attn = true;
                 if *rows != 1 || *head_dim % 4 != 0 || *head_dim > 512 {
                     return false;
+                }
+                // Multi-position graph (see the comment above `attn_kv_len`): different kv_len across
+                // attention ops ⟹ not a single-token decode ⟹ ineligible for record-once replay.
+                match attn_kv_len {
+                    Some(prev) if prev != *kv_len => return false,
+                    _ => attn_kv_len = Some(*kv_len),
                 }
                 // A COUPLED Q8_0 KV cache (K==V==Q8) replays: store_q8_dyn writes the row at
                 // params' pos and the planar-Q8 dyn attention kernels (attention_kv_dyn_q8 /
@@ -2067,13 +2081,28 @@ fn lower_op(
             head_v,
             eps,
         } => {
-            // Prefill (rows ≥ 32): the chunkwise delta rule processes 32 tokens per state
-            // traversal (matmuls + a triangular solve) instead of the token-serial recurrence —
-            // the difference between rows and rows/32 sequential state sweeps. The default is the
+            // Prefill AND multi-row batches (rows ≥ 2): the chunkwise delta rule processes up to 32
+            // tokens per state traversal (matmuls + a triangular solve) instead of the token-serial
+            // recurrence — the difference between rows and ⌈rows/32⌉ sequential state sweeps. The
+            // partial-chunk case (rows < 32, one chunk) is the SAME shader path prefill already uses
+            // for its tail chunk (c = min(32, rows-base) is masked throughout deltanet_chunked.comp /
+            // deltanet_prep.comp), so this isn't a new code path — just a lower row count triggering
+            // it. Threshold was 32 (i.e. only prefill); MTP verify runs a batched trunk forward over
+            // only m≈2-19 rows (committed_suffix ++ drafted, prefix-diffed) and was stranded on the
+            // sequential kernel below 32, capping the whole spec-decode cycle (verify was 68-69% of
+            // it). Measured crossover (gemm_bench.rs microbench, qwen35 dims nv=nk=16 kd=vd=128,
+            // isolated dispatch cost): chunked_split beats sequential at EVERY row count from 1..32
+            // (2.0x at rows=1 up to 8.2x at rows=32; rows=2..8, the MTP-verify range, is 3.2-4.4x).
+            // rows=1 stays on the sequential kernel anyway — this is plain single-token decode, out
+            // of scope here (decode has its own hot path; the extra transient-buffer allocs below
+            // aren't free at decode's much higher call frequency, unlike prep+scan's per-call cost
+            // which the microbench doesn't include either but easily amortizes at rows≥2). The
+            // real-workload win: MTP 4B, `deltanet` total dropped 116.3ms→~28ms (prep+gates+scan) at
+            // an identical (bit-exact) accept pattern across a 128-token run. The default is the
             // SPLIT form (parallel prep/gates passes + a light state-coupled scan; the monolithic
-            // kernel duplicated the prep work per column block). Decode/short rows keep the
-            // sequential kernel. INFR_NO_DN_CHUNK forces sequential; INFR_NO_DN_SPLIT keeps the
-            // chunked math but in the monolithic kernel (A/B).
+            // kernel duplicated the prep work per column block). INFR_NO_DN_CHUNK forces sequential
+            // (A/B, also the m==1-decode behavior); INFR_NO_DN_SPLIT keeps the chunked math but in
+            // the monolithic kernel (A/B).
             let (rows_, nv_, nk_, kd_, vd_) = (
                 *rows as usize,
                 *n_vhead as usize,
@@ -2081,7 +2110,7 @@ fn lower_op(
                 *head_k as usize,
                 *head_v as usize,
             );
-            let chunked = rows_ >= 32 && std::env::var("INFR_NO_DN_CHUNK").is_err();
+            let chunked = rows_ >= 2 && std::env::var("INFR_NO_DN_CHUNK").is_err();
             // deltanet_chunked_split's prep pass (deltanet_prep.comp) is the ONLY DeltaNet shader
             // using coopmat (the D/Dq dot matrices); deltanet_chunked (monolithic) and deltanet
             // (sequential) are both scalar. `!caps.f16_coopmat` routes to the still-chunked

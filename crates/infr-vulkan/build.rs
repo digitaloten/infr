@@ -1053,6 +1053,31 @@ fn main() {
             "native_gemm_warp_q8_0_n128_ag_bm32",
             &["-DFMT_Q8_0", "-DNARROW_N", "-DA_GLOBAL", "-DBM32"],
         ),
+        // BM=16 row-tile variants — one coopmat M-frag floor, mirroring the BM=32 family above but
+        // for the m<=~12-16 sub-band where BM=32's own tile is still ~half masked waste (see
+        // `DENSE_SMALL_TILE_MAX_M16` in recorder.rs for the measured crossover). Same formats as
+        // BM32 (Q4_K/Q5_K/Q6_K/Q8_0), same NARROW_N + A_GLOBAL, no split-K variant (unmeasured;
+        // BM32 already skips sk_ag for the same reason — see `matmul_native_splitk`'s doc).
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q4k_n128_ag_bm16",
+            &["-DFMT_Q4K", "-DNARROW_N", "-DA_GLOBAL", "-DBM16"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q5k_n128_ag_bm16",
+            &["-DFMT_Q5K", "-DNARROW_N", "-DA_GLOBAL", "-DBM16"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q6k_n128_ag_bm16",
+            &["-DFMT_Q6K", "-DNARROW_N", "-DA_GLOBAL", "-DBM16"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q8_0_n128_ag_bm16",
+            &["-DFMT_Q8_0", "-DNARROW_N", "-DA_GLOBAL", "-DBM16"],
+        ),
         ("splitk_reduce", "splitk_reduce", &[]),
         ("native_gemm", "native_gemm_q8_0", &["-DFMT_Q8_0"]),
         ("native_gemm", "native_gemm_bf16", &["-DFMT_BF16"]),

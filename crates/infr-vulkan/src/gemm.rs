@@ -982,6 +982,44 @@ pub(crate) fn native_gemm_warp_n128_ag_bm32_build_spv(
     })
 }
 
+/// BM=16 row-tile variant of [`native_gemm_warp_n128_ag_build_spv`] — one coopmat M-frag floor,
+/// see the recorder's `DENSE_SMALL_TILE_MAX_M16` doc. Same format coverage as the BM=32 variant
+/// (Q4_K/Q5_K/Q6_K/Q8_0), no sk_ag family.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_warp_n128_ag_bm16_build_spv(
+    dtype: infr_core::DType,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            S.get_or_init(|| {
+                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+            })
+            .as_slice()
+        }};
+    }
+    Some(match dtype {
+        Q4K => (
+            "native_gemm_warp_q4k_n128_ag_bm16",
+            v!("native_gemm_warp_q4k_n128_ag_bm16"),
+        ),
+        Q5K => (
+            "native_gemm_warp_q5k_n128_ag_bm16",
+            v!("native_gemm_warp_q5k_n128_ag_bm16"),
+        ),
+        Q6K => (
+            "native_gemm_warp_q6k_n128_ag_bm16",
+            v!("native_gemm_warp_q6k_n128_ag_bm16"),
+        ),
+        Q8_0 => (
+            "native_gemm_warp_q8_0_n128_ag_bm16",
+            v!("native_gemm_warp_q8_0_n128_ag_bm16"),
+        ),
+        _ => return None,
+    })
+}
+
 /// SPIR-V for the SPLIT-K narrow warptile (NARROW_N + a k-split grid dimension writing partials).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_warp_sk_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {

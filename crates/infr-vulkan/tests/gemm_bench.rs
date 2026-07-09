@@ -1413,6 +1413,103 @@ fn dense_small_m_row_tile_bench() {
     std::env::remove_var("INFR_NO_SMALL_BM");
 }
 
+/// BM=16 vs BM=32 vs BM=64 dense A_GLOBAL warp-GEMM row tile at the SAME real qwen35-4B verify
+/// shapes as `dense_small_m_row_tile_bench` (n128_ag family only — BM16 has no sk_ag variant, see
+/// that bench's doc). BM=16 is one coopmat M-frag (the tiling floor): at m<=16 it halves BM=32's
+/// remaining masked waste again, but it also doubles WARPS_N (halves WN) to keep all 8 launched
+/// warps mapped to a valid tile — fewer, thinner accumulator frags per warp. Sweeps the recorder's
+/// REAL gate (`DENSE_SMALL_TILE_MAX_M16` in recorder.rs) via `INFR_NO_BM16` (forces BM=32 within
+/// the small-tile band) / `INFR_NO_SMALL_BM` (forces BM=64), so — like `dense_small_m_row_tile_bench`
+/// — this exercises the same code path production uses. Finds the m where BM16 stops beating BM32
+/// so `DENSE_SMALL_TILE_MAX_M16` can be set to the measured crossover.
+#[test]
+#[ignore = "requires a Vulkan GPU (perf micro-bench)"]
+fn bm16_crossover_bench() {
+    let be = VulkanBackend::new().unwrap();
+    let reps = 30usize;
+    let ms: &[usize] = &[4, 6, 8, 12, 16, 24, 32];
+
+    fn blk(dtype: infr_core::DType) -> (usize, usize) {
+        use infr_core::DType::*;
+        match dtype {
+            Q4K => (256, 144),
+            Q5K => (256, 176),
+            Q6K => (256, 210),
+            Q8_0 => (32, 34),
+            _ => unreachable!("bench dtype not covered"),
+        }
+    }
+
+    // n128_ag family (matmul_native_f16a) at the qwen35-4B-UD-Q4_K_XL verify's dominant projection
+    // shapes captured via INFR_MTP=1 INFR_PROF2_SHAPES=1 — attn qkv/o (deep-k narrow-n, routed
+    // through sk_ag / matmul_native_splitk in production so NOT reachable by BM16, listed here only
+    // via the wide gate_up/vocab_head n128_ag shapes that ARE reachable).
+    let n128_shapes: &[(&str, infr_core::DType, usize, usize)] = &[
+        ("gate_up", infr_core::DType::Q4K, 2560, 18432),
+        ("vocab_head", infr_core::DType::Q6K, 2560, 248320),
+    ];
+    for &(label, dtype, k, n) in n128_shapes {
+        let (be_, k_, n_) = (&be, k, n);
+        let mpad_max = 64usize;
+        let (belem, bbytes) = blk(dtype);
+        let a16 = be_
+            .alloc(mpad_max * k_ * 2, BufferUsage::Activations)
+            .unwrap();
+        let w = be_
+            .alloc(n_ * (k_ / belem) * bbytes, BufferUsage::Weights)
+            .unwrap();
+        let c = be_
+            .alloc(mpad_max * n_ * 4, BufferUsage::Activations)
+            .unwrap();
+        for &m in ms {
+            for (tile_label, no_small_bm, no_bm16, bm) in [
+                ("BM16", false, false, 16.0),
+                ("BM32", false, true, 32.0),
+                ("BM64", true, false, 64.0),
+            ] {
+                if no_small_bm {
+                    std::env::set_var("INFR_NO_SMALL_BM", "1");
+                } else {
+                    std::env::remove_var("INFR_NO_SMALL_BM");
+                }
+                if no_bm16 {
+                    std::env::set_var("INFR_NO_BM16", "1");
+                } else {
+                    std::env::remove_var("INFR_NO_BM16");
+                }
+                let rec = be_.recorder().unwrap();
+                rec.matmul_native_f16a(dtype, a16.as_ref(), w.as_ref(), 0, c.as_ref(), m, k_, n_);
+                rec.finish().unwrap(); // warmup (pipeline compile)
+                let t0 = std::time::Instant::now();
+                let rec = be_.recorder().unwrap();
+                for _ in 0..reps {
+                    rec.matmul_native_f16a(
+                        dtype,
+                        a16.as_ref(),
+                        w.as_ref(),
+                        0,
+                        c.as_ref(),
+                        m,
+                        k_,
+                        n_,
+                    );
+                }
+                rec.finish().unwrap();
+                let us = t0.elapsed().as_micros() as f64 / reps as f64;
+                let flops = 2.0 * m as f64 * k_ as f64 * n_ as f64;
+                let tflops = flops / (us * 1e-6) / 1e12;
+                let fill = m as f64 / bm;
+                println!(
+                    "[n128_ag {label:>10} k={k_} n={n_:>6}] m={m:3} tile={tile_label}: {us:7.1} us  ({tflops:5.2} TFLOP/s, fill={fill:4.0}%)",
+                    fill = fill * 100.0,
+                );
+            }
+        }
+    }
+    std::env::remove_var("INFR_NO_SMALL_BM");
+    std::env::remove_var("INFR_NO_BM16");
+}
+
 // REAL production routing distributions captured via `INFR_MOE_COUNTS_DEBUG=1
 // INFR_MOE_COUNTS_DUMP=1 infr bench <model> -p 512 -n 0 -r 1 --ngl 0` (CPU reference path, whose
 // top-k routing is bit-identical to the GPU's) at pp512 on the bench's synthetic `i%100` prompt.

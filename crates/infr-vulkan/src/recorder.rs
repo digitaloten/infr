@@ -46,6 +46,30 @@ const MOE_EXPERT_SMALL_TILE_AVG_ROWS: usize = 24;
 /// no occupancy win to pay for it (see `matmul_native_splitk`'s doc).
 const DENSE_SMALL_TILE_MAX_M: usize = 24;
 
+/// Dense A_GLOBAL warp-GEMM `matmul_native_f16a` (n128_ag family) BM=32 → BM=16 row-tile
+/// crossover, in real batched-prefill rows `m`. BM=16 is one coopmat M-frag — the tiling floor —
+/// so it halves BM=32's masked waste again (m=8 on BM=32 is 75% masked; on BM=16 it's 50%), but it
+/// ALSO halves WN (doubling WARPS_N to keep all 8 launched warps mapped to a valid tile), so it's
+/// a genuinely different, thinner-frag tile shape, not just "BM=32 again but smaller" — worth
+/// measuring rather than assuming.
+///
+/// `bm16_crossover_bench` (gemm_bench.rs) swept m ∈ {4,6,8,12,16,24,32} on the real qwen35-4B-
+/// UD-Q4_K_XL n128_ag verify shapes (gate_up: Q4_K k=2560 n=18432; vocab_head: Q6_K k=2560
+/// n=248320) on the 7900 XTX (RADV). BM=16 wins clearly and by a growing margin through m=16 (the
+/// single-M-tile regime: ceil(m/16)==1) — e.g. gate_up m=8: 70.3us vs BM=32's 89.5us (+27%); m=16:
+/// 75.3us vs 90.8us (+21%). At m=24 (ceil(24/16)==2 — a SECOND M-tile appears) it falls off a
+/// cliff: the weight-decode work (independent of M-tile, redone once per M-tile per column-tile)
+/// now happens twice, and on the wide vocab_head weight (n=248320, decode-heavy) that alone makes
+/// BM=16 77% SLOWER than BM=32 (2771us vs 1564us) despite the smaller per-tile masked waste. m=32
+/// is a wash on both shapes (~same µs ± noise). So the crossover is exactly the BM=16 tiling floor
+/// itself: profitable only while m stays within a single M-tile.
+///
+/// Capped at 16 (not `DENSE_SMALL_TILE_MAX_M`'s 24) for that reason: above the single-M-tile
+/// regime (ceil(m/16) > 1) BM=16 redoes the weight-decode per extra M-tile and loses. Default-ON
+/// (`INFR_NO_BM16` A/B escape → BM=32); a win on both 4B and 9B MTP (see the gate's comment). Only
+/// applies within the small-tile band and never disturbs `INFR_NO_SMALL_BM`'s BM=64 override.
+const DENSE_SMALL_TILE_MAX_M16: usize = 16;
+
 /// Elements packed per u32 weight word for a given quant width (8 nibbles for q4, 4 bytes for q8).
 /// `None` ⇒ the subgroup GEMV has no specialization for this width; caller uses the WGSL fallback.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -1018,12 +1042,25 @@ impl<'a> Recorder<'a> {
         // never fires at these m anyway, short of the vocab-head GEMM under INFR_GEMM_WIDE_TILE).
         let small_bm =
             !use_wide && m <= DENSE_SMALL_TILE_MAX_M && std::env::var("INFR_NO_SMALL_BM").is_err();
+        // Sub-band of small_bm: at the very smallest m, the BM=32 tile itself is still ~half
+        // masked — BM=16 (one coopmat M-frag, the tiling floor) halves that again. It also HALVES
+        // WN (doubling WARPS_N), a thinner-frag shape, so both model sizes were measured interleaved
+        // rather than trusting one run: MTP +3.5% on qwen35-4B (k=2560) AND +2.8% on qwen35-9B
+        // (k=4096), consistent across passes — a real win on both. `INFR_NO_BM16` is a standalone A/B
+        // escape (falls back to BM=32, not BM=64).
+        let bm16 =
+            small_bm && m <= DENSE_SMALL_TILE_MAX_M16 && std::env::var("INFR_NO_BM16").is_err();
+        let bm16 = bm16
+            .then(|| crate::gemm::native_gemm_warp_n128_ag_bm16_build_spv(dtype))
+            .flatten();
         let bm32 = small_bm
             .then(|| crate::gemm::native_gemm_warp_n128_ag_bm32_build_spv(dtype))
             .flatten();
         let (name, spv, bn, bm): (_, _, usize, usize) = if use_wide {
             let (name, spv) = crate::gemm::native_gemm_warp_ag_build_spv(dtype).expect("ag spv");
             (name, spv, 256, 64)
+        } else if let Some((name, spv)) = bm16 {
+            (name, spv, 128, 16)
         } else if let Some((name, spv)) = bm32 {
             (name, spv, 128, 32)
         } else {
@@ -3728,11 +3765,13 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// CHUNKED gated-DeltaNet prefill (chunkwise delta rule, C=32): per 32-token chunk the
-    /// recurrence collapses to dense matmuls + one unit-lower-triangular solve, so the state is
-    /// traversed rows/32 times instead of `rows`. Same signature/bindings as `deltanet`; math
-    /// validated against the sequential form in tests/chunked_delta_math.rs. Use for rows ≥ 32
-    /// (decode keeps the sequential kernel). See shaders/deltanet_chunked.comp.
+    /// CHUNKED gated-DeltaNet (chunkwise delta rule, C=32, one chunk when rows < 32): per 32-token
+    /// chunk the recurrence collapses to dense matmuls + one unit-lower-triangular solve, so the
+    /// state is traversed ⌈rows/32⌉ times instead of `rows`. Same signature/bindings as `deltanet`;
+    /// math validated against the sequential form in tests/chunked_delta_math.rs (including a
+    /// partial-chunk case). Use for rows ≥ 2 — prefill AND the MTP verify batch (m≈2-19 rows), which
+    /// measurably beats the sequential kernel down to rows=2 (rows==1 decode keeps the sequential
+    /// kernel; see the call site in adapter.rs for why). See shaders/deltanet_chunked.comp.
     #[allow(clippy::too_many_arguments)]
     pub fn deltanet_chunked(
         &self,
@@ -4160,10 +4199,17 @@ impl<'a> Recorder<'a> {
         let p1 = (n as u32).to_ne_bytes();
         self.dispatch(k1, &[Self::vkb(logits), Self::vkb(part)], 1, &p1, 256);
         let p2 = 256u32.to_ne_bytes();
+        // TWO output buffers (`out_id` AND `out_prob`) — `n_out` must be 2, not 1, or the hazard
+        // tracker's `dispatch3` split treats `out_id` as a READ (see that fn's doc), so a LATER op
+        // in the SAME graph that reads `out_id` (issue #33's chained draft loop feeds it straight
+        // into the next step's `Op::EmbedGather` `ids`) gets no RAW barrier against this write —
+        // previously harmless because nothing downstream of a fused `id_prob` ever read `out_id`
+        // within the same `execute()` call (the caller always downloaded it after a full
+        // queue-idle `execute`), until `build_mtp_draft_chain_graph` did exactly that.
         self.dispatch(
             k2,
             &[Self::vkb(part), Self::vkb(out_id), Self::vkb(out_prob)],
-            1,
+            2,
             &p2,
             1,
         );

@@ -42,12 +42,25 @@ const uint THREADS = 256u;
 // WIDE tile (half the barriers, 2 staging iterations per thread). Composable. WARPS_M = BM/WM is
 // always 2 (128/64, 64/32, 32/16) — the coopmat compute/store loop indexes `gl_SubgroupID` over
 // WARPS_M*WARPS_N (=2*4=8) without bounds-checking, so this ratio must stay fixed at 2 for any
-// new BM variant to reuse the same warp-index math.
+// BM32/64/128-style variant to reuse the same warp-index math.
+//
+// -DBM16 is the one exception: 16 rows is exactly one coopmat M-frag (WM=16, the floor — coopmat
+// frags are 16×16, so WM can't shrink further), forcing WARPS_M = BM/WM = 1 instead of 2. Keeping
+// WARPS_N at its usual 4 would leave only WARPS_M*WARPS_N=4 of the 8 launched warps (256
+// threads/32) mapped to valid (warp_r, warp_c) pairs — the other 4 would get warp_c >= WARPS_N via
+// `warp_c = warp / WARPS_M`, reading/writing Bs and C past the intended tile (real OOB, not just
+// waste). So -DBM16 also HALVES WN (32→16 narrow, 64→32 wide), doubling WARPS_N to 8 and
+// restoring the WARPS_M*WARPS_N==8 invariant the compute/store loop relies on — every launched
+// warp gets exactly one CMS_M×CMS_N frag block (1×1 narrow, 1×2 wide) and the tile math stays
+// generic (CMS_M/CMS_N fall out of WM/WN as always).
 #ifdef BM128
 const uint BM = 128u;
 const uint WM = 64u;
 #elif defined(BM32)
 const uint BM = 32u;
+const uint WM = 16u;
+#elif defined(BM16)
+const uint BM = 16u;
 const uint WM = 16u;
 #else
 const uint BM = 64u;
@@ -56,7 +69,11 @@ const uint WM = 32u;
 #ifdef NARROW_N
 const uint BN = 128u;
 const uint BK = 64u;
+#ifdef BM16
+const uint WN = 16u;
+#else
 const uint WN = 32u;
+#endif
 #else
 const uint BN = 256u;
 #ifdef BK64W
@@ -64,12 +81,16 @@ const uint BK = 64u;
 #else
 const uint BK = 32u;
 #endif
+#ifdef BM16
+const uint WN = 32u;
+#else
 const uint WN = 64u;
 #endif
-const uint WARPS_M = BM / WM; // 2
-const uint WARPS_N = BN / WN; // 4 → 8 warps / 256 threads
-const uint CMS_M = WM / 16u;  // 2
-const uint CMS_N = WN / 16u;  // 4
+#endif
+const uint WARPS_M = BM / WM; // 2 (1 for BM16)
+const uint WARPS_N = BN / WN; // 4 → 8 warps / 256 threads (8 for BM16, same product)
+const uint CMS_M = WM / 16u;  // 2 (1 for BM16/BM32)
+const uint CMS_N = WN / 16u;  // 4 (1 narrow / 2 wide for BM16)
 const uint SAK = BK + 8u;
 const uint SBK = BK + 8u;     // Bs is [BN][BK]
 
