@@ -2137,6 +2137,7 @@ impl MetalBackend {
                 nff,
                 act,
                 up_off,
+                up_stride,
             } => {
                 let (rows, nff) = (rows as usize, nff as usize);
                 let bg = self.ensure_device(r, gate);
@@ -2152,6 +2153,7 @@ impl MetalBackend {
                 p.extend_from_slice(&(nff as u32).to_ne_bytes());
                 p.extend_from_slice(&act_code.to_ne_bytes());
                 p.extend_from_slice(&up_off.to_ne_bytes());
+                p.extend_from_slice(&up_stride.to_ne_bytes());
                 self.encode_w(
                     r,
                     &pso,

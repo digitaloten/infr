@@ -1369,7 +1369,8 @@ fn lower_op(
             }
         }
         // Gated FFN activation: `act(gate) * up[+up_off]`. up_off (E2B per-layer slice) only
-        // arises with Gelu (gemma); silu/sigmoid are always up_off==0.
+        // arises with Gelu (gemma); silu/sigmoid are always up_off==0. up_stride enables per-row
+        // strided reads from a wider buffer (eliminates the CopyStrided dispatch per layer).
         Op::GatedAct {
             gate,
             up,
@@ -1378,27 +1379,32 @@ fn lower_op(
             nff,
             act,
             up_off,
+            up_stride,
         } => {
             let n = *rows as usize * *nff as usize;
             let (g_, u_, y) = (r(*gate)?, r(*up)?, r(*dst)?);
+            let eb = graph.desc(*up).dtype.dense_bytes(1).unwrap_or(4);
             match act {
                 Activation::Silu => {
-                    if *up_off != 0 {
-                        return Err(be("vulkan adapter: GatedAct Silu up_off!=0 unsupported"));
+                    if *up_off != 0 || *up_stride != 0 {
+                        return Err(be("vulkan adapter: GatedAct Silu up_off/stride!=0 unsupported"));
                     }
                     rec.silu_mul(g_, u_, y, n);
                 }
                 Activation::Sigmoid => {
-                    if *up_off != 0 {
-                        return Err(be("vulkan adapter: GatedAct Sigmoid up_off!=0 unsupported"));
+                    if *up_off != 0 || *up_stride != 0 {
+                        return Err(be("vulkan adapter: GatedAct Sigmoid up_off/stride!=0 unsupported"));
                     }
-                    // GatedAct semantics: `act(gate) * up` = sigmoid(gate) * up. mul_sigmoid computes
-                    // `a * sigmoid(b)`, so pass (up, gate) — NOT (gate, up), which would sigmoid `up`.
                     rec.mul_sigmoid(u_, g_, y, n);
                 }
                 Activation::Gelu => {
-                    let eb = graph.desc(*up).dtype.dense_bytes(1).unwrap_or(4);
-                    rec.gelu_mul_off(g_, u_, *up_off as usize * eb, y, n);
+                    rec.gelu_mul_off(
+                        g_, u_,
+                        *up_off as usize * eb,
+                        *up_stride as usize * eb,
+                        *nff as usize,
+                        y, n,
+                    );
                 }
             }
         }
@@ -2853,7 +2859,7 @@ fn lower_op(
                         rec.mul_sigmoid(gbuf.get(pool), ubuf.get(pool), abuf.get(pool), n_act)
                     }
                     Activation::Gelu => {
-                        rec.gelu_mul_off(gbuf.get(pool), ubuf.get(pool), 0, abuf.get(pool), n_act)
+                        rec.gelu_mul_off(gbuf.get(pool), ubuf.get(pool), 0, 0, nff, abuf.get(pool), n_act)
                     }
                 }
             }

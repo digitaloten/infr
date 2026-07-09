@@ -5,7 +5,9 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 // up_off shifts the `up` buffer read by a whole-element offset, so a layer-major slice of a larger
 // buffer (gemma4's per-layer-embd input) can be consumed without a separate sub-buffer binding.
-layout(push_constant) uniform PC { uint n; uint up_off; } pc;
+// up_stride is the per-row stride (in elements) when reading from a wider row-major buffer;
+// 0 means rows are tightly packed (stride == row_width). row_width is the element count per row.
+layout(push_constant) uniform PC { uint n; uint up_off; uint up_stride; uint row_width; } pc;
 layout(binding = 0) readonly buffer GB { float gate[]; };
 layout(binding = 1) readonly buffer UB { float up[]; };
 layout(binding = 2) buffer YB { float y[]; };
@@ -20,5 +22,13 @@ void main() {
 #else
     float a = g / (1.0 + exp(-g));
 #endif
-    y[i] = a * up[pc.up_off + i];
+    uint up_idx;
+    if (pc.up_stride == 0u) {
+        up_idx = pc.up_off + i;
+    } else {
+        uint r = i / pc.row_width;
+        uint c = i % pc.row_width;
+        up_idx = pc.up_off + r * pc.up_stride + c;
+    }
+    y[i] = a * up[up_idx];
 }

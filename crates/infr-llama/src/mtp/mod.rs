@@ -661,6 +661,7 @@ fn build_mtp_graph(
         nff: qrow as u32,
         act: Activation::Sigmoid,
         up_off: 0,
+        up_stride: 0,
     });
     g.push(Op::Linear {
         x: attn,
@@ -715,6 +716,7 @@ fn build_mtp_graph(
         nff: nff as u32,
         act: Activation::Silu,
         up_off: 0,
+        up_stride: 0,
     });
     g.push(Op::Linear {
         x: actbuf,
@@ -1114,6 +1116,7 @@ fn build_mtp_draft_chain_graph(
             nff: qrow as u32,
             act: Activation::Sigmoid,
             up_off: 0,
+            up_stride: 0,
         });
         g.push(Op::Linear {
             x: attn,
@@ -1164,6 +1167,7 @@ fn build_mtp_draft_chain_graph(
             nff: nff as u32,
             act: Activation::Silu,
             up_off: 0,
+            up_stride: 0,
         });
         g.push(Op::Linear {
             x: actbuf,

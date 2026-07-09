@@ -1414,6 +1414,7 @@ pub(crate) fn generate_dense_backend(
                     nff: nff as u32,
                     act: Activation::Gelu,
                     up_off: 0,
+                    up_stride: 0,
                 });
                 let sc_sig = g.internal(f32d(batch * ne));
                 g.push(Op::Linear {
@@ -1625,8 +1626,9 @@ pub(crate) fn generate_dense_backend(
                         rows: batch as u32,
                         nff: (q35_nv * q35_vd) as u32,
                         act: Activation::Silu,
-                        up_off: 0,
-                    });
+up_off: 0,
+                    up_stride: 0,
+                });
                 }
                 g.push(Op::Linear {
                     x: dn_out,
@@ -1927,8 +1929,9 @@ pub(crate) fn generate_dense_backend(
                         rows: batch as u32,
                         nff: qrow as u32,
                         act: Activation::Sigmoid,
-                        up_off: 0,
-                    });
+up_off: 0,
+                    up_stride: 0,
+                });
                 }
                 g.push(Op::Linear {
                     x: attn,
@@ -2020,8 +2023,9 @@ pub(crate) fn generate_dense_backend(
                         rows: batch as u32,
                         nff: nff_l as u32,
                         act,
-                        up_off: 0,
-                    });
+up_off: 0,
+                    up_stride: 0,
+                });
                     g.push(Op::Linear {
                         x: actbuf,
                         weight: wdown,
@@ -2110,6 +2114,7 @@ pub(crate) fn generate_dense_backend(
                             nff: nff_l as u32,
                             act,
                             up_off: 0,
+                            up_stride: 0,
                         });
                         g.push(Op::Linear {
                             x: actbuf,
@@ -2194,6 +2199,7 @@ pub(crate) fn generate_dense_backend(
                             nff: nff_l as u32,
                             act,
                             up_off: 0,
+                            up_stride: 0,
                         });
                     }
                     g.push(Op::Linear {
@@ -2316,29 +2322,17 @@ pub(crate) fn generate_dense_backend(
                     out_f: npl as u32,
                     w_off: 0,
                 });
-                // gelu(plg) * ipl[r, l*npl .. l*npl+npl] — gather each row's layer-l slice of the
-                // [batch, n_layer*npl] input into a contiguous [batch, npl] scratch (one strided-
-                // copy dispatch), then the plain gated activation. Keeps GatedAct's semantics
-                // unchanged (its up_off has no per-row stride).
-                let ipl_l = g.internal(f32d(batch * npl));
-                g.push(Op::CopyStrided {
-                    src: ipl,
-                    src_off: (l * npl) as u32,
-                    src_stride: (c.n_layer * npl) as u32,
-                    dst: ipl_l,
-                    dst_off: 0,
-                    dst_stride: npl as u32,
-                    rows: batch as u32,
-                    n: npl as u32,
-                });
+                // gelu(plg) * ipl[r, l*npl .. l*npl+npl] — read the layer-l slice directly from
+                // the [batch, n_layer*npl] buffer via per-row stride, without a CopyStrided dispatch.
                 g.push(Op::GatedAct {
                     gate: plg,
-                    up: ipl_l,
+                    up: ipl,
                     dst: plg,
                     rows: batch as u32,
                     nff: npl as u32,
                     act: Activation::Gelu,
-                    up_off: 0,
+                    up_off: (l * npl) as u32,
+                    up_stride: (c.n_layer * npl) as u32,
                 });
                 g.push(Op::Linear {
                     x: plg,

@@ -1093,17 +1093,15 @@ impl Backend for CpuBackend {
                     nff,
                     act,
                     up_off,
+                    up_stride,
                 } => {
-                    let (rows, nff, up_off) = (rows as usize, nff as usize, up_off as usize);
+                    let (rows, nff, up_off, up_stride) = (rows as usize, nff as usize, up_off as usize, up_stride as usize);
                     let gs = &vals[gate.0 as usize];
                     let us = &vals[up.0 as usize];
-                    // `up` may be a wider layer-major buffer (E2B); the per-row stride stays `nff`
-                    // but the read is shifted by `up_off` (0 for the normal [rows, nff] case). Rows
-                    // are independent — spin-pool over rows, bit-identical to the serial version.
                     let mut out = vec![0f32; rows * nff];
                     self.pool().for_chunks_mut(&mut out, nff, 1, &|r, orow| {
                         let gb = r * nff;
-                        let ub = r * nff + up_off;
+                        let ub = if up_stride == 0 { r * nff + up_off } else { r * up_stride + up_off };
                         for i in 0..nff {
                             orow[i] = act_fn(act, gs[gb + i]) * us[ub + i];
                         }

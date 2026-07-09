@@ -3733,8 +3733,8 @@ impl<'a> Recorder<'a> {
     pub fn silu_mul(&self, gate: &dyn Buffer, up: &dyn Buffer, y: &dyn Buffer, n: usize) {
         let k = self
             .be
-            .kernel("silu_mul", crate::gemm::silu_mul_spv(), 3, 8);
-        let mut push = [0u8; 8];
+            .kernel("silu_mul", crate::gemm::silu_mul_spv(), 3, 16);
+        let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         self.dispatch(
             k,
@@ -4118,23 +4118,29 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// GeGLU with separate gate/up buffers: `y[i] = gelu(gate[i]) * up[up_off_bytes/4 + i]` (GELU
+    /// GeGLU with separate gate/up buffers: `y[i] = gelu(gate[i]) * up[idx(i)]` (GELU
     /// tanh-approx). `up_off_bytes` lets a layer-major slice of a larger buffer be read in place
     /// (gemma4 per-layer-embd gate: `gelu(inp_gate·hidden) * inp_per_layer[il]`).
+    /// `up_stride_bytes` is the per-row byte stride when reading from a wider row-major tensor;
+    /// 0 means rows are tightly packed. `row_width` is the element count per row.
     pub fn gelu_mul_off(
         &self,
         gate: &dyn Buffer,
         up: &dyn Buffer,
         up_off_bytes: usize,
+        up_stride_bytes: usize,
+        row_width: usize,
         y: &dyn Buffer,
         n: usize,
     ) {
         let k = self
             .be
-            .kernel("gelu_mul", crate::gemm::gelu_mul_spv(), 3, 8);
-        let mut push = [0u8; 8];
+            .kernel("gelu_mul", crate::gemm::gelu_mul_spv(), 3, 16);
+        let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&((up_off_bytes / 4) as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&((up_stride_bytes / 4) as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(row_width as u32).to_ne_bytes());
         self.dispatch(
             k,
             &[Self::vkb(gate), Self::vkb(up), Self::vkb(y)],
