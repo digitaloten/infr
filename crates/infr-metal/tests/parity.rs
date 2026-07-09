@@ -2269,6 +2269,7 @@ fn gated_test(act: infr_core::graph::Activation, up_off: usize, seed: u64) {
         nff: nff as u32,
         act,
         up_off: up_off as u32,
+        up_stride: 0,
     });
     let bound = vec![
         (gate, f32_bytes(&rand_f32(rows * nff, seed))),

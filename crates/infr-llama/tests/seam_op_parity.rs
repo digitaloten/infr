@@ -193,9 +193,9 @@ fn gated_sigmoid_parity() {
         rows: rows as u32,
         nff: nff as u32,
         act: Activation::Sigmoid,
-            up_off: 0,
-            up_stride: 0,
-        });
+        up_off: 0,
+        up_stride: 0,
+    });
     let gi = gen(rows * nff, 2);
     let ui = gen(rows * nff, 3);
     let c = run(&cpu, &g, &[(gate, &gi), (up, &ui)], &[], dst, rows * nff);
