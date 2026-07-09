@@ -1797,10 +1797,17 @@ impl<'a> Recorder<'a> {
             }
         }
         // Multi-output-row route (m=1 decode, low out_f → memory-latency-starved single-row grid).
+        // Default is the subgroup-register reduce variant (faster on all models, largest win on
+        // models ≥14B). Fall back to the original shared-mem tree-reduce via INFR_NO_GEMV_REG.
         if rows == 1 {
-            let variant = std::env::var("INFR_GEMV_VARIANT").ok();
+            let variant = if std::env::var("INFR_NO_GEMV_REG").is_ok() {
+                None
+            } else {
+                std::env::var("INFR_GEMV_VARIANT")
+                    .ok()
+                    .or_else(|| Some("reg".to_string()))
+            };
             if let Some(ref v) = variant {
-                // Experimental kernel variant, env-gated for A/B testing.
                 if let Some((name, spv)) = crate::gemm::native_rm_variant_spv(v, dtype, false) {
                     let rm: u32 = 2; // variants are RM=2
                     self.label_gemv("gemv", rows, in_f, out_f);
@@ -1988,7 +1995,13 @@ impl<'a> Recorder<'a> {
         }
         // Multi-output-row route (see linear_native_off): o/down decode GEMVs are low-out_f.
         if rows == 1 {
-            let variant = std::env::var("INFR_GEMV_VARIANT").ok();
+            let variant = if std::env::var("INFR_NO_GEMV_REG").is_ok() {
+                None
+            } else {
+                std::env::var("INFR_GEMV_VARIANT")
+                    .ok()
+                    .or_else(|| Some("reg".to_string()))
+            };
             if let Some(ref v) = variant {
                 if let Some((name, spv)) = crate::gemm::native_rm_variant_spv(v, dtype, true) {
                     let rm: u32 = 2;
