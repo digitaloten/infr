@@ -21,15 +21,20 @@
 //! `l+1` while `l` runs) — nothing in the arena/LUT/upload core below assumes MoE or LRU.
 //!
 //! # LUT
-//! One small `Staging` (host-visible, persistently mapped — no GPU submit to update) buffer of
-//! `n_blocks` `u32` per-slot arena WORD bases (`infr_core::pager::NOT_RESIDENT` for an absent
-//! block), mirrored host-side and fully rewritten + re-uploaded whenever residency changes since
-//! the last [`GpuPager::flush_lut`] — cheap at the block counts this task's models need (Scout:
-//! 48 layers x 16 experts x 3 roles = 2304 entries, 9 KiB).
+//! The host keeps an `n_blocks`-entry mirror of per-slot arena WORD bases
+//! (`infr_core::pager::NOT_RESIDENT` for an absent block). The paged EXECUTION path never reads a
+//! live device LUT: each (layer, role) batch freezes its `n_expert`-entry window into the
+//! session's append-only LUT tape ([`MoePagerSession::lut_window`]) at record time, so staging
+//! for later layers can keep mutating the mirror while earlier recorded-but-in-flight segments
+//! read a consistent view. The classic per-pager device LUT + [`GpuPager::flush_lut`] remain for
+//! the standalone [`GpuPager::ensure_resident`] surface (parity tests / future non-MoE users).
 //!
-//! # Eviction upgrade path
-//! Plain LRU (see `infr_core::pager`). llama.cpp issue #20757's SLRU-with-admission is the
-//! documented upgrade if pure LRU thrashes on an adversarial access pattern — not implemented here.
+//! # Eviction policy
+//! Classic LRU for recency-driven touches (decode's routed-only path) plus the scan-resistant
+//! cold-end insertion (`infr_core::pager::Pager::touch_cold`) for the batched prefill's
+//! full-set sweeps — see that method's doc for why plain LRU is pathological there. llama.cpp
+//! issue #20757's SLRU-with-admission remains the documented upgrade if these thrash on an
+//! adversarial pattern.
 use std::collections::HashMap;
 use std::sync::Arc;
 
