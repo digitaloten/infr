@@ -95,6 +95,9 @@ fn main() {
         // same reduction as `rmsnorm`, one extra buffer + the gate multiply on store.
         ("rmsnorm", "rmsnorm_gate", &["-DGATE"]),
         ("rmsnorm", "rmsnorm_add", &["-DADD"]),
+        // f16-in/f16-out RMSNorm (llama4's post-rope weightless Q/K L2-norm, `Op::QkNorm` on the
+        // f16 rope scratch — `w` stays f32).
+        ("rmsnorm", "rmsnorm_f16", &["-DF16IO"]),
         ("softmax", "softmax", &[]),
         // DiffusionGemma denoise self-conditioning perf: scale read from a device buffer instead
         // of a push constant (see `Op::Softmax::scale_buf`'s doc + `Recorder::softmax_dyn`).
@@ -872,6 +875,9 @@ fn main() {
             &["-DDSCALE"],
         ),
         ("add_scaled_id", "add_scaled_id", &[]),
+        // llama4 weight-before-FFN: in-place per-row scale of gate/up outputs by the routing
+        // weight (see Op::MoeFfn's `weight_before`).
+        ("moe_weight_scale", "moe_weight_scale", &[]),
         // Native-block prefill GEMMs: one .spv per quant format (coopmat tiled, no residual).
         ("native_gemm_warp", "native_gemm_warp_q4k", &["-DFMT_Q4K"]),
         ("native_gemm_warp", "native_gemm_warp_q6k", &["-DFMT_Q6K"]),

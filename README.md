@@ -47,7 +47,7 @@ system prompt) is read from the GGUF's own `tokenizer.chat_template`.
 | Family            | Arch (GGUF)       | Notes                                                  |
 | ----------------- | ----------------- | ------------------------------------------------------ |
 | Llama             | `llama`           | dense transformer                                      |
-| Llama 4           | `llama4`          | sigmoid top-1 MoE + shared expert, iRoPE (CPU-only)    |
+| Llama 4           | `llama4`          | sigmoid top-1 MoE + shared expert, iRoPE (CPU default) |
 | Qwen2 / Qwen2.5   | `qwen2`           | dense, QKV bias, NEOX rope                             |
 | Qwen3             | `qwen3`           | dense, QK-norm                                         |
 | Qwen3 MoE         | `qwen3moe`        | softmax router, top-_k_ experts (CPU offload)          |
@@ -229,12 +229,17 @@ the memory-bandwidth wall (decode GEMVs run at 77–88% of DRAM peak). The
 throughput not yet matching llama.cpp's batched-speculative path.
 **DiffusionGemma** (`dg-step`) is at parity-or-better vs the reference fork.
 
-**Llama-4-Scout** (109B-A17B, Q2_K) is a CPU-only correctness bring-up and is
+**Llama-4-Scout** (109B-A17B, Q2_K) is a correctness bring-up and is
 deliberately absent from the table: the CPU reference path runs it at ~0.3 t/s
 prefill/decode vs llama.cpp CPU's 10.0/3.3 (pp64/tg32) — Q2_K is a codebook
-quant with no batched-MoE path, and the llama4 GPU lowering (sigmoid
-weight-before-FFN routing, NoPE) hasn't been built yet. Greedy output is
-oracle-locked against llama.cpp (`cpu_llama4_scout_greedy`).
+quant with no batched-MoE path. The llama4 Vulkan lowering (sigmoid
+weight-before-FFN routing, NoPE rope-skip, post-rope Q/K L2-norm) is implemented
+and parity-tested on-device, but Scout itself cannot run end-to-end on a 24 GB
+card: even with every expert bank host-offloaded, the ~33 GB of host-visible
+expert reads overflow the GTT submission budget (device lost).
+`INFR_L4_ALLOW_GPU=1` opts into Vulkan on hardware that fits it; the CLI
+defaults llama4 to CPU. Greedy output is oracle-locked against llama.cpp
+(`cpu_llama4_scout_greedy`).
 
 **Also validated for correctness** (GPU seam vs CPU reference), beyond the perf
 table: Qwen2-0.5B, Llama-3.2-1B, Gemma-4-12B (dense), and Qwen3-0.6B across
@@ -253,7 +258,7 @@ dequant).
 - **Models:** Llama, Qwen2/2.5, Qwen3 (dense + MoE), Gemma 3, Gemma 4 (dense +
   E2B + 26B-A4B MoE), Qwen3.5/3.6 (dense + MoE) — all on GPU **and** the CPU
   reference; DiffusionGemma (block text-diffusion, CPU + GPU); Llama 4 (Scout —
-  CPU-only for now)
+  CPU by default, Vulkan lowering parity-tested; needs >37 GB VRAM end-to-end)
 - **GPU:** AMD / NVIDIA / Intel via Vulkan (cooperative-matrix matmul); Apple
   via a native **Metal backend** (`INFR_METAL=1`) covering every op the CPU
   reference does — dense, MoE (`qwen3moe`) and Qwen3.5 (`qwen35`). Dense is

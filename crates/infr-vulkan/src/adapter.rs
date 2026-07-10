@@ -1326,15 +1326,29 @@ fn lower_op(
             dst_off,
             n,
         } => {
-            // IR offsets/counts are in ELEMENTS; the recorder copy takes BYTES.
-            let eb = graph.desc(*src).dtype.dense_bytes(1).unwrap_or(4);
-            rec.copy(
-                r(*src)?,
-                *src_off as usize * eb,
-                r(*dst)?,
-                *dst_off as usize * eb,
-                *n as usize * eb,
-            );
+            let (sdt, ddt) = (graph.desc(*src).dtype, graph.desc(*dst).dtype);
+            if matches!(sdt, infr_core::DType::F32) && matches!(ddt, infr_core::DType::F16) {
+                // Cross-dtype cast-copy (llama4's NoPE Q/K → the f16 rope scratch, unroped/
+                // unnormed on those layers — see runner.rs): a raw byte copy would corrupt values
+                // (f32 is 2x f16's width), so cast element-wise instead (reuses WriteKv's f32→f16
+                // kernel). `store_f16` has no source offset — every in-tree caller of a cross-dtype
+                // Copy extracts a whole row range (`src_off == 0`).
+                assert_eq!(
+                    *src_off, 0,
+                    "vulkan adapter: cross-dtype Copy needs src_off==0 (store_f16 has no source offset)"
+                );
+                rec.store_f16(r(*src)?, r(*dst)?, *n as usize, *dst_off as usize);
+            } else {
+                // IR offsets/counts are in ELEMENTS; the recorder copy takes BYTES.
+                let eb = sdt.dense_bytes(1).unwrap_or(4);
+                rec.copy(
+                    r(*src)?,
+                    *src_off as usize * eb,
+                    r(*dst)?,
+                    *dst_off as usize * eb,
+                    *n as usize * eb,
+                );
+            }
         }
         // Batched strided copy = `rows` buffer-copy regions (cheap vkCmdCopyBuffer). Splits a
         // batched interleaved buffer (conv q|k|v) into packed per-row slices.
@@ -2170,7 +2184,9 @@ fn lower_op(
             }
         }
         // Per-head RMSNorm == rmsnorm over rows*n_head rows of head_dim (gemma4's weightless
-        // V-norm passes a ones weight → out = x/rms).
+        // V-norm passes a ones weight → out = x/rms; llama4's post-rope weightless Q/K L2-norm
+        // runs in-place on the f16 rope scratch — `x`'s dtype picks the f16 or f32 kernel, `w`
+        // (the ones-vector weight) stays f32 either way).
         Op::QkNorm {
             x,
             weight,
@@ -2181,14 +2197,12 @@ fn lower_op(
             eps,
             ..
         } => {
-            rec.rmsnorm(
-                r(*x)?,
-                r(*weight)?,
-                r(*dst)?,
-                (*rows * *n_head) as usize,
-                *head_dim as usize,
-                *eps,
-            );
+            let (rows_n, dim) = ((*rows * *n_head) as usize, *head_dim as usize);
+            if matches!(graph.desc(*x).dtype, infr_core::DType::F16) {
+                rec.rmsnorm_f16(r(*x)?, r(*weight)?, r(*dst)?, rows_n, dim, *eps);
+            } else {
+                rec.rmsnorm(r(*x)?, r(*weight)?, r(*dst)?, rows_n, dim, *eps);
+            }
         }
         // Fused per-head RMSNorm + SiLU gate multiply (qwen35 DeltaNet z-gate) — one dispatch
         // instead of QkNorm→GatedAct's two, removing the read-after-write barrier between them.
@@ -2476,10 +2490,11 @@ fn lower_op(
                 *n as usize,
             );
         }
-        // MoE FFN (single token): router GEMV → GPU-resident top-k (softmax-renorm, ×scale) →
-        // fused multi-slot expert SwiGLU (gate/up share the row, down reads each slot's act) →
-        // weighted accumulate. Mirrors the production GPU-resident decode path (transformer.rs)
-        // and the CPU `Op::MoeFfn` interpreter. Expert banks must use an id-native quant format.
+        // MoE FFN (single token): router GEMV → GPU-resident top-k (gating-dependent weighting,
+        // ×scale) → fused multi-slot expert SwiGLU (gate/up share the row, down reads each slot's
+        // act) → weighted accumulate. Mirrors the production GPU-resident decode path
+        // (transformer.rs) and the CPU `Op::MoeFfn` interpreter. Expert banks must use an
+        // id-native quant format.
         Op::MoeFfn {
             x,
             router_x,
@@ -2500,14 +2515,16 @@ fn lower_op(
             norm_w,
             weight_before,
         } => {
-            // The Vulkan MoE lowering implements only softmax gating + top-k renormalization +
-            // output-weighting (qwen3moe/qwen35moe/diffusion-gemma). llama4's sigmoid/no-renorm/
-            // weight-before-FFN routing is CPU-only (see the `llama4` arch note) — it never reaches
-            // a GPU backend in-tree, so guard rather than silently miscompute.
-            assert!(
-                matches!(*gating, infr_core::graph::MoeGating::Softmax) && *norm_w && !*weight_before,
-                "Vulkan MoeFfn: only softmax + renorm + output-weighting supported (llama4 is CPU-only)"
-            );
+            // Router gating (softmax vs sigmoid) and renormalization are `moe_topk` push-constant
+            // flags — see its shader doc. `weight_before` (llama4: the routing weight scales the
+            // expert INPUT) is folded in as a post-GEMM/GEMV, pre-activation scale of the gate/up
+            // outputs (`moe_weight_scale`, exact since gate/up are linear — see its shader doc),
+            // with the corresponding accumulate/reduce stage told `prescaled` so it doesn't also
+            // apply the weight to the (already-weighted) down output.
+            let gating_u32 = match gating {
+                infr_core::graph::MoeGating::Softmax => 0u32,
+                infr_core::graph::MoeGating::Sigmoid => 1u32,
+            };
             let (ne, n_expert, n_used, nff) = (
                 *ne as usize,
                 *n_expert as usize,
@@ -2668,6 +2685,8 @@ fn lower_op(
                     n_expert,
                     n_used,
                     *scale,
+                    gating_u32,
+                    *norm_w,
                 );
                 rec.zero(counts.as_ref(), n_expert);
                 rec.moe_bucket_count(ids.as_ref(), counts.as_ref(), n_pairs);
@@ -2753,6 +2772,15 @@ fn lower_op(
                         n_used,
                     );
                     rec.suppress_sync(false);
+                    // llama4 weight-before-FFN: scale the gate/up GEMM outputs by the packed
+                    // per-pair routing weight (`bucket_wts`, indexed the same way `ge`/`ue` are
+                    // packed) BEFORE the activation — exact-equivalent to the CPU's input-side
+                    // fold (see `moe_weight_scale`'s doc). `moe_scatter_reduce` below is told
+                    // `prescaled` so it doesn't apply the weight a second time.
+                    if *weight_before {
+                        rec.moe_weight_scale(pool[&ge].as_ref(), bucket_wts.as_ref(), n_pairs, nff);
+                        rec.moe_weight_scale(pool[&ue].as_ref(), bucket_wts.as_ref(), n_pairs, nff);
+                    }
                     rec.silu_mul(
                         pool[&ge].as_ref(),
                         pool[&ue].as_ref(),
@@ -2762,6 +2790,14 @@ fn lower_op(
                 } else {
                     // Fused: `ge` already holds [n_pairs, 2*nff] (gate half first, up half second
                     // per row) from the single wide GEMM above.
+                    if *weight_before {
+                        rec.moe_weight_scale(
+                            pool[&ge].as_ref(),
+                            bucket_wts.as_ref(),
+                            n_pairs,
+                            gu_width,
+                        );
+                    }
                     match act {
                         Activation::Silu => {
                             rec.silu_mul_fused(pool[&ge].as_ref(), pool[&ae].as_ref(), n_pairs, nff)
@@ -2814,6 +2850,7 @@ fn lower_op(
                     rows,
                     ne,
                     n_used,
+                    *weight_before,
                 );
                 transient.extend([
                     logits,
@@ -2903,7 +2940,7 @@ fn lower_op(
             } else {
                 rec.linear(rw, rxb, logits.get(pool), rows, ne, n_expert);
             }
-            // Softmax-renormalized top-`n_used` per token, weights pre-scaled by `scale`.
+            // Top-`n_used` per token (gating-dependent weighting), weights pre-scaled by `scale`.
             rec.moe_topk(
                 logits.get(pool),
                 ids.get(pool),
@@ -2912,6 +2949,8 @@ fn lower_op(
                 n_expert,
                 n_used,
                 *scale,
+                gating_u32,
+                *norm_w,
             );
             let n_act = n_slots * nff;
             if let Some(gubuf) = &gubuf {
@@ -2929,6 +2968,13 @@ fn lower_op(
                     2 * nff,
                     rows,
                 );
+                // llama4 weight-before-FFN: scale the fused gate|up GEMV output by the per-slot
+                // routing weight (`wts`, one weight per (token,slot) = one row of `gubuf`) BEFORE
+                // the activation — see `moe_weight_scale`'s doc. `moe_accumulate` below is told
+                // `prescaled` so it doesn't apply the weight a second time.
+                if *weight_before {
+                    rec.moe_weight_scale(gubuf.get(pool), wts.get(pool), n_slots, 2 * nff);
+                }
                 match act {
                     Activation::Silu => {
                         rec.silu_mul_fused(gubuf.get(pool), abuf.get(pool), n_slots, nff)
@@ -2971,6 +3017,10 @@ fn lower_op(
                     nff,
                     rows,
                 );
+                if *weight_before {
+                    rec.moe_weight_scale(gbuf.get(pool), wts.get(pool), n_slots, nff);
+                    rec.moe_weight_scale(ubuf.get(pool), wts.get(pool), n_slots, nff);
+                }
                 match act {
                     Activation::Silu => {
                         rec.silu_mul(gbuf.get(pool), ubuf.get(pool), abuf.get(pool), n_act)
@@ -3026,7 +3076,15 @@ fn lower_op(
                     n_used,
                     rows,
                 ),
-                None => rec.moe_accumulate(ybuf.get(pool), wts.get(pool), dstb, ne, n_used, rows),
+                None => rec.moe_accumulate(
+                    ybuf.get(pool),
+                    wts.get(pool),
+                    dstb,
+                    ne,
+                    n_used,
+                    rows,
+                    *weight_before,
+                ),
             }
             // Under the `no_pool` escape these are owned per-layer boxes — drain them into
             // `transient` so the recording outlives them; pooled buffers are no-ops here (owned by
@@ -3668,6 +3726,124 @@ mod tests {
                 "qk_norm_rope mismatch at {i}: got {} want {}",
                 got[i],
                 want[i]
+            );
+        }
+    }
+
+    /// A one-op `Op::QkNorm` graph with F16 x/dst (llama4's post-rope weightless Q/K L2-norm,
+    /// in-place on the f16 rope scratch — `x == dst`, exactly the shape `seam/runner.rs` emits on
+    /// rope layers) must match a host per-head RMSNorm computed on the SAME f16-rounded input.
+    /// Multi-head (n_head=2) exercises the per-head reduction boundary — the op doesn't
+    /// distinguish Q from K, just a head count, so this also covers K's `nkv`-headed call.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn qk_norm_f16_inplace_matches_host() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        let (nh, hd, eps) = (2usize, 8usize, 1e-6f32);
+        let to_f16 = |v: &[f32]| -> Vec<u8> {
+            v.iter()
+                .flat_map(|&x| half::f16::from_f32(x).to_le_bytes())
+                .collect()
+        };
+        let deq = |b: &[u8]| -> Vec<f32> {
+            b.chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect()
+        };
+        let x_f32: Vec<f32> = (0..nh * hd).map(|i| i as f32 * 0.1 - 0.5).collect();
+        let w: Vec<f32> = (0..hd).map(|i| 1.0 + i as f32 * 0.05).collect(); // NOT ones — general
+        let xb16 = to_f16(&x_f32);
+        let x = deq(&xb16); // the f16-rounded input the GPU shader actually reads
+                            // host reference: per-head rmsnorm(x) * w, on the SAME f16-rounded input.
+        let mut want = vec![0f32; nh * hd];
+        for h in 0..nh {
+            let b = h * hd;
+            let ss = (0..hd).map(|i| x[b + i] * x[b + i]).sum::<f32>() / hd as f32;
+            let s = 1.0 / (ss + eps).sqrt();
+            for i in 0..hd {
+                want[b + i] = x[b + i] * s * w[i];
+            }
+        }
+        let mut g = Graph::new();
+        let xi = g.input(TensorDesc::new(vec![1, nh, hd], DType::F16));
+        let wi = g.weight(TensorDesc::new(vec![hd], DType::F32));
+        g.push(Op::QkNorm {
+            x: xi,
+            weight: wi,
+            dst: xi, // in-place — matches the runner's q16/k16 usage exactly
+            rows: 1,
+            n_head: nh as u32,
+            head_dim: hd as u32,
+            eps,
+            x_stride: 0,
+        });
+        let xbuf = be_.alloc(nh * hd * 2, BufferUsage::Activations).unwrap();
+        let wbuf = be_.alloc(hd * 4, BufferUsage::Weights).unwrap();
+        be_.upload(xbuf.as_ref(), &xb16).unwrap();
+        be_.upload(wbuf.as_ref(), bytemuck::cast_slice(&w)).unwrap();
+        let plan = be_.compile(&g).unwrap();
+        let mut bind = Bindings::new();
+        bind.bind(xi, xbuf.as_ref());
+        bind.bind(wi, wbuf.as_ref());
+        be_.execute(plan.as_ref(), &bind).unwrap();
+        let mut got16 = vec![0u8; nh * hd * 2];
+        be_.download(xbuf.as_ref(), &mut got16).unwrap();
+        let got = deq(&got16);
+        for i in 0..nh * hd {
+            assert!(
+                (got[i] - want[i]).abs() < 2e-2,
+                "qk_norm f16 in-place mismatch at {i}: got {} want {}",
+                got[i],
+                want[i]
+            );
+        }
+    }
+
+    /// A one-op `Op::Copy` graph with a cross-dtype (f32 src → f16 dst) shape — llama4's NoPE
+    /// (global) attention layers cast the raw Q/K projection into the f16 rope scratch this way
+    /// (`seam/runner.rs`, `nope` branch) — must match the f32 values cast to f16, NOT a raw byte
+    /// copy (which would corrupt every value: f32 is 2x f16's width). Same-dtype `Copy` (the
+    /// common case elsewhere) is exercised implicitly by every other graph test that uses it.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn copy_f32_to_f16_cast_matches_host() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        let n = 37usize; // not a multiple of the dispatch's local size — exercises the tail
+        let x: Vec<f32> = (0..n).map(|i| (i as f32 * 0.31).sin() * 3.0).collect();
+        let want: Vec<f32> = x.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect();
+        let mut g = Graph::new();
+        let xi = g.input(TensorDesc::new(vec![n], DType::F32));
+        let yi = g.output(TensorDesc::new(vec![n], DType::F16));
+        g.push(Op::Copy {
+            src: xi,
+            src_off: 0,
+            dst: yi,
+            dst_off: 0,
+            n: n as u32,
+        });
+        let xb = be_.alloc(n * 4, BufferUsage::Activations).unwrap();
+        let yb = be_.alloc(n * 2, BufferUsage::Activations).unwrap();
+        be_.upload(xb.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+        let plan = be_.compile(&g).unwrap();
+        let mut bind = Bindings::new();
+        bind.bind(xi, xb.as_ref());
+        bind.bind(yi, yb.as_ref());
+        be_.execute(plan.as_ref(), &bind).unwrap();
+        let mut got16 = vec![0u8; n * 2];
+        be_.download(yb.as_ref(), &mut got16).unwrap();
+        let got: Vec<f32> = got16
+            .chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect();
+        for i in 0..n {
+            assert_eq!(
+                got[i], want[i],
+                "copy f32->f16 cast mismatch at {i}: got {} want {}",
+                got[i], want[i]
             );
         }
     }
@@ -4643,6 +4819,252 @@ mod tests {
                 got[i],
                 want[i]
             );
+        }
+    }
+
+    /// llama4's exact routing shape on the SMALL-m path: sigmoid gating, NO top-k renorm, top-1
+    /// (n_used=1), and weight-before-FFN (the routing weight scales the expert INPUT — folded
+    /// here into the gate/up GEMV outputs via `moe_weight_scale`, BEFORE the activation; see its
+    /// doc). Host reference mirrors the CPU `Op::MoeFfn` interpreter's llama4 arm bit-for-bit
+    /// (sigmoid prob, no renorm, weight applied to gate/up pre-activation, not re-applied at the
+    /// output). Runs rows=1 (decode) and rows=4 (small prefill chunk) — both
+    /// ≤ `moe_small_m_threshold()`, so this exercises ONLY the small-m fast path; the batched-path
+    /// counterpart is `moe_ffn_llama4_batched_matches_host`.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn moe_ffn_llama4_small_m_matches_host() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        let (ne, n_expert, n_used, nff) = (32usize, 4usize, 1usize, 32usize);
+        let scale = 1.3f32;
+        let f = |i: usize, s: f32| (i as f32 * s).sin() * 0.5;
+        let router: Vec<f32> = (0..n_expert * ne)
+            .map(|i| f(i, 0.037) + (i / ne) as f32 * 0.15)
+            .collect();
+        let gate: Vec<f32> = (0..n_expert * nff * ne).map(|i| f(i, 0.017)).collect();
+        let up: Vec<f32> = (0..n_expert * nff * ne).map(|i| f(i, 0.023)).collect();
+        let down: Vec<f32> = (0..n_expert * ne * nff).map(|i| f(i, 0.029)).collect();
+        let (rq, gq, uq, dq) = (q8_0(&router), q8_0(&gate), q8_0(&up), q8_0(&down));
+        let (rd, gd, ud, dd) = (deq_q8(&rq), deq_q8(&gq), deq_q8(&uq), deq_q8(&dq));
+        let dot = |w: &[f32], v: &[f32]| w.iter().zip(v).map(|(a, b)| a * b).sum::<f32>();
+        let sigmoid = |z: f32| 1.0 / (1.0 + (-z).exp());
+        let silu = |z: f32| z / (1.0 + (-z).exp());
+
+        for &rows in &[1usize, 4usize] {
+            let x: Vec<f32> = (0..rows * ne).map(|i| f(i, 0.11) + 0.05).collect();
+            let mut want = vec![0f32; rows * ne];
+            for t in 0..rows {
+                let xr = &x[t * ne..(t + 1) * ne];
+                let logits: Vec<f32> = (0..n_expert)
+                    .map(|e| dot(&rd[e * ne..(e + 1) * ne], xr))
+                    .collect();
+                // top-1 by raw logit — sigmoid is monotone, so this matches top-1-by-sigmoid-prob.
+                let e = (0..n_expert)
+                    .max_by(|&a, &b| logits[a].partial_cmp(&logits[b]).unwrap())
+                    .unwrap();
+                let w = sigmoid(logits[e]) * scale; // no renorm: raw prob × scale
+                let gs = e * nff * ne;
+                let ds = e * ne * nff;
+                let actv: Vec<f32> = (0..nff)
+                    .map(|j| {
+                        let g = dot(&gd[gs + j * ne..gs + (j + 1) * ne], xr);
+                        let u = dot(&ud[gs + j * ne..gs + (j + 1) * ne], xr);
+                        // weight-before: w scales gate/up BEFORE the activation.
+                        silu(w * g) * (w * u)
+                    })
+                    .collect();
+                for i in 0..ne {
+                    want[t * ne + i] = dot(&dd[ds + i * nff..ds + (i + 1) * nff], &actv);
+                }
+            }
+            // graph
+            let mut g = Graph::new();
+            let xi = g.input(TensorDesc::new(vec![rows, ne], DType::F32));
+            let ri = g.weight(TensorDesc::new(vec![n_expert, ne], DType::Q8_0));
+            let gi = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::Q8_0));
+            let ui = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::Q8_0));
+            let di = g.weight(TensorDesc::new(vec![n_expert, ne, nff], DType::Q8_0));
+            let yi = g.output(TensorDesc::new(vec![rows, ne], DType::F32));
+            g.push(Op::MoeFfn {
+                x: xi,
+                router_x: xi,
+                router: ri,
+                gate_exps: gi,
+                up_exps: ui,
+                down_exps: di,
+                down_scale: None,
+                fused_gate_up: false,
+                dst: yi,
+                ne: ne as u32,
+                n_expert: n_expert as u32,
+                n_used: n_used as u32,
+                n_ff_exp: nff as u32,
+                scale,
+                act: Activation::Silu,
+                gating: infr_core::graph::MoeGating::Sigmoid,
+                norm_w: false,
+                weight_before: true,
+            });
+            let mk = |bytes: &[u8], usage| {
+                let b = be_.alloc(bytes.len(), usage).unwrap();
+                be_.upload(b.as_ref(), bytes).unwrap();
+                b
+            };
+            let xb = mk(bytemuck::cast_slice(&x), BufferUsage::Activations);
+            let rb = mk(&rq, BufferUsage::Weights);
+            let gb = mk(&gq, BufferUsage::Weights);
+            let ub = mk(&uq, BufferUsage::Weights);
+            let db = mk(&dq, BufferUsage::Weights);
+            let yb = be_.alloc(rows * ne * 4, BufferUsage::Activations).unwrap();
+            let plan = be_.compile(&g).unwrap();
+            let mut bind = Bindings::new();
+            bind.bind(xi, xb.as_ref());
+            bind.bind(ri, rb.as_ref());
+            bind.bind(gi, gb.as_ref());
+            bind.bind(ui, ub.as_ref());
+            bind.bind(di, db.as_ref());
+            bind.bind(yi, yb.as_ref());
+            be_.execute(plan.as_ref(), &bind).unwrap();
+            let mut got = vec![0f32; rows * ne];
+            be_.download(yb.as_ref(), bytemuck::cast_slice_mut(&mut got))
+                .unwrap();
+            for i in 0..rows * ne {
+                assert!(
+                    (got[i] - want[i]).abs() < 3e-3,
+                    "llama4 small-m moe_ffn mismatch rows={rows} at {i}: got {} want {}",
+                    got[i],
+                    want[i]
+                );
+            }
+        }
+    }
+
+    /// llama4's exact routing shape on the BATCHED path (large `rows`, id-native mmq experts):
+    /// sigmoid gating, no renorm, top-1, weight-before-FFN. Twin of
+    /// `moe_ffn_llama4_small_m_matches_host` — same math, but exercises the packed
+    /// bucket-scatter → `moe_weight_scale` (post-GEMM, pre-activation) →
+    /// `moe_scatter_reduce(prescaled)` sequence the batched path uses instead of the small-m
+    /// path's per-slot GEMV + `moe_accumulate(prescaled)`. No shipped llama4 GGUF reaches this
+    /// path today (Scout's Q2_K expert banks have no dp4a-mmq kernel — see the `llama4` arch
+    /// note), but a future non-codebook-quant llama4 checkpoint would.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn moe_ffn_llama4_batched_matches_host() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        let (ne, n_expert, n_used, nff) = (256usize, 4usize, 1usize, 256usize);
+        let scale = 1.3f32;
+        let f = |i: usize, s: f32| (i as f32 * s).sin() * 0.5;
+        let sigmoid = |z: f32| 1.0 / (1.0 + (-z).exp());
+        let silu = |z: f32| z / (1.0 + (-z).exp());
+        let dot = |w: &[f32], v: &[f32]| w.iter().zip(v).map(|(a, b)| a * b).sum::<f32>();
+        let router: Vec<f32> = (0..n_expert * ne)
+            .map(|i| f(i, 0.037) + (i / ne) as f32 * 0.15)
+            .collect();
+        // 0.3x amplitude — see `moe_ffn_batched_split_q5k_down_matches_host`'s rationale (256-term
+        // dots need damping to stay in the int8-activation-quant's well-conditioned range).
+        let gate: Vec<f32> = (0..n_expert * nff * ne)
+            .map(|i| f(i, 0.017) * 0.3)
+            .collect();
+        let up: Vec<f32> = (0..n_expert * nff * ne)
+            .map(|i| f(i, 0.023) * 0.3)
+            .collect();
+        let down: Vec<f32> = (0..n_expert * ne * nff)
+            .map(|i| f(i, 0.029) * 0.3)
+            .collect();
+        let (rq, gq, uq, dq) = (q8_0(&router), q4k(&gate), q4k(&up), q8_0(&down));
+        let (rd, gd, ud, dd) = (deq_q8(&rq), deq_q4k(&gq), deq_q4k(&uq), deq_q8(&dq));
+
+        for &rows in &[9usize, 256usize] {
+            let x: Vec<f32> = (0..rows * ne).map(|i| f(i, 0.11) + 0.05).collect();
+            let mut want = vec![0f32; rows * ne];
+            for t in 0..rows {
+                let xr = &x[t * ne..(t + 1) * ne];
+                let logits: Vec<f32> = (0..n_expert)
+                    .map(|e| dot(&rd[e * ne..(e + 1) * ne], xr))
+                    .collect();
+                let e = (0..n_expert)
+                    .max_by(|&a, &b| logits[a].partial_cmp(&logits[b]).unwrap())
+                    .unwrap();
+                let w = sigmoid(logits[e]) * scale;
+                let gs = e * nff * ne;
+                let ds = e * ne * nff;
+                // The batched path reads int8-quantized activations (quant_q8_gather for gate/up,
+                // quant_q8 for the down input) — round-trip both so the reference matches.
+                let xrq = deq_q8(&q8_0(xr));
+                let actv: Vec<f32> = (0..nff)
+                    .map(|j| {
+                        let g = dot(&gd[gs + j * ne..gs + (j + 1) * ne], &xrq);
+                        let u = dot(&ud[gs + j * ne..gs + (j + 1) * ne], &xrq);
+                        silu(w * g) * (w * u)
+                    })
+                    .collect();
+                let actvq = deq_q8(&q8_0(&actv));
+                for i in 0..ne {
+                    want[t * ne + i] = dot(&dd[ds + i * nff..ds + (i + 1) * nff], &actvq);
+                }
+            }
+            // graph
+            let mut g = Graph::new();
+            let xi = g.input(TensorDesc::new(vec![rows, ne], DType::F32));
+            let ri = g.weight(TensorDesc::new(vec![n_expert, ne], DType::Q8_0));
+            let gi = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::Q4K));
+            let ui = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::Q4K));
+            let di = g.weight(TensorDesc::new(vec![n_expert, ne, nff], DType::Q8_0));
+            let yi = g.output(TensorDesc::new(vec![rows, ne], DType::F32));
+            g.push(Op::MoeFfn {
+                x: xi,
+                router_x: xi,
+                router: ri,
+                gate_exps: gi,
+                up_exps: ui,
+                down_exps: di,
+                down_scale: None,
+                fused_gate_up: false,
+                dst: yi,
+                ne: ne as u32,
+                n_expert: n_expert as u32,
+                n_used: n_used as u32,
+                n_ff_exp: nff as u32,
+                scale,
+                act: Activation::Silu,
+                gating: infr_core::graph::MoeGating::Sigmoid,
+                norm_w: false,
+                weight_before: true,
+            });
+            let mk = |bytes: &[u8], usage| {
+                let b = be_.alloc(bytes.len(), usage).unwrap();
+                be_.upload(b.as_ref(), bytes).unwrap();
+                b
+            };
+            let xb = mk(bytemuck::cast_slice(&x), BufferUsage::Activations);
+            let rb = mk(&rq, BufferUsage::Weights);
+            let gb = mk(&gq, BufferUsage::Weights);
+            let ub = mk(&uq, BufferUsage::Weights);
+            let db = mk(&dq, BufferUsage::Weights);
+            let yb = be_.alloc(rows * ne * 4, BufferUsage::Activations).unwrap();
+            let plan = be_.compile(&g).unwrap();
+            let mut bind = Bindings::new();
+            bind.bind(xi, xb.as_ref());
+            bind.bind(ri, rb.as_ref());
+            bind.bind(gi, gb.as_ref());
+            bind.bind(ui, ub.as_ref());
+            bind.bind(di, db.as_ref());
+            bind.bind(yi, yb.as_ref());
+            be_.execute(plan.as_ref(), &bind).unwrap();
+            let mut got = vec![0f32; rows * ne];
+            be_.download(yb.as_ref(), bytemuck::cast_slice_mut(&mut got))
+                .unwrap();
+            for i in 0..rows * ne {
+                assert!(
+                    (got[i] - want[i]).abs() < 2e-2,
+                    "llama4 batched moe_ffn mismatch rows={rows} at {i}: got {} want {}",
+                    got[i],
+                    want[i]
+                );
+            }
         }
     }
 

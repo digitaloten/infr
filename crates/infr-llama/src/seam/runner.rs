@@ -1878,10 +1878,20 @@ pub(crate) fn generate_dense_backend(
                             k16
                         }
                         None if nope => {
-                            // llama4 NoPE (global) layer: NO rope, NO L2-norm — cache the raw K
-                            // projection directly. (On CPU every buffer is f32, so the "f16" k16
-                            // scratch isn't needed; the raw `k` feeds WriteKv unchanged.)
-                            k
+                            // llama4 NoPE (global) layer: NO rope, NO L2-norm — the reference
+                            // caches the RAW K projection. `Op::Copy` is a value-preserving cast
+                            // here (CPU stores every buffer as f32 regardless of declared dtype,
+                            // so this is a no-op there; Vulkan's WriteKv/attention kernels require
+                            // the f16 scratch, and the adapter's `Op::Copy` lowering casts f32→f16
+                            // instead of a raw byte copy when src/dst dtypes differ).
+                            g.push(Op::Copy {
+                                src: k,
+                                src_off: 0,
+                                dst: k16,
+                                dst_off: 0,
+                                n: (batch * nkv * hd) as u32,
+                            });
+                            k16
                         }
                         None => {
                             // llama (no k-norm): interleaved RoPE straight to the f16 scratch — the
@@ -1956,12 +1966,20 @@ pub(crate) fn generate_dense_backend(
                         q16
                     }
                     None if nope => {
-                        // llama4 NoPE (global) layer: Q is UNROPED — the attention reads the raw
-                        // f32 projection directly. (The reference multiplies Q by an attention-
-                        // temperature scale here; that scale is EXACTLY 1.0 below the 8192-token
-                        // chunk size, so it is a no-op in infr's CPU-testable regime — see the
-                        // `llama4` arch note for the long-context follow-up.)
-                        q
+                        // llama4 NoPE (global) layer: Q is UNROPED — cast the raw f32 projection
+                        // into q16 the same way K does above (`Op::Copy`, value-preserving; see
+                        // its doc there). The reference multiplies Q by an attention-temperature
+                        // scale here; that scale is EXACTLY 1.0 below the 8192-token chunk size,
+                        // so it is a no-op in infr's CPU-testable regime — see the `llama4` arch
+                        // note for the long-context follow-up.
+                        g.push(Op::Copy {
+                            src: q,
+                            src_off: 0,
+                            dst: q16,
+                            dst_off: 0,
+                            n: (batch * nh * hd) as u32,
+                        });
+                        q16
                     }
                     None => {
                         // llama: Q roped to the f16 scratch (the attention kernels read f16 q).

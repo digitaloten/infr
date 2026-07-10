@@ -2,20 +2,33 @@
 // RMSNorm: y[i] = x[i] * inversesqrt(mean(x²) + eps) * w[i], one workgroup per row.
 // -DGATE build (`rmsnorm_gate`): fuses in the qwen35 DeltaNet z-gate multiply
 // -DADD build (`rmsnorm_add`): fuses in an in-place add to dst: dst[i] += norm_result[i]
+// -DF16IO build (`rmsnorm_f16`): x/y are f16 instead of f32 (llama4's post-rope weightless Q/K
+// L2-norm, `Op::QkNorm` on the f16 rope scratch — `w` stays f32 either way). Mutually exclusive
+// with GATE/ADD (no in-tree caller needs the combination).
 // Requires requiredSubgroupSize=32 (wave32 → 8 subgroups).
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#ifdef F16IO
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC { uint rows; uint dim; float eps; } pc;
+#ifdef F16IO
+layout(binding = 0) readonly buffer XB { float16_t x[]; };
+#else
 layout(binding = 0) readonly buffer XB { float x[]; };
+#endif
 layout(binding = 1) readonly buffer WB { float w[]; };
 #ifdef GATE
 layout(binding = 2) readonly buffer ZB { float z[]; };
 layout(binding = 3) buffer YB { float y[]; };
 #elif defined(ADD)
 layout(binding = 2) buffer DB { float dst[]; };
+#elif defined(F16IO)
+layout(binding = 2) buffer YB { float16_t y[]; };
 #else
 layout(binding = 2) buffer YB { float y[]; };
 #endif
@@ -28,7 +41,11 @@ void main() {
     uint base = r * pc.dim;
 
     float ss = 0.0;
+#ifdef F16IO
+    for (uint i = t; i < pc.dim; i += 256u) { float v = float(x[base + i]); ss += v * v; }
+#else
     for (uint i = t; i < pc.dim; i += 256u) { float v = x[base + i]; ss += v * v; }
+#endif
     ss = subgroupAdd(ss);
     if (subgroupElect()) { part[gl_SubgroupID] = ss; }
     barrier();
@@ -46,6 +63,10 @@ void main() {
     }
 #elif defined(ADD)
     for (uint i = t; i < pc.dim; i += 256u) { dst[base + i] += x[base + i] * scale * w[i]; }
+#elif defined(F16IO)
+    for (uint i = t; i < pc.dim; i += 256u) {
+        y[base + i] = float16_t(float(x[base + i]) * scale * w[i]);
+    }
 #else
     for (uint i = t; i < pc.dim; i += 256u) { y[base + i] = x[base + i] * scale * w[i]; }
 #endif

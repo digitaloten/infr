@@ -480,9 +480,15 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
                 infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
             ))
         }
-    } else if std::env::var("INFR_CPU").is_ok() || is_l4 {
+    } else if std::env::var("INFR_CPU").is_ok()
+        || (is_l4 && std::env::var("INFR_L4_ALLOW_GPU").is_err())
+    {
+        // llama4 defaults to CPU: the Vulkan lowering is implemented + parity-tested, but the
+        // only published llama4 (Scout, 37GB Q2_K) exceeds any 24GB card even with expert
+        // host-offload (the ~33GB host-visible expert banks overflow the GTT submission budget →
+        // device lost). INFR_L4_ALLOW_GPU=1 opts in on hardware that fits it.
         if is_l4 && std::env::var("INFR_CPU").is_err() {
-            eprintln!("[llama4 is CPU-only for now — forcing the CPU backend]");
+            eprintln!("[llama4 defaults to the CPU backend — INFR_L4_ALLOW_GPU=1 to opt into Vulkan on big-VRAM hardware]");
         }
         eprintln!(
             "[cpu backend — dense/MoE forward on CPU via the agnostic compute graph, no GPU]"
@@ -1037,9 +1043,9 @@ fn cmd_bench(
     // (`Config::from_gguf` + `MixerW::DeltaNet`), reusing the exact same pp/tg/depth methodology
     // every other arch gets (no more qwen35-only bench arm or depth-accounting artifacts).
     // -ngl 0: run on the CPU reference backend (no GPU), comparable to `llama-bench -ngl 0`.
-    // llama4 also lands here regardless of -ngl: CPU-only for now (same forced-CPU fallback as
-    // `cmd_run` — the GPU MoeFfn lowerings assert on llama4's routing).
-    if ngl == 0 || infr_llama::is_llama4(&gguf) {
+    // llama4 also lands here regardless of -ngl unless INFR_L4_ALLOW_GPU opts into Vulkan —
+    // see `cmd_run`'s comment.
+    if ngl == 0 || (infr_llama::is_llama4(&gguf) && std::env::var("INFR_L4_ALLOW_GPU").is_err()) {
         return cmd_bench_cpu(
             &gguf,
             tok.as_deref(),
@@ -2510,8 +2516,10 @@ fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
                 infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
             ))
         }
-    } else if std::env::var("INFR_CPU").is_ok() || infr_llama::is_llama4(&gguf) {
-        // llama4: CPU-only for now — same forced-CPU fallback as `cmd_run` (see its comment).
+    } else if std::env::var("INFR_CPU").is_ok()
+        || (infr_llama::is_llama4(&gguf) && std::env::var("INFR_L4_ALLOW_GPU").is_err())
+    {
+        // llama4 defaults to CPU (INFR_L4_ALLOW_GPU opts in) — see `cmd_run`'s comment.
         Box::new(infr_llama::chat::CpuDenseChat::new(
             infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
         ))

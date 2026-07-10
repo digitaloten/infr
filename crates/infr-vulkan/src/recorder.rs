@@ -2344,6 +2344,34 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Like [`Self::rmsnorm`], but `x`/`y` are f16 instead of f32 (`rmsnorm.comp`'s -DF16IO build)
+    /// — llama4's post-rope weightless Q/K L2-norm (`Op::QkNorm` in-place on the f16 rope scratch,
+    /// `x == dst`). `w` stays f32 either way.
+    pub fn rmsnorm_f16(
+        &self,
+        x: &dyn Buffer,
+        w: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) {
+        let k = self
+            .be
+            .kernel_sg("rmsnorm_f16", crate::gemm::rmsnorm_f16_spv(), 3, 12, 32);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(dim as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&eps.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(w), Self::vkb(y)],
+            1,
+            &push,
+            rows as u32,
+        );
+    }
+
     /// Fused per-head RMSNorm + SiLU gate multiply: `y[i] = rmsnorm(x)[i] * silu(z[i])`, one
     /// workgroup per (row, head) — `rmsnorm.comp`'s -DGATE build (`Op::GatedRmsNorm`, qwen35
     /// DeltaNet z-gate). Same reduction as `rmsnorm`; `z` must be the SAME shape/layout as `x`
@@ -4459,9 +4487,12 @@ impl<'a> Recorder<'a> {
         crate::linear::native_id_kernel_name(dtype).is_some()
     }
 
-    /// GPU MoE router top-k for `n_tokens` tokens (one workgroup per token): softmax-renormalized
-    /// top-`n_used` over each token's `logits[n_expert]` → selected expert `ids` + `wts` (per token,
-    /// `n_used` each), all in VRAM (no host round-trip). `scale` = routing scale.
+    /// GPU MoE router top-k for `n_tokens` tokens (one workgroup per token): top-`n_used` over each
+    /// token's `logits[n_expert]` → selected expert `ids` + `wts` (per token, `n_used` each), all in
+    /// VRAM (no host round-trip). `scale` = routing scale. `gating` (0 = softmax, 1 = sigmoid) and
+    /// `norm_w` (renormalize the selected weights to sum to 1) select the weighting formula —
+    /// qwen3moe/qwen35moe/diffusion-gemma pass (softmax, true); llama4 passes (sigmoid, false).
+    #[allow(clippy::too_many_arguments)]
     pub fn moe_topk(
         &self,
         logits: &dyn Buffer,
@@ -4471,14 +4502,18 @@ impl<'a> Recorder<'a> {
         n_expert: usize,
         n_used: usize,
         scale: f32,
+        gating: u32,
+        norm_w: bool,
     ) {
         let k = self
             .be
-            .kernel("moe_topk", crate::gemm::moe_topk_spv(), 3, 12);
-        let mut push = [0u8; 12];
+            .kernel("moe_topk", crate::gemm::moe_topk_spv(), 3, 20);
+        let mut push = [0u8; 20];
         push[0..4].copy_from_slice(&(n_expert as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n_used as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&scale.to_ne_bytes());
+        push[12..16].copy_from_slice(&gating.to_ne_bytes());
+        push[16..20].copy_from_slice(&(norm_w as u32).to_ne_bytes());
         // ids is read-modify-write (exclusion scan); bind it as an output alongside wts.
         self.dispatch(
             k,
@@ -4486,6 +4521,33 @@ impl<'a> Recorder<'a> {
             2,
             &push,
             n_tokens as u32,
+        );
+    }
+
+    /// llama4 weight-before-FFN: in-place per-row scale `y[row*width+i] *= w[row]` — applied to the
+    /// gate/up projection OUTPUT (before the activation), exact-equivalent to the CPU's
+    /// input-side fold since gate/up are linear (see `Op::MoeFfn`'s `weight_before` doc and the
+    /// shader comment). `n_rows`/`w` are at whatever granularity `y` is packed at (small-m: n_slots
+    /// = rows*n_used; batched: n_pairs bucket-sorted assignments).
+    pub fn moe_weight_scale(&self, y: &dyn Buffer, w: &dyn Buffer, n_rows: usize, width: usize) {
+        let k = self.be.kernel(
+            "moe_weight_scale",
+            crate::gemm::moe_weight_scale_spv(),
+            2,
+            8,
+        );
+        let mut push = [0u8; 8];
+        push[0..4].copy_from_slice(&(n_rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(width as u32).to_ne_bytes());
+        // w first, y LAST: dispatch3 hazard-tracks the last n_out buffers as writes — y is the
+        // read-modify-write target, so it must sit in the write slot or the downstream activation
+        // kernel races the in-place scale (shader bindings match this order).
+        self.dispatch(
+            k,
+            &[Self::vkb(w), Self::vkb(y)],
+            1,
+            &push,
+            ((n_rows * width) as u32).div_ceil(64),
         );
     }
 
@@ -5061,7 +5123,9 @@ impl<'a> Recorder<'a> {
 
     /// Batched-MoE epilogue: `dst[t] = Σ_s bucket_wts[p]·y_all[p]` over the token's `n_used`
     /// assignments (p = inv_pos[t·n_used+s]) — fixed slot order, deterministic, no atomics, and
-    /// dst is written directly (no zero + per-expert accumulate passes).
+    /// dst is written directly (no zero + per-expert accumulate passes). `prescaled` (llama4's
+    /// weight-before-FFN): `bucket_wts` was already folded into the packed activations upstream
+    /// (`moe_weight_scale`) — sum `y_all` unweighted instead of multiplying by `bucket_wts` again.
     #[allow(clippy::too_many_arguments)]
     pub fn moe_scatter_reduce(
         &self,
@@ -5072,17 +5136,19 @@ impl<'a> Recorder<'a> {
         rows: usize,
         ne: usize,
         n_used: usize,
+        prescaled: bool,
     ) {
         let k = self.be.kernel(
             "moe_scatter_reduce",
             crate::gemm::moe_scatter_reduce_spv(),
             4,
-            12,
+            16,
         );
-        let mut push = [0u8; 12];
+        let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(n_used as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(prescaled as u32).to_ne_bytes());
         self.dispatch(
             k,
             &[
@@ -5270,6 +5336,10 @@ impl<'a> Recorder<'a> {
     /// `hidden[row*ne+i] += Σ_slot wts[row*n_used+slot] * down[(row*n_used+slot)*ne + i]`. Folds the
     /// per-expert axpys into one op. `rows` widens this to independent tokens via grid.y (the MoE
     /// small-m fast path — see `Op::MoeFfn` in adapter.rs); `rows == 1` is the original decode call.
+    /// `prescaled` (llama4's weight-before-FFN): `wts` was already folded into the gate/up
+    /// activations upstream (`moe_weight_scale`) — sum `down` unweighted instead of multiplying by
+    /// `wts` again.
+    #[allow(clippy::too_many_arguments)]
     pub fn moe_accumulate(
         &self,
         down: &dyn Buffer,
@@ -5278,13 +5348,15 @@ impl<'a> Recorder<'a> {
         ne: usize,
         n_used: usize,
         rows: usize,
+        prescaled: bool,
     ) {
         let k = self
             .be
-            .kernel("moe_accumulate", crate::gemm::moe_accumulate_spv(), 3, 8);
-        let mut push = [0u8; 8];
+            .kernel("moe_accumulate", crate::gemm::moe_accumulate_spv(), 3, 12);
+        let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(ne as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n_used as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(prescaled as u32).to_ne_bytes());
         self.dispatch3(
             k,
             &[Self::vkb(down), Self::vkb(wts), Self::vkb(hidden)],

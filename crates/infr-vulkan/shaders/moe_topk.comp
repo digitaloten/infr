@@ -1,8 +1,14 @@
 #version 460
-// MoE router top-k on the GPU (one workgroup, 128 lanes): softmax-renormalized top-`n_used` over
-// `n_expert` logits → selected expert ids + weights, all in VRAM. Mirrors the host `moe_topk`
-// (max-shift, top-k by logit, renorm over the selected set, × routing scale) so an on-GPU router can
-// drive the expert matmuls with no host round-trip.
+// MoE router top-k on the GPU (one workgroup, 128 lanes): top-`n_used` over `n_expert` logits →
+// selected expert ids + weights, all in VRAM. Mirrors the host `moe_topk` (max-shift, top-k by
+// logit, weight by gating function, optional renorm over the selected set, × routing scale) so an
+// on-GPU router can drive the expert matmuls with no host round-trip.
+//
+// `gating` (0 = softmax, 1 = sigmoid) and `norm_w` (renormalize the selected weights to sum to 1)
+// are independent push-constant flags — qwen3moe/qwen35moe/diffusion-gemma ship softmax+renorm;
+// llama4 ships sigmoid+no-renorm (top-1, `w = sigmoid(logit) · scale`). Selection is unaffected by
+// either flag: both gating functions are monotone in the logit, so top-k-by-logit always picks the
+// same expert set the reference gating function would.
 //
 // General `n_expert`: each lane owns `ceil(n_expert / 128)` experts (lane `t` owns `t, t+128,
 // t+256, ...`, up to MAX_CHUNKS — headroom for n_expert up to 128*MAX_CHUNKS; out-of-range/absent
@@ -16,17 +22,30 @@
 // extra tree-reduce stage + halved occupancy, so this chunked-lane form is preferred), and for
 // n_expert<=128 (one chunk) this is byte-identical to the old one-lane-per-expert code path.
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
-layout(push_constant) uniform PC { uint n_expert; uint n_used; float scale; } pc;
+layout(push_constant) uniform PC {
+    uint n_expert;
+    uint n_used;
+    float scale;
+    uint gating;  // 0 = softmax, 1 = sigmoid
+    uint norm_w;  // 1 = renormalize the selected weights to sum to 1 before scaling
+} pc;
 layout(binding = 0) readonly buffer LB { float logits[]; };
 layout(binding = 1) buffer IB { uint ids[]; };
 layout(binding = 2) writeonly buffer WB { float wts[]; };
 
 shared float sval[128];
 shared uint sidx[128];
+shared float glmax; // global max logit (thread 0 broadcasts after the first pick)
 
 // n_expert headroom: 128 lanes * 8 chunks = 1024 experts. Bump if a model ever exceeds that (loud
 // silent-truncation risk otherwise — same bug class this kernel just got fixed for).
 #define MAX_CHUNKS 8u
+
+float score_of(float logit) {
+    // Per-expert routing score: exp(logit - glmax) for softmax (max-shifted, pre-normalization —
+    // the shared `glmax` keeps every score in a safe exp() range), or sigmoid(logit) directly.
+    return (pc.gating == 0u) ? exp(logit - glmax) : (1.0 / (1.0 + exp(-logit)));
+}
 
 void main() {
     uint tok = gl_WorkGroupID.x;       // one workgroup per token (decode: 1, prefill: t)
@@ -42,7 +61,6 @@ void main() {
         taken[c] = false;
     }
 
-    float lmax = -1e30; // thread 0 captures the global max at the first (unexcluded) pick
     for (uint k = 0u; k < pc.n_used; k++) {
         // this lane's best still-unpicked owned expert (registers only, no shared/barrier)
         float bv = -1e30;
@@ -70,21 +88,41 @@ void main() {
         uint winner = sidx[0];
         if (t == 0u) {
             ids[obase + k] = winner;
-            if (k == 0u) { lmax = sval[0]; }
+            if (k == 0u) { glmax = sval[0]; }
         }
         for (uint c = 0u; c < MAX_CHUNKS; c++) {
             if (t + c * 128u == winner) { taken[c] = true; }
         }
-        barrier();
+        barrier(); // also publishes glmax (written before this barrier on k==0)
     }
     if (t == 0u) {
-        float wsum = 0.0;
+        float wsum_sel = 0.0;
         for (uint k = 0u; k < pc.n_used; k++) {
-            wsum += exp(logits[lbase + ids[obase + k]] - lmax);
+            wsum_sel += score_of(logits[lbase + ids[obase + k]]);
         }
-        wsum = max(wsum, 1e-20);
-        for (uint k = 0u; k < pc.n_used; k++) {
-            wts[obase + k] = exp(logits[lbase + ids[obase + k]] - lmax) / wsum * pc.scale;
+        if (pc.norm_w != 0u) {
+            wsum_sel = max(wsum_sel, 1e-20);
+            for (uint k = 0u; k < pc.n_used; k++) {
+                wts[obase + k] = score_of(logits[lbase + ids[obase + k]]) / wsum_sel * pc.scale;
+            }
+        } else if (pc.gating == 0u) {
+            // Softmax, no renorm: need the FULL denominator over every expert (not just the
+            // selected subset) — unlike the renorm case, the full-softmax denominator does NOT
+            // cancel. No in-tree model uses this combination (llama4's no-renorm path is
+            // sigmoid), so this stays a simple serial scan rather than a parallel reduction.
+            float full_sum = 0.0;
+            for (uint e = 0u; e < pc.n_expert; e++) {
+                full_sum += exp(logits[lbase + e] - glmax);
+            }
+            full_sum = max(full_sum, 1e-20);
+            for (uint k = 0u; k < pc.n_used; k++) {
+                wts[obase + k] = exp(logits[lbase + ids[obase + k]] - glmax) / full_sum * pc.scale;
+            }
+        } else {
+            // Sigmoid, no renorm (llama4): w = sigmoid(logit) * scale, no denominator at all.
+            for (uint k = 0u; k < pc.n_used; k++) {
+                wts[obase + k] = score_of(logits[lbase + ids[obase + k]]) * pc.scale;
+            }
         }
     }
 }

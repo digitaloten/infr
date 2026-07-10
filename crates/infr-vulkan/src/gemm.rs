@@ -813,6 +813,13 @@ pub(crate) fn add_scaled_id_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// SPIR-V for llama4's weight-before-FFN in-place per-row scale (`Op::MoeFfn`'s `weight_before`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn moe_weight_scale_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_weight_scale.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 
 /// SPIR-V for the LARGE-WARPTILE native-block prefill GEMM (8-warp BM=64×BN=256, gemm_proj_warp
 /// structure with in-shader native dequant). Only the hot formats are compiled; `None` falls back
@@ -1433,6 +1440,13 @@ pub(crate) fn rmsnorm_gate_spv() -> &'static [u32] {
 pub(crate) fn rmsnorm_add_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/rmsnorm_add.spv"))))
+}
+/// SPIR-V for f16-in/f16-out RMSNorm (`rmsnorm.comp`'s -DF16IO build) — llama4's post-rope
+/// weightless Q/K L2-norm (`Op::QkNorm` on the f16 rope scratch).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn rmsnorm_f16_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/rmsnorm_f16.spv"))))
 }
 /// SPIR-V for the 256-thread subgroup row-softmax (`y=softmax(x*scale)`). Used by the recorder's
 /// `softmax` (diffusion-gemma's in-graph self-conditioning).
