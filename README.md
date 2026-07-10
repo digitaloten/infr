@@ -265,23 +265,24 @@ throughput not yet matching llama.cpp's batched-speculative path.
 **Llama-4-Scout** (109B-A17B, Q2_K, 37 GB) is deliberately absent from the table
 above (its per-token small-m dispatch shape isn't comparable to the batched
 pp/tg columns) but now runs end to end on a 24 GB card via the paged expert
-cache (`infr_vulkan::pager`): Scout's Q2_K expert banks are a codebook quant
-with no batched-MoE dp4a path, so both prefill and decode route through the
-id-indexed small-m GEMV — the ONE shape the paged executor split targets. Greedy
-output is oracle-locked against llama.cpp (`cpu_llama4_scout_greedy`) AND
+cache (`infr_vulkan::pager`). Scout's Q2_K (gate/up) and Q3_K (down) expert
+banks now have their own dp4a mmq kernels, so prefill runs the batched
+bucket-scatter expert-GEMM pipeline against the pager arena (one residency
+readback per layer per ubatch chunk); decode keeps the id-indexed small-m GEMV.
+Greedy output is oracle-locked against llama.cpp (`cpu_llama4_scout_greedy`) AND
 against the paged Vulkan path itself
 (`gpu_seam_paged_moe_matches_scout_oracle`), token-for-token identical. Measured
 (all 48 expert layers paged, per-role LRU caches of 312/312/238 experts — each
-role's arena is one SSBO, capped at the device's 4 GiB binding range): `tg32`
-**12.6 t/s** at 72-77% hit rates (> llama.cpp's CPU-offload-hybrid 6.55 t/s),
-`pp512` **27.6 t/s** at 94-96% hit rates — still far below llama.cpp's 136,
-because Scout's prefill has no batched path at all (every token pays a
-router→readback→touch→GEMV round trip per layer, per the small-m-only constraint
-above); closing that gap needs a batched paged-expert GEMM for codebook quants,
-filed as a follow-up (as is splitting a role across several arena buffers to
-lift the 4 GiB per-role cache cap). `INFR_MOE_CACHE_GB` sizes the pager's budget
-(see the MoE placement paragraph above); pure CPU stays available under
-`INFR_CPU=1` / `-ngl 0`.
+role's arena is one SSBO, capped at the device's 4 GiB binding range): warm
+decode `tg64@d128` **~27 t/s** at ~94% hit rates (llama.cpp's CPU-offload
+hybrid: 6.55), `pp512` **41.2 t/s** at 97-98% hit rates. The prefill wall-clock
+is now HOST-bound, not GPU-bound: the profiler puts the GPU work itself at ~363
+t/s-equivalent (the mmq kernels beat llama.cpp's 136 ceiling handily) with ~89%
+GPU idle from the per-layer submit→readback→upload cadence — pipelining that
+orchestration is the filed follow-up (as is splitting a role across several
+arena buffers to lift the 4 GiB per-role cache cap). `INFR_MOE_CACHE_GB` sizes
+the pager's budget (see the MoE placement paragraph above); pure CPU stays
+available under `INFR_CPU=1` / `-ngl 0`.
 
 **Also validated for correctness** (GPU seam vs CPU reference), beyond the perf
 table: Qwen2-0.5B, Llama-3.2-1B, Gemma-4-12B (dense), and Qwen3-0.6B across

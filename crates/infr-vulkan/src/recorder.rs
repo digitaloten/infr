@@ -4983,8 +4983,10 @@ impl<'a> Recorder<'a> {
     /// indexed `w_base + e·stride`. Grid x covers the worst-case row tiles (`ceil(rows/BM)` — the
     /// whole chunk landing on one expert); tiles past a segment exit immediately, so the empty
     /// launches cost ~nothing while the dispatch count drops from ~n_expert·stages per layer to
-    /// stages. `sact` is Q4_K/Q5_K/Q5_1's min-term row sums (None for Q6_K/Q8_0/Q5_0, which have
-    /// no min).
+    /// stages. `sact` is Q4_K/Q5_K/Q5_1's min-term row sums (None for Q6_K/Q8_0/Q5_0/Q3_K, which
+    /// have no min, AND for Q2_K — also min-carrying, but its 16-elem sub-block is HALF the
+    /// activation's 32-elem `sact` granularity, so it self-computes its own 16-wide Σx in-shader
+    /// instead of binding this buffer; see `native_gemm_mmq_q2_k.comp`'s doc).
     ///
     /// `rows` is a GRID-SIZING BOUND ONLY (never read by the shader — the kernel derives every
     /// real row range from `counts`/`offsets`): it must be `>=` the largest possible `counts[e]`
@@ -5099,7 +5101,33 @@ impl<'a> Recorder<'a> {
                 crate::gemm::native_gemm_mmq_q5_1_xp32_spv(),
                 7,
             ),
-            _ => unreachable!("batched MoE expert GEMM: Q4_K/Q5_K/Q6_K/Q8_0/Q5_0/Q5_1 only"),
+            // NB: Q2_K is min-carrying but does NOT bind `sact` — its 16-elem sub-block is HALF
+            // the activation's 32-elem quant block, so the shared 32-wide `sact` can't supply
+            // the min term (see the shader's doc); it self-computes the needed 16-wide Σx from
+            // the already-staged int8 codes instead.
+            (infr_core::DType::Q2K, false) => (
+                "native_gemm_mmq_q2_k_xp",
+                crate::gemm::native_gemm_mmq_q2_k_xp_spv(),
+                6,
+            ),
+            (infr_core::DType::Q2K, true) => (
+                "native_gemm_mmq_q2_k_xp32",
+                crate::gemm::native_gemm_mmq_q2_k_xp32_spv(),
+                6,
+            ),
+            (infr_core::DType::Q3K, false) => (
+                "native_gemm_mmq_q3_k_xp",
+                crate::gemm::native_gemm_mmq_q3_k_xp_spv(),
+                6,
+            ),
+            (infr_core::DType::Q3K, true) => (
+                "native_gemm_mmq_q3_k_xp32",
+                crate::gemm::native_gemm_mmq_q3_k_xp32_spv(),
+                6,
+            ),
+            _ => unreachable!(
+                "batched MoE expert GEMM: Q4_K/Q5_K/Q6_K/Q8_0/Q5_0/Q5_1/Q2_K/Q3_K only"
+            ),
         };
         let kern = self.be.kernel(name, spv, nb, 16);
         let mut push = [0u8; 16];
@@ -5118,6 +5146,78 @@ impl<'a> Recorder<'a> {
             Self::vkb(offsets),
             Self::vkb(c),
         ]);
+        self.dispatch3(kern, &bufs, 1, &push, gx, n_expert as u32, 1);
+    }
+
+    /// [`Self::matmul_mmq_experts`]'s paged twin: `arena` is a `GpuPager` arena (uniform slots)
+    /// and `lut` its device LUT of arena WORD bases; the kernel resolves each bucket's weight
+    /// base as `lut[layer_base + expert]` instead of `w_base + expert·stride` (the shaders'
+    /// `-DPAGED` build — word-base indirection at the `rb()` chokepoint, same u32-overflow lesson
+    /// as the paged GEMVs). The caller must have made every ROUTED expert of this layer resident
+    /// (all of them simultaneously — buckets run in one dispatch) and flushed the LUT before this
+    /// records; buckets with count 0 exit before any LUT/weight read, so unrouted experts may be
+    /// absent. Only the dtypes a shipped paged model needs have `_xpg` builds (Scout: Q2_K
+    /// gate/up + Q3_K down — both symmetric-or-self-summed, so no `sact` param at all). Tile
+    /// selection (BM=64 vs 32) matches the resident twin.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_mmq_experts_paged(
+        &self,
+        dtype: infr_core::DType,
+        stage: &'static str,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        arena: &dyn Buffer,
+        lut: &dyn Buffer,
+        layer_base: usize,
+        counts: &dyn Buffer,
+        offsets: &dyn Buffer,
+        c: &dyn Buffer,
+        rows: usize,
+        k: usize,
+        n: usize,
+        n_expert: usize,
+        n_used: usize,
+    ) {
+        self.label_next(stage);
+        let avg_rows = rows.saturating_mul(n_used) / n_expert.max(1);
+        let small_tile = avg_rows <= MOE_EXPERT_SMALL_TILE_AVG_ROWS;
+        let bm: usize = if small_tile { 32 } else { 64 };
+        let (name, spv) = match (dtype, small_tile) {
+            (infr_core::DType::Q2K, false) => (
+                "native_gemm_mmq_q2_k_xpg",
+                crate::gemm::native_gemm_mmq_q2_k_xpg_spv(),
+            ),
+            (infr_core::DType::Q2K, true) => (
+                "native_gemm_mmq_q2_k_xpg32",
+                crate::gemm::native_gemm_mmq_q2_k_xpg32_spv(),
+            ),
+            (infr_core::DType::Q3K, false) => (
+                "native_gemm_mmq_q3_k_xpg",
+                crate::gemm::native_gemm_mmq_q3_k_xpg_spv(),
+            ),
+            (infr_core::DType::Q3K, true) => (
+                "native_gemm_mmq_q3_k_xpg32",
+                crate::gemm::native_gemm_mmq_q3_k_xpg32_spv(),
+            ),
+            _ => unreachable!("paged batched MoE expert GEMM: Q2_K/Q3_K only"),
+        };
+        let kern = self.be.kernel(name, spv, 7, 16);
+        let mut push = [0u8; 16];
+        // pc.m unused in the PAGED build (slot bases come from the LUT); pc.w_base carries the
+        // layer's global-id base.
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(layer_base as u32).to_ne_bytes());
+        let gx = (rows.div_ceil(bm) * (n / 64)) as u32;
+        let bufs = [
+            Self::vkb(qa),
+            Self::vkb(dact),
+            Self::vkb(arena),
+            Self::vkb(lut),
+            Self::vkb(counts),
+            Self::vkb(offsets),
+            Self::vkb(c),
+        ];
         self.dispatch3(kern, &bufs, 1, &push, gx, n_expert as u32, 1);
     }
 

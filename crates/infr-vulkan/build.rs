@@ -894,6 +894,18 @@ fn main() {
             "native_gemm_mmq_q5_1_xp",
             &["-DEXPERT_GRID"],
         ),
+        // Llama-4-Scout's shipped MoE expert dtypes (gate/up=Q2_K, down=Q3_K) — see the two
+        // shaders' doc comments for the block layout / sact conventions.
+        (
+            "native_gemm_mmq_q2_k",
+            "native_gemm_mmq_q2_k_xp",
+            &["-DEXPERT_GRID"],
+        ),
+        (
+            "native_gemm_mmq_q3_k",
+            "native_gemm_mmq_q3_k_xp",
+            &["-DEXPERT_GRID"],
+        ),
         // BM=32 row-tile variants of the expert-grid GEMM (see matmul_mmq_experts' `n_used` doc):
         // at small rows-per-expert (Qwen3.6-MoE's 256-expert pool averages ~16/expert at pp512)
         // the default BM=64 tile is ~75% masked waste — a BM=32 tile halves that. Selected
@@ -929,6 +941,38 @@ fn main() {
             "native_gemm_mmq_q5_1",
             "native_gemm_mmq_q5_1_xp32",
             &["-DEXPERT_GRID", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_q2_k",
+            "native_gemm_mmq_q2_k_xp32",
+            &["-DEXPERT_GRID", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_q3_k",
+            "native_gemm_mmq_q3_k_xp32",
+            &["-DEXPERT_GRID", "-DBM_TILE=32u"],
+        ),
+        // PAGED expert-grid variants (Scout's batched prefill through the GpuPager arena+LUT —
+        // see the shaders' PAGED doc): only the dtypes a shipped paged model needs today.
+        (
+            "native_gemm_mmq_q2_k",
+            "native_gemm_mmq_q2_k_xpg",
+            &["-DEXPERT_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemm_mmq_q3_k",
+            "native_gemm_mmq_q3_k_xpg",
+            &["-DEXPERT_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemm_mmq_q2_k",
+            "native_gemm_mmq_q2_k_xpg32",
+            &["-DEXPERT_GRID", "-DPAGED", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_q3_k",
+            "native_gemm_mmq_q3_k_xpg32",
+            &["-DEXPERT_GRID", "-DPAGED", "-DBM_TILE=32u"],
         ),
         ("quant_q8", "quant_q8_gather", &["-DGATHER"]),
         ("moe_scatter_reduce", "moe_scatter_reduce", &[]),

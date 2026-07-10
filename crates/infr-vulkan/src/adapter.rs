@@ -2558,13 +2558,14 @@ fn lower_op(
             // on-GPU) + a prologue that writes per-expert INDIRECT dispatch args from the counts —
             // so the whole expert loop records with NO host readback (the bespoke path downloads
             // counts mid-graph to size its GEMMs; indirect dispatch replaces that). Gate/up AND
-            // down each independently accept Q4_K/Q5_K/Q6_K/Q8_0/Q5_0/Q5_1 (split OR fused gate/up;
-            // Q5_0 is what the shipped diffusiongemma-26B-A4B-it-GGUF's down banks use; Q5_1 is
-            // what the shipped gemma-4-26B-A4B-it-GGUF's down banks use (29/30 layers); Q5_K/Q6_K
-            // is what unsloth-dynamic Qwen3.6-MoE quants mix into most layers' gate/up/down
-            // banks) — every dtype routes through the SAME dtype-generic `matmul_mmq_experts`
-            // dp4a kernel table, so there's no per-role dtype restriction beyond that shared set.
-            // Codebook quants (IQ*/Q2_K/Q3_K — no dp4a-mmq kernel) route through the per-token
+            // down each independently accept Q4_K/Q5_K/Q6_K/Q8_0/Q5_0/Q5_1/Q2_K/Q3_K (split OR
+            // fused gate/up; Q5_0 is what the shipped diffusiongemma-26B-A4B-it-GGUF's down banks
+            // use; Q5_1 is what the shipped gemma-4-26B-A4B-it-GGUF's down banks use (29/30
+            // layers); Q5_K/Q6_K is what unsloth-dynamic Qwen3.6-MoE quants mix into most layers'
+            // gate/up/down banks; Q2_K/Q3_K is Llama-4-Scout's shipped gate/up (Q2_K) and down
+            // (Q3_K) — every dtype routes through the SAME dtype-generic `matmul_mmq_experts` dp4a
+            // kernel table, so there's no per-role dtype restriction beyond that shared set. Other
+            // codebook quants (IQ*) still have no dp4a-mmq kernel and route through the per-token
             // path below regardless of role.
             //
             // Fused gate_up (diffusion-gemma): native block formats can't be split at an
@@ -2584,30 +2585,30 @@ fn lower_op(
             // correct for any `rows`, just without the batched path's cross-token weight-bank
             // reuse (a real perf cost for large-batch MoE prefill on such hardware).
             if rows > moe_small_m_threshold() && be_.caps().i8_dot {
-                use infr_core::DType::{Q4K, Q5K, Q5_0, Q5_1, Q6K, Q8_0};
-                // `matmul_mmq_experts` is dtype-generic (dp4a mmq kernels exist for all six of
+                use infr_core::DType::{Q2K, Q3K, Q4K, Q5K, Q5_0, Q5_1, Q6K, Q8_0};
+                // `matmul_mmq_experts` is dtype-generic (dp4a mmq kernels exist for all eight of
                 // these — that's why `down_ok` already covered the wider set) and role-agnostic
                 // (gate/up/down all call the SAME function, just with a different weight handle
-                // and stride) — so gate/up get the SAME coverage as down, not just Q4_K. Codebook
-                // quants (IQ*/Q2_K/Q3_K) have no dp4a-mmq kernel at all and stay out of this set;
+                // and stride) — so gate/up get the SAME coverage as down, not just Q4_K. Other
+                // codebook quants (IQ*) have no dp4a-mmq kernel at all and stay out of this set;
                 // those experts keep falling through to the per-token path below.
                 //
                 // MUST mirror infr-llama/seam/runner.rs's `moe_mmq_ok` exactly — a mismatch either
                 // silently falls back to per-token prefill (this gate stricter) or compiles a
                 // batched graph this adapter then rejects (that gate stricter).
-                let mmq_ok = |dt| matches!(dt, Q4K | Q5K | Q6K | Q8_0 | Q5_0 | Q5_1);
+                let mmq_ok = |dt| matches!(dt, Q4K | Q5K | Q6K | Q8_0 | Q5_0 | Q5_1 | Q2K | Q3K);
                 let down_ok = mmq_ok(ddt);
                 let act_ok = if *fused_gate_up {
                     matches!(act, Activation::Silu | Activation::Gelu)
                 } else {
-                    // qwen3moe (the only split-gate_up batched caller) ships SiLU only; a non-
+                    // qwen3moe/llama4 (the split-gate_up batched callers) ship SiLU only; a non-
                     // fused GELU batched kernel doesn't exist (no caller needs it today).
                     matches!(act, Activation::Silu)
                 };
                 if !(mmq_ok(gdt) && mmq_ok(udt) && down_ok && act_ok) {
                     return Err(be(format!(
-                        "vulkan adapter: batched MoeFfn needs Q4_K/Q5_K/Q6_K/Q8_0/Q5_0/Q5_1 \
-                         gate/up + Q4_K/Q5_K/Q6_K/Q8_0/Q5_0/Q5_1 down \
+                        "vulkan adapter: batched MoeFfn needs Q4_K/Q5_K/Q6_K/Q8_0/Q5_0/Q5_1/Q2_K/Q3_K \
+                         gate/up + Q4_K/Q5_K/Q6_K/Q8_0/Q5_0/Q5_1/Q2_K/Q3_K down \
                          (+ SiLU, or GELU when fused_gate_up) \
                          (got gate={gdt:?} up={udt:?} \
                          down={ddt:?} act={act:?} fused={fused_gate_up})"
@@ -2725,10 +2726,12 @@ fn lower_op(
                     ne,
                 );
                 // `sact` (the activation's per-block min-correction sums) is only READ by the
-                // Q4_K/Q5_K/Q5_1 kernels — Q6_K/Q8_0/Q5_0 are symmetric (no min term), same split
-                // `down_needs_sact` already uses below. Mirrored per-role here since gate/up can
-                // now each independently be any of the six dtypes (unlike before this change,
-                // when gdt/udt were both forced to Q4_K and always needed it).
+                // Q4_K/Q5_K/Q5_1 kernels — Q6_K/Q8_0/Q5_0/Q3_K are symmetric (no min term), and
+                // Q2_K (also min-carrying) self-computes its own narrower Σx in-shader instead
+                // (its 16-elem sub-block is half `sact`'s 32-elem granularity — see
+                // `native_gemm_mmq_q2_k.comp`'s doc). Same split `down_needs_sact` already uses
+                // below. Mirrored per-role here since gate/up can each independently be any of
+                // the eight dtypes.
                 let gate_needs_sact = matches!(gdt, Q4K | Q5K | Q5_1);
                 rec.matmul_mmq_experts(
                     gdt,
@@ -2749,8 +2752,8 @@ fn lower_op(
                     n_used,
                 );
                 if let Some(ue) = ue {
-                    // Split (qwen3moe): the up GEMM reads the same quantized activations and
-                    // writes its own buffer — disjoint from the gate GEMM, no barrier needed.
+                    // Split (qwen3moe, llama4): the up GEMM reads the same quantized activations
+                    // and writes its own buffer — disjoint from the gate GEMM, no barrier needed.
                     let up_needs_sact = matches!(udt, Q4K | Q5K | Q5_1);
                     rec.suppress_sync(true);
                     rec.matmul_mmq_experts(
@@ -2821,8 +2824,9 @@ fn lower_op(
                     nff,
                 );
                 // The min-carrying down formats (Q4_K/Q5_K's K-quant min, Q5_1's legacy min) bind
-                // `sact` — Q6_K/Q8_0/Q5_0 are symmetric (no min), same as the per-token path's
-                // dtype-gated `sact` use.
+                // `sact` — Q6_K/Q8_0/Q5_0/Q3_K are symmetric (no min), and Q2_K self-computes its
+                // own min term in-shader (see the gate/up `_needs_sact` comment above), same as
+                // the per-token path's dtype-gated `sact` use.
                 let down_needs_sact = matches!(ddt, Q4K | Q5K | Q5_1);
                 rec.matmul_mmq_experts(
                     ddt,
@@ -3602,6 +3606,179 @@ fn execute_paged_moe(
         bytemuck::cast_slice(&global_ids),
     )
     .map_err(|e| be(e.to_string()))?;
+
+    // ── Segment 2, BATCHED (rows > threshold, Scout's chunked prefill): the same GPU-resident
+    // bucket count/scan/scatter → dp4a mmq expert-GEMM pipeline as the resident batched arm
+    // (`lower_op`'s `Op::MoeFfn`), with the GEMMs reading the pager arena through the word-base
+    // LUT (`matmul_mmq_experts_paged`) instead of a resident bank. All ROUTED experts of this
+    // layer are already resident and the LUT flushed (the `touch_role` calls above resolve every
+    // id in the chunk — up to `n_expert` distinct simultaneously, which the pager budget floor in
+    // `seam::mod` guarantees fits); buckets with count 0 never read the LUT. Gated on the exact
+    // dtype set that has `_xpg` kernel builds (Q2_K/Q3_K — Scout's shipped formats) + SiLU + dp4a
+    // support; anything else stays on the id-GEMV segment below, which is shape-general.
+    {
+        use infr_core::DType::{Q2K, Q3K};
+        let paged_mmq_ok = |dt| matches!(dt, Q2K | Q3K);
+        if rows > moe_small_m_threshold()
+            && be_.caps().i8_dot
+            && matches!(act, Activation::Silu)
+            && paged_mmq_ok(gdt)
+            && paged_mmq_ok(udt)
+            && paged_mmq_ok(ddt)
+        {
+            // gate/up/down of one layer share the SAME layer_base (asserted above).
+            let layer_base = (global_ids[0] - local_ids[0]) as usize;
+            let n_pairs = n_slots;
+            // The GEMM As stage reads up to 63 rows past a segment end — pad the packed row
+            // dimension so the LAST expert's overread stays in-bounds (the resident arm's npad).
+            let npad = n_pairs.div_ceil(64) * 64 + 64;
+            let counts = pooled(pool, be_, "moe_pgb_counts", n_expert * 4)?;
+            let offsets = pooled(pool, be_, "moe_pgb_offsets", n_expert * 4)?;
+            let fill = pooled(pool, be_, "moe_pgb_fill", n_expert * 4)?;
+            let bucket_rows = pooled(pool, be_, "moe_pgb_brows", n_pairs * 4)?;
+            let bucket_wts = pooled(pool, be_, "moe_pgb_bwts", n_pairs * 4)?;
+            let inv_pos = pooled(pool, be_, "moe_pgb_ipos", n_pairs * 4)?;
+            let qa = pooled(pool, be_, "moe_pgb_qa", npad * ne)?;
+            let qda = pooled(pool, be_, "moe_pgb_qda", npad * (ne / 32) * 2)?;
+            let qsa = pooled(pool, be_, "moe_pgb_qsa", npad * (ne / 32) * 2)?;
+            let ge = pooled(pool, be_, "moe_pgb_ge", npad * nff * 4)?;
+            let ue = pooled(pool, be_, "moe_pgb_ue", npad * nff * 4)?;
+            let ae = pooled(pool, be_, "moe_pgb_ae", npad * nff * 4)?;
+            let dqa = pooled(pool, be_, "moe_pgb_dqa", npad * nff)?;
+            let dda = pooled(pool, be_, "moe_pgb_dda", npad * (nff / 32) * 2)?;
+            let dsa = pooled(pool, be_, "moe_pgb_dsa", npad * (nff / 32) * 2)?;
+            let ye = pooled(pool, be_, "moe_pgb_ye", npad * ne * 4)?;
+
+            let rec2 = be_.recorder()?;
+            let xb = r(*x)?;
+            rec2.zero(pool[&counts].as_ref(), n_expert);
+            rec2.moe_bucket_count(pool[&ids_key].as_ref(), pool[&counts].as_ref(), n_pairs);
+            rec2.moe_bucket_scan(
+                pool[&counts].as_ref(),
+                pool[&offsets].as_ref(),
+                pool[&fill].as_ref(),
+                n_expert,
+            );
+            let dsb: Option<&dyn Buffer> = match down_scale {
+                Some(ds) => Some(r(*ds)?),
+                None => None,
+            };
+            rec2.moe_bucket_scatter(
+                pool[&ids_key].as_ref(),
+                pool[&wts].as_ref(),
+                pool[&offsets].as_ref(),
+                pool[&fill].as_ref(),
+                pool[&bucket_rows].as_ref(),
+                pool[&bucket_wts].as_ref(),
+                pool[&inv_pos].as_ref(),
+                dsb,
+                n_pairs,
+                n_used,
+            );
+            rec2.quant_q8_gather(
+                xb,
+                pool[&bucket_rows].as_ref(),
+                pool[&qa].as_ref(),
+                pool[&qda].as_ref(),
+                pool[&qsa].as_ref(),
+                n_pairs,
+                ne,
+            );
+            {
+                let guard = be_.moe_pager().lock().unwrap();
+                let sess = guard.as_ref().expect("checked above");
+                rec2.matmul_mmq_experts_paged(
+                    gdt,
+                    "expert_gateup",
+                    pool[&qa].as_ref(),
+                    pool[&qda].as_ref(),
+                    sess.arena(Role::Gate),
+                    sess.lut(Role::Gate),
+                    layer_base,
+                    pool[&counts].as_ref(),
+                    pool[&offsets].as_ref(),
+                    pool[&ge].as_ref(),
+                    rows,
+                    ne,
+                    nff,
+                    n_expert,
+                    n_used,
+                );
+                // The up GEMM reads the same quantized activations and writes its own buffer —
+                // disjoint from the gate GEMM, no barrier needed (resident arm's pattern).
+                rec2.suppress_sync(true);
+                rec2.matmul_mmq_experts_paged(
+                    udt,
+                    "expert_gateup",
+                    pool[&qa].as_ref(),
+                    pool[&qda].as_ref(),
+                    sess.arena(Role::Up),
+                    sess.lut(Role::Up),
+                    layer_base,
+                    pool[&counts].as_ref(),
+                    pool[&offsets].as_ref(),
+                    pool[&ue].as_ref(),
+                    rows,
+                    ne,
+                    nff,
+                    n_expert,
+                    n_used,
+                );
+                rec2.suppress_sync(false);
+            }
+            if *weight_before {
+                rec2.moe_weight_scale(pool[&ge].as_ref(), pool[&bucket_wts].as_ref(), n_pairs, nff);
+                rec2.moe_weight_scale(pool[&ue].as_ref(), pool[&bucket_wts].as_ref(), n_pairs, nff);
+            }
+            rec2.silu_mul(
+                pool[&ge].as_ref(),
+                pool[&ue].as_ref(),
+                pool[&ae].as_ref(),
+                n_pairs * nff,
+            );
+            rec2.quant_q8(
+                pool[&ae].as_ref(),
+                pool[&dqa].as_ref(),
+                pool[&dda].as_ref(),
+                pool[&dsa].as_ref(),
+                n_pairs,
+                nff,
+            );
+            {
+                let guard = be_.moe_pager().lock().unwrap();
+                let sess = guard.as_ref().expect("checked above");
+                rec2.matmul_mmq_experts_paged(
+                    ddt,
+                    "expert_down",
+                    pool[&dqa].as_ref(),
+                    pool[&dda].as_ref(),
+                    sess.arena(Role::Down),
+                    sess.lut(Role::Down),
+                    layer_base,
+                    pool[&counts].as_ref(),
+                    pool[&offsets].as_ref(),
+                    pool[&ye].as_ref(),
+                    rows,
+                    nff,
+                    ne,
+                    n_expert,
+                    n_used,
+                );
+            }
+            rec2.moe_scatter_reduce(
+                pool[&ye].as_ref(),
+                pool[&bucket_wts].as_ref(),
+                pool[&inv_pos].as_ref(),
+                r(*dst)?,
+                rows,
+                ne,
+                n_used,
+                *weight_before,
+            );
+            rec2.finish().map_err(|e| be(e.to_string()))?;
+            return Ok(());
+        }
+    }
 
     // ── Segment 2: the paged expert GEMVs (arena+LUT instead of a resident bank) through the rest
     // of this MoeFfn's math — activation, down-projection, weighted accumulate — exactly mirroring
@@ -5550,6 +5727,212 @@ mod tests {
         out
     }
 
+    // ---- Q2_K helpers (block=256: 16-byte scales[16] (low nibble=4-bit scale, high nibble=4-bit
+    // min) + 64-byte qs (2-bit codes) + f16 d + f16 dmin = 84 bytes) — mirrors
+    // `native_gemm_mmq_q2_k`'s decode exactly: min-carrying (like Q4_K/Q5_K, MINUS convention:
+    // `y = d*(sc&0xF)*q2 - dmin*(sc>>4)`) but with 16-element sub-block granularity (one whole
+    // byte per sub-block, no 6-bit packing) — Llama-4-Scout's shipped gate/up MoE format. The
+    // byte/shift mapping (`base(si) = 32*(si>>3) + 16*(si&1)`, `shift(si) = 2*((si&7)>>1)`) is
+    // ground-truthed against infr-gguf's dequant.rs Q2_K reference (and the shader's own doc).
+    // Same internal-round-trip-only caveat as the Q4_K/Q5_K helpers (this is a self-consistent
+    // encoder for test data, not a bit-exact ggml quantizer — only the DECODER must match the GPU
+    // shader exactly).
+    fn q2_k(x: &[f32]) -> Vec<u8> {
+        let base = |si: usize| 32 * (si >> 3) + 16 * (si & 1);
+        let shift = |si: usize| 2 * ((si & 7) >> 1);
+        let mut out = Vec::with_capacity(x.len() / 256 * 84);
+        for blk in x.chunks(256) {
+            let mut sub_lo = [0f32; 16];
+            let mut sub_sc = [0f32; 16];
+            for (si, sub) in blk.chunks(16).enumerate() {
+                let lo = sub.iter().cloned().fold(f32::INFINITY, f32::min);
+                let hi = sub.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                sub_lo[si] = lo;
+                sub_sc[si] = ((hi - lo) / 3.0).max(1e-8);
+            }
+            let d = sub_sc.iter().cloned().fold(0f32, f32::max) / 15.0;
+            let dmin = sub_lo
+                .iter()
+                .cloned()
+                .fold(0f32, |m, v| m.max(v.abs()))
+                .max(1e-8)
+                / 15.0;
+            let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+            let idmin = if dmin > 0.0 { 1.0 / dmin } else { 0.0 };
+            let mut scales = [0u8; 16];
+            let mut sc = [0u32; 16];
+            let mut mn = [0u32; 16];
+            for si in 0..16 {
+                sc[si] = ((sub_sc[si] * id).round() as i32).clamp(0, 15) as u32;
+                mn[si] = ((sub_lo[si].abs() * idmin).round() as i32).clamp(0, 15) as u32;
+                scales[si] = (sc[si] | (mn[si] << 4)) as u8;
+            }
+            out.extend_from_slice(&scales);
+            let mut qs = [0u8; 64];
+            for si in 0..16 {
+                let scale = d * sc[si] as f32;
+                let min = dmin * mn[si] as f32;
+                let iscale = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+                let b = base(si);
+                let sh = shift(si);
+                for l in 0..16 {
+                    let v = blk[si * 16 + l];
+                    let q = (((v - min) * iscale).round() as i32).clamp(0, 3) as u8;
+                    qs[b + l] |= q << sh;
+                }
+            }
+            out.extend_from_slice(&qs);
+            out.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+            out.extend_from_slice(&half::f16::from_f32(dmin).to_le_bytes());
+        }
+        out
+    }
+    fn deq_q2_k(bytes: &[u8]) -> Vec<f32> {
+        let base = |si: usize| 32 * (si >> 3) + 16 * (si & 1);
+        let shift = |si: usize| 2 * ((si & 7) >> 1);
+        let mut out = Vec::with_capacity(bytes.len() / 84 * 256);
+        for blk in bytes.chunks(84) {
+            let scales = &blk[0..16];
+            let qs = &blk[16..80];
+            let d = half::f16::from_le_bytes([blk[80], blk[81]]).to_f32();
+            let dmin = half::f16::from_le_bytes([blk[82], blk[83]]).to_f32();
+            for (si, &scb) in scales.iter().enumerate() {
+                let scale = d * (scb & 0xF) as f32;
+                let min = dmin * (scb >> 4) as f32;
+                let b = base(si);
+                let sh = shift(si);
+                for l in 0..16 {
+                    let q = (qs[b + l] >> sh) & 3;
+                    out.push(scale * q as f32 - min);
+                }
+            }
+        }
+        out
+    }
+
+    // ---- Q3_K helpers (block=256: 32-byte hmask + 64-byte qs (2-bit) + 12-byte packed 6-bit
+    // scales + f16 d = 110 bytes) — mirrors `native_gemm_mmq_q3_k`'s decode exactly: SYMMETRIC (no
+    // min, unlike Q2_K/Q4_K/Q5_K), `y = d*(sc6-32)*(q3u-4)` with q3u = 2 low bits from `qs` OR'd
+    // with a high bit from `hmask` — Llama-4-Scout's shipped down-projection MoE format. Same
+    // byte/shift mapping as Q2_K for the low 2 bits; `hmask` bit position cycles
+    // `4*(si>>3) + ((si&7)>>1)` within byte `16*(si&1)+l`. Scale packing follows llama.cpp's
+    // 4-word bit-interleave (`sc3` in the shader); this encoder inverts it directly (no need for
+    // the CPU reference's SIMD-vectorized reconstruction — one scalar per sub-block suffices for
+    // test-data synthesis). Same internal-round-trip-only caveat as the other K-quant helpers.
+    fn q3_k(x: &[f32]) -> Vec<u8> {
+        let base = |si: usize| 32 * (si >> 3) + 16 * (si & 1);
+        let shift = |si: usize| 2 * ((si & 7) >> 1);
+        let hbit = |si: usize| 4 * (si >> 3) + ((si & 7) >> 1);
+        let mut out = Vec::with_capacity(x.len() / 256 * 110);
+        for blk in x.chunks(256) {
+            let mut sub_sc = [0f32; 16]; // per-sub-block (max abs)/3, sign-agnostic
+            for (si, sub) in blk.chunks(16).enumerate() {
+                let amax = sub.iter().cloned().fold(0f32, |m, v| m.max(v.abs()));
+                sub_sc[si] = (amax / 3.0).max(1e-8);
+            }
+            let d = sub_sc.iter().cloned().fold(0f32, f32::max) / 31.0;
+            let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+            // signed 6-bit scale in [-32, 31]; keep it positive here (>=1) since a real 3-bit
+            // symmetric quantizer never needs a negative overall sub-block scale for this
+            // synthetic (non-adversarial) test data.
+            let mut s6 = [0i32; 16];
+            for si in 0..16 {
+                s6[si] = ((sub_sc[si] * id).round() as i32).clamp(1, 31);
+            }
+            // Pack s6 (stored as sc6+32, i.e. 33..63) into the 12-byte scales_raw using the SAME
+            // byte-wise scheme `sc3()` decodes (inverse of that function).
+            let mut sr = [0u8; 12];
+            for (si, &s) in s6.iter().enumerate() {
+                let val = (s + 32) as u8; // 0..63
+                let k = si >> 2;
+                let bi = si & 3;
+                let lo4 = val & 0xF;
+                let hi2 = (val >> 4) & 3;
+                match k {
+                    0 => {
+                        sr[bi] |= lo4;
+                        sr[8 + bi] |= hi2;
+                    }
+                    1 => {
+                        sr[4 + bi] |= lo4;
+                        sr[8 + bi] |= hi2 << 2;
+                    }
+                    2 => {
+                        sr[bi] |= lo4 << 4;
+                        sr[8 + bi] |= hi2 << 4;
+                    }
+                    _ => {
+                        sr[4 + bi] |= lo4 << 4;
+                        sr[8 + bi] |= hi2 << 6;
+                    }
+                }
+            }
+            out.extend_from_slice(&[0u8; 32]); // hmask placeholder, filled below
+            let hmask_start = out.len() - 32;
+            let mut qs = [0u8; 64];
+            for si in 0..16 {
+                let scale = d * s6[si] as f32;
+                let iscale = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+                let b = base(si);
+                let sh = shift(si);
+                let hb = hbit(si);
+                for l in 0..16 {
+                    let v = blk[si * 16 + l];
+                    let q3u = (((v * iscale) + 4.0).round() as i32).clamp(0, 7) as u8;
+                    qs[b + l] |= (q3u & 3) << sh;
+                    if q3u & 4 != 0 {
+                        let hbyte_idx = hmask_start + 16 * (si & 1) + l;
+                        out[hbyte_idx] |= 1 << hb;
+                    }
+                }
+            }
+            out.extend_from_slice(&qs);
+            out.extend_from_slice(&sr);
+            out.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+        }
+        out
+    }
+    fn deq_q3_k(bytes: &[u8]) -> Vec<f32> {
+        let base = |si: usize| 32 * (si >> 3) + 16 * (si & 1);
+        let shift = |si: usize| 2 * ((si & 7) >> 1);
+        let hbit = |si: usize| 4 * (si >> 3) + ((si & 7) >> 1);
+        let sc3 = |sr: &[u8], si: usize| -> i32 {
+            let k = si >> 2;
+            let bi = si & 3;
+            let a = sr[bi] as u32;
+            let b = sr[4 + bi] as u32;
+            let c = sr[8 + bi] as u32;
+            let val = match k {
+                0 => (a & 0xF) | ((c & 3) << 4),
+                1 => (b & 0xF) | (((c >> 2) & 3) << 4),
+                2 => ((a >> 4) & 0xF) | (((c >> 4) & 3) << 4),
+                _ => ((b >> 4) & 0xF) | (((c >> 6) & 3) << 4),
+            };
+            val as i32 - 32
+        };
+        let mut out = Vec::with_capacity(bytes.len() / 110 * 256);
+        for blk in bytes.chunks(110) {
+            let hmask = &blk[0..32];
+            let qs = &blk[32..96];
+            let sr = &blk[96..108];
+            let d = half::f16::from_le_bytes([blk[108], blk[109]]).to_f32();
+            for si in 0..16usize {
+                let s = sc3(sr, si);
+                let scale = d * s as f32;
+                let b = base(si);
+                let sh = shift(si);
+                let hb = hbit(si);
+                for l in 0..16 {
+                    let low2 = (qs[b + l] >> sh) & 3;
+                    let high = (hmask[16 * (si & 1) + l] >> hb) & 1;
+                    let q3u = low2 | (high << 2);
+                    out.push(scale * (q3u as f32 - 4.0));
+                }
+            }
+        }
+        out
+    }
+
     /// The `rows>moe_small_m_threshold()` (batched, GPU-resident routing) twin of
     /// `moe_ffn_fused_scaled_matches_host`: diffusion-gemma's ACTUAL production dtypes (fused Q4_K
     /// gate_up, not Q8_0 — exercises `matmul_mmq_experts`'s Q4_K path with `gu_width = 2*nff`) +
@@ -6108,6 +6491,143 @@ mod tests {
                 assert!(
                     (got[i] - want[i]).abs() < 2e-2,
                     "batched fused q5_1-down moe_ffn mismatch rows={rows} at {i}: got {} want {}",
+                    got[i],
+                    want[i]
+                );
+            }
+        }
+    }
+
+    /// Batched split-gate MoeFfn in Llama-4-Scout's actual shipped shape: gate=Q2_K, up=Q2_K
+    /// (min-carrying, but its 16-elem sub-block is HALF the activation's 32-elem `sact`
+    /// granularity, so it self-computes its own Σx in-shader instead of binding `sact` — see
+    /// `native_gemm_mmq_q2_k.comp`'s doc; exercises that kernel for BOTH gate/up roles at once),
+    /// down=Q3_K (symmetric, no min at all, no `sact` — exercises the new
+    /// `native_gemm_mmq_q3_k_xp` kernel and confirms `mmq_ok`/`down_needs_sact` handle it
+    /// correctly). SiLU, split gate/up (llama4's `dual_moe()` is false), separate `router_x`
+    /// unused (bound to `x`, matching qwen3moe/llama4's convention). Host reference structure
+    /// mirrors `moe_ffn_batched_split_q5k_gate_up_matches_host`; 0.3x amplitude damping for the
+    /// same int8-activation-quant conditioning reason. An earlier version of this kernel had a
+    /// real bug here, caught by an isolated single-expert diagnostic during development: Q2_K's
+    /// min term tried to reuse the shared 32-wide `sact` buffer, which silently mixed in the
+    /// wrong half's activation sum — fixed by computing the 16-wide sum in-shader from the
+    /// already-staged int8 codes instead.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn moe_ffn_batched_split_q2_k_q3_k_scout_shape_matches_host() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        let (ne, n_expert, n_used, nff) = (256usize, 4usize, 2usize, 256usize);
+        let scale = 1.0f32;
+        let f = |i: usize, s: f32| (i as f32 * s).sin() * 0.5;
+        let silu = |z: f32| z / (1.0 + (-z).exp());
+        let dot = |w: &[f32], v: &[f32]| w.iter().zip(v).map(|(a, b)| a * b).sum::<f32>();
+        let router: Vec<f32> = (0..n_expert * ne)
+            .map(|i| f(i, 0.037) + (i / ne) as f32 * 0.15)
+            .collect();
+        let gate: Vec<f32> = (0..n_expert * nff * ne)
+            .map(|i| f(i, 0.017) * 0.3)
+            .collect();
+        let up: Vec<f32> = (0..n_expert * nff * ne)
+            .map(|i| f(i, 0.023) * 0.3)
+            .collect();
+        let down: Vec<f32> = (0..n_expert * ne * nff)
+            .map(|i| f(i, 0.029) * 0.3)
+            .collect();
+        let (rq, gq, uq, dq) = (q8_0(&router), q2_k(&gate), q2_k(&up), q3_k(&down));
+        let (rd, gd, ud, dd) = (deq_q8(&rq), deq_q2_k(&gq), deq_q2_k(&uq), deq_q3_k(&dq));
+
+        for &rows in &[9usize, 256usize] {
+            let x: Vec<f32> = (0..rows * ne).map(|i| f(i, 0.11) + 0.05).collect();
+            let mut want = vec![0f32; rows * ne];
+            for t in 0..rows {
+                let xr = &x[t * ne..(t + 1) * ne];
+                let logits: Vec<f32> = (0..n_expert)
+                    .map(|e| dot(&rd[e * ne..(e + 1) * ne], xr))
+                    .collect();
+                let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut probs: Vec<f32> = logits.iter().map(|&v| (v - maxl).exp()).collect();
+                let psum: f32 = probs.iter().sum();
+                probs.iter_mut().for_each(|p| *p /= psum);
+                let mut idx: Vec<usize> = (0..n_expert).collect();
+                idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+                idx.truncate(n_used);
+                let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
+                let xrq = deq_q8(&q8_0(xr));
+                for &e in &idx {
+                    let gs = e * nff * ne;
+                    let ds = e * ne * nff;
+                    let actv: Vec<f32> = (0..nff)
+                        .map(|j| {
+                            let g = dot(&gd[gs + j * ne..gs + (j + 1) * ne], &xrq);
+                            let u = dot(&ud[gs + j * ne..gs + (j + 1) * ne], &xrq);
+                            silu(g) * u
+                        })
+                        .collect();
+                    let actvq = deq_q8(&q8_0(&actv));
+                    let w_e = probs[e] / wsum * scale;
+                    for i in 0..ne {
+                        want[t * ne + i] +=
+                            w_e * dot(&dd[ds + i * nff..ds + (i + 1) * nff], &actvq);
+                    }
+                }
+            }
+            // graph
+            let mut g = Graph::new();
+            let xi = g.input(TensorDesc::new(vec![rows, ne], DType::F32));
+            let ri = g.weight(TensorDesc::new(vec![n_expert, ne], DType::Q8_0));
+            let gi = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::Q2K));
+            let ui = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::Q2K));
+            let di = g.weight(TensorDesc::new(vec![n_expert, ne, nff], DType::Q3K));
+            let yi = g.output(TensorDesc::new(vec![rows, ne], DType::F32));
+            g.push(Op::MoeFfn {
+                x: xi,
+                router_x: xi,
+                router: ri,
+                gate_exps: gi,
+                up_exps: ui,
+                down_exps: di,
+                down_scale: None,
+                fused_gate_up: false,
+                dst: yi,
+                ne: ne as u32,
+                n_expert: n_expert as u32,
+                n_used: n_used as u32,
+                n_ff_exp: nff as u32,
+                scale,
+                act: Activation::Silu,
+                gating: infr_core::graph::MoeGating::Softmax,
+                norm_w: true,
+                weight_before: false,
+            });
+            let mk = |bytes: &[u8], usage| {
+                let b = be_.alloc(bytes.len(), usage).unwrap();
+                be_.upload(b.as_ref(), bytes).unwrap();
+                b
+            };
+            let xb = mk(bytemuck::cast_slice(&x), BufferUsage::Activations);
+            let rb = mk(&rq, BufferUsage::Weights);
+            let gb = mk(&gq, BufferUsage::Weights);
+            let ub = mk(&uq, BufferUsage::Weights);
+            let db = mk(&dq, BufferUsage::Weights);
+            let yb = be_.alloc(rows * ne * 4, BufferUsage::Activations).unwrap();
+            let plan = be_.compile(&g).unwrap();
+            let mut bind = Bindings::new();
+            bind.bind(xi, xb.as_ref());
+            bind.bind(ri, rb.as_ref());
+            bind.bind(gi, gb.as_ref());
+            bind.bind(ui, ub.as_ref());
+            bind.bind(di, db.as_ref());
+            bind.bind(yi, yb.as_ref());
+            be_.execute(plan.as_ref(), &bind).unwrap();
+            let mut got = vec![0f32; rows * ne];
+            be_.download(yb.as_ref(), bytemuck::cast_slice_mut(&mut got))
+                .unwrap();
+            for i in 0..rows * ne {
+                assert!(
+                    (got[i] - want[i]).abs() < 2e-2,
+                    "batched split q2_k/q3_k (Scout shape) moe_ffn mismatch rows={rows} at {i}: got {} want {}",
                     got[i],
                     want[i]
                 );

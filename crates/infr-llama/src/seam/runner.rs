@@ -3253,14 +3253,25 @@ pub(crate) fn generate_dense_backend(
     // Guard: E2B/gemma4 requires a per-(token,layer) host-side input vector that is computed in
     // the per-step loop, so it falls through to the original token-by-token loop below unchanged.
     // Batched MoE prefill needs the adapter's GPU-routed expert path: gate/up AND down each
-    // independently in {Q4_K, Q5_K, Q6_K, Q8_0, Q5_0, Q5_1} (split gate/up, what qwen3moe/qwen35moe
-    // ship, or fused gate_up, diffusion-gemma's/gemma-4-MoE's `ffn_gate_up_exps`) — Q5_0 is what
-    // the shipped diffusiongemma-26B-A4B-it-GGUF's down banks use; Q5_1 is what the shipped
-    // gemma-4-26B-A4B-it-GGUF's down banks use (29/30 layers); unsloth-dynamic Qwen3.6-MoE (UD)
-    // quants mix Q5_K/Q6_K into gate/up/down banks across layers. Codebook quants (IQ*/Q2_K/Q3_K —
-    // no dp4a-mmq kernel) keep the per-token loop. This set must exactly mirror the Vulkan
-    // adapter's batched `Op::MoeFfn` coverage (its `mmq_ok`) — a mismatch either silently falls
-    // back to per-token prefill or compiles a graph the adapter rejects.
+    // independently in {Q4_K, Q5_K, Q6_K, Q8_0, Q5_0, Q5_1, Q2_K, Q3_K} (split gate/up, what
+    // qwen3moe/qwen35moe/llama4 ship, or fused gate_up, diffusion-gemma's/gemma-4-MoE's
+    // `ffn_gate_up_exps`) — Q5_0 is what the shipped diffusiongemma-26B-A4B-it-GGUF's down banks
+    // use; Q5_1 is what the shipped gemma-4-26B-A4B-it-GGUF's down banks use (29/30 layers);
+    // unsloth-dynamic Qwen3.6-MoE (UD) quants mix Q5_K/Q6_K into gate/up/down banks across layers;
+    // Q2_K/Q3_K is Llama-4-Scout's shipped gate/up (Q2_K) and down (Q3_K). Other codebook quants
+    // (IQ*) still have no dp4a-mmq kernel and keep the per-token loop. This set must exactly
+    // mirror the Vulkan adapter's batched `Op::MoeFfn` coverage (its `mmq_ok`) — a mismatch either
+    // silently falls back to per-token prefill or compiles a graph the adapter rejects. NOTE:
+    // accepting Q2_K/Q3_K here also flips paged models (Scout: 37GB Q2_K/Q3_K experts on a 24GB
+    // card) onto the batched-chunk `Op::MoeFfn` construction — the Vulkan adapter's paged-buffer
+    // interception (`execute_static`, ahead of `lower_op`'s batched/small-m split) routes every
+    // paged MoeFfn through `execute_paged_moe`, whose own batched arm runs the same
+    // bucket-scatter → dp4a mmq expert-GEMM pipeline against the pager arena
+    // (`matmul_mmq_experts_paged`): one residency readback per layer per ubatch chunk instead of
+    // one per token, with the mmq GEMM's cross-token expert-bank reuse. (Routing the batched
+    // chunk through the paged id-GEMV instead was measured SLOWER than per-token — 14.7 vs
+    // 27.6 t/s pp512 — the giant uncoalesced multi-row GEMV loses more to cache-hostile weight
+    // re-reads than it saves in readbacks.)
     let moe_mmq_ok = |d: Option<DType>| {
         matches!(
             d,
@@ -3270,6 +3281,8 @@ pub(crate) fn generate_dense_backend(
                 | Some(DType::Q8_0)
                 | Some(DType::Q5_0)
                 | Some(DType::Q5_1)
+                | Some(DType::Q2K)
+                | Some(DType::Q3K)
         )
     };
     let moe_batched_ok = c.moe.is_some() && {

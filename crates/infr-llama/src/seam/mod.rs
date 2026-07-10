@@ -314,17 +314,15 @@ pub(crate) fn generate_dense_vulkan_session(
         );
         let n_blocks = n_paged * moe.n_expert;
         let per_slot = (gb + ub + db).max(1) as u64;
-        // Floor at `n_used`: a single rows=1 (decode) touch needs `n_used` DISTINCT experts
-        // simultaneously resident (the within-batch safety invariant — see
-        // `infr_core::pager::Pager::new`'s doc) and decode is unavoidable for every paged model. A
-        // CHUNKED batched-prefill row (rows>1) can touch up to `n_expert` distinct experts in one
-        // dispatch — llama4/Scout never takes that path (Q2_K isn't batched-mmq-eligible, so its
-        // prefill is per-token like decode), but a future paged model whose bank DOES qualify for
-        // the batched path (and whose seam doesn't reduce INFR_UBATCH) would need a much larger
-        // budget or a batched-aware paged path (not implemented here) — this floor only guarantees
-        // the decode case.
-        let budget_slots =
-            ((pager_budget_bytes / per_slot) as usize).clamp(moe.n_used.max(1), n_blocks);
+        // Floor at `n_expert`: a chunked batched-prefill `Op::MoeFfn` (rows>1) runs ALL of a
+        // layer's routed buckets in ONE dispatch (`matmul_mmq_experts_paged` — Scout's Q2_K/Q3_K
+        // banks ARE batched-mmq-eligible now), touching up to `n_expert` DISTINCT experts that
+        // must be simultaneously resident (the within-batch safety invariant — see
+        // `infr_core::pager::Pager::new`'s doc). Decode's rows=1 needs only `n_used`, but the
+        // batched bound subsumes it and `n_expert` slots is tiny next to any real budget
+        // (Scout: 16 x ~18 MB per role).
+        let budget_slots = ((pager_budget_bytes / per_slot) as usize)
+            .clamp(moe.n_expert.max(moe.n_used).max(1), n_blocks);
         // Per-role ceiling: each role's arena is ONE SSBO binding, capped by the smaller of the
         // paged kernels' u32 word reach (16 GiB) and the device's maxStorageBufferRange (4 GiB
         // on RADV — found empirically: Scout's auto budget wanted a 7.6 GiB down arena, and
