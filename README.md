@@ -44,20 +44,20 @@ e.g. `infr run unsloth/Qwen3-14B-GGUF:Q4_K_M`). Models share the standard
 All run on the Vulkan GPU backend unless noted. The chat template (turn markers,
 system prompt) is read from the GGUF's own `tokenizer.chat_template`.
 
-| Family            | Arch (GGUF)       | Notes                                                  |
-| ----------------- | ----------------- | ------------------------------------------------------ |
-| Llama             | `llama`           | dense transformer                                      |
-| Llama 4           | `llama4`          | sigmoid top-1 MoE + shared expert, iRoPE (CPU default) |
-| Qwen2 / Qwen2.5   | `qwen2`           | dense, QKV bias, NEOX rope                             |
-| Qwen3             | `qwen3`           | dense, QK-norm                                         |
-| Qwen3 MoE         | `qwen3moe`        | softmax router, top-_k_ experts (CPU offload)          |
-| Gemma 3           | `gemma3`          | SWA + QK-norm + GeGLU, dual-RoPE                       |
-| Gemma 4 (dense)   | `gemma4`          | per-layer head dims, proportional RoPE, V-norm         |
-| Gemma 4 **E2B**   | `gemma4`          | + per-layer input embeddings / FFN, KV sharing         |
-| Gemma 4 **MoE**   | `gemma4`          | 26B-A4B: dual FFN (dense GeGLU ∥ 8-of-128 routed), AR  |
-| Qwen3.5 / Qwen3.6 | `qwen35`          | hybrid gated-DeltaNet + attention (NOT `qwen3next`)    |
-| Qwen3.6 MoE       | `qwen35moe`       | `qwen35` skeleton + routed experts + shared expert     |
-| DiffusionGemma    | `diffusion-gemma` | block text-diffusion MoE, entropy-bound denoise decode |
+| Family            | Arch (GGUF)       | Notes                                                   |
+| ----------------- | ----------------- | ------------------------------------------------------- |
+| Llama             | `llama`           | dense transformer                                       |
+| Llama 4           | `llama4`          | sigmoid top-1 MoE + shared expert, iRoPE, paged experts |
+| Qwen2 / Qwen2.5   | `qwen2`           | dense, QKV bias, NEOX rope                              |
+| Qwen3             | `qwen3`           | dense, QK-norm                                          |
+| Qwen3 MoE         | `qwen3moe`        | softmax router, top-_k_ experts (CPU offload)           |
+| Gemma 3           | `gemma3`          | SWA + QK-norm + GeGLU, dual-RoPE                        |
+| Gemma 4 (dense)   | `gemma4`          | per-layer head dims, proportional RoPE, V-norm          |
+| Gemma 4 **E2B**   | `gemma4`          | + per-layer input embeddings / FFN, KV sharing          |
+| Gemma 4 **MoE**   | `gemma4`          | 26B-A4B: dual FFN (dense GeGLU ∥ 8-of-128 routed), AR   |
+| Qwen3.5 / Qwen3.6 | `qwen35`          | hybrid gated-DeltaNet + attention (NOT `qwen3next`)     |
+| Qwen3.6 MoE       | `qwen35moe`       | `qwen35` skeleton + routed experts + shared expert      |
+| DiffusionGemma    | `diffusion-gemma` | block text-diffusion MoE, entropy-bound denoise decode  |
 
 Fine-tunes on any of these backbones run unchanged. **Ornith-1.0**
 (DeepReinforce.AI agentic-coding) validated 2026-07-09 — the 9B rides `qwen35`
@@ -68,8 +68,12 @@ and the 35B rides `qwen35moe` with no code changes
 # Qwen3 dense
 infr run unsloth/Qwen3-1.7B-GGUF:Q4_K_M "What is the capital of France?"
 
-# Qwen3 MoE (expert CPU offload with INFR_NCMOE=N for tight VRAM)
+# Qwen3 MoE (expert host offload with INFR_NCMOE=N, or the paged VRAM cache —
+# see INFR_MOE_CACHE_GB below — for tight VRAM)
 infr run unsloth/Qwen3-30B-A3B-GGUF:Q4_K_M "Explain MoE routing."
+
+# Llama 4 Scout (37 GB Q2_K) — paged expert cache runs it on a 24 GB card
+infr run unsloth/Llama-4-Scout-17B-16E-Instruct-GGUF:Q2_K "What is the capital of France?"
 
 # Gemma 3
 infr run unsloth/gemma-3-1b-it-GGUF:Q4_K_M "What is bash?"
@@ -169,8 +173,22 @@ folded into the row so the mismatch is visible). Details in
 [`docs/DIFFUSIONGEMMA.md`](docs/DIFFUSIONGEMMA.md).
 
 Useful env: `INFR_TEMP` / `INFR_TOP_K` / `INFR_TOP_P` (sampling; `TEMP=0` →
-greedy), `INFR_MAX_NEW`, `INFR_MAX_CTX`, `INFR_NCMOE` (MoE expert CPU offload),
-`INFR_NO_FLASH`.
+greedy), `INFR_MAX_NEW`, `INFR_MAX_CTX`, `INFR_NO_FLASH`.
+
+**MoE expert placement** (when the expert banks don't fit VRAM): resident when
+they fit (zero config, zero change); otherwise `INFR_NCMOE=N` explicitly forces
+the first `N` layers' expert banks HOST-VISIBLE (GPU reads them over the PCIe
+bus every dispatch — the legacy path, unconditional even if everything would
+otherwise fit); with `INFR_NCMOE` unset, an overflow instead pages through a
+VRAM-resident LRU expert cache (`infr_vulkan::pager`) — `INFR_MOE_CACHE_GB=X`
+forces every layer through the pager with an `X` GB budget regardless of fit
+(useful for testing, or to free VRAM for a larger `--ctx`). The pager needs a
+SPLIT (non-fused) gate/up bank with one dtype per role across every layer —
+llama4/Qwen3-MoE/Qwen3.6-MoE qualify; a fused-gate-up bank (DiffusionGemma,
+Gemma-4 MoE) or a mixed-dtype role (some unsloth-dynamic quants bump a subset of
+layers' `ffn_down_exps` to a wider K-quant) falls back to the host-visible split
+instead — paging can't address a role whose experts aren't all one byte size.
+`INFR_PAGER_STATS=1` prints each role's hit/miss/eviction counts.
 
 ## Validated models & performance
 
@@ -229,17 +247,24 @@ the memory-bandwidth wall (decode GEMVs run at 77–88% of DRAM peak). The
 throughput not yet matching llama.cpp's batched-speculative path.
 **DiffusionGemma** (`dg-step`) is at parity-or-better vs the reference fork.
 
-**Llama-4-Scout** (109B-A17B, Q2_K) is a correctness bring-up and is
-deliberately absent from the table: the CPU reference path runs it at ~0.3 t/s
-prefill/decode vs llama.cpp CPU's 10.0/3.3 (pp64/tg32) — Q2_K is a codebook
-quant with no batched-MoE path. The llama4 Vulkan lowering (sigmoid
-weight-before-FFN routing, NoPE rope-skip, post-rope Q/K L2-norm) is implemented
-and parity-tested on-device, but Scout itself cannot run end-to-end on a 24 GB
-card: even with every expert bank host-offloaded, the ~33 GB of host-visible
-expert reads overflow the GTT submission budget (device lost).
-`INFR_L4_ALLOW_GPU=1` opts into Vulkan on hardware that fits it; the CLI
-defaults llama4 to CPU. Greedy output is oracle-locked against llama.cpp
-(`cpu_llama4_scout_greedy`).
+**Llama-4-Scout** (109B-A17B, Q2_K, 37 GB) is deliberately absent from the table
+above (its per-token small-m dispatch shape isn't comparable to the batched
+pp/tg columns) but now runs end to end on a 24 GB card via the paged expert
+cache (`infr_vulkan::pager`): Scout's Q2_K expert banks are a codebook quant
+with no batched-MoE dp4a path, so both prefill and decode route through the
+id-indexed small-m GEMV — the ONE shape the paged executor split targets. Greedy
+output is oracle-locked against llama.cpp (`cpu_llama4_scout_greedy`) AND
+against the paged Vulkan path itself
+(`gpu_seam_paged_moe_matches_scout_oracle`), token-for-token identical. Measured
+(22/48 layers paged, tiny 6-8 slot cache — VRAM left no room for more): `tg32`
+**9.7 t/s** (> llama.cpp's CPU-offload-hybrid 6.55 t/s; the reused-staging floor
+at a 0%-hit-rate top-1 router is ~10 t/s). `pp512` **~9-10.5 t/s** — far below
+llama.cpp's 136, because Scout's prefill has no batched path at all (every token
+pays a router→readback→touch→GEMV round trip per layer, per the small-m-only
+constraint above); closing that gap needs a batched paged-expert GEMM for
+codebook quants, filed as a follow-up. `INFR_MOE_CACHE_GB` sizes the pager's
+budget (see the MoE placement paragraph above); pure CPU stays available under
+`INFR_CPU=1` / `-ngl 0`.
 
 **Also validated for correctness** (GPU seam vs CPU reference), beyond the perf
 table: Qwen2-0.5B, Llama-3.2-1B, Gemma-4-12B (dense), and Qwen3-0.6B across
@@ -258,7 +283,8 @@ dequant).
 - **Models:** Llama, Qwen2/2.5, Qwen3 (dense + MoE), Gemma 3, Gemma 4 (dense +
   E2B + 26B-A4B MoE), Qwen3.5/3.6 (dense + MoE) — all on GPU **and** the CPU
   reference; DiffusionGemma (block text-diffusion, CPU + GPU); Llama 4 (Scout —
-  CPU by default, Vulkan lowering parity-tested; needs >37 GB VRAM end-to-end)
+  GPU by default via the paged expert cache, 37 GB Q2_K on a 24 GB card; pure
+  CPU under `INFR_CPU=1`)
 - **GPU:** AMD / NVIDIA / Intel via Vulkan (cooperative-matrix matmul); Apple
   via a native **Metal backend** (`INFR_METAL=1`) covering every op the CPU
   reference does — dense, MoE (`qwen3moe`) and Qwen3.5 (`qwen35`). Dense is

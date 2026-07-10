@@ -421,9 +421,6 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     // whole blocks for a "Hi" reply; 1024 (4 blocks) is the same order of magnitude as a normal
     // chat reply and still overridable via INFR_MAX_NEW.
     let is_dg = infr_llama::diffusion::is_diffusion_gemma(&gguf);
-    // llama4: CPU-only for now (the GPU MoeFfn lowerings don't implement its sigmoid/no-renorm/
-    // weight-before-FFN routing and assert on it) — force the CPU backend instead of panicking.
-    let is_l4 = infr_llama::is_llama4(&gguf);
     // Generation ceiling per reply (a turn also caps to remaining context). High enough for long
     // answers (lists/stories); override with INFR_MAX_NEW.
     let max_new = envu("INFR_MAX_NEW", if is_dg { 1024 } else { 2048 });
@@ -480,16 +477,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
                 infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
             ))
         }
-    } else if std::env::var("INFR_CPU").is_ok()
-        || (is_l4 && std::env::var("INFR_L4_ALLOW_GPU").is_err())
-    {
-        // llama4 defaults to CPU: the Vulkan lowering is implemented + parity-tested, but the
-        // only published llama4 (Scout, 37GB Q2_K) exceeds any 24GB card even with expert
-        // host-offload (the ~33GB host-visible expert banks overflow the GTT submission budget →
-        // device lost). INFR_L4_ALLOW_GPU=1 opts in on hardware that fits it.
-        if is_l4 && std::env::var("INFR_CPU").is_err() {
-            eprintln!("[llama4 defaults to the CPU backend — INFR_L4_ALLOW_GPU=1 to opt into Vulkan on big-VRAM hardware]");
-        }
+    } else if std::env::var("INFR_CPU").is_ok() {
         eprintln!(
             "[cpu backend — dense/MoE forward on CPU via the agnostic compute graph, no GPU]"
         );
@@ -498,9 +486,11 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         ))
     } else {
         // The default: dense/MoE on the VULKAN agnostic seam — persistent multi-slot KV sessions
-        // (per-turn suffix-only prefill), record-once decode replay, MoE expert auto-fit. qwen35
-        // (Qwen3.5) lands here too — same seam, same `Config::from_gguf` + `MixerW::DeltaNet`
-        // unified runner (see `unified_qwen35_*` tests).
+        // (per-turn suffix-only prefill), record-once decode replay, MoE expert auto-fit (fully
+        // resident when experts fit; INFR_NCMOE / the paged expert cache — INFR_MOE_CACHE_GB —
+        // otherwise). qwen35 (Qwen3.5) lands here too — same seam, same `Config::from_gguf` +
+        // `MixerW::DeltaNet` unified runner (see `unified_qwen35_*` tests). llama4 (Scout) lands
+        // here too now: the paged expert cache lets its 37 GB Q2_K bank run on a 24 GB card.
         eprintln!("[vulkan seam — dense/MoE on the agnostic compute graph, persistent KV session]");
         Box::new(infr_llama::chat::DenseSeamChat::new(
             infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
@@ -1043,9 +1033,9 @@ fn cmd_bench(
     // (`Config::from_gguf` + `MixerW::DeltaNet`), reusing the exact same pp/tg/depth methodology
     // every other arch gets (no more qwen35-only bench arm or depth-accounting artifacts).
     // -ngl 0: run on the CPU reference backend (no GPU), comparable to `llama-bench -ngl 0`.
-    // llama4 also lands here regardless of -ngl unless INFR_L4_ALLOW_GPU opts into Vulkan —
-    // see `cmd_run`'s comment.
-    if ngl == 0 || (infr_llama::is_llama4(&gguf) && std::env::var("INFR_L4_ALLOW_GPU").is_err()) {
+    // llama4 benches through the standard Vulkan arm below like every other model now (the paged
+    // expert cache) — only -ngl 0 forces it onto this CPU arm.
+    if ngl == 0 {
         return cmd_bench_cpu(
             &gguf,
             tok.as_deref(),
@@ -2516,10 +2506,7 @@ fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
                 infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
             ))
         }
-    } else if std::env::var("INFR_CPU").is_ok()
-        || (infr_llama::is_llama4(&gguf) && std::env::var("INFR_L4_ALLOW_GPU").is_err())
-    {
-        // llama4 defaults to CPU (INFR_L4_ALLOW_GPU opts in) — see `cmd_run`'s comment.
+    } else if std::env::var("INFR_CPU").is_ok() {
         Box::new(infr_llama::chat::CpuDenseChat::new(
             infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
         ))
