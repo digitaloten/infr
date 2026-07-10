@@ -544,6 +544,11 @@ fn main() {
         ("native_gemv_id", "native_id_q4k", &["-DFMT_Q4K"]),
         ("native_gemv_id", "native_id_q5k", &["-DFMT_Q5K"]),
         ("native_gemv_id", "native_id_q6k", &["-DFMT_Q6K"]),
+        // Codebook id-GEMV (native_decode.glsl's generic FMT_IQ4NL/FMT_IQ4XS dequant already
+        // exists for the dense id-less GEMV; these are the id-indexed twins so GPU-resident MoE
+        // decode can pick an IQ4_NL/IQ4_XS expert from a GPU buffer too — previously absent).
+        ("native_gemv_id", "native_id_iq4nl", &["-DFMT_IQ4NL"]),
+        ("native_gemv_id", "native_id_iq4xs", &["-DFMT_IQ4XS"]),
         // Paged twins (`infr_vulkan::pager::GpuPager`): one extra LUT-buffer hop, `slot =
         // lut[expert_id]` — see native_gemv_id.comp's `-DPAGED` doc comment. Same format coverage
         // as the resident-bank kernels above (the pager only ever holds native-block formats).
@@ -597,6 +602,16 @@ fn main() {
             "native_id_q6k_paged",
             &["-DFMT_Q6K", "-DPAGED"],
         ),
+        (
+            "native_gemv_id",
+            "native_id_iq4nl_paged",
+            &["-DFMT_IQ4NL", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id",
+            "native_id_iq4xs_paged",
+            &["-DFMT_IQ4XS", "-DPAGED"],
+        ),
         // Multi-slot id GEMV: all n_used experts in one dispatch (concurrent, no inter-expert barrier).
         ("native_gemv_id_multi", "native_idm_q8_0", &["-DFMT_Q8_0"]),
         ("native_gemv_id_multi", "native_idm_q4_0", &["-DFMT_Q4_0"]),
@@ -608,6 +623,8 @@ fn main() {
         ("native_gemv_id_multi", "native_idm_q4k", &["-DFMT_Q4K"]),
         ("native_gemv_id_multi", "native_idm_q5k", &["-DFMT_Q5K"]),
         ("native_gemv_id_multi", "native_idm_q6k", &["-DFMT_Q6K"]),
+        ("native_gemv_id_multi", "native_idm_iq4nl", &["-DFMT_IQ4NL"]),
+        ("native_gemv_id_multi", "native_idm_iq4xs", &["-DFMT_IQ4XS"]),
         // Paged twins — same LUT hop as above, for the decode/small-m multi-expert dispatch.
         (
             "native_gemv_id_multi",
@@ -658,6 +675,16 @@ fn main() {
             "native_gemv_id_multi",
             "native_idm_q6k_paged",
             &["-DFMT_Q6K", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq4nl_paged",
+            &["-DFMT_IQ4NL", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq4xs_paged",
+            &["-DFMT_IQ4XS", "-DPAGED"],
         ),
         // Reassociation-tolerant subgroup+NR variant of the multi-slot id GEMV (wave32, subgroupAdd,
         // no shared reduce) for the latency-STARVED Q6_K MoE expert down-projection (out_f≈2048 — the
@@ -906,6 +933,30 @@ fn main() {
             "native_gemm_mmq_q3_k_xp",
             &["-DEXPERT_GRID"],
         ),
+        // Q4_0 (symmetric trivial family member) / Q4_1 (min-carrying, Q5_1 minus the highbit) /
+        // IQ4_NL (codebook, 32-elem block) / IQ4_XS (codebook, 256-elem superblock) — no shipped
+        // MoE GGUF in the audited cache uses Q4_0/Q4_1 for expert banks, but unsloth's UD quants
+        // mix IQ4_XS into most of Qwen3.6-35B-A3B's gate/up banks (see the shader doc comments).
+        (
+            "native_gemm_mmq_q4_0",
+            "native_gemm_mmq_q4_0_xp",
+            &["-DEXPERT_GRID"],
+        ),
+        (
+            "native_gemm_mmq_q4_1",
+            "native_gemm_mmq_q4_1_xp",
+            &["-DEXPERT_GRID"],
+        ),
+        (
+            "native_gemm_mmq_iq4_nl",
+            "native_gemm_mmq_iq4_nl_xp",
+            &["-DEXPERT_GRID"],
+        ),
+        (
+            "native_gemm_mmq_iq4_xs",
+            "native_gemm_mmq_iq4_xs_xp",
+            &["-DEXPERT_GRID"],
+        ),
         // BM=32 row-tile variants of the expert-grid GEMM (see matmul_mmq_experts' `n_used` doc):
         // at small rows-per-expert (Qwen3.6-MoE's 256-expert pool averages ~16/expert at pp512)
         // the default BM=64 tile is ~75% masked waste — a BM=32 tile halves that. Selected
@@ -952,8 +1003,29 @@ fn main() {
             "native_gemm_mmq_q3_k_xp32",
             &["-DEXPERT_GRID", "-DBM_TILE=32u"],
         ),
+        (
+            "native_gemm_mmq_q4_0",
+            "native_gemm_mmq_q4_0_xp32",
+            &["-DEXPERT_GRID", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_q4_1",
+            "native_gemm_mmq_q4_1_xp32",
+            &["-DEXPERT_GRID", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_iq4_nl",
+            "native_gemm_mmq_iq4_nl_xp32",
+            &["-DEXPERT_GRID", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_iq4_xs",
+            "native_gemm_mmq_iq4_xs_xp32",
+            &["-DEXPERT_GRID", "-DBM_TILE=32u"],
+        ),
         // PAGED expert-grid variants (Scout's batched prefill through the GpuPager arena+LUT —
-        // see the shaders' PAGED doc): only the dtypes a shipped paged model needs today.
+        // see the shaders' PAGED doc): every dtype the batched-MoE gate (`mmq_ok`) covers, now
+        // that `paged_mmq_ok` mirrors it in full (see adapter.rs's drift-guard doc).
         (
             "native_gemm_mmq_q2_k",
             "native_gemm_mmq_q2_k_xpg",
@@ -972,6 +1044,46 @@ fn main() {
         (
             "native_gemm_mmq_q3_k",
             "native_gemm_mmq_q3_k_xpg32",
+            &["-DEXPERT_GRID", "-DPAGED", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_q4_0",
+            "native_gemm_mmq_q4_0_xpg",
+            &["-DEXPERT_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemm_mmq_q4_0",
+            "native_gemm_mmq_q4_0_xpg32",
+            &["-DEXPERT_GRID", "-DPAGED", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_q4_1",
+            "native_gemm_mmq_q4_1_xpg",
+            &["-DEXPERT_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemm_mmq_q4_1",
+            "native_gemm_mmq_q4_1_xpg32",
+            &["-DEXPERT_GRID", "-DPAGED", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_iq4_nl",
+            "native_gemm_mmq_iq4_nl_xpg",
+            &["-DEXPERT_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemm_mmq_iq4_nl",
+            "native_gemm_mmq_iq4_nl_xpg32",
+            &["-DEXPERT_GRID", "-DPAGED", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_iq4_xs",
+            "native_gemm_mmq_iq4_xs_xpg",
+            &["-DEXPERT_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemm_mmq_iq4_xs",
+            "native_gemm_mmq_iq4_xs_xpg32",
             &["-DEXPERT_GRID", "-DPAGED", "-DBM_TILE=32u"],
         ),
         ("quant_q8", "quant_q8_gather", &["-DGATHER"]),

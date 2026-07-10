@@ -5125,8 +5125,55 @@ impl<'a> Recorder<'a> {
                 crate::gemm::native_gemm_mmq_q3_k_xp32_spv(),
                 6,
             ),
+            // Q4_0: symmetric trivial family member, no `sact` (like Q6_K/Q8_0/Q5_0/Q3_K).
+            (infr_core::DType::Q4_0, false) => (
+                "native_gemm_mmq_q4_0_xp",
+                crate::gemm::native_gemm_mmq_q4_0_xp_spv(),
+                6,
+            ),
+            (infr_core::DType::Q4_0, true) => (
+                "native_gemm_mmq_q4_0_xp32",
+                crate::gemm::native_gemm_mmq_q4_0_xp32_spv(),
+                6,
+            ),
+            // Q4_1: min-carrying (Q5_1's pattern minus the highbit) — binds `sact`.
+            (infr_core::DType::Q4_1, false) => (
+                "native_gemm_mmq_q4_1_xp",
+                crate::gemm::native_gemm_mmq_q4_1_xp_spv(),
+                7,
+            ),
+            (infr_core::DType::Q4_1, true) => (
+                "native_gemm_mmq_q4_1_xp32",
+                crate::gemm::native_gemm_mmq_q4_1_xp32_spv(),
+                7,
+            ),
+            // IQ4_NL: codebook, symmetric — the LUT value is already the signed dp4a operand, no
+            // `sact`.
+            (infr_core::DType::Iq4Nl, false) => (
+                "native_gemm_mmq_iq4_nl_xp",
+                crate::gemm::native_gemm_mmq_iq4_nl_xp_spv(),
+                6,
+            ),
+            (infr_core::DType::Iq4Nl, true) => (
+                "native_gemm_mmq_iq4_nl_xp32",
+                crate::gemm::native_gemm_mmq_iq4_nl_xp32_spv(),
+                6,
+            ),
+            // IQ4_XS: codebook + Q4_K-shaped superblock, symmetric — no `sact` (the sub-block
+            // scale `ls-32` is already signed, no separate min).
+            (infr_core::DType::Iq4Xs, false) => (
+                "native_gemm_mmq_iq4_xs_xp",
+                crate::gemm::native_gemm_mmq_iq4_xs_xp_spv(),
+                6,
+            ),
+            (infr_core::DType::Iq4Xs, true) => (
+                "native_gemm_mmq_iq4_xs_xp32",
+                crate::gemm::native_gemm_mmq_iq4_xs_xp32_spv(),
+                6,
+            ),
             _ => unreachable!(
-                "batched MoE expert GEMM: Q4_K/Q5_K/Q6_K/Q8_0/Q5_0/Q5_1/Q2_K/Q3_K only"
+                "batched MoE expert GEMM: Q4_0/Q4_1/Q4_K/Q5_K/Q6_K/Q8_0/Q5_0/Q5_1/Q2_K/Q3_K/\
+                 IQ4_NL/IQ4_XS only"
             ),
         };
         let kern = self.be.kernel(name, spv, nb, 16);
@@ -5156,9 +5203,10 @@ impl<'a> Recorder<'a> {
     /// as the paged GEMVs). The caller must have made every ROUTED expert of this layer resident
     /// (all of them simultaneously — buckets run in one dispatch) and flushed the LUT before this
     /// records; buckets with count 0 exit before any LUT/weight read, so unrouted experts may be
-    /// absent. Only the dtypes a shipped paged model needs have `_xpg` builds (Scout: Q2_K
-    /// gate/up + Q3_K down — both symmetric-or-self-summed, so no `sact` param at all). Tile
-    /// selection (BM=64 vs 32) matches the resident twin.
+    /// absent. Covers every dtype `paged_mmq_ok` accepts (mirrors the resident twin's dtype set in
+    /// full — see adapter.rs's drift-guard doc); `sact` is `Some` only for the min-carrying dtypes
+    /// (Q4_1 — Q2_K/Q3_K/Q4_0/IQ4_NL/IQ4_XS are symmetric-or-self-summed, same split the resident
+    /// twin's `*_needs_sact` uses). Tile selection (BM=64 vs 32) matches the resident twin.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_mmq_experts_paged(
         &self,
@@ -5166,6 +5214,7 @@ impl<'a> Recorder<'a> {
         stage: &'static str,
         qa: &dyn Buffer,
         dact: &dyn Buffer,
+        sact: Option<&dyn Buffer>,
         arena: &dyn Buffer,
         lut: &dyn Buffer,
         layer_base: usize,
@@ -5182,26 +5231,73 @@ impl<'a> Recorder<'a> {
         let avg_rows = rows.saturating_mul(n_used) / n_expert.max(1);
         let small_tile = avg_rows <= MOE_EXPERT_SMALL_TILE_AVG_ROWS;
         let bm: usize = if small_tile { 32 } else { 64 };
-        let (name, spv) = match (dtype, small_tile) {
+        let (name, spv, nb): (_, _, usize) = match (dtype, small_tile) {
             (infr_core::DType::Q2K, false) => (
                 "native_gemm_mmq_q2_k_xpg",
                 crate::gemm::native_gemm_mmq_q2_k_xpg_spv(),
+                7,
             ),
             (infr_core::DType::Q2K, true) => (
                 "native_gemm_mmq_q2_k_xpg32",
                 crate::gemm::native_gemm_mmq_q2_k_xpg32_spv(),
+                7,
             ),
             (infr_core::DType::Q3K, false) => (
                 "native_gemm_mmq_q3_k_xpg",
                 crate::gemm::native_gemm_mmq_q3_k_xpg_spv(),
+                7,
             ),
             (infr_core::DType::Q3K, true) => (
                 "native_gemm_mmq_q3_k_xpg32",
                 crate::gemm::native_gemm_mmq_q3_k_xpg32_spv(),
+                7,
             ),
-            _ => unreachable!("paged batched MoE expert GEMM: Q2_K/Q3_K only"),
+            (infr_core::DType::Q4_0, false) => (
+                "native_gemm_mmq_q4_0_xpg",
+                crate::gemm::native_gemm_mmq_q4_0_xpg_spv(),
+                7,
+            ),
+            (infr_core::DType::Q4_0, true) => (
+                "native_gemm_mmq_q4_0_xpg32",
+                crate::gemm::native_gemm_mmq_q4_0_xpg32_spv(),
+                7,
+            ),
+            // Q4_1: min-carrying — one extra `sact` binding vs the symmetric formats above.
+            (infr_core::DType::Q4_1, false) => (
+                "native_gemm_mmq_q4_1_xpg",
+                crate::gemm::native_gemm_mmq_q4_1_xpg_spv(),
+                8,
+            ),
+            (infr_core::DType::Q4_1, true) => (
+                "native_gemm_mmq_q4_1_xpg32",
+                crate::gemm::native_gemm_mmq_q4_1_xpg32_spv(),
+                8,
+            ),
+            (infr_core::DType::Iq4Nl, false) => (
+                "native_gemm_mmq_iq4_nl_xpg",
+                crate::gemm::native_gemm_mmq_iq4_nl_xpg_spv(),
+                7,
+            ),
+            (infr_core::DType::Iq4Nl, true) => (
+                "native_gemm_mmq_iq4_nl_xpg32",
+                crate::gemm::native_gemm_mmq_iq4_nl_xpg32_spv(),
+                7,
+            ),
+            (infr_core::DType::Iq4Xs, false) => (
+                "native_gemm_mmq_iq4_xs_xpg",
+                crate::gemm::native_gemm_mmq_iq4_xs_xpg_spv(),
+                7,
+            ),
+            (infr_core::DType::Iq4Xs, true) => (
+                "native_gemm_mmq_iq4_xs_xpg32",
+                crate::gemm::native_gemm_mmq_iq4_xs_xpg32_spv(),
+                7,
+            ),
+            _ => unreachable!(
+                "paged batched MoE expert GEMM: Q2_K/Q3_K/Q4_0/Q4_1/IQ4_NL/IQ4_XS only"
+            ),
         };
-        let kern = self.be.kernel(name, spv, 7, 16);
+        let kern = self.be.kernel(name, spv, nb, 16);
         let mut push = [0u8; 16];
         // pc.m unused in the PAGED build (slot bases come from the LUT); pc.w_base carries the
         // layer's global-id base.
@@ -5209,15 +5305,17 @@ impl<'a> Recorder<'a> {
         push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(layer_base as u32).to_ne_bytes());
         let gx = (rows.div_ceil(bm) * (n / 64)) as u32;
-        let bufs = [
-            Self::vkb(qa),
-            Self::vkb(dact),
+        let mut bufs = vec![Self::vkb(qa), Self::vkb(dact)];
+        if let Some(sa) = sact {
+            bufs.push(Self::vkb(sa));
+        }
+        bufs.extend_from_slice(&[
             Self::vkb(arena),
             Self::vkb(lut),
             Self::vkb(counts),
             Self::vkb(offsets),
             Self::vkb(c),
-        ];
+        ]);
         self.dispatch3(kern, &bufs, 1, &push, gx, n_expert as u32, 1);
     }
 

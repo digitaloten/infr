@@ -43,6 +43,8 @@ pub fn native_id_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
         Q4K => "native_id_q4k",
         Q5K => "native_id_q5k",
         Q6K => "native_id_q6k",
+        Iq4Nl => "native_id_iq4nl",
+        Iq4Xs => "native_id_iq4xs",
         _ => return None,
     })
 }
@@ -62,6 +64,8 @@ pub fn native_idm_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
         Q4K => "native_idm_q4k",
         Q5K => "native_idm_q5k",
         Q6K => "native_idm_q6k",
+        Iq4Nl => "native_idm_iq4nl",
+        Iq4Xs => "native_idm_iq4xs",
         _ => return None,
     })
 }
@@ -83,6 +87,8 @@ pub fn native_id_paged_kernel_name(dtype: infr_core::DType) -> Option<&'static s
         Q4K => "native_id_q4k_paged",
         Q5K => "native_id_q5k_paged",
         Q6K => "native_id_q6k_paged",
+        Iq4Nl => "native_id_iq4nl_paged",
+        Iq4Xs => "native_id_iq4xs_paged",
         _ => return None,
     })
 }
@@ -103,6 +109,8 @@ pub fn native_idm_paged_kernel_name(dtype: infr_core::DType) -> Option<&'static 
         Q4K => "native_idm_q4k_paged",
         Q5K => "native_idm_q5k_paged",
         Q6K => "native_idm_q6k_paged",
+        Iq4Nl => "native_idm_iq4nl_paged",
+        Iq4Xs => "native_idm_iq4xs_paged",
         _ => return None,
     })
 }
@@ -557,6 +565,37 @@ impl VulkanBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The drift guard the task's step 4 asks for: every dtype `infr_core::tensor::MOE_MMQ_DTYPES`
+    /// lists (the batched-MoE dp4a mmq expert-GEMM family's SINGLE SOURCE OF TRUTH — see its doc)
+    /// must ALSO have small-m decode coverage — id-GEMV (`native_id_kernel_name`), its multi-slot
+    /// twin (`native_idm_kernel_name`), and BOTH of their paged twins. Pure-function, no GPU: these
+    /// are `&'static str` lookups, not device calls. Forgetting to wire a newly-added mmq format
+    /// into the id-GEMV families (this test's whole reason to exist — IQ4_NL/IQ4_XS were missing
+    /// here until this change) used to only surface as a silent decode-perf regression (GPU-
+    /// resident MoE decode falling back to the host top-k path for that format), not a build/test
+    /// failure — this test turns that into an immediate, CI-visible failure instead.
+    #[test]
+    fn moe_mmq_dtypes_have_id_gemv_coverage() {
+        for &d in infr_core::tensor::MOE_MMQ_DTYPES {
+            assert!(
+                native_id_kernel_name(d).is_some(),
+                "{d:?} is in MOE_MMQ_DTYPES but native_id_kernel_name has no variant"
+            );
+            assert!(
+                native_idm_kernel_name(d).is_some(),
+                "{d:?} is in MOE_MMQ_DTYPES but native_idm_kernel_name has no variant"
+            );
+            assert!(
+                native_id_paged_kernel_name(d).is_some(),
+                "{d:?} is in MOE_MMQ_DTYPES but native_id_paged_kernel_name has no variant"
+            );
+            assert!(
+                native_idm_paged_kernel_name(d).is_some(),
+                "{d:?} is in MOE_MMQ_DTYPES but native_idm_paged_kernel_name has no variant"
+            );
+        }
+    }
 
     #[test]
     #[ignore = "requires a Vulkan GPU"]

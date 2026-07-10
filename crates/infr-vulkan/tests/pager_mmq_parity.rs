@@ -185,6 +185,130 @@ fn deq_q3_k(bytes: &[u8]) -> Vec<f32> {
     out
 }
 
+// ---- Q4_1 / IQ4_XS synthetic encoders + reference decoders (same internal-round-trip-only
+// contract as above) — the two NEW paged formats exercised by
+// `paged_mmq_expert_gemm_new_formats_matches_host` below: Q4_1 (min-carrying, binds `sact`
+// through the paged path) and IQ4_XS (codebook + superblock, symmetric).
+
+fn q4_1(x: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(x.len() / 32 * 20);
+    for blk in x.chunks(32) {
+        let lo = blk.iter().cloned().fold(f32::INFINITY, f32::min);
+        let hi = blk.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let d = ((hi - lo) / 15.0).max(1e-8);
+        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+        out.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+        out.extend_from_slice(&half::f16::from_f32(lo).to_le_bytes());
+        let q: Vec<u8> = blk
+            .iter()
+            .map(|&v| (((v - lo) * id).round() as i32).clamp(0, 15) as u8)
+            .collect();
+        let mut qs = [0u8; 16];
+        for l in 0..16 {
+            qs[l] = (q[l] & 0xF) | ((q[l + 16] & 0xF) << 4);
+        }
+        out.extend_from_slice(&qs);
+    }
+    out
+}
+fn deq_q4_1(bytes: &[u8]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(bytes.len() / 20 * 32);
+    for blk in bytes.chunks(20) {
+        let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
+        let m = half::f16::from_le_bytes([blk[2], blk[3]]).to_f32();
+        let qs = &blk[4..20];
+        let mut code = [0u8; 32];
+        for j in 0..16 {
+            code[j] = qs[j] & 0xF;
+            code[j + 16] = qs[j] >> 4;
+        }
+        out.extend(code.iter().map(|&c| d * c as f32 + m));
+    }
+    out
+}
+
+const KVALUES_IQ4NL_TEST: [i8; 16] = [
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+];
+fn nearest_iq4nl(v: f32) -> u8 {
+    let mut best = 0usize;
+    let mut bd = f32::INFINITY;
+    for (i, &k) in KVALUES_IQ4NL_TEST.iter().enumerate() {
+        let dd = (v - k as f32).abs();
+        if dd < bd {
+            bd = dd;
+            best = i;
+        }
+    }
+    best as u8
+}
+fn iq4_xs(x: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(x.len() / 256 * 136);
+    for blk in x.chunks(256) {
+        let mut sub_amax = [0f32; 8];
+        for (si, sub) in blk.chunks(32).enumerate() {
+            sub_amax[si] = sub.iter().cloned().fold(0f32, |m, v| m.max(v.abs()));
+        }
+        let dmax = sub_amax.iter().cloned().fold(1e-8f32, f32::max);
+        let d = dmax / 113.0 / 31.0;
+        let mut ls = [0u32; 8];
+        let mut codes = [0u8; 256];
+        for (si, sub) in blk.chunks(32).enumerate() {
+            let target_dl = sub_amax[si] / 113.0;
+            let ls_signed = (target_dl / d).round().clamp(-32.0, 31.0) as i32;
+            ls[si] = (ls_signed + 32) as u32;
+            let dl = d * ls_signed as f32;
+            let idl = if dl.abs() > 1e-12 { 1.0 / dl } else { 0.0 };
+            for (l, &v) in sub.iter().enumerate() {
+                codes[si * 32 + l] = nearest_iq4nl(v * idl);
+            }
+        }
+        out.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+        let mut scales_h: u16 = 0;
+        for (si, &l) in ls.iter().enumerate() {
+            scales_h |= (((l >> 4) & 3) as u16) << (2 * si);
+        }
+        out.extend_from_slice(&scales_h.to_le_bytes());
+        let mut scales_l = [0u8; 4];
+        for si in 0..8 {
+            scales_l[si / 2] |= ((ls[si] & 0xF) as u8) << (4 * (si % 2));
+        }
+        out.extend_from_slice(&scales_l);
+        let mut qs = [0u8; 128];
+        for si in 0..8 {
+            for l in 0..16 {
+                qs[si * 16 + l] =
+                    (codes[si * 32 + l] & 0xF) | ((codes[si * 32 + l + 16] & 0xF) << 4);
+            }
+        }
+        out.extend_from_slice(&qs);
+    }
+    out
+}
+fn deq_iq4_xs(bytes: &[u8]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(bytes.len() / 136 * 256);
+    for blk in bytes.chunks(136) {
+        let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
+        let scales_h = u16::from_le_bytes([blk[2], blk[3]]);
+        let scales_l = &blk[4..8];
+        let qs = &blk[8..136];
+        let mut vals = [0f32; 256];
+        for si in 0..8usize {
+            let lo = ((scales_l[si / 2] >> (4 * (si % 2))) & 0xF) as u32;
+            let hi = ((scales_h >> (2 * si)) & 3) as u32;
+            let ls = lo | (hi << 4);
+            let dl = d * (ls as i32 - 32) as f32;
+            for l in 0..16 {
+                let byte = qs[si * 16 + l];
+                vals[si * 32 + l] = dl * KVALUES_IQ4NL_TEST[(byte & 0xF) as usize] as f32;
+                vals[si * 32 + l + 16] = dl * KVALUES_IQ4NL_TEST[(byte >> 4) as usize] as f32;
+            }
+        }
+        out.extend_from_slice(&vals);
+    }
+    out
+}
+
 /// Host mirror of `quant_q8` (per-32-block symmetric int8): the GEMM's activation operand.
 fn quant_act(x: &[f32]) -> Vec<f32> {
     let mut out = Vec::with_capacity(x.len());
@@ -314,6 +438,7 @@ fn paged_mmq_expert_gemm_matches_host_under_eviction() {
         "expert_gateup",
         qa.as_ref(),
         qda.as_ref(),
+        None, // Q2_K self-computes its min term in-shader — no `sact` binding
         gate_pager.arena_buffer(),
         gate_pager.lut_buffer(),
         0, // single "layer": layer_base 0, local id == global id
@@ -339,6 +464,7 @@ fn paged_mmq_expert_gemm_matches_host_under_eviction() {
         "expert_down",
         dqa.as_ref(),
         dda.as_ref(),
+        None, // Q3_K is symmetric — no min term, no `sact`
         down_pager.arena_buffer(),
         down_pager.lut_buffer(),
         0,
@@ -403,4 +529,207 @@ fn paged_mmq_expert_gemm_matches_host_under_eviction() {
         }
     }
     println!("paged mmq expert GEMM under eviction OK");
+}
+
+/// Same eviction-churn shape as `paged_mmq_expert_gemm_matches_host_under_eviction`, covering the
+/// TWO paged formats that test doesn't: Q4_1 as the gate GEMM (min-carrying — exercises
+/// `matmul_mmq_experts_paged`'s `sact` threading through the PAGED path, previously untested: Q2_K/
+/// Q3_K are both symmetric-or-self-summed and never bind `sact`) and IQ4_XS as the down GEMM
+/// (codebook + Q4_K-shaped superblock, symmetric). Q4_0/IQ4_NL are strictly simpler members of the
+/// same two families (symmetric, no superblock) so are not separately paged-parity-tested here;
+/// their batched-resident coverage lives in adapter.rs's `moe_ffn_batched_fused_*_down_matches_host`.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn paged_mmq_expert_gemm_new_formats_matches_host() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let (k, n, n_expert) = (256usize, 64usize, 5usize);
+    let stride_elems = k * n;
+    let gate_slot_bytes = stride_elems / 32 * 20; // Q4_1
+    let down_slot_bytes = stride_elems / 256 * 136; // IQ4_XS
+    let f = |i: usize, s: f32| (i as f32 * s).sin() * 0.15;
+
+    let gate_banks: Vec<Vec<u8>> = (0..n_expert)
+        .map(|e| {
+            let w: Vec<f32> = (0..stride_elems).map(|i| f(i + e * 977, 0.017)).collect();
+            q4_1(&w)
+        })
+        .collect();
+    let down_banks: Vec<Vec<u8>> = (0..n_expert)
+        .map(|e| {
+            let w: Vec<f32> = (0..stride_elems).map(|i| f(i + e * 977, 0.029)).collect();
+            iq4_xs(&w)
+        })
+        .collect();
+    let gate_host: Vec<Vec<f32>> = gate_banks.iter().map(|b| deq_q4_1(b)).collect();
+    let down_host: Vec<Vec<f32>> = down_banks.iter().map(|b| deq_iq4_xs(b)).collect();
+
+    let mut gate_pager = GpuPager::new(&be, n_expert, 3, gate_slot_bytes).unwrap();
+    let mut down_pager = GpuPager::new(&be, n_expert, 3, down_slot_bytes).unwrap();
+    let staging = be
+        .alloc_uninit(gate_slot_bytes.max(down_slot_bytes), BufferUsage::Staging)
+        .unwrap();
+
+    // Same churn pattern as the Q2_K/Q3_K test: fill slots with 0/1/2, route to {2,3,4} (3 and 4
+    // evict 0 and 1 via LRU, landing in reused slots).
+    for pre in [0u32, 1, 2] {
+        gate_pager
+            .ensure_resident(&be, staging.as_ref(), pre, &gate_banks[pre as usize])
+            .unwrap();
+        down_pager
+            .ensure_resident(&be, staging.as_ref(), pre, &down_banks[pre as usize])
+            .unwrap();
+    }
+    let routed = [2u32, 3, 4];
+    for &eid in &routed {
+        gate_pager
+            .ensure_resident(&be, staging.as_ref(), eid, &gate_banks[eid as usize])
+            .unwrap();
+        down_pager
+            .ensure_resident(&be, staging.as_ref(), eid, &down_banks[eid as usize])
+            .unwrap();
+    }
+    gate_pager.flush_lut(&be).unwrap();
+    down_pager.flush_lut(&be).unwrap();
+
+    let counts_host: Vec<u32> = vec![0, 0, 4, 3, 2];
+    let offsets_host: Vec<u32> = vec![0, 0, 0, 4, 7];
+    let n_pairs = 9usize;
+    let npad = n_pairs.div_ceil(64) * 64 + 64;
+
+    let x: Vec<f32> = (0..n_pairs * k).map(|i| f(i, 0.11) + 0.02).collect();
+    let xq = quant_act(&x);
+
+    let mk_u32 = |v: &[u32]| {
+        let b = be.alloc(v.len() * 4, BufferUsage::Activations).unwrap();
+        be.upload(b.as_ref(), bytemuck::cast_slice(v)).unwrap();
+        b
+    };
+    let counts = mk_u32(&counts_host);
+    let offsets = mk_u32(&offsets_host);
+    let xbuf = be.alloc(n_pairs * k * 4, BufferUsage::Activations).unwrap();
+    be.upload(xbuf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+    let qa = be.alloc(npad * k, BufferUsage::Activations).unwrap();
+    let qda = be
+        .alloc(npad * (k / 32) * 2, BufferUsage::Activations)
+        .unwrap();
+    let qsa = be
+        .alloc(npad * (k / 32) * 2, BufferUsage::Activations)
+        .unwrap();
+    let gbuf = be.alloc(npad * n * 4, BufferUsage::Activations).unwrap();
+    let dqa = be.alloc(npad * n, BufferUsage::Activations).unwrap();
+    let dda = be
+        .alloc(npad * (n / 32) * 2, BufferUsage::Activations)
+        .unwrap();
+    let dsa = be
+        .alloc(npad * (n / 32) * 2, BufferUsage::Activations)
+        .unwrap();
+    let ybuf = be.alloc(npad * k * 4, BufferUsage::Activations).unwrap();
+
+    let rec = be.recorder().unwrap();
+    rec.quant_q8(
+        xbuf.as_ref(),
+        qa.as_ref(),
+        qda.as_ref(),
+        qsa.as_ref(),
+        n_pairs,
+        k,
+    );
+    rec.matmul_mmq_experts_paged(
+        DType::Q4_1,
+        "expert_gateup",
+        qa.as_ref(),
+        qda.as_ref(),
+        Some(qsa.as_ref()), // Q4_1 is min-carrying — binds `sact`
+        gate_pager.arena_buffer(),
+        gate_pager.lut_buffer(),
+        0,
+        counts.as_ref(),
+        offsets.as_ref(),
+        gbuf.as_ref(),
+        n_pairs,
+        k,
+        n,
+        n_expert,
+        1,
+    );
+    rec.quant_q8(
+        gbuf.as_ref(),
+        dqa.as_ref(),
+        dda.as_ref(),
+        dsa.as_ref(),
+        n_pairs,
+        n,
+    );
+    rec.matmul_mmq_experts_paged(
+        DType::Iq4Xs,
+        "expert_down",
+        dqa.as_ref(),
+        dda.as_ref(),
+        None, // IQ4_XS is symmetric — no min term, no `sact`
+        down_pager.arena_buffer(),
+        down_pager.lut_buffer(),
+        0,
+        counts.as_ref(),
+        offsets.as_ref(),
+        ybuf.as_ref(),
+        n_pairs,
+        n,
+        k,
+        n_expert,
+        1,
+    );
+    rec.finish().unwrap();
+
+    let mut g_out = vec![0f32; npad * n];
+    be.download(gbuf.as_ref(), bytemuck::cast_slice_mut(&mut g_out))
+        .unwrap();
+    let mut y_out = vec![0f32; npad * k];
+    be.download(ybuf.as_ref(), bytemuck::cast_slice_mut(&mut y_out))
+        .unwrap();
+
+    let mut want_g = vec![0f32; n_pairs * n];
+    for e in 0..n_expert {
+        let (off, cnt) = (offsets_host[e] as usize, counts_host[e] as usize);
+        for r in off..off + cnt {
+            let xr = &xq[r * k..(r + 1) * k];
+            for o in 0..n {
+                want_g[r * n + o] = gate_host[e][o * k..(o + 1) * k]
+                    .iter()
+                    .zip(xr)
+                    .map(|(a, b)| a * b)
+                    .sum();
+            }
+        }
+    }
+    for i in 0..n_pairs * n {
+        assert!(
+            (g_out[i] - want_g[i]).abs() < 5e-2,
+            "paged Q4_1 GEMM mismatch at {i}: got {} want {}",
+            g_out[i],
+            want_g[i]
+        );
+    }
+    let gq = quant_act(&want_g);
+    for e in 0..n_expert {
+        let (off, cnt) = (offsets_host[e] as usize, counts_host[e] as usize);
+        for r in off..off + cnt {
+            let gr = &gq[r * n..(r + 1) * n];
+            for o in 0..k {
+                let want: f32 = down_host[e][o * n..(o + 1) * n]
+                    .iter()
+                    .zip(gr)
+                    .map(|(a, b)| a * b)
+                    .sum();
+                let got = y_out[r * k + o];
+                assert!(
+                    (got - want).abs() < 5e-2,
+                    "paged IQ4_XS GEMM mismatch row {r} out {o}: got {got} want {want}"
+                );
+            }
+        }
+    }
+    println!("paged mmq expert GEMM (Q4_1/IQ4_XS) under eviction OK");
 }

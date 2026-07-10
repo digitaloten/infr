@@ -90,6 +90,72 @@ impl DType {
     }
 }
 
+/// SINGLE SOURCE OF TRUTH for the batched-MoE dp4a "mmq" expert-GEMM family's dtype coverage.
+/// Two independent gates MUST accept exactly this set — Vulkan's `infr_vulkan::adapter`'s
+/// `mmq_ok` (batched resident-bank prefill) and `infr_llama`'s `seam::runner::moe_mmq_ok`
+/// (decides whether the seam even BUILDS a batched `Op::MoeFfn` graph node) — because a mismatch
+/// either silently falls back to the slow per-token path (adapter stricter) or compiles a graph
+/// the adapter then rejects at record time (runner stricter). Both gates derive from this list
+/// instead of re-enumerating it so a format added here PROPAGATES automatically instead of
+/// silently drifting; `moe_mmq_drift_test` in this module still checks the two crates' actual
+/// gate closures against it (a `DType` isn't `Hash`-derivable across crate boundaries in a way
+/// that lets the gates literally `use` this const in a `matches!`, so the arms are still
+/// hand-written per format — this list is what a reviewer/test diffs them against, and the
+/// recorder's per-format kernel-name match arms `unreachable!()` at runtime if a format is listed
+/// here without its kernel wired, which is the compile-adjacent failure mode for that side).
+pub const MOE_MMQ_DTYPES: &[DType] = &[
+    DType::Q4_0,
+    DType::Q4_1,
+    DType::Q5_0,
+    DType::Q5_1,
+    DType::Q8_0,
+    DType::Q2K,
+    DType::Q3K,
+    DType::Q4K,
+    DType::Q5K,
+    DType::Q6K,
+    DType::Iq4Nl,
+    DType::Iq4Xs,
+];
+
+/// True for dtypes the batched-MoE dp4a mmq expert-GEMM family covers (gate/up/down each
+/// independently — see [`MOE_MMQ_DTYPES`]'s doc for why this is the single source of truth).
+pub fn moe_mmq_ok(dt: DType) -> bool {
+    MOE_MMQ_DTYPES.contains(&dt)
+}
+
+/// Subset of [`MOE_MMQ_DTYPES`] that is min-carrying AND needs the activation's `sact` (Σx)
+/// term to reconstruct the min: Q4_K/Q5_K (K-quant 6-bit min), Q5_1/Q4_1 (legacy min, PLUS
+/// convention). Q2_K is ALSO min-carrying but is deliberately excluded — its 16-elem sub-block is
+/// HALF the activation's 32-elem `sact` granularity, so it self-computes its own narrower Σx
+/// in-shader instead (see `native_gemm_mmq_q2_k.comp`'s doc); Q3_K/Q6_K/Q8_0/Q5_0/Q4_0/IQ4_NL/
+/// IQ4_XS are symmetric (no min term at all).
+pub const MOE_MMQ_SACT_DTYPES: &[DType] = &[DType::Q4K, DType::Q5K, DType::Q5_1, DType::Q4_1];
+
+/// True for [`MOE_MMQ_DTYPES`] members whose mmq kernel reads the activation's `sact` buffer.
+pub fn moe_mmq_needs_sact(dt: DType) -> bool {
+    MOE_MMQ_SACT_DTYPES.contains(&dt)
+}
+
+/// Subset of [`MOE_MMQ_DTYPES`] with a PAGED (`_xpg`/`_xpg32`) batched expert-GEMM build — i.e.
+/// usable in Scout-style paged-expert-cache prefill, not just the resident-bank path. A STRICT
+/// subset of `MOE_MMQ_DTYPES` (not every format needs a paged build — only ones a shipped paged
+/// model's expert banks actually use); `moe_mmq_drift_test` checks the subset relationship holds.
+pub const MOE_MMQ_PAGED_DTYPES: &[DType] = &[
+    DType::Q2K,
+    DType::Q3K,
+    DType::Q4_0,
+    DType::Q4_1,
+    DType::Iq4Nl,
+    DType::Iq4Xs,
+];
+
+/// True for [`MOE_MMQ_DTYPES`] members with a paged (Scout-style GpuPager) batched expert-GEMM
+/// build.
+pub fn moe_paged_mmq_ok(dt: DType) -> bool {
+    MOE_MMQ_PAGED_DTYPES.contains(&dt)
+}
+
 pub type Shape = Vec<usize>;
 
 /// Shape + dtype of a tensor value flowing through the graph.
@@ -116,3 +182,65 @@ impl TensorDesc {
 /// Handle to a node's output value within a single [`crate::graph::Graph`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TensorId(pub u32);
+
+#[cfg(test)]
+mod moe_mmq_drift_tests {
+    use super::*;
+
+    /// [`MOE_MMQ_SACT_DTYPES`] must be a strict subset of [`MOE_MMQ_DTYPES`] — a format can't need
+    /// `sact` without being an mmq format at all. Catches copy-paste errors when adding a format to
+    /// one list but not the other.
+    #[test]
+    fn sact_dtypes_subset_of_mmq_dtypes() {
+        for d in MOE_MMQ_SACT_DTYPES {
+            assert!(
+                MOE_MMQ_DTYPES.contains(d),
+                "{d:?} is in MOE_MMQ_SACT_DTYPES but not MOE_MMQ_DTYPES"
+            );
+        }
+    }
+
+    /// [`MOE_MMQ_PAGED_DTYPES`] must be a subset of [`MOE_MMQ_DTYPES`] — the paged batched-GEMM
+    /// build only ever needs to cover a format the resident batched path already covers.
+    #[test]
+    fn paged_dtypes_subset_of_mmq_dtypes() {
+        for d in MOE_MMQ_PAGED_DTYPES {
+            assert!(
+                MOE_MMQ_DTYPES.contains(d),
+                "{d:?} is in MOE_MMQ_PAGED_DTYPES but not MOE_MMQ_DTYPES"
+            );
+        }
+    }
+
+    /// No duplicate entries in any of the three lists — a dupe wouldn't break `contains`-based
+    /// lookups but would signal a copy-paste mistake at the point a format was added.
+    #[test]
+    fn no_duplicate_entries() {
+        for list in [MOE_MMQ_DTYPES, MOE_MMQ_SACT_DTYPES, MOE_MMQ_PAGED_DTYPES] {
+            for (i, a) in list.iter().enumerate() {
+                for b in &list[i + 1..] {
+                    assert_ne!(a, b, "duplicate {a:?} in an MOE_MMQ_* list");
+                }
+            }
+        }
+    }
+
+    /// The helper predicates must agree with their backing lists (guards against the fn body and
+    /// the const list drifting apart if either is hand-edited later).
+    #[test]
+    fn predicates_match_lists() {
+        for &d in MOE_MMQ_DTYPES {
+            assert!(moe_mmq_ok(d));
+        }
+        for &d in MOE_MMQ_SACT_DTYPES {
+            assert!(moe_mmq_needs_sact(d));
+        }
+        for &d in MOE_MMQ_PAGED_DTYPES {
+            assert!(moe_paged_mmq_ok(d));
+        }
+        // A format NOT in MOE_MMQ_DTYPES must read as uncovered everywhere.
+        assert!(!moe_mmq_ok(DType::Iq2Xxs));
+        assert!(!moe_mmq_needs_sact(DType::Iq2Xxs));
+        assert!(!moe_paged_mmq_ok(DType::Iq2Xxs));
+    }
+}

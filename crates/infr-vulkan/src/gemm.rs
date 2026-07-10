@@ -268,6 +268,8 @@ pub(crate) fn native_id_build_spv(dtype: infr_core::DType) -> Option<&'static [u
         Q4K => v!("native_id_q4k"),
         Q5K => v!("native_id_q5k"),
         Q6K => v!("native_id_q6k"),
+        Iq4Nl => v!("native_id_iq4nl"),
+        Iq4Xs => v!("native_id_iq4xs"),
         _ => return None,
     })
 }
@@ -295,6 +297,8 @@ pub(crate) fn native_idm_build_spv(dtype: infr_core::DType) -> Option<&'static [
         Q4K => v!("native_idm_q4k"),
         Q5K => v!("native_idm_q5k"),
         Q6K => v!("native_idm_q6k"),
+        Iq4Nl => v!("native_idm_iq4nl"),
+        Iq4Xs => v!("native_idm_iq4xs"),
         _ => return None,
     })
 }
@@ -322,6 +326,8 @@ pub(crate) fn native_id_paged_build_spv(dtype: infr_core::DType) -> Option<&'sta
         Q4K => v!("native_id_q4k_paged"),
         Q5K => v!("native_id_q5k_paged"),
         Q6K => v!("native_id_q6k_paged"),
+        Iq4Nl => v!("native_id_iq4nl_paged"),
+        Iq4Xs => v!("native_id_iq4xs_paged"),
         _ => return None,
     })
 }
@@ -349,6 +355,8 @@ pub(crate) fn native_idm_paged_build_spv(dtype: infr_core::DType) -> Option<&'st
         Q4K => v!("native_idm_q4k_paged"),
         Q5K => v!("native_idm_q5k_paged"),
         Q6K => v!("native_idm_q6k_paged"),
+        Iq4Nl => v!("native_idm_iq4nl_paged"),
+        Iq4Xs => v!("native_idm_iq4xs_paged"),
         _ => return None,
     })
 }
@@ -1705,6 +1713,127 @@ pub(crate) fn native_gemm_mmq_q2_k_xpg32_spv() -> &'static [u32] {
 pub(crate) fn native_gemm_mmq_q3_k_xpg32_spv() -> &'static [u32] {
     const BYTES: &[u8] =
         include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q3_k_xpg32.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+
+/// SPIR-V for the tiled Q4_0 dp4a (mmq) GEMM, expert-grid variant (symmetric, no shipped MoE GGUF
+/// in the audited cache uses it for expert banks — trivial family member, synthetic parity only).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q4_0_xp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4_0_xp.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q4_0_xp32_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4_0_xp32.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q4_0_xpg_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4_0_xpg.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q4_0_xpg32_spv() -> &'static [u32] {
+    const BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4_0_xpg32.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+
+/// SPIR-V for the tiled Q4_1 dp4a (mmq) GEMM, expert-grid variant (min-carrying, Q5_1's pattern
+/// minus the highbit — binds `sact`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q4_1_xp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4_1_xp.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q4_1_xp32_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4_1_xp32.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q4_1_xpg_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4_1_xpg.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q4_1_xpg32_spv() -> &'static [u32] {
+    const BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4_1_xpg32.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+
+/// SPIR-V for the tiled IQ4_NL dp4a (mmq) GEMM, expert-grid variant (codebook, symmetric — the
+/// LUT value itself is the signed dp4a operand, no `sact`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_iq4_nl_xp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq4_nl_xp.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_iq4_nl_xp32_spv() -> &'static [u32] {
+    const BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq4_nl_xp32.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_iq4_nl_xpg_spv() -> &'static [u32] {
+    const BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq4_nl_xpg.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_iq4_nl_xpg32_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_iq4_nl_xpg32.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+
+/// SPIR-V for the tiled IQ4_XS dp4a (mmq) GEMM, expert-grid variant (codebook + Q4_K-shaped
+/// superblock, symmetric — no `sact`; unsloth's UD quants mix this into most of
+/// Qwen3.6-35B-A3B's gate/up expert banks).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_iq4_xs_xp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq4_xs_xp.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_iq4_xs_xp32_spv() -> &'static [u32] {
+    const BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq4_xs_xp32.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_iq4_xs_xpg_spv() -> &'static [u32] {
+    const BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq4_xs_xpg.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_iq4_xs_xpg32_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_iq4_xs_xpg32.spv"
+    ));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
