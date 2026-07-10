@@ -1719,6 +1719,75 @@ fn cpu_golden_qwen3moe() {
     check_golden(&model, QWEN3MOE_GOLDEN);
 }
 
+/// Paged MoE expert cache (`infr_vulkan::pager`, wired into the seam via `INFR_MOE_CACHE_GB`):
+/// forces the paged path's PLACEMENT DECISION on this model and asserts the greedy output is
+/// IDENTICAL, token-for-token, to both the all-resident GPU run and the CPU reference either way.
+///
+/// Qwen3-30B-A3B-Q4_K_M's `ffn_down_exps` bank is NOT uniformly quantized (this unsloth-dynamic
+/// quant bumps a subset of layers' down-projection to Q6_K for quality — verified via the GGUF
+/// tensor directory) — the pager's fixed-byte-per-slot arena can't address a role whose experts
+/// don't all share one dtype (see `generate_dense_vulkan_session`'s `role_dtype_uniform` guard, the
+/// real bug this task's paged-execution work tripped over and root-caused: a fixed-size arena slot
+/// combined with a per-dtype element→byte conversion silently misaligns any non-first slot holding
+/// a different-dtype expert). So `INFR_MOE_CACHE_GB` here exercises the GUARD (falls back to fully
+/// resident, same as never having set it) rather than the paged executor split itself — this test's
+/// job is proving that fallback stays correct, NOT proving the pager (see
+/// `gpu_seam_paged_moe_matches_scout_oracle` / the Scout bench for the real paged-execution proof,
+/// since llama4/Scout's gate/up/down banks are each uniformly one dtype across every layer).
+///
+/// `INFR_UBATCH=1`: pins every prefill chunk to rows=1, so EVERY MoeFfn call — CPU, resident GPU
+/// alike — takes the small-m id-indexed dequant GEMV path (exact f32-equivalent math). Without it
+/// the resident run would default to the BATCHED int8-dp4a prefill path (Q4_K_M is mmq-eligible) —
+/// a coarser-precision route that `gpu_seam_golden_qwen3moe`'s own doc notes CAN diverge from the
+/// f32 CPU oracle on a near-tie greedy pick, which would make any divergence here ambiguous
+/// (quantization noise vs a real bug).
+#[test]
+fn gpu_seam_paged_moe_matches_resident_and_cpu() {
+    let path = need_model!(qwen3moe_30b(), "Qwen3-30B-A3B");
+    need_gpu!();
+    let _tlk = test_serial_lock();
+    std::env::set_var("INFR_TEMP", "0");
+    std::env::set_var("INFR_UBATCH", "1");
+    let n = 8usize;
+
+    let model = infr_llama::SeamModel::load(&path, None).expect("load");
+    let rendered = model
+        .render_chat("What is 2+2? Answer briefly.")
+        .expect("render chat");
+    let prompt_ids = model.encode(&rendered).expect("encode");
+
+    let mut cpu_ids = Vec::new();
+    model
+        .generate_cpu_ids(&prompt_ids, n, |id| cpu_ids.push(id))
+        .expect("cpu gen");
+
+    std::env::remove_var("INFR_MOE_CACHE_GB");
+    let mut resident_ids = Vec::new();
+    model
+        .generate_vulkan_ids(&prompt_ids, n, |id| resident_ids.push(id))
+        .expect("resident gpu gen");
+
+    // 0.05 GB is far below what even ONE Q4_K_M expert layer's gate+up+down banks need — guarantees
+    // real eviction pressure across the model's 48 MoE layers.
+    std::env::set_var("INFR_MOE_CACHE_GB", "0.05");
+    std::env::set_var("INFR_PAGER_STATS", "1");
+    let mut paged_ids = Vec::new();
+    let paged_result = model.generate_vulkan_ids(&prompt_ids, n, |id| paged_ids.push(id));
+    std::env::remove_var("INFR_MOE_CACHE_GB");
+    std::env::remove_var("INFR_UBATCH");
+    std::env::remove_var("INFR_PAGER_STATS");
+    paged_result.expect("paged gpu gen");
+
+    assert_eq!(
+        paged_ids, resident_ids,
+        "paged MoE diverged from the all-resident GPU run"
+    );
+    assert_eq!(
+        paged_ids, cpu_ids,
+        "paged MoE diverged from the CPU reference"
+    );
+}
+
 /// CPU-only: Gemma 4 E2B golden-hash lock.
 #[test]
 fn cpu_golden_gemma4_e2b() {
@@ -1952,6 +2021,44 @@ fn cpu_llama4_scout_greedy() {
     }
     assert!(!out.is_empty());
     assert!(out.iter().all(|&t| (t as usize) < model.config().vocab));
+}
+
+/// Vulkan seam, GPU-resident: Scout's 37 GB Q2_K expert banks don't fit a 24 GB card, so this
+/// exercises the paged executor split end to end (real weights, real eviction, real host
+/// readback/upload cadence — not a synthetic bank) and locks it against the SAME oracle prefix
+/// `cpu_llama4_scout_greedy` checks. llama4's gate/up/down banks are each uniformly Q2_K/Q2_K/Q3_K
+/// across every layer (verified — unlike the UD quants `gpu_seam_paged_moe_matches_resident_and_cpu`
+/// documents), so this is real paged execution, not the uniform-dtype fallback.
+#[test]
+fn gpu_seam_paged_moe_matches_scout_oracle() {
+    let path = need_model!(llama4_scout(), "Llama-4-Scout");
+    need_gpu!();
+    let _tlk = test_serial_lock();
+    std::env::set_var("INFR_TEMP", "0");
+    std::env::set_var("INFR_PAGER_STATS", "1");
+    let model = infr_llama::SeamModel::load(&path, None).expect("load");
+    let mut ids = model.encode("The capital of France is").expect("encode");
+    ids.insert(0, 200000); // Scout's BOS (<|begin_of_text|>), matching cpu_llama4_scout_greedy
+    let n = 24usize;
+    let mut gen = Vec::new();
+    let out = model
+        .generate_vulkan_ids(&ids, n, |id| gen.push(id))
+        .expect("vulkan seam generate (paged MoE)");
+    println!("scout paged-GPU generated ids: {out:?}");
+    println!(
+        "scout paged-GPU text: {:?}",
+        model.decode(&out).expect("decode")
+    );
+    const ORACLE_PREFIX: &[u32] = &[
+        13796, 26, 589, 7963, 323, 19584, 373, 20589, 26, 589, 7963, 323, 26049, 373, 30827, 26,
+        589, 7963, 323,
+    ];
+    assert!(
+        out.len() >= ORACLE_PREFIX.len() && out[..ORACLE_PREFIX.len()] == *ORACLE_PREFIX,
+        "llama4 paged-GPU greedy diverged from the CPU oracle within the deterministic prefix\n  \
+         got: {:?}\n  want prefix: {ORACLE_PREFIX:?}",
+        &out[..ORACLE_PREFIX.len().min(out.len())],
+    );
 }
 
 // ─── Gemma 4 12b (dense) ────────────────────────────────────────────────────────
