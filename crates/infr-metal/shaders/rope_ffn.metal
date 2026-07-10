@@ -39,7 +39,11 @@ kernel void rope_f32(device const float* x   [[buffer(0)]],
 // One SIMD group per (row, head): `simd_sum` for the norm, then lanes split the rotation pairs. Each
 // lane forms its normed values straight from `x` (× s × w), so no cross-lane read of `dst` — no
 // barrier needed. Pass-through dims [rope_dim, head_dim) are written normed in the tail loop.
-struct QkRopeParams { uint rows; uint n_head; uint head_dim; uint rope_dim; float theta; float eps; uint has_ff; };
+// `x_stride > 0` reads x from an INTERLEAVED q+g buffer (qwen35 attn): row stride is `x_stride`
+// and each head occupies a `x_stride/n_head`-wide block (query first `head_dim` elements). `dst`
+// is always packed `[rows*n_head*head_dim]`. `x_stride == 0` is the packed-in case (stride =
+// n_head*head_dim). Mirrors the Vulkan `qk_norm_rope_interleaved` kernel and infr-cpu QkNormRope.
+struct QkRopeParams { uint rows; uint n_head; uint head_dim; uint rope_dim; float theta; float eps; uint has_ff; uint x_stride; };
 kernel void qknormrope_f32(device const float* x   [[buffer(0)]],
                            device const float* w   [[buffer(1)]],
                            device const int*   pos [[buffer(2)]],
@@ -51,9 +55,12 @@ kernel void qknormrope_f32(device const float* x   [[buffer(0)]],
     uint grp = gid / 32u;
     if (grp >= p.rows * p.n_head) return;
     uint r = grp / p.n_head;
-    uint base = grp * p.head_dim;
+    uint dbase = grp * p.head_dim;
+    uint xbase = p.x_stride > 0u
+        ? r * p.x_stride + (grp % p.n_head) * (p.x_stride / p.n_head)
+        : dbase;
     float ss = 0.0f;
-    for (uint i = lane; i < p.head_dim; i += 32u) { float v = x[base + i]; ss += v * v; }
+    for (uint i = lane; i < p.head_dim; i += 32u) { float v = x[xbase + i]; ss += v * v; }
     ss = simd_sum(ss) / (float)p.head_dim;
     float s = 1.0f / sqrt(ss + p.eps);
     uint hf = p.rope_dim / 2;
@@ -63,12 +70,12 @@ kernel void qknormrope_f32(device const float* x   [[buffer(0)]],
         float ang = p0 * pow(p.theta, -2.0f * (float)pp / (float)p.rope_dim);
         if (p.has_ff != 0) ang /= ff[pp];
         float c = cos(ang), sn = sin(ang);
-        float a = x[base + i0] * s * w[i0];
-        float b = x[base + i1] * s * w[i1];
-        dst[base + i0] = a * c - b * sn;
-        dst[base + i1] = a * sn + b * c;
+        float a = x[xbase + i0] * s * w[i0];
+        float b = x[xbase + i1] * s * w[i1];
+        dst[dbase + i0] = a * c - b * sn;
+        dst[dbase + i1] = a * sn + b * c;
     }
-    for (uint i = p.rope_dim + lane; i < p.head_dim; i += 32u) dst[base + i] = x[base + i] * s * w[i];
+    for (uint i = p.rope_dim + lane; i < p.head_dim; i += 32u) dst[dbase + i] = x[xbase + i] * s * w[i];
 }
 
 // Wide fused QkNorm+RoPE for DECODE (rows == 1): 8 simdgroups (256 threads) per (row, head) —
@@ -87,10 +94,13 @@ kernel void qknormrope_wide_f32(device const float* x   [[buffer(0)]],
     threadgroup float red[8];
     if (grp >= p.rows * p.n_head) return;
     uint r = grp / p.n_head;
-    uint base = grp * p.head_dim;
+    uint dbase = grp * p.head_dim;
+    uint xbase = p.x_stride > 0u
+        ? r * p.x_stride + (grp % p.n_head) * (p.x_stride / p.n_head)
+        : dbase;
     float ss = 0.0f;
     for (uint i = tid; i < p.head_dim; i += 256u) {
-        float v = x[base + i];
+        float v = x[xbase + i];
         ss += v * v;
     }
     ss = simd_sum(ss);
@@ -105,13 +115,13 @@ kernel void qknormrope_wide_f32(device const float* x   [[buffer(0)]],
         float ang = p0 * pow(p.theta, -2.0f * (float)pp / (float)p.rope_dim);
         if (p.has_ff != 0) ang /= ff[pp];
         float c = cos(ang), sn = sin(ang);
-        float a = x[base + i0] * s * w[i0];
-        float b = x[base + i1] * s * w[i1];
-        dst[base + i0] = a * c - b * sn;
-        dst[base + i1] = a * sn + b * c;
+        float a = x[xbase + i0] * s * w[i0];
+        float b = x[xbase + i1] * s * w[i1];
+        dst[dbase + i0] = a * c - b * sn;
+        dst[dbase + i1] = a * sn + b * c;
     }
     for (uint i = p.rope_dim + tid; i < p.head_dim; i += 256u) {
-        dst[base + i] = x[base + i] * s * w[i];
+        dst[dbase + i] = x[xbase + i] * s * w[i];
     }
 }
 
@@ -135,15 +145,28 @@ kernel void gatedactfused_f32(device const float* gu  [[buffer(0)]],
     ulong gb = (ulong)r * 2u * p.nff;
     dst[gid] = gated_act(p.act, gu[gb + i]) * gu[gb + p.nff + i];
 }
+// `up_stride`/`gate_stride`/`gate_block_width` read gate/up from wider interleaved buffers (qwen35
+// attn output gate reads the query+gate block layout; Gemma E2B reads a per-layer up slice) —
+// mirrors infr-cpu GatedAct. All zero = tightly-packed rows (stride = nff). `dst` is packed.
+struct GatedActParams { uint rows; uint nff; uint act; uint up_off; uint up_stride; uint gate_stride; uint gate_block_width; };
 kernel void gatedact_f32(device const float* gate [[buffer(0)]],
                          device const float* up   [[buffer(1)]],
                          device float*       dst  [[buffer(2)]],
-                         constant GatedParams& p  [[buffer(3)]],
+                         constant GatedActParams& p [[buffer(3)]],
                          uint gid [[thread_position_in_grid]]) {
     if (gid >= p.rows * p.nff) return;
     uint r = gid / p.nff;
     uint i = gid % p.nff;
-    uint gb = r * p.nff + i;
-    uint ub = r * p.nff + p.up_off + i;
-    dst[gb] = gated_act(p.act, gate[gb]) * up[ub];
+    uint grow = (p.gate_block_width > 0u || p.gate_stride > 0u) ? r * p.gate_stride : r * p.nff;
+    uint gi;
+    if (p.gate_block_width > 0u) {
+        uint headw = p.gate_block_width / 2u;
+        uint head = i / headw;
+        uint off = i % headw;
+        gi = grow + head * p.gate_block_width + headw + off;
+    } else {
+        gi = grow + i;
+    }
+    uint ub = (p.up_stride == 0u ? r * p.nff : r * p.up_stride) + p.up_off + i;
+    dst[gid] = gated_act(p.act, gate[gi]) * up[ub];
 }

@@ -1379,7 +1379,15 @@ impl MetalBackend {
                 n_head,
                 head_dim,
                 eps,
+                x_stride,
             } => {
+                // Strided QkNorm reads (qwen35 q+g interleave) are wired only into QkNormRope; the
+                // runner always emits packed rows for the standalone QkNorm (llama4 L2-norm, gemma4
+                // V-norm, DeltaNet ssm_norm split path).
+                assert_eq!(
+                    x_stride, 0,
+                    "Metal QkNorm: strided x not supported (runner emits packed)"
+                );
                 let (rows, nh, hd) = (rows as usize, n_head as usize, head_dim as usize);
                 let bx = self.ensure_device(r, x);
                 let bw = self.weight_buf(weight, g, bindings)?;
@@ -1848,7 +1856,14 @@ impl MetalBackend {
                 rope_dim,
                 theta,
                 freq_factors,
+                x_stride,
             } => {
+                // The runner only strides the fused QkNormRope (qwen35 q+g interleave); the plain
+                // llama-family Rope always reads packed rows.
+                assert_eq!(
+                    x_stride, 0,
+                    "Metal Rope: strided x not supported (runner emits packed)"
+                );
                 let (rows, nh, hd) = (rows as usize, n_head as usize, head_dim as usize);
                 let bx = self.ensure_device(r, x);
                 let bpos = self.ensure_device(r, positions);
@@ -1888,6 +1903,7 @@ impl MetalBackend {
                 theta,
                 eps,
                 freq_factors,
+                x_stride,
             } => {
                 let (rows, nh, hd) = (rows as usize, n_head as usize, head_dim as usize);
                 let bx = self.ensure_device(r, x);
@@ -1929,6 +1945,7 @@ impl MetalBackend {
                 p.extend_from_slice(&theta.to_ne_bytes());
                 p.extend_from_slice(&eps.to_ne_bytes());
                 p.extend_from_slice(&(freq_factors.is_some() as u32).to_ne_bytes());
+                p.extend_from_slice(&x_stride.to_ne_bytes());
                 // One simdgroup per (row, head) — 8 on the wide decode form.
                 let tgw = if wide { 256 } else { 32 };
                 self.encode_tg_w(
@@ -2166,6 +2183,8 @@ impl MetalBackend {
                 act,
                 up_off,
                 up_stride,
+                gate_stride,
+                gate_block_width,
             } => {
                 let (rows, nff) = (rows as usize, nff as usize);
                 let bg = self.ensure_device(r, gate);
@@ -2182,6 +2201,8 @@ impl MetalBackend {
                 p.extend_from_slice(&act_code.to_ne_bytes());
                 p.extend_from_slice(&up_off.to_ne_bytes());
                 p.extend_from_slice(&up_stride.to_ne_bytes());
+                p.extend_from_slice(&gate_stride.to_ne_bytes());
+                p.extend_from_slice(&gate_block_width.to_ne_bytes());
                 self.encode_w(
                     r,
                     &pso,
@@ -3361,7 +3382,15 @@ impl MetalBackend {
                 head_k,
                 head_v,
                 eps,
+                src_stride,
             } => {
+                // Strided q/k/v from a shared conv_out buffer is the INFR_DELTA_STRIDED experimental
+                // decode path (Vulkan-only); the runner always emits src_stride == 0 for the Metal
+                // graph (separate packed q/k/v buffers via CopyStrided).
+                assert_eq!(
+                    src_stride, 0,
+                    "Metal DeltaNet: strided q/k/v not supported (runner emits packed buffers)"
+                );
                 let (rr, nv, nk, kd, vd) = (
                     rows as usize,
                     n_vhead as usize,

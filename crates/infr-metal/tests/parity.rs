@@ -1326,7 +1326,6 @@ fn rmsnorm_parity() {
         rows: rows as u32,
         dim: dim as u32,
         eps: 1e-6,
-        src_stride: 0,
     });
     let bound = vec![
         (x, f32_bytes(&rand_f32(rows * dim, 10))),
@@ -1351,7 +1350,7 @@ fn qknorm_parity() {
         n_head: nh as u32,
         head_dim: hd as u32,
         eps: 1e-6,
-        src_stride: 0,
+        x_stride: 0,
     });
     let bound = vec![
         (x, f32_bytes(&rand_f32(rows * nh * hd, 12))),
@@ -1378,6 +1377,7 @@ fn rope_parity() {
         rope_dim: rd as u32,
         theta: 10000.0,
         freq_factors: None,
+        x_stride: 0,
     });
     let positions: Vec<i32> = (0..rows as i32).map(|i| i + 3).collect();
     let bound = vec![
@@ -1407,6 +1407,7 @@ fn rope_partial_with_freq_factors_parity() {
         rope_dim: rd as u32,
         theta: 1000000.0,
         freq_factors: Some(ff),
+        x_stride: 0,
     });
     let positions: Vec<i32> = (0..rows as i32).map(|i| i * 2 + 1).collect();
     let ffv: Vec<f32> = (0..rd / 2).map(|i| 1.0 + i as f32 * 0.1).collect();
@@ -1438,7 +1439,7 @@ fn qknormrope_parity() {
         rope_dim: rd as u32,
         theta: 10000.0,
         eps: 1e-6,
-        src_stride: 0,
+        x_stride: 0,
         freq_factors: None,
     });
     let positions: Vec<i32> = (0..rows as i32).map(|i| i + 1).collect();
@@ -1476,7 +1477,7 @@ fn qknormrope_hd256_partial_parity() {
         rope_dim: rd as u32,
         theta: 1.0e7,
         eps: 1e-6,
-        src_stride: 0,
+        x_stride: 0,
         freq_factors: None,
     });
     let positions: Vec<i32> = (0..rows as i32).collect(); // 0,1,2,3,4,5 — includes pos >= 2
@@ -2274,6 +2275,8 @@ fn gated_test(act: infr_core::graph::Activation, up_off: usize, seed: u64) {
         act,
         up_off: up_off as u32,
         up_stride: 0,
+        gate_stride: 0,
+        gate_block_width: 0,
     });
     let bound = vec![
         (gate, f32_bytes(&rand_f32(rows * nff, seed))),
