@@ -90,6 +90,28 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --workspace --locked
 
+  # Cheap Linux guard for the macOS-only `infr-metal` crate: `cargo check`
+  # cross-compiled to aarch64-apple-darwin doesn't link, so no macOS SDK is
+  # needed — it just typechecks the match arms/tests that the Linux clippy/test
+  # jobs skip (they never build `infr-metal`). Catches Op-signature drift before
+  # the expensive `test-macos` runner. Drop this job if it ever proves flaky.
+  metal-check:
+    name: cargo check (infr-metal, Apple target)
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install glslc (shaderc)
+        run: sudo apt-get update && sudo apt-get install -y glslc
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: aarch64-apple-darwin
+          cache: false
+      - run: rustup update --no-self-update stable
+      - run: rustup target add aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p infr-metal --all-targets --locked --target aarch64-apple-darwin
+
   # macOS / Metal: the Linux jobs above never build `infr-metal` (it is
   # `#![cfg(target_os = "macos")]`). This job builds the workspace on an
   # Apple-Silicon runner — which has a real Metal device — and runs the
