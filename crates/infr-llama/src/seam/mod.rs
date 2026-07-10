@@ -134,38 +134,114 @@ pub(crate) fn generate_dense_vulkan_session(
     want_ctx: usize,
     constraint: Option<&mut crate::grammar::Constraint>,
 ) -> AResult<(Vec<u32>, GenStats)> {
-    // ── MoE expert auto-fit ──────────────────────────────────────────────────────────────────
-    // When the full weight set (+ the want_ctx KV cache + activation headroom) exceeds VRAM,
-    // keep the FIRST n_host_moe layers' stacked expert banks in HOST-VISIBLE memory instead of
-    // VRAM. The graph and lowering are untouched — the banks bind like any other weight and the
-    // GPU reads them over the bus (the seam's zero-readback GPU routing can't know active experts
-    // host-side, so per-expert streaming à la bespoke doesn't apply; resident-or-host per layer
-    // does). INFR_NCMOE overrides the automatic count.
-    let n_host_moe: usize = if cfg.moe.is_some() {
-        let explicit = std::env::var("INFR_NCMOE")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok());
-        match explicit {
-            Some(n) => n.min(cfg.n_layer),
-            None => {
+    // ── MoE expert placement ─────────────────────────────────────────────────────────────────
+    // Three tiers, in precedence order:
+    //   1. `INFR_NCMOE=N` EXPLICIT override — the legacy host-visible split: the FIRST N layers'
+    //      banks land in HOST-VISIBLE memory (HostWeights = system-RAM GTT), the GPU reading them
+    //      over the bus every dispatch. Kept verbatim for models/hardware where that already
+    //      works today (some overflow, no readback stalls) — explicit opt-in, unconditional (forces
+    //      N layers off VRAM even if everything would otherwise fit).
+    //   2. `INFR_MOE_CACHE_GB=X` EXPLICIT override (NCMOE unset) — force EVERY expert layer through
+    //      the pager (`infr_vulkan::pager`) with an X GB byte budget, regardless of whether the
+    //      banks would fit resident. Lets a caller (or a test) force the paged path deterministically
+    //      instead of depending on this box's free VRAM — see the `gpu_seam_paged_moe_matches_*`
+    //      tests. Needs a SPLIT (non-fused) gate/up bank (`fused_bank` below); a fused-bank model
+    //      falls back to fully resident here (paging can't help it, and forcing host-visible on a
+    //      model that already fits would be a pure regression).
+    //   3. Auto (both unset): fully resident (today's fast path, zero change) when the banks fit
+    //      VRAM; otherwise the pager with budget = remaining VRAM after dense+KV+headroom — same
+    //      split-bank-only caveat as tier 2 (a fused bank falls back to the legacy host-visible
+    //      split here, unchanged from before this task).
+    // Tier 2/3 paging needs the adapter's paged executor split
+    // (`infr_vulkan::adapter::execute_static`'s paged branch) — llama4/qwen3moe/qwen35moe-shaped
+    // (split gate/up) banks only.
+    let explicit_ncmoe = std::env::var("INFR_NCMOE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    let moe_cache_gb_override = std::env::var("INFR_MOE_CACHE_GB")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok());
+    let fused_bank = g
+        .tensors()
+        .iter()
+        .any(|t| t.name.contains("ffn_gate_up_exps"));
+    // The pager's arena addresses slot `k` at a FIXED byte offset `k * slot_bytes` (uniform per
+    // role), while the GEMV shader computes the SAME slot's element offset as `k * stride`
+    // (`stride` = `n_ff_exp * n_embd`, a pure matrix-shape constant — identical regardless of
+    // quant format). Those only agree if EVERY expert ever placed in that role's arena shares the
+    // SAME dtype (so "stride elements" converts to the SAME byte count everywhere): a role whose
+    // dtype varies by layer — some "unsloth-dynamic" (UD) quants bump `ffn_down_exps` to a wider
+    // K-quant on a subset of layers for quality, e.g. Qwen3-30B-A3B-Q4_K_M's down bank mixes
+    // Q4_K/Q6_K — would have two different experts claim the SAME slot's byte range, silently
+    // corrupting whichever doesn't match the dtype the arena was sized from (found empirically:
+    // layers past the first few produced wildly out-of-range GEMV output on a mixed-dtype model;
+    // see the task's write-up). Detect this UP FRONT and refuse to page — falling back to the
+    // legacy host-visible split, exactly like `fused_bank` — rather than risk it. llama4/Scout
+    // ships ONE dtype per role across every layer (verified), so this never trips there.
+    let role_dtype_uniform = |suffix: &str| -> bool {
+        let mut seen: Option<(infr_core::DType, usize)> = None;
+        for l in 0..cfg.n_layer {
+            let name = format!("blk.{l}.{suffix}");
+            if let Some(t) = g.tensors().iter().find(|t| t.name == name) {
+                let key = (t.dtype, t.nbytes);
+                match seen {
+                    None => seen = Some(key),
+                    Some(prev) if prev != key => return false,
+                    _ => {}
+                }
+            }
+        }
+        true
+    };
+    let cannot_page = fused_bank
+        || !role_dtype_uniform("ffn_gate_exps.weight")
+        || !role_dtype_uniform("ffn_up_exps.weight")
+        || !role_dtype_uniform("ffn_down_exps.weight");
+
+    let mut n_host_moe = 0usize; // tier 1: first N layers host-visible
+    let mut n_paged = 0usize; // tier 2/3: first N layers paged
+    let mut pager_budget_bytes = 0u64;
+    if cfg.moe.is_some() {
+        match (explicit_ncmoe, moe_cache_gb_override) {
+            (Some(n), _) => n_host_moe = n.min(cfg.n_layer),
+            (None, Some(gb)) if !cannot_page => {
+                n_paged = cfg.n_layer;
+                pager_budget_bytes = (gb * 1e9) as u64;
+            }
+            (None, _) => {
                 let fp = crate::weights::weight_footprint(g);
                 let vram = vk.vram();
                 let kv_bytes: u64 = (0..cfg.n_layer)
                     .map(|l| (cfg.layer_n_kv(l) * cfg.layer_head_dim(l) * 2 * 2) as u64)
                     .sum::<u64>()
                     * (want_ctx as u64 + 64);
-                const ACT_HEADROOM: u64 = 512 * 1024 * 1024;
+                // 2 GiB: covers activation scratch (pooled, but per-tag sizes scale with n_embd/
+                // n_ff and this budget calc's `fp`/`kv_bytes` are estimates, not the exact bytes
+                // `alloc`/gpu-allocator's 256 MiB block granularity ends up committing) plus the
+                // pager's own arena+staging+LUT allocations, which aren't counted in `fp` at all
+                // (found empirically sizing Scout's 48-layer, 37 GB Q2_K pager placement — 512 MiB
+                // undershot by a few hundred MiB and the guard rightly refused to over-commit).
+                const ACT_HEADROOM: u64 = 2 * 1024 * 1024 * 1024;
                 let budget = vram
                     .available
                     .saturating_sub(fp.dense + kv_bytes + ACT_HEADROOM);
                 let per_layer = (fp.expert / cfg.n_layer.max(1) as u64).max(1);
                 let gpu_layers = (budget / per_layer).min(cfg.n_layer as u64) as usize;
-                cfg.n_layer - gpu_layers
+                let overflow = cfg.n_layer - gpu_layers;
+                if overflow > 0 {
+                    if cannot_page {
+                        n_host_moe = overflow; // tier 2/3 can't handle a fused/mixed-dtype bank
+                    } else {
+                        n_paged = overflow;
+                        // `budget` is the WHOLE remaining-VRAM figure; `gpu_layers` of it is
+                        // already spoken for by the layers staying fully resident (unchanged from
+                        // the host-visible auto-fit above) — the pager only gets what's left.
+                        pager_budget_bytes = budget.saturating_sub(gpu_layers as u64 * per_layer);
+                    }
+                }
             }
         }
-    } else {
-        0
-    };
+    }
     if n_host_moe > 0 {
         eprintln!(
             "MoE auto-fit: {}/{} expert layers on GPU, {n_host_moe} host-visible (GPU reads over \
@@ -184,7 +260,82 @@ pub(crate) fn generate_dense_vulkan_session(
             .and_then(|l| l.parse::<usize>().ok())
             .is_some_and(|l| l < n_host_moe)
     };
-    generate_dense_backend(
+    // A layer-l `_exps` tensor of a PAGED layer — split gate/up/down only (see `fused_bank` above).
+    let paged_layer = move |name: &str| -> Option<usize> {
+        if n_paged == 0 || !name.contains("_exps") {
+            return None;
+        }
+        name.strip_prefix("blk.")
+            .and_then(|r| r.split('.').next())
+            .and_then(|l| l.parse::<usize>().ok())
+            .filter(|&l| l < n_paged)
+    };
+    let moe_role_of = |name: &str| -> Option<infr_vulkan::pager::Role> {
+        use infr_vulkan::pager::Role;
+        if name.ends_with("ffn_gate_exps.weight") {
+            Some(Role::Gate)
+        } else if name.ends_with("ffn_up_exps.weight") {
+            Some(Role::Up)
+        } else if name.ends_with("ffn_down_exps.weight") {
+            Some(Role::Down)
+        } else {
+            None
+        }
+    };
+    // The session must exist (and answer `Backend::moe_paged` truthy) BEFORE `generate_dense_backend`
+    // below uploads a single weight: the FIRST paged tensor the `bind_weight` closure sees still
+    // has to bind a placeholder the adapter recognizes as paged the very first time a graph
+    // executes — sizing (and installing) it AFTER the call, once every weight was already bound
+    // to a 4-byte placeholder nobody registered, would leave `execute_static` reading that
+    // placeholder as if it were the full bank (see `pager::MoePagerLayout`'s doc). Only on the
+    // FIRST load of a session (`bind_weight` isn't called again once `state` already holds
+    // uploaded weights, so a second `init_moe_pager` would wipe an already-warm cache for nothing).
+    let first_load = state.is_none();
+    if first_load && n_paged > 0 {
+        let moe = cfg.moe.as_ref().expect("n_paged > 0 implies MoE");
+        let tensor_bytes = |suffix: &str| -> Option<usize> {
+            (0..n_paged).find_map(|l| {
+                let name = format!("blk.{l}.{suffix}");
+                g.tensors()
+                    .iter()
+                    .find(|t| t.name == name)
+                    .map(|t| t.nbytes)
+            })
+        };
+        let (gb, ub, db) = (
+            tensor_bytes("ffn_gate_exps.weight").unwrap_or(4) / moe.n_expert.max(1),
+            tensor_bytes("ffn_up_exps.weight").unwrap_or(4) / moe.n_expert.max(1),
+            tensor_bytes("ffn_down_exps.weight").unwrap_or(4) / moe.n_expert.max(1),
+        );
+        let n_blocks = n_paged * moe.n_expert;
+        let per_slot = (gb + ub + db).max(1) as u64;
+        // Floor at `n_used`: a single rows=1 (decode) touch needs `n_used` DISTINCT experts
+        // simultaneously resident (the within-batch safety invariant — see
+        // `infr_core::pager::Pager::new`'s doc) and decode is unavoidable for every paged model. A
+        // CHUNKED batched-prefill row (rows>1) can touch up to `n_expert` distinct experts in one
+        // dispatch — llama4/Scout never takes that path (Q2_K isn't batched-mmq-eligible, so its
+        // prefill is per-token like decode), but a future paged model whose bank DOES qualify for
+        // the batched path (and whose seam doesn't reduce INFR_UBATCH) would need a much larger
+        // budget or a batched-aware paged path (not implemented here) — this floor only guarantees
+        // the decode case.
+        let n_slots = ((pager_budget_bytes / per_slot) as usize).clamp(moe.n_used.max(1), n_blocks);
+        eprintln!(
+            "MoE pager: {n_paged}/{} expert layers PAGED ({n_slots}/{n_blocks} experts cached, \
+             {:.2} GB budget; ctx={want_ctx})",
+            cfg.n_layer,
+            pager_budget_bytes as f64 / 1e9,
+        );
+        vk.init_moe_pager(infr_vulkan::pager::MoePagerLayout {
+            n_blocks,
+            n_slots,
+            gate_slot_bytes: gb,
+            up_slot_bytes: ub,
+            down_slot_bytes: db,
+        })
+        .map_err(|e| anyhow!("{e}"))?;
+    }
+
+    let out = generate_dense_backend(
         vk,
         &|name, tb, dt, _n| {
             // Raw upload for EVERY dtype — the file's bytes go straight to VRAM (u32-padded) and the
@@ -192,6 +343,35 @@ pub(crate) fn generate_dense_vulkan_session(
             // F32 stays native (rmsnorm/qk_norm_rope read f32); bf16 → in-shader expand (bf16 is the
             // top 16 bits of an f32, EXACT; the warp GEMM narrows to f16 for the matrix cores like
             // every other format); quant weights → raw blocks. No host dtype conversion on any path.
+            //
+            // Tier 2/3 (paged): register this layer's mmap bytes with the pager and bind a tiny
+            // placeholder instead of uploading the full bank — the Vulkan adapter recognizes the
+            // placeholder's identity (see `infr_vulkan::pager`'s module doc) and diverts to the
+            // paged executor split at execute time. `down_scale`/router/every other tensor of a
+            // paged layer is unaffected — only the three `_exps` banks divert here.
+            if let Some(l) = paged_layer(name) {
+                if let (WBytes::Mmap(bytes), Some(role)) = (&tb, moe_role_of(name)) {
+                    let n_expert = cfg
+                        .moe
+                        .as_ref()
+                        .expect("a paged tensor implies an MoE config")
+                        .n_expert
+                        .max(1);
+                    let stride_bytes = bytes.len() / n_expert;
+                    let placeholder = vk
+                        .alloc_uninit(4, BufferUsage::Weights)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    let buf_id = infr_vulkan::pager::buffer_identity(placeholder.as_ref());
+                    let source = infr_vulkan::pager::ExpertSource {
+                        bytes: std::sync::Arc::new(bytes.clone())
+                            as std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>,
+                        stride_bytes,
+                        layer_base: (l * n_expert) as u32,
+                    };
+                    vk.register_paged_expert(role, buf_id, source);
+                    return Ok((placeholder, dt));
+                }
+            }
             let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
             // Auto-fit-offloaded expert banks land in HOST memory (HostWeights = system-RAM GTT the
             // GPU reads over the bus; it binds as an SSBO like any weight). alloc_uninit: the upload
@@ -226,7 +406,13 @@ pub(crate) fn generate_dense_vulkan_session(
         None,
         None,
         None,
-    )
+    )?;
+    // INFR_PAGER_STATS=1: cumulative hit/miss/eviction counters since this pager was installed
+    // (persists across calls on the same session — see `MoePagerSession`). A no-op when no paged
+    // model is loaded. Printed every call rather than gated to "last call only" since neither the
+    // CLI's run/serve loop nor this function know which call is the process's last one.
+    vk.print_moe_pager_stats();
+    Ok(out)
 }
 
 /// Metal seam runner: the SAME dense forward as [`generate_dense_cpu`], on the reference Metal

@@ -3431,7 +3431,12 @@ pub(crate) fn generate_dense_backend(
     // values. Hence the per-layer head-dim mirror of the adapter's Attention check.
     // llama (no qk-norm) replays too — its f16-out Rope has a dyn kernel — but only without
     // freq_factors (the standalone Rope kernel has no ff binding; gemma4's ff rides QkNormRope).
+    // A paged MoE model (see `Backend::moe_paged`'s doc) forces the static per-execute path: the
+    // adapter's own `execute`/`execute_chain` already refuse to replay one (belt-and-suspenders,
+    // the actual correctness guarantee), but skipping `dyn_replay` here too avoids building the
+    // (then-never-used) replay plan's persistent scratch/self-advancing params machinery at all.
     let dyn_replay = be.capabilities().decode_replay
+        && !be.moe_paged()
         && std::env::var("INFR_SEAM_NO_REPLAY").is_err()
         && (qk_norm || rope_freqs.is_none())
         // Quantized/dense-alt KV caches force the per-execute STATIC decode (see the adapter's

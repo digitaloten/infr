@@ -591,6 +591,34 @@ impl SeamModel {
             .map_err(|e| anyhow!("decode: {e}"))
     }
 
+    /// Token-level Vulkan greedy generation: prefill the given prompt token ids and stream each
+    /// GENERATED token id through `on_id` (BOS/template handling is entirely the caller's — nothing
+    /// is prepended). Returns the generated ids. The id-exact, Vulkan-backed counterpart to
+    /// [`Self::generate_cpu_ids`] — used for token-identity checks (CPU oracle, paged-vs-resident
+    /// MoE) that need raw ids rather than detokenized text. A fresh [`infr_vulkan::VulkanBackend`]
+    /// per call (like [`Self::generate_dense_vulkan`]) — every weight re-uploads, so the MoE
+    /// placement decision (resident/host-visible/paged — see `generate_dense_vulkan_session`) is
+    /// re-made fresh each call, which is exactly what a paged-vs-resident A/B needs.
+    pub fn generate_vulkan_ids(
+        &self,
+        prompt_tokens: &[u32],
+        max_new: usize,
+        on_id: impl FnMut(u32),
+    ) -> Result<Vec<u32>> {
+        let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
+        let (generated, _stats) = crate::seam::generate_dense_vulkan(
+            &vk,
+            &self.gguf,
+            &self.cfg,
+            &self.token_embd,
+            self.per_layer_embd.as_ref(),
+            prompt_tokens,
+            max_new,
+            on_id,
+        )?;
+        Ok(generated)
+    }
+
     /// Token-level bench on the Vulkan seam, llama-bench-comparable: ONE weight upload (a
     /// persistent session) + an untimed pipeline warmup, then per rep — reset the KV, warm it to
     /// `depth` (untimed), and time ONE metric: `pg` = a whole (P prefill + G decode) turn,
