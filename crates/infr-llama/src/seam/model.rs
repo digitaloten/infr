@@ -1233,21 +1233,22 @@ impl DiffusionGemmaCpuSession {
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl DiffusionGemmaVulkanSession {
-    /// [`DiffusionGemmaCpuSession::prefill`]'s Vulkan twin.
+    /// [`DiffusionGemmaCpuSession::prefill`]'s Vulkan twin. Weights bind through the SHARED
+    /// [`crate::seam::vulkan_moe_binder`] so DG gets the same MoE expert placement tiers
+    /// (resident / `INFR_MOE_CACHE_GB` / auto-paged) as every other MoE model — DG's fused
+    /// `ffn_gate_up_exps` bank pages under `Role::Gate` and its mixed Q5_0/Q8_0 down banks split
+    /// into per-byte-size pools (see `infr_vulkan::pager`'s MoE-session doc).
     pub fn prefill(&mut self, model: &SeamModel, tokens: &[u32]) -> Result<()> {
+        let bind = crate::seam::vulkan_moe_binder(
+            &self.be,
+            &model.gguf,
+            &model.cfg,
+            self.state.is_none(),
+            self.max_ctx,
+        )?;
         crate::seam::generate_dense_backend(
             &self.be,
-            &|_name, tb, dt, _n| {
-                let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
-                let buf = self
-                    .be
-                    .alloc(padded.len(), BufferUsage::Weights)
-                    .map_err(|e| anyhow!("{e}"))?;
-                self.be
-                    .upload(buf.as_ref(), &padded)
-                    .map_err(|e| anyhow!("{e}"))?;
-                Ok((buf, dt))
-            },
+            &*bind,
             &model.gguf,
             &model.cfg,
             &model.token_embd,
@@ -1264,6 +1265,8 @@ impl DiffusionGemmaVulkanSession {
             None,
             None,
         )?;
+        // Once per prefill (a denoise step would print per step — far too noisy).
+        self.be.print_moe_pager_stats();
         Ok(())
     }
 
@@ -1289,19 +1292,19 @@ impl DiffusionGemmaVulkanSession {
     ) -> Result<crate::seam::DenoiseOutcome> {
         let mut out_logits = Vec::new();
         let mut reduced = None;
+        // The shared placement-aware binder (see `prefill`): only ever CALLED when this denoise
+        // is the session's first load (no prior `prefill` — a direct-denoise test), where it must
+        // make the same placement decision prefill would have.
+        let bind = crate::seam::vulkan_moe_binder(
+            &self.be,
+            &model.gguf,
+            &model.cfg,
+            self.state.is_none(),
+            self.max_ctx,
+        )?;
         crate::seam::generate_dense_backend(
             &self.be,
-            &|_name, tb, dt, _n| {
-                let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
-                let buf = self
-                    .be
-                    .alloc(padded.len(), BufferUsage::Weights)
-                    .map_err(|e| anyhow!("{e}"))?;
-                self.be
-                    .upload(buf.as_ref(), &padded)
-                    .map_err(|e| anyhow!("{e}"))?;
-                Ok((buf, dt))
-            },
+            &*bind,
             &model.gguf,
             &model.cfg,
             &model.token_embd,

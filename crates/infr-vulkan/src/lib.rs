@@ -922,20 +922,21 @@ impl VulkanBackend {
 
     /// Register one paged layer's role tensor with the session `init_moe_pager` already installed
     /// — called from the seam's weight-load closure instead of uploading the tensor's full bytes.
-    /// Panics if no session is installed (a caller bug: `init_moe_pager` must run first).
+    /// Panics if no session is installed (a caller bug: `init_moe_pager` must run first); errors
+    /// if the layout has no pool matching the tensor's (role, per-expert bytes).
     pub fn register_paged_expert(
         &self,
         role: crate::pager::Role,
         buf_id: usize,
         source: crate::pager::ExpertSource,
-    ) {
+    ) -> Result<()> {
         self.shared
             .moe_pager
             .lock()
             .unwrap()
             .as_mut()
             .expect("register_paged_expert called before init_moe_pager")
-            .register(role, buf_id, source);
+            .register(role, buf_id, source)
     }
 
     /// `INFR_PAGER_STATS=1` reporting hook — a no-op when no paged model is loaded.

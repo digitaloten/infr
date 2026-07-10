@@ -3472,10 +3472,13 @@ fn pooled_usage(
 /// (`lower_op`'s `Op::MoeFfn` match, the `rows <= moe_small_m_threshold()` branch) exactly, just
 /// split around one readback and reading the pager's arena+LUT instead of a fully-resident bank.
 ///
-/// Scope: split gate/up only (`fused_gate_up` errors — no paged model needs the diffusion-gemma
-/// fused-bank shape today; that's a follow-up if one ever does). `rows`/`n_used` are otherwise
-/// general (not hardcoded to llama4's rows=1/n_used=1), reusing the same shapes the existing
-/// small-m arm already supports.
+/// Split AND fused gate/up: a fused `ffn_gate_up_exps` bank (gemma-4 MoE / DiffusionGemma) is
+/// registered under `Role::Gate` with a double-width ([ne, 2*nff]) slot (see
+/// `infr_vulkan::pager`'s MoE-session doc), so its GEMV/GEMM reads the same arena+LUT hop with
+/// `out_f = 2*nff` and the activation splits gate|up per row exactly like the resident fused
+/// arms (`silu_mul_fused`/`gelu_mul_fused`). `rows`/`n_used` are otherwise general (not
+/// hardcoded to llama4's rows=1/n_used=1), reusing the same shapes the existing small-m arm
+/// already supports.
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn execute_paged_moe(
@@ -3510,12 +3513,6 @@ fn execute_paged_moe(
     else {
         unreachable!("execute_paged_moe only ever called for an Op::MoeFfn");
     };
-    if *fused_gate_up {
-        return Err(be(
-            "vulkan adapter: paged MoeFfn needs split gate/up (fused_gate_up unsupported — no \
-             paged model needs the diffusion-gemma fused-bank shape today)",
-        ));
-    }
     let gating_u32 = match gating {
         infr_core::graph::MoeGating::Softmax => 0u32,
         infr_core::graph::MoeGating::Sigmoid => 1u32,
@@ -3526,7 +3523,11 @@ fn execute_paged_moe(
         *n_used as usize,
         *n_ff_exp as usize,
     );
-    let stride = nff * ne;
+    // Fused gate_up: the expert slice (and thus the GEMV/GEMM output width) is [ne, 2*nff] —
+    // mirrors the resident arms' `gu_width` (`stride` is unused by the paged kernels themselves,
+    // the LUT bakes the base; it still shapes the pooled scratch below).
+    let gu_width = if *fused_gate_up { 2 * nff } else { nff };
+    let stride = gu_width * ne;
     let down_stride = nff * ne;
     let (gdt, udt, ddt) = (
         graph.desc(*gate_exps).dtype,
@@ -3591,9 +3592,14 @@ fn execute_paged_moe(
             .as_mut()
             .expect("execute_static only reaches here when be_.moe_paged() is true");
         let g = sess.touch_role(be_, Role::Gate, gate_id, &local_ids)?;
-        let u = sess.touch_role(be_, Role::Up, up_id, &local_ids)?;
+        // Fused gate_up: `up_exps` is the SAME handle as `gate_exps` (never separately read, per
+        // `Op::MoeFfn`'s doc) and the bank was registered once under `Role::Gate` — there is no
+        // Up source to touch.
+        if !*fused_gate_up {
+            let u = sess.touch_role(be_, Role::Up, up_id, &local_ids)?;
+            debug_assert_eq!(g, u, "gate/up/down of one layer share the SAME layer_base");
+        }
         let d = sess.touch_role(be_, Role::Down, down_id, &local_ids)?;
-        debug_assert_eq!(g, u, "gate/up/down of one layer share the SAME layer_base");
         debug_assert_eq!(g, d, "gate/up/down of one layer share the SAME layer_base");
         g
     };
@@ -3623,9 +3629,16 @@ fn execute_paged_moe(
     // id-GEMV segment below, which is shape-general.
     {
         let paged_mmq_ok = infr_core::tensor::moe_paged_mmq_ok;
+        let act_ok = if *fused_gate_up {
+            // Fused callers ship GeGLU (gemma-4 MoE / DiffusionGemma) or SwiGLU — same set the
+            // resident fused arm accepts.
+            matches!(act, Activation::Silu | Activation::Gelu)
+        } else {
+            matches!(act, Activation::Silu)
+        };
         if rows > moe_small_m_threshold()
             && be_.caps().i8_dot
-            && matches!(act, Activation::Silu)
+            && act_ok
             && paged_mmq_ok(gdt)
             && paged_mmq_ok(udt)
             && paged_mmq_ok(ddt)
@@ -3645,8 +3658,14 @@ fn execute_paged_moe(
             let qa = pooled(pool, be_, "moe_pgb_qa", npad * ne)?;
             let qda = pooled(pool, be_, "moe_pgb_qda", npad * (ne / 32) * 2)?;
             let qsa = pooled(pool, be_, "moe_pgb_qsa", npad * (ne / 32) * 2)?;
-            let ge = pooled(pool, be_, "moe_pgb_ge", npad * nff * 4)?;
-            let ue = pooled(pool, be_, "moe_pgb_ue", npad * nff * 4)?;
+            // Fused: `ge` holds the single wide [n_pairs, 2*nff] gate|up GEMM output (the
+            // resident batched fused arm's shape); `ue` is unused/unallocated.
+            let ge = pooled(pool, be_, "moe_pgb_ge", npad * gu_width * 4)?;
+            let ue = if *fused_gate_up {
+                None
+            } else {
+                Some(pooled(pool, be_, "moe_pgb_ue", npad * nff * 4)?)
+            };
             let ae = pooled(pool, be_, "moe_pgb_ae", npad * nff * 4)?;
             let dqa = pooled(pool, be_, "moe_pgb_dqa", npad * nff)?;
             let dda = pooled(pool, be_, "moe_pgb_dda", npad * (nff / 32) * 2)?;
@@ -3700,52 +3719,80 @@ fn execute_paged_moe(
                     pool[&qa].as_ref(),
                     pool[&qda].as_ref(),
                     gate_needs_sact.then(|| pool[&qsa].as_ref()),
-                    sess.arena(Role::Gate),
-                    sess.lut(Role::Gate),
+                    sess.arena(gate_id),
+                    sess.lut(gate_id),
                     layer_base,
                     pool[&counts].as_ref(),
                     pool[&offsets].as_ref(),
                     pool[&ge].as_ref(),
                     rows,
                     ne,
-                    nff,
+                    gu_width,
                     n_expert,
                     n_used,
                 );
-                // The up GEMM reads the same quantized activations and writes its own buffer —
-                // disjoint from the gate GEMM, no barrier needed (resident arm's pattern).
-                rec2.suppress_sync(true);
-                let up_needs_sact = infr_core::tensor::moe_mmq_needs_sact(udt);
-                rec2.matmul_mmq_experts_paged(
-                    udt,
-                    "expert_gateup",
-                    pool[&qa].as_ref(),
-                    pool[&qda].as_ref(),
-                    up_needs_sact.then(|| pool[&qsa].as_ref()),
-                    sess.arena(Role::Up),
-                    sess.lut(Role::Up),
-                    layer_base,
-                    pool[&counts].as_ref(),
-                    pool[&offsets].as_ref(),
-                    pool[&ue].as_ref(),
-                    rows,
-                    ne,
-                    nff,
-                    n_expert,
-                    n_used,
-                );
-                rec2.suppress_sync(false);
+                if let Some(ue) = &ue {
+                    // The up GEMM reads the same quantized activations and writes its own buffer —
+                    // disjoint from the gate GEMM, no barrier needed (resident arm's pattern).
+                    rec2.suppress_sync(true);
+                    let up_needs_sact = infr_core::tensor::moe_mmq_needs_sact(udt);
+                    rec2.matmul_mmq_experts_paged(
+                        udt,
+                        "expert_gateup",
+                        pool[&qa].as_ref(),
+                        pool[&qda].as_ref(),
+                        up_needs_sact.then(|| pool[&qsa].as_ref()),
+                        sess.arena(up_id),
+                        sess.lut(up_id),
+                        layer_base,
+                        pool[&counts].as_ref(),
+                        pool[&offsets].as_ref(),
+                        pool[ue].as_ref(),
+                        rows,
+                        ne,
+                        nff,
+                        n_expert,
+                        n_used,
+                    );
+                    rec2.suppress_sync(false);
+                }
             }
             if *weight_before {
-                rec2.moe_weight_scale(pool[&ge].as_ref(), pool[&bucket_wts].as_ref(), n_pairs, nff);
-                rec2.moe_weight_scale(pool[&ue].as_ref(), pool[&bucket_wts].as_ref(), n_pairs, nff);
+                rec2.moe_weight_scale(
+                    pool[&ge].as_ref(),
+                    pool[&bucket_wts].as_ref(),
+                    n_pairs,
+                    gu_width,
+                );
+                if let Some(ue) = &ue {
+                    rec2.moe_weight_scale(
+                        pool[ue].as_ref(),
+                        pool[&bucket_wts].as_ref(),
+                        n_pairs,
+                        nff,
+                    );
+                }
             }
-            rec2.silu_mul(
-                pool[&ge].as_ref(),
-                pool[&ue].as_ref(),
-                pool[&ae].as_ref(),
-                n_pairs * nff,
-            );
+            match &ue {
+                // Split: gate and up are separate [n_pairs, nff] buffers.
+                Some(ue) => rec2.silu_mul(
+                    pool[&ge].as_ref(),
+                    pool[ue].as_ref(),
+                    pool[&ae].as_ref(),
+                    n_pairs * nff,
+                ),
+                // Fused: `ge` already holds [n_pairs, 2*nff] (gate half first, up half second per
+                // row) from the single wide GEMM above — the resident batched fused arm's shape.
+                None => match act {
+                    Activation::Silu => {
+                        rec2.silu_mul_fused(pool[&ge].as_ref(), pool[&ae].as_ref(), n_pairs, nff)
+                    }
+                    Activation::Gelu => {
+                        rec2.gelu_mul_fused(pool[&ge].as_ref(), pool[&ae].as_ref(), n_pairs, nff)
+                    }
+                    Activation::Sigmoid => unreachable!("act_ok gate above excludes Sigmoid"),
+                },
+            }
             rec2.quant_q8(
                 pool[&ae].as_ref(),
                 pool[&dqa].as_ref(),
@@ -3764,8 +3811,8 @@ fn execute_paged_moe(
                     pool[&dqa].as_ref(),
                     pool[&dda].as_ref(),
                     down_needs_sact.then(|| pool[&dsa].as_ref()),
-                    sess.arena(Role::Down),
-                    sess.lut(Role::Down),
+                    sess.arena(down_id),
+                    sess.lut(down_id),
                     layer_base,
                     pool[&counts].as_ref(),
                     pool[&offsets].as_ref(),
@@ -3794,9 +3841,14 @@ fn execute_paged_moe(
 
     // ── Segment 2: the paged expert GEMVs (arena+LUT instead of a resident bank) through the rest
     // of this MoeFfn's math — activation, down-projection, weighted accumulate — exactly mirroring
-    // the non-paged small-m arm.
-    let gbuf = pooled(pool, be_, "moe_paged_g", n_slots * nff * 4)?;
-    let ubuf = pooled(pool, be_, "moe_paged_u", n_slots * nff * 4)?;
+    // the non-paged small-m arm (including its fused-gate_up shape: one double-width GEMV into a
+    // gate|up buffer, split by the fused activation kernel).
+    let gbuf = pooled(pool, be_, "moe_paged_g", n_slots * gu_width * 4)?;
+    let ubuf = if *fused_gate_up {
+        None
+    } else {
+        Some(pooled(pool, be_, "moe_paged_u", n_slots * nff * 4)?)
+    };
     let abuf = pooled(pool, be_, "moe_paged_a", n_slots * nff * 4)?;
     let ybuf = pooled(pool, be_, "moe_paged_y", n_slots * ne * 4)?;
     let n_act = n_slots * nff;
@@ -3807,8 +3859,8 @@ fn execute_paged_moe(
         let sess = guard.as_ref().expect("checked above");
         rec2.linear_native_id_multi_paged(
             gdt,
-            sess.arena(Role::Gate),
-            sess.lut(Role::Gate),
+            sess.arena(gate_id),
+            sess.lut(gate_id),
             pool[&ids_global_key].as_ref(),
             n_used,
             stride,
@@ -3816,64 +3868,86 @@ fn execute_paged_moe(
             false,
             pool[&gbuf].as_ref(),
             ne,
-            nff,
+            gu_width,
             rows,
         );
-        rec2.linear_native_id_multi_paged(
-            udt,
-            sess.arena(Role::Up),
-            sess.lut(Role::Up),
-            pool[&ids_global_key].as_ref(),
-            n_used,
-            stride,
-            xb,
-            false,
-            pool[&ubuf].as_ref(),
-            ne,
-            nff,
-            rows,
-        );
+        if let Some(ubuf) = &ubuf {
+            rec2.linear_native_id_multi_paged(
+                udt,
+                sess.arena(up_id),
+                sess.lut(up_id),
+                pool[&ids_global_key].as_ref(),
+                n_used,
+                stride,
+                xb,
+                false,
+                pool[ubuf].as_ref(),
+                ne,
+                nff,
+                rows,
+            );
+        }
     }
     if *weight_before {
-        rec2.moe_weight_scale(pool[&gbuf].as_ref(), pool[&wts].as_ref(), n_slots, nff);
-        rec2.moe_weight_scale(pool[&ubuf].as_ref(), pool[&wts].as_ref(), n_slots, nff);
+        rec2.moe_weight_scale(pool[&gbuf].as_ref(), pool[&wts].as_ref(), n_slots, gu_width);
+        if let Some(ubuf) = &ubuf {
+            rec2.moe_weight_scale(pool[ubuf].as_ref(), pool[&wts].as_ref(), n_slots, nff);
+        }
     }
-    match act {
-        Activation::Silu => rec2.silu_mul(
-            pool[&gbuf].as_ref(),
-            pool[&ubuf].as_ref(),
-            pool[&abuf].as_ref(),
-            n_act,
-        ),
-        Activation::Sigmoid => rec2.mul_sigmoid(
-            pool[&gbuf].as_ref(),
-            pool[&ubuf].as_ref(),
-            pool[&abuf].as_ref(),
-            n_act,
-            0,
-            0,
-            0,
-        ),
-        Activation::Gelu => rec2.gelu_mul_off(
-            pool[&gbuf].as_ref(),
-            pool[&ubuf].as_ref(),
-            0,
-            0,
-            nff,
-            0,
-            nff,
-            0,
-            pool[&abuf].as_ref(),
-            n_act,
-        ),
+    match &ubuf {
+        Some(ubuf) => match act {
+            Activation::Silu => rec2.silu_mul(
+                pool[&gbuf].as_ref(),
+                pool[ubuf].as_ref(),
+                pool[&abuf].as_ref(),
+                n_act,
+            ),
+            Activation::Sigmoid => rec2.mul_sigmoid(
+                pool[&gbuf].as_ref(),
+                pool[ubuf].as_ref(),
+                pool[&abuf].as_ref(),
+                n_act,
+                0,
+                0,
+                0,
+            ),
+            Activation::Gelu => rec2.gelu_mul_off(
+                pool[&gbuf].as_ref(),
+                pool[ubuf].as_ref(),
+                0,
+                0,
+                nff,
+                0,
+                nff,
+                0,
+                pool[&abuf].as_ref(),
+                n_act,
+            ),
+        },
+        // Fused: `gbuf` is [n_slots, 2*nff] gate|up rows; the fused activation kernels split it
+        // (gate half first, up half second per row — `Op::GatedActFused`'s convention), exactly
+        // like the resident small-m fused arm.
+        None => match act {
+            Activation::Silu => {
+                rec2.silu_mul_fused(pool[&gbuf].as_ref(), pool[&abuf].as_ref(), n_slots, nff)
+            }
+            Activation::Gelu => {
+                rec2.gelu_mul_fused(pool[&gbuf].as_ref(), pool[&abuf].as_ref(), n_slots, nff)
+            }
+            Activation::Sigmoid => {
+                return Err(be(
+                    "vulkan adapter: fused_gate_up paged MoeFfn Sigmoid unsupported",
+                ))
+            }
+        },
     }
     {
         let guard = be_.moe_pager().lock().unwrap();
         let sess = guard.as_ref().expect("checked above");
         rec2.linear_native_id_multi_paged(
             ddt,
-            sess.arena(Role::Down),
-            sess.lut(Role::Down),
+            sess.arena(down_id),
+            sess.lut(down_id),
             pool[&ids_global_key].as_ref(),
             n_used,
             down_stride,

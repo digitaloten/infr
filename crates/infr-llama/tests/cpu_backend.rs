@@ -1720,20 +1720,18 @@ fn cpu_golden_qwen3moe() {
 }
 
 /// Paged MoE expert cache (`infr_vulkan::pager`, wired into the seam via `INFR_MOE_CACHE_GB`):
-/// forces the paged path's PLACEMENT DECISION on this model and asserts the greedy output is
-/// IDENTICAL, token-for-token, to both the all-resident GPU run and the CPU reference either way.
+/// forces the paged path on this model and asserts the greedy output is IDENTICAL,
+/// token-for-token, to both the all-resident GPU run and the CPU reference.
 ///
 /// Qwen3-30B-A3B-Q4_K_M's `ffn_down_exps` bank is NOT uniformly quantized (this unsloth-dynamic
 /// quant bumps a subset of layers' down-projection to Q6_K for quality — verified via the GGUF
-/// tensor directory) — the pager's fixed-byte-per-slot arena can't address a role whose experts
-/// don't all share one dtype (see `generate_dense_vulkan_session`'s `role_dtype_uniform` guard, the
-/// real bug this task's paged-execution work tripped over and root-caused: a fixed-size arena slot
-/// combined with a per-dtype element→byte conversion silently misaligns any non-first slot holding
-/// a different-dtype expert). So `INFR_MOE_CACHE_GB` here exercises the GUARD (falls back to fully
-/// resident, same as never having set it) rather than the paged executor split itself — this test's
-/// job is proving that fallback stays correct, NOT proving the pager (see
-/// `gpu_seam_paged_moe_matches_scout_oracle` / the Scout bench for the real paged-execution proof,
-/// since llama4/Scout's gate/up/down banks are each uniformly one dtype across every layer).
+/// tensor directory) — a fixed-byte-per-slot arena can't hold experts of different byte sizes, a
+/// real corruption this task's paged-execution work tripped over and root-caused (a fixed-size
+/// arena slot combined with a per-dtype element→byte conversion silently misaligns any non-first
+/// slot holding a different-dtype expert). The pager now splits such a role into one arena POOL
+/// per (role, per-expert byte size) — see `infr_vulkan::pager`'s MoE-session doc — so this test
+/// exercises REAL mixed-dtype paged execution (the down role resolves through two pools), on top
+/// of what `gpu_seam_paged_moe_matches_scout_oracle` proves for the uniform split-bank shape.
 ///
 /// `INFR_UBATCH=1`: pins every prefill chunk to rows=1, so EVERY MoeFfn call — CPU, resident GPU
 /// alike — takes the small-m id-indexed dequant GEMV path (exact f32-equivalent math). Without it
@@ -2027,8 +2025,9 @@ fn cpu_llama4_scout_greedy() {
 /// exercises the paged executor split end to end (real weights, real eviction, real host
 /// readback/upload cadence — not a synthetic bank) and locks it against the SAME oracle prefix
 /// `cpu_llama4_scout_greedy` checks. llama4's gate/up/down banks are each uniformly Q2_K/Q2_K/Q3_K
-/// across every layer (verified — unlike the UD quants `gpu_seam_paged_moe_matches_resident_and_cpu`
-/// documents), so this is real paged execution, not the uniform-dtype fallback.
+/// across every layer (verified — unlike the UD quants
+/// `gpu_seam_paged_moe_matches_resident_and_cpu` documents, whose mixed down role spans two arena
+/// pools), so this is the classic one-pool-per-role split-bank shape.
 #[test]
 fn gpu_seam_paged_moe_matches_scout_oracle() {
     let path = need_model!(llama4_scout(), "Llama-4-Scout");

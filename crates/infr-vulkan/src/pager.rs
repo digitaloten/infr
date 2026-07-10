@@ -241,10 +241,27 @@ fn copy_into_slot(
 // ─── MoE expert-bank paging session (slice 2: wiring into the execution path) ─────────────────
 //
 // The pieces above are the block-agnostic host<->VRAM cache; everything below is the MoE-specific
-// glue: one [`GpuPager`] per expert ROLE (gate/up/down — a split, non-fused bank, the only shape
-// llama4/Scout needs; a fused gate_up bank would need a 4th role and is a follow-up), a table
-// mapping a bound weight BUFFER's identity to where its layer's expert bytes live in the mmap'd
-// GGUF, and the one persistent staging buffer every role's uploads share.
+// glue: one [`GpuPager`] POOL per (expert role, per-expert byte size) pair, a table mapping a
+// bound weight BUFFER's identity to where its layer's expert bytes live in the mmap'd GGUF, and
+// the one persistent staging buffer every pool's uploads share.
+//
+// Why (role, slot_bytes) pools and not one pager per role: the arena/LUT design requires every
+// block sharing an arena to have the SAME byte size (fixed slot offsets + a word-base LUT), and
+// the GEMV/GEMM kernels additionally assume the layer's dtype when decoding a slot's bytes. Two
+// shapes break a naive per-role pager:
+//   - MIXED-dtype roles: unsloth-dynamic (UD) quants bump a SUBSET of layers' banks to a wider
+//     format for quality (gemma-4-MoE: down = Q5_1 on 29 layers + Q8_0 on 1; DiffusionGemma:
+//     down = Q5_0/Q8_0 16/14; Qwen3.6-UD: down mixes Q4_K/Q6_K). Slot sizes differ per dtype, so
+//     one arena can't hold both — but a pool PER byte-size can: each layer registers into the
+//     pool matching its own per-expert byte size, and a dispatch only ever reads ids of ONE
+//     layer (whose dtype it knows statically from the graph), so blocks of different dtypes that
+//     happen to share a byte size may even share a pool safely.
+//   - FUSED gate_up banks (gemma-4 MoE / DiffusionGemma `ffn_gate_up_exps`): a fused expert is
+//     just a BIGGER uniform block ([ne, 2*n_ff_exp] instead of [ne, n_ff_exp]) — it pages under
+//     `Role::Gate` with its own slot size, and the model simply has no `Role::Up` pool.
+// Every pool shares the same GLOBAL block-id space (`layer_index * n_expert + local_id`), so the
+// paged kernels' `lut[layer_base + expert]` hop is unchanged — a pool's LUT just holds
+// NOT_RESIDENT for the layers that live in other pools (they are never asked for).
 //
 // Design note (see the task doc): `Op::MoeFfn` carries NO `paged` flag. A paged layer's graph is
 // byte-for-byte the same shape as a resident one (same tensor roles, same op) — only the ACTUAL
@@ -259,14 +276,25 @@ fn copy_into_slot(
 // segmented paged path on a hit. CPU and Metal never call any of this — zero changes there.
 use std::sync::Mutex;
 
-/// One paged expert role. `gate`/`up`/`down` each get an independent arena+LUT (their per-expert
-/// byte sizes need not match, though in practice they're equal — same `ne*n_ff_exp` elements, same
-/// dtype).
+/// One paged expert role. A FUSED gate_up bank registers under `Gate` (see the module-section doc
+/// above); a fused model simply has no `Up` sources. Roles with mixed per-expert byte sizes
+/// across layers span several pools — the (role, slot_bytes) pair, not the role alone, names a
+/// pool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Role {
     Gate,
     Up,
     Down,
+}
+
+impl Role {
+    fn name(self) -> &'static str {
+        match self {
+            Role::Gate => "gate",
+            Role::Up => "up",
+            Role::Down => "down",
+        }
+    }
 }
 
 /// Stable identity of a bound `&dyn Buffer` — a thin-pointer cast of the trait object's data
@@ -296,26 +324,124 @@ pub struct ExpertSource {
     pub layer_base: u32,
 }
 
-struct RolePager {
+/// One arena pool: every block in it shares `slot_bytes` (see the section doc above for why the
+/// pool key is `(role, slot_bytes)`, not the role alone).
+struct Pool {
+    role: Role,
+    slot_bytes: usize,
     pager: GpuPager,
-    /// `buffer_identity(placeholder)` -> this layer's expert source, for every PAGED layer of this
-    /// role. A non-paged layer's gate/up/down buffer is never registered here — the adapter's
-    /// lookup simply misses and falls through to the ordinary resident-weight path.
-    sources: HashMap<usize, ExpertSource>,
 }
 
-impl RolePager {
-    fn touch(
+/// One model's whole paged-MoE session: the `(role, slot_bytes)` arena pools + the shared
+/// persistent staging buffer their uploads reuse (the bandwidth probe's headline finding — see
+/// `pager.rs`'s module doc and `tests/bandwidth_probe.rs`). Lives on `VulkanShared` for the
+/// process's lifetime once a paged model is loaded (`VulkanBackend::init_moe_pager`); `None` for
+/// every non-paged model — zero cost, zero behavior change on the common (fits-in-VRAM) path.
+pub struct MoePagerSession {
+    pools: Vec<Pool>,
+    /// `buffer_identity(placeholder)` -> (role, pool index, this layer's expert source), for
+    /// every PAGED `_exps` tensor. A non-paged layer's gate/up/down buffer is never registered
+    /// here — the adapter's lookup simply misses and falls through to the ordinary
+    /// resident-weight path.
+    sources: HashMap<usize, (Role, usize, ExpertSource)>,
+    staging: Box<dyn Buffer>,
+    print_stats: bool,
+}
+
+/// One pool's spec in [`MoePagerLayout`]: slot counts are INDEPENDENT per pool, because each
+/// pool's arena is its own SSBO with its own [`GpuPager::max_arena_bytes`] ceiling: with 4 GiB
+/// bindings (RADV) and unequal per-expert sizes (Scout: gate/up 13.8 MB, down 18 MB), a shared
+/// count is dragged down to the LARGEST pool's cap and strands budget the smaller pools could
+/// have used as real hit rate (Scout: uniform 238 slots everywhere left ~6 GB of a 19 GB budget
+/// unused; per-pool caps give gate/up 312 each). Each pool has its own LRU/LUT and `touch_role`
+/// resolves pools independently, so unequal counts are correctness-neutral — a pool with fewer
+/// slots just misses more often. Computed by the caller (budget-driven count, then per-pool cap —
+/// see `seam::mod`'s placement policy).
+pub struct MoePoolSpec {
+    pub role: Role,
+    pub slot_bytes: usize,
+    pub n_slots: usize,
+}
+
+/// Fixed layout for [`MoePagerSession::new`] — sizes every arena/LUT UP FRONT, before any tensor
+/// is registered. This split (layout now, registration per tensor later) matters for sequencing:
+/// the session must exist and answer `is_paged`/`Backend::moe_paged` truthy BEFORE the seam's
+/// weight-load closure runs (so a paged tensor's placeholder buffer is recognized the very first
+/// time the adapter executes a graph, not just after the whole model is loaded) — see
+/// `infr-llama`'s `generate_dense_vulkan_session` for the call order this enables.
+pub struct MoePagerLayout {
+    /// Total distinct experts nameable per pool's LUT = `n_paged_layers * n_expert` — the GLOBAL
+    /// id space every pool shares (a pool only ever resolves ids of the layers registered into
+    /// it; other layers' entries stay `NOT_RESIDENT`).
+    pub n_blocks: usize,
+    pub pools: Vec<MoePoolSpec>,
+}
+
+impl MoePagerSession {
+    pub fn new(vk: &VulkanBackend, layout: MoePagerLayout) -> Result<Self> {
+        let mut pools = Vec::with_capacity(layout.pools.len());
+        let mut staging_bytes = 4usize;
+        for spec in &layout.pools {
+            pools.push(Pool {
+                role: spec.role,
+                slot_bytes: spec.slot_bytes,
+                pager: GpuPager::new(vk, layout.n_blocks, spec.n_slots, spec.slot_bytes)?,
+            });
+            staging_bytes = staging_bytes.max(spec.slot_bytes);
+        }
+        let staging = vk.alloc_uninit(staging_bytes, BufferUsage::Staging)?;
+        Ok(Self {
+            pools,
+            sources: HashMap::new(),
+            staging,
+            print_stats: std::env::var("INFR_PAGER_STATS").is_ok(),
+        })
+    }
+
+    /// Register one paged layer's `role` tensor — called from the seam's weight-load closure
+    /// (once per paged `_exps` tensor) instead of uploading it. `buf_id` is the placeholder
+    /// buffer's identity (see [`buffer_identity`]); `source` is where its bytes actually live.
+    /// The pool is picked by `(role, source.stride_bytes)` — errors if the layout has no matching
+    /// pool (a seam sizing bug: the layout enumeration and this registration must derive the slot
+    /// size from the same tensor bytes).
+    pub fn register(&mut self, role: Role, buf_id: usize, source: ExpertSource) -> Result<()> {
+        let pool = self
+            .pools
+            .iter()
+            .position(|p| p.role == role && p.slot_bytes == source.stride_bytes)
+            .ok_or_else(|| {
+                be(format!(
+                    "moe pager: no ({:?}, {} B/expert) pool in the layout for this tensor",
+                    role, source.stride_bytes,
+                ))
+            })?;
+        self.sources.insert(buf_id, (role, pool, source));
+        Ok(())
+    }
+
+    /// Whether `buf_id` (see [`buffer_identity`]) is a registered paged tensor of `role` — the
+    /// adapter's per-`MoeFfn` dispatch check.
+    pub fn is_paged(&self, role: Role, buf_id: usize) -> bool {
+        self.sources.get(&buf_id).is_some_and(|(r, ..)| *r == role)
+    }
+
+    /// Resolve residency for every id in `local_ids` (this token's routed experts, LOCAL to the
+    /// layer) against `buf_id`'s pool, uploading misses through the shared staging buffer and
+    /// flushing the LUT once. Returns the GLOBAL ids (`layer_base + local_id`) the paged GEMV
+    /// must read instead of `local_ids` — see [`ExpertSource::layer_base`].
+    pub fn touch_role(
         &mut self,
         vk: &VulkanBackend,
-        staging: &dyn Buffer,
+        role: Role,
         buf_id: usize,
         local_ids: &[u32],
     ) -> Result<Vec<u32>> {
-        let src = self
+        let (r, pool, src) = self
             .sources
             .get(&buf_id)
             .ok_or_else(|| be("moe pager: touch on an unregistered buffer"))?;
+        debug_assert_eq!(*r, role, "touch_role: role/buffer mismatch");
+        let pager = &mut self.pools[*pool].pager;
         let stride = src.stride_bytes;
         // Explicit deref-to-trait-object first: `Arc<T>` itself implements `AsRef<T>`, which
         // would make a bare `src.bytes.as_ref()` resolve to THAT (returning the fat
@@ -330,168 +456,63 @@ impl RolePager {
             let slice = bytes
                 .get(off..off + stride)
                 .ok_or_else(|| be("moe pager: expert id out of range for this layer's bank"))?;
-            self.pager
-                .ensure_resident(vk, staging, layer_base + lid, slice)?;
+            pager.ensure_resident(vk, self.staging.as_ref(), layer_base + lid, slice)?;
             global.push(layer_base + lid);
         }
-        self.pager.flush_lut(vk)?;
+        pager.flush_lut(vk)?;
         Ok(global)
     }
-}
 
-/// One model's whole paged-MoE session: gate/up/down role pagers + the shared persistent staging
-/// buffer their uploads reuse (the bandwidth probe's headline finding — see `pager.rs`'s module
-/// doc and `tests/bandwidth_probe.rs`). Lives on `VulkanShared` for the process's lifetime once a
-/// paged model is loaded (`VulkanBackend::init_moe_pager`); `None` for every non-paged model —
-/// zero cost, zero behavior change on the common (fits-in-VRAM) path.
-pub struct MoePagerSession {
-    gate: RolePager,
-    up: RolePager,
-    down: RolePager,
-    staging: Box<dyn Buffer>,
-    print_stats: bool,
-}
-
-/// Fixed layout for [`MoePagerSession::new`] — sizes the three arenas/LUTs UP FRONT, before any
-/// tensor is registered. This split (layout now, [`MoePagerSession::register`] per tensor later)
-/// matters for sequencing: the session must exist and answer `is_paged`/`Backend::moe_paged` truthy
-/// BEFORE the seam's weight-load closure runs (so a paged tensor's placeholder buffer is
-/// recognized the very first time the adapter executes a graph, not just after the whole model is
-/// loaded) — see `infr-llama`'s `generate_dense_vulkan_session` for the call order this enables.
-pub struct MoePagerLayout {
-    /// Total distinct experts nameable per role's LUT = `n_paged_layers * n_expert`.
-    pub n_blocks: usize,
-    /// VRAM slots per role — INDEPENDENT counts, because each role's arena is its own SSBO with
-    /// its own [`GpuPager::max_arena_bytes`] ceiling: with 4 GiB bindings (RADV) and unequal
-    /// per-role expert sizes (Scout: gate/up 13.8 MB, down 18 MB), a shared count is dragged down
-    /// to the LARGEST role's cap and strands budget the smaller roles could have used as real
-    /// hit rate (Scout: uniform 238 slots everywhere left ~6 GB of a 19 GB budget unused; per-role
-    /// caps give gate/up 312 each). Each role has its own LRU/LUT and `touch_role` resolves roles
-    /// independently, so unequal counts are correctness-neutral — a role with fewer slots just
-    /// misses more often. Computed by the caller (budget-driven count, then per-role cap — see
-    /// `seam::mod`'s placement policy).
-    pub gate_n_slots: usize,
-    pub up_n_slots: usize,
-    pub down_n_slots: usize,
-    pub gate_slot_bytes: usize,
-    pub up_slot_bytes: usize,
-    pub down_slot_bytes: usize,
-}
-
-impl MoePagerSession {
-    pub fn new(vk: &VulkanBackend, layout: MoePagerLayout) -> Result<Self> {
-        let gate = RolePager {
-            pager: GpuPager::new(
-                vk,
-                layout.n_blocks,
-                layout.gate_n_slots,
-                layout.gate_slot_bytes,
-            )?,
-            sources: HashMap::new(),
-        };
-        let up = RolePager {
-            pager: GpuPager::new(vk, layout.n_blocks, layout.up_n_slots, layout.up_slot_bytes)?,
-            sources: HashMap::new(),
-        };
-        let down = RolePager {
-            pager: GpuPager::new(
-                vk,
-                layout.n_blocks,
-                layout.down_n_slots,
-                layout.down_slot_bytes,
-            )?,
-            sources: HashMap::new(),
-        };
-        let staging_bytes = layout
-            .gate_slot_bytes
-            .max(layout.up_slot_bytes)
-            .max(layout.down_slot_bytes);
-        let staging = vk.alloc_uninit(staging_bytes.max(4), BufferUsage::Staging)?;
-        Ok(Self {
-            gate,
-            up,
-            down,
-            staging,
-            print_stats: std::env::var("INFR_PAGER_STATS").is_ok(),
-        })
+    fn pool_of(&self, buf_id: usize) -> &Pool {
+        let (_, pool, _) = self
+            .sources
+            .get(&buf_id)
+            .expect("moe pager: arena/lut lookup on an unregistered buffer");
+        &self.pools[*pool]
     }
 
-    /// Register one paged layer's `role` tensor — called from the seam's weight-load closure
-    /// (once per paged `_exps` tensor) instead of uploading it. `buf_id` is the placeholder buffer's
-    /// identity (see [`buffer_identity`]); `source` is where its bytes actually live.
-    pub fn register(&mut self, role: Role, buf_id: usize, source: ExpertSource) {
-        let sources = match role {
-            Role::Gate => &mut self.gate.sources,
-            Role::Up => &mut self.up.sources,
-            Role::Down => &mut self.down.sources,
-        };
-        sources.insert(buf_id, source);
+    /// The arena buffer `buf_id`'s pool dispatches against (callers gate on [`Self::is_paged`]
+    /// first — this panics on an unregistered buffer).
+    pub fn arena(&self, buf_id: usize) -> &dyn Buffer {
+        self.pool_of(buf_id).pager.arena_buffer()
     }
 
-    fn role(&self, role: Role) -> &RolePager {
-        match role {
-            Role::Gate => &self.gate,
-            Role::Up => &self.up,
-            Role::Down => &self.down,
-        }
+    /// [`Self::arena`]'s LUT twin.
+    pub fn lut(&self, buf_id: usize) -> &dyn Buffer {
+        self.pool_of(buf_id).pager.lut_buffer()
     }
 
-    /// Whether `buf_id` (see [`buffer_identity`]) is a registered paged tensor of `role` — the
-    /// adapter's per-`MoeFfn` dispatch check.
-    pub fn is_paged(&self, role: Role, buf_id: usize) -> bool {
-        self.role(role).sources.contains_key(&buf_id)
-    }
-
-    /// Resolve residency for every id in `local_ids` (this token's routed experts, LOCAL to the
-    /// layer) against `role`'s pager, uploading misses through the shared staging buffer and
-    /// flushing the LUT once. Returns the GLOBAL ids (`layer_base + local_id`) the paged GEMV must
-    /// read instead of `local_ids` — see [`ExpertSource::layer_base`].
-    pub fn touch_role(
-        &mut self,
-        vk: &VulkanBackend,
-        role: Role,
-        buf_id: usize,
-        local_ids: &[u32],
-    ) -> Result<Vec<u32>> {
-        // `staging` (a disjoint field) borrowed immutably alongside `&mut self.{gate,up,down}`
-        // below — ordinary disjoint-field borrowing, not a whole-`self` borrow, so this needs no
-        // helper method gymnastics.
-        let staging = self.staging.as_ref();
-        match role {
-            Role::Gate => self.gate.touch(vk, staging, buf_id, local_ids),
-            Role::Up => self.up.touch(vk, staging, buf_id, local_ids),
-            Role::Down => self.down.touch(vk, staging, buf_id, local_ids),
-        }
-    }
-
-    pub fn arena(&self, role: Role) -> &dyn Buffer {
-        self.role(role).pager.arena_buffer()
-    }
-
-    pub fn lut(&self, role: Role) -> &dyn Buffer {
-        self.role(role).pager.lut_buffer()
-    }
-
+    /// Aggregate stats across every pool of `role` (the pool split is a capacity detail; the
+    /// hit/miss story reads per role).
     pub fn stats(&self, role: Role) -> PagerStats {
-        self.role(role).pager.stats()
+        let mut agg = PagerStats::default();
+        for p in self.pools.iter().filter(|p| p.role == role) {
+            let s = p.pager.stats();
+            agg.hits += s.hits;
+            agg.misses += s.misses;
+            agg.evictions += s.evictions;
+        }
+        agg
     }
 
-    /// `INFR_PAGER_STATS=1`: print each role's hit/miss/eviction counters. Called after generation
-    /// finishes (see the CLI's bench/run/serve exit paths) — cheap enough to always compute, only
-    /// printed when asked.
+    /// `INFR_PAGER_STATS=1`: print each pool's hit/miss/eviction counters. Called after
+    /// generation finishes (see the CLI's bench/run/serve exit paths) — cheap enough to always
+    /// compute, only printed when asked.
     pub fn print_stats_if_enabled(&self) {
         if !self.print_stats {
             return;
         }
-        for (name, role) in [("gate", Role::Gate), ("up", Role::Up), ("down", Role::Down)] {
-            let s = self.stats(role);
+        for p in &self.pools {
+            let s = p.pager.stats();
             eprintln!(
-                "[moe pager] {name}: hits={} misses={} evictions={} hit_rate={:.3} slots={}",
+                "[moe pager] {}/{:.1}MB: hits={} misses={} evictions={} hit_rate={:.3} slots={}",
+                p.role.name(),
+                p.slot_bytes as f64 / 1e6,
                 s.hits,
                 s.misses,
                 s.evictions,
                 s.hit_rate(),
-                self.role(role).pager.n_slots(),
+                p.pager.n_slots(),
             );
         }
     }
