@@ -31,6 +31,18 @@ mod tokenizer;
 pub(crate) use quant::*;
 pub(crate) use tokenizer::*;
 
+/// Metadata-only peek: is this GGUF a Llama 4 model (`arch::LLAMA4`)? llama4's MoE routing
+/// (sigmoid / no-renorm / weight-before-FFN) + iRoPE are CPU-only for now — the GPU `MoeFfn`
+/// lowerings assert on the non-default routing — so the CLI uses this to force the CPU backend
+/// instead of panicking mid-lowering. Mirrors `diffusion::is_diffusion_gemma`.
+pub fn is_llama4(path: &std::path::Path) -> bool {
+    use infr_core::WeightSource;
+    infr_gguf::Gguf::open(path)
+        .ok()
+        .map(|g| g.metadata().str("general.architecture") == Some(arch::LLAMA4))
+        .unwrap_or(false)
+}
+
 /// Per-turn generation timing — backend-agnostic (shared by the CPU runner and the GPU
 /// `ChatTurn` path). `prompt_secs` = prefill (time to first token), `decode_secs` = generation.
 #[derive(Debug, Clone, Copy, Default)]

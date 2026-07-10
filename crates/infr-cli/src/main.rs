@@ -421,6 +421,9 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     // whole blocks for a "Hi" reply; 1024 (4 blocks) is the same order of magnitude as a normal
     // chat reply and still overridable via INFR_MAX_NEW.
     let is_dg = infr_llama::diffusion::is_diffusion_gemma(&gguf);
+    // llama4: CPU-only for now (the GPU MoeFfn lowerings don't implement its sigmoid/no-renorm/
+    // weight-before-FFN routing and assert on it) — force the CPU backend instead of panicking.
+    let is_l4 = infr_llama::is_llama4(&gguf);
     // Generation ceiling per reply (a turn also caps to remaining context). High enough for long
     // answers (lists/stories); override with INFR_MAX_NEW.
     let max_new = envu("INFR_MAX_NEW", if is_dg { 1024 } else { 2048 });
@@ -477,7 +480,10 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
                 infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
             ))
         }
-    } else if std::env::var("INFR_CPU").is_ok() {
+    } else if std::env::var("INFR_CPU").is_ok() || is_l4 {
+        if is_l4 && std::env::var("INFR_CPU").is_err() {
+            eprintln!("[llama4 is CPU-only for now — forcing the CPU backend]");
+        }
         eprintln!(
             "[cpu backend — dense/MoE forward on CPU via the agnostic compute graph, no GPU]"
         );
@@ -1031,7 +1037,9 @@ fn cmd_bench(
     // (`Config::from_gguf` + `MixerW::DeltaNet`), reusing the exact same pp/tg/depth methodology
     // every other arch gets (no more qwen35-only bench arm or depth-accounting artifacts).
     // -ngl 0: run on the CPU reference backend (no GPU), comparable to `llama-bench -ngl 0`.
-    if ngl == 0 {
+    // llama4 also lands here regardless of -ngl: CPU-only for now (same forced-CPU fallback as
+    // `cmd_run` — the GPU MoeFfn lowerings assert on llama4's routing).
+    if ngl == 0 || infr_llama::is_llama4(&gguf) {
         return cmd_bench_cpu(
             &gguf,
             tok.as_deref(),
@@ -2502,7 +2510,8 @@ fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
                 infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
             ))
         }
-    } else if std::env::var("INFR_CPU").is_ok() {
+    } else if std::env::var("INFR_CPU").is_ok() || infr_llama::is_llama4(&gguf) {
+        // llama4: CPU-only for now — same forced-CPU fallback as `cmd_run` (see its comment).
         Box::new(infr_llama::chat::CpuDenseChat::new(
             infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
         ))

@@ -47,6 +47,7 @@ system prompt) is read from the GGUF's own `tokenizer.chat_template`.
 | Family            | Arch (GGUF)       | Notes                                                  |
 | ----------------- | ----------------- | ------------------------------------------------------ |
 | Llama             | `llama`           | dense transformer                                      |
+| Llama 4           | `llama4`          | sigmoid top-1 MoE + shared expert, iRoPE (CPU-only)    |
 | Qwen2 / Qwen2.5   | `qwen2`           | dense, QKV bias, NEOX rope                             |
 | Qwen3             | `qwen3`           | dense, QK-norm                                         |
 | Qwen3 MoE         | `qwen3moe`        | softmax router, top-_k_ experts (CPU offload)          |
@@ -239,7 +240,8 @@ dequant).
 - **Format:** GGUF
 - **Models:** Llama, Qwen2/2.5, Qwen3 (dense + MoE), Gemma 3, Gemma 4 (dense +
   E2B + 26B-A4B MoE), Qwen3.5/3.6 (dense + MoE) — all on GPU **and** the CPU
-  reference; DiffusionGemma (block text-diffusion, CPU + GPU)
+  reference; DiffusionGemma (block text-diffusion, CPU + GPU); Llama 4 (Scout —
+  CPU-only for now)
 - **GPU:** AMD / NVIDIA / Intel via Vulkan (cooperative-matrix matmul); Apple
   via a native **Metal backend** (`INFR_METAL=1`) covering every op the CPU
   reference does — dense, MoE (`qwen3moe`) and Qwen3.5 (`qwen35`). Dense is
