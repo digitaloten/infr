@@ -232,11 +232,16 @@ pub(crate) fn generate_dense_vulkan_session(
                     if cannot_page {
                         n_host_moe = overflow; // tier 2/3 can't handle a fused/mixed-dtype bank
                     } else {
-                        n_paged = overflow;
-                        // `budget` is the WHOLE remaining-VRAM figure; `gpu_layers` of it is
-                        // already spoken for by the layers staying fully resident (unchanged from
-                        // the host-visible auto-fit above) — the pager only gets what's left.
-                        pager_budget_bytes = budget.saturating_sub(gpu_layers as u64 * per_layer);
+                        // Page EVERY expert layer with the WHOLE budget (tier-2 semantics), NOT
+                        // "keep the first gpu_layers banks resident and page the overflow with
+                        // the leftover": the leftover degenerates to a few slots and the paged
+                        // layers thrash at a 0% hit rate (measured, Scout Q2_K on 24GB:
+                        // resident-26-layers + 3-slot pager decoded at 3.3 t/s; all-paged with
+                        // the same total VRAM = 307 slots/role, 66% hits, 6.2 t/s). A shared LRU
+                        // arena keeps the hot experts of EVERY layer resident — strictly more
+                        // flexible than pinning whole layer banks.
+                        n_paged = cfg.n_layer;
+                        pager_budget_bytes = budget;
                     }
                 }
             }
@@ -318,16 +323,44 @@ pub(crate) fn generate_dense_vulkan_session(
         // the batched path (and whose seam doesn't reduce INFR_UBATCH) would need a much larger
         // budget or a batched-aware paged path (not implemented here) — this floor only guarantees
         // the decode case.
-        let n_slots = ((pager_budget_bytes / per_slot) as usize).clamp(moe.n_used.max(1), n_blocks);
+        let budget_slots =
+            ((pager_budget_bytes / per_slot) as usize).clamp(moe.n_used.max(1), n_blocks);
+        // Per-role ceiling: each role's arena is ONE SSBO binding, capped by the smaller of the
+        // paged kernels' u32 word reach (16 GiB) and the device's maxStorageBufferRange (4 GiB
+        // on RADV — found empirically: Scout's auto budget wanted a 7.6 GiB down arena, and
+        // reads past the binding range came back as garbage → NaN logits → sentinel router ids).
+        // `GpuPager::new` hard-errors past this; clamping here keeps an oversized budget usable
+        // instead of fatal. Applied PER ROLE (their expert sizes differ — Scout: gate/up 13.8 MB
+        // vs down 18 MB — so a shared count dragged to the largest role's cap strands budget the
+        // smaller roles could hold as real hit rate; see `MoePagerLayout`'s doc). Every role's
+        // count starts from the same budget-driven figure, so the total can only come in UNDER
+        // budget when a cap bites. Splitting a role across several arena buffers (or u64 shader
+        // addressing where the device allows bigger buffers) is the lift that raises the cap.
+        let arena_cap = infr_vulkan::pager::GpuPager::max_arena_bytes(vk);
+        let role_slots = |slot_bytes: usize| -> usize {
+            let cap = (arena_cap / slot_bytes.max(4) as u64) as usize;
+            if budget_slots > cap {
+                eprintln!(
+                    "MoE pager: clamping a role's {budget_slots} -> {cap} slots (per-role arena \
+                     capped by the device's storage-buffer range / u32 word addressing)"
+                );
+            }
+            budget_slots.min(cap).min(n_blocks)
+        };
+        let (gate_n_slots, up_n_slots, down_n_slots) =
+            (role_slots(gb), role_slots(ub), role_slots(db));
         eprintln!(
-            "MoE pager: {n_paged}/{} expert layers PAGED ({n_slots}/{n_blocks} experts cached, \
-             {:.2} GB budget; ctx={want_ctx})",
+            "MoE pager: {n_paged}/{} expert layers PAGED (gate/up/down {gate_n_slots}/\
+             {up_n_slots}/{down_n_slots} of {n_blocks} experts cached, {:.2} GB budget; \
+             ctx={want_ctx})",
             cfg.n_layer,
             pager_budget_bytes as f64 / 1e9,
         );
         vk.init_moe_pager(infr_vulkan::pager::MoePagerLayout {
             n_blocks,
-            n_slots,
+            gate_n_slots,
+            up_n_slots,
+            down_n_slots,
             gate_slot_bytes: gb,
             up_slot_bytes: ub,
             down_slot_bytes: db,

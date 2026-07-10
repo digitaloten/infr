@@ -12,19 +12,20 @@
 //! (`infr-llama`'s seam / this crate's `adapter.rs`) packs a `BlockId` from `(layer, role,
 //! expert_id)` and calls [`GpuPager::ensure_resident`] with that block's mmap'd tensor bytes
 //! before dispatching the id-indexed GEMV/GEMM through the LUT hop (the `PAGED` branch in
-//! `shaders/native_gemv_id.comp` / `native_gemv_id_multi.comp`: `wbase = lut[ids[slot]] * stride`
-//! instead of `wbase = ids[slot] * stride`). A FUTURE dense layer-streaming policy (NOT
-//! implemented here — see the task doc) would reuse this exact struct with `BlockId = layer_idx`,
-//! `slot_bytes` = one layer's weight size, and a schedule-driven (not LRU) `touch` order (a dense
-//! decode visits layers in a fixed known order, so it can exact-prefetch layer `l+1` while `l`
-//! runs) — nothing in the arena/LUT/upload core below assumes MoE or LRU.
+//! `shaders/native_gemv_id.comp` / `native_gemv_id_multi.comp`: `nw_base = lut[ids[slot]]`, a
+//! u32-WORD arena base added at the shader's final `nw[]` indexing step — see the `lut_host`
+//! field's doc for why a word base and not a slot index). A FUTURE dense layer-streaming policy
+//! (NOT implemented here — see the task doc) would reuse this exact struct with `BlockId =
+//! layer_idx`, `slot_bytes` = one layer's weight size, and a schedule-driven (not LRU) `touch`
+//! order (a dense decode visits layers in a fixed known order, so it can exact-prefetch layer
+//! `l+1` while `l` runs) — nothing in the arena/LUT/upload core below assumes MoE or LRU.
 //!
 //! # LUT
 //! One small `Staging` (host-visible, persistently mapped — no GPU submit to update) buffer of
-//! `n_blocks` `u32` slot indices (`infr_core::pager::NOT_RESIDENT` for an absent block), mirrored
-//! host-side and fully rewritten + re-uploaded whenever residency changes since the last
-//! [`GpuPager::flush_lut`] — cheap at the block counts this task's models need (Scout: 48 layers
-//! x 16 experts x 3 roles = 2304 entries, 9 KiB).
+//! `n_blocks` `u32` per-slot arena WORD bases (`infr_core::pager::NOT_RESIDENT` for an absent
+//! block), mirrored host-side and fully rewritten + re-uploaded whenever residency changes since
+//! the last [`GpuPager::flush_lut`] — cheap at the block counts this task's models need (Scout:
+//! 48 layers x 16 experts x 3 roles = 2304 entries, 9 KiB).
 //!
 //! # Eviction upgrade path
 //! Plain LRU (see `infr_core::pager`). llama.cpp issue #20757's SLRU-with-admission is the
@@ -45,11 +46,22 @@ use super::{as_vk_buf, be, VulkanBackend};
 pub struct GpuPager {
     pager: Pager,
     slot_bytes: usize,
-    /// Device-local arena: `n_slots * slot_bytes`, one contiguous buffer (the id-indexed shaders
-    /// address it as `array<u32>` with `lut[id] * stride` offsets — one binding, not N).
+    /// `slot_bytes / 4` — the per-slot stride in u32 WORDS, the unit the device LUT speaks (see
+    /// `lut_host`'s doc). Cached to avoid re-dividing on every miss.
+    words_per_slot: u32,
+    /// Device-local arena: `n_slots * slot_bytes`, one contiguous buffer bound as `array<u32>`.
     arena: Box<dyn Buffer>,
     /// Host-visible LUT mirror (mutated in place, re-uploaded on change) + the device buffer it's
-    /// pushed to. `n_blocks` entries.
+    /// pushed to. `n_blocks` entries, each the resident block's arena base offset in u32 WORDS
+    /// (`slot_index * words_per_slot`) — NOT the raw slot index. The paged GEMV shaders add this
+    /// word base at their final `nw[]` indexing step (`NW(i)` in `native_decode.glsl`), keeping
+    /// every other offset they compute WITHIN one expert. A slot-index LUT + in-shader
+    /// `index * stride` multiply — the original design — wraps u32 in ELEMENT space once
+    /// `slot_index * stride` crosses 4.29e9 (Scout: 41.9M elements/expert overflows at slot
+    /// ≥ ~102), which surfaced as coherent-but-wrong output the moment a real VRAM budget gave
+    /// the cache more than ~100 slots. Word-space bases push the ceiling to a 16 GiB arena
+    /// (u32 words), enforced in [`GpuPager::new`]; true u64 shader addressing is the lift that
+    /// removes that cap entirely.
     lut_host: Vec<u32>,
     lut_dev: Box<dyn Buffer>,
     lut_dirty: bool,
@@ -62,6 +74,18 @@ impl GpuPager {
     /// within-batch sizing note on `infr_core::pager::Pager::new`, which applies unchanged here).
     /// `slot_bytes`: one block's PADDED byte size (the largest block the model will ever page —
     /// MoE experts of one model are uniform per role, so this is exact, not a worst-case pad).
+    /// Must be u32-aligned (`% 4 == 0`) — the LUT addresses slots in u32 words.
+    ///
+    /// Errors if the arena exceeds what one SSBO binding can address: the smaller of the paged
+    /// kernels' u32 word reach (16 GiB — `nw[]` is indexed by a u32 word offset) and the device's
+    /// `maxStorageBufferRange`/`maxBufferSize` (4 GiB on RADV/RDNA3 — the binding range AND the
+    /// single-VkBuffer size are both ~u32 BYTES there, the binding ceiling most desktop drivers
+    /// share). Silently exceeding either wraps/out-of-ranges reads into coherent-but-wrong output
+    /// — exactly the corruption class this design exists to prevent. Callers sizing `n_slots`
+    /// from a VRAM budget should clamp below [`GpuPager::max_arena_bytes`] first (see the seam's
+    /// placement policy) — this check is the backstop, not the policy. Splitting a role across
+    /// several arena buffers (or true u64 shader addressing where the device allows bigger
+    /// buffers) is the lift that raises this cap.
     pub fn new(
         vk: &VulkanBackend,
         n_blocks: usize,
@@ -69,6 +93,21 @@ impl GpuPager {
         slot_bytes: usize,
     ) -> Result<Self> {
         assert!(n_slots > 0, "GpuPager needs at least one slot");
+        assert!(
+            slot_bytes.is_multiple_of(4),
+            "GpuPager slot_bytes must be u32-aligned (the LUT speaks u32 words)"
+        );
+        let arena_bytes = n_slots as u64 * slot_bytes as u64;
+        let cap = Self::max_arena_bytes(vk);
+        if arena_bytes > cap {
+            return Err(be(format!(
+                "GpuPager arena of {n_slots} x {slot_bytes} B = {:.2} GiB exceeds the \
+                 per-arena addressing cap of {:.2} GiB (min of the paged kernels' u32 word \
+                 reach and this device's maxStorageBufferRange) — clamp n_slots",
+                arena_bytes as f64 / (1u64 << 30) as f64,
+                cap as f64 / (1u64 << 30) as f64,
+            )));
+        }
         let arena = vk.alloc_uninit(n_slots * slot_bytes, BufferUsage::Weights)?;
         let lut_dev = vk.alloc_uninit(n_blocks.max(1) * 4, BufferUsage::Staging)?;
         let lut_host = vec![NOT_RESIDENT; n_blocks.max(1)];
@@ -77,11 +116,20 @@ impl GpuPager {
         Ok(Self {
             pager: Pager::new(n_slots),
             slot_bytes,
+            words_per_slot: (slot_bytes / 4) as u32,
             arena,
             lut_host,
             lut_dev,
             lut_dirty: false,
         })
+    }
+
+    /// Largest arena (bytes) one [`GpuPager`] can address on this device: the smaller of the
+    /// paged kernels' u32 WORD reach (16 GiB) and the device's storage-buffer binding range
+    /// (4 GiB on RADV — see [`GpuPager::new`]'s doc). The placement policy divides its budget by
+    /// per-slot bytes and clamps to `max_arena_bytes / slot_bytes` slots per role.
+    pub fn max_arena_bytes(vk: &VulkanBackend) -> u64 {
+        (u32::MAX as u64 * 4).min(vk.caps().max_buffer_bytes)
     }
 
     pub fn n_slots(&self) -> usize {
@@ -139,7 +187,10 @@ impl GpuPager {
                     }
                 }
                 if let Some(v) = self.lut_host.get_mut(id as usize) {
-                    *v = slot;
+                    // The LUT stores the slot's arena WORD base, not the slot index — see
+                    // `lut_host`'s doc. `new()` proved slot * words_per_slot fits u32 for every
+                    // slot in this arena.
+                    *v = slot * self.words_per_slot;
                 }
                 self.lut_dirty = true;
                 Ok(slot)
@@ -310,11 +361,18 @@ pub struct MoePagerSession {
 pub struct MoePagerLayout {
     /// Total distinct experts nameable per role's LUT = `n_paged_layers * n_expert`.
     pub n_blocks: usize,
-    /// VRAM slots to give EACH role (paired 1:1 — one touch always resolves one gate + one up + one
-    /// down expert together, so keeping the same slot count per role keeps them from thrashing at
-    /// different rates). Computed by the caller from the pager's byte budget / (per-expert bytes
-    /// summed across roles) — see `seam::mod`'s placement policy.
-    pub n_slots: usize,
+    /// VRAM slots per role — INDEPENDENT counts, because each role's arena is its own SSBO with
+    /// its own [`GpuPager::max_arena_bytes`] ceiling: with 4 GiB bindings (RADV) and unequal
+    /// per-role expert sizes (Scout: gate/up 13.8 MB, down 18 MB), a shared count is dragged down
+    /// to the LARGEST role's cap and strands budget the smaller roles could have used as real
+    /// hit rate (Scout: uniform 238 slots everywhere left ~6 GB of a 19 GB budget unused; per-role
+    /// caps give gate/up 312 each). Each role has its own LRU/LUT and `touch_role` resolves roles
+    /// independently, so unequal counts are correctness-neutral — a role with fewer slots just
+    /// misses more often. Computed by the caller (budget-driven count, then per-role cap — see
+    /// `seam::mod`'s placement policy).
+    pub gate_n_slots: usize,
+    pub up_n_slots: usize,
+    pub down_n_slots: usize,
     pub gate_slot_bytes: usize,
     pub up_slot_bytes: usize,
     pub down_slot_bytes: usize,
@@ -323,15 +381,25 @@ pub struct MoePagerLayout {
 impl MoePagerSession {
     pub fn new(vk: &VulkanBackend, layout: MoePagerLayout) -> Result<Self> {
         let gate = RolePager {
-            pager: GpuPager::new(vk, layout.n_blocks, layout.n_slots, layout.gate_slot_bytes)?,
+            pager: GpuPager::new(
+                vk,
+                layout.n_blocks,
+                layout.gate_n_slots,
+                layout.gate_slot_bytes,
+            )?,
             sources: HashMap::new(),
         };
         let up = RolePager {
-            pager: GpuPager::new(vk, layout.n_blocks, layout.n_slots, layout.up_slot_bytes)?,
+            pager: GpuPager::new(vk, layout.n_blocks, layout.up_n_slots, layout.up_slot_bytes)?,
             sources: HashMap::new(),
         };
         let down = RolePager {
-            pager: GpuPager::new(vk, layout.n_blocks, layout.n_slots, layout.down_slot_bytes)?,
+            pager: GpuPager::new(
+                vk,
+                layout.n_blocks,
+                layout.down_n_slots,
+                layout.down_slot_bytes,
+            )?,
             sources: HashMap::new(),
         };
         let staging_bytes = layout

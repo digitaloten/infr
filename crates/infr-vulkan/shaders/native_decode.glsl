@@ -5,16 +5,29 @@
 //   * dqblk(uint gstart, out v[32])   — decode a contiguous 32-elem sub-block, scale decoded ONCE.
 // dqblk is the amortized path; formats without an optimized one fall back to looping dq() (below).
 // Grid-based i-quants pull their tables from native_grids.glsl.
+//
+// NW(i): the nw[] read chokepoint. An includer may pre-define NW to add a WORD-offset base to
+// every weight read — the paged expert kernels (`native_gemv_id(_multi).comp`'s -DPAGED build) use
+// this to relocate all dequant math into one arena slot: the within-expert ELEMENT offsets this
+// library computes stay small (they fit u32 comfortably for any real expert), while the slot's
+// arena position — whose ELEMENT/BYTE offset would overflow u32 past a few dozen ~14 MB slots
+// (u32 element math wrapped at slot ≥ ~102 on Scout, the task's coherent-but-wrong bug) — is
+// carried as a u32 WORD index added only here, at the final indexing step (a 16 GiB-per-arena
+// reach, enforced host-side; see `GpuPager`). Undefined = plain nw[i]: every non-paged build
+// expands to exactly the code this library always had.
+#ifndef NW
+#define NW(i) nw[i]
+#endif
 
-uint rb(uint bo) { return (nw[bo >> 2u] >> ((bo & 3u) << 3u)) & 0xFFu; }
+uint rb(uint bo) { return (NW(bo >> 2u) >> ((bo & 3u) << 3u)) & 0xFFu; }
 uint ru16(uint bo) { return rb(bo) | (rb(bo + 1u) << 8u); }
 uint ru32b(uint bo) { return rb(bo) | (rb(bo + 1u) << 8u) | (rb(bo + 2u) << 16u) | (rb(bo + 3u) << 24u); }
 // Unaligned u32 via two word loads + funnel shift (vs ru32b's four byte-extract chains).
 uint ru32u(uint bo) {
-    uint w0 = nw[bo >> 2u];
+    uint w0 = NW(bo >> 2u);
     uint sh = (bo & 3u) << 3u;
     if (sh == 0u) { return w0; }
-    return (w0 >> sh) | (nw[(bo >> 2u) + 1u] << (32u - sh));
+    return (w0 >> sh) | (NW((bo >> 2u) + 1u) << (32u - sh));
 }
 float f16tof32(uint bits) { return unpackHalf2x16(bits & 0xffffu).x; }
 int sgn8(uint byte) { return int(byte) - int(byte >= 128u ? 256u : 0u); }
@@ -173,7 +186,7 @@ void dqblk(uint gstart, out float v[32]) {
     uint shift = 2u * ((p0 % 128u) / 32u);
     uint qw = (bd + 16u + 32u * (p0 / 128u)) >> 2u; // 84-byte blocks are word-aligned; +16+32n too
     for (uint w8 = 0u; w8 < 8u; w8++) {
-        uint word = nw[qw + w8];
+        uint word = NW(qw + w8);
         for (uint b = 0u; b < 4u; b++) {
             uint w = w8 * 4u + b;
             uint q2 = ((word >> (8u * b)) >> shift) & 3u;
@@ -280,7 +293,7 @@ void dqblk(uint gstart, out float v[32]) {  // decode d/dmin/6-bit scale once fo
     uint qw = (bd + 16u + (sub / 2u) * 32u) >> 2u;
     uint nsh = ((sub & 1u) == 0u) ? 0u : 4u;
     for (uint w8 = 0u; w8 < 8u; w8++) {
-        uint q = nw[qw + w8] >> nsh;
+        uint q = NW(qw + w8) >> nsh;
         for (uint b = 0u; b < 4u; b++) {
             v[w8 * 4u + b] = dl * float((q >> (8u * b)) & 0xFu) - mm;
         }
@@ -319,8 +332,8 @@ void dqblk(uint gstart, out float v[32]) {  // decode d/dmin/6-bit scale once fo
     uint nsh = ((sub & 1u) == 0u) ? 0u : 4u;      // low/high nibble of qs
     uint hsh = 2u * j + (((sub & 1u) == 0u) ? 0u : 1u); // qh bit index for this sub-block
     for (uint w8 = 0u; w8 < 8u; w8++) {
-        uint q = nw[qw + w8] >> nsh;
-        uint h = nw[hw + w8] >> hsh;
+        uint q = NW(qw + w8) >> nsh;
+        uint h = NW(hw + w8) >> hsh;
         for (uint b = 0u; b < 4u; b++) {
             uint val = ((q >> (8u * b)) & 0xFu) | (((h >> (8u * b)) & 1u) << 4u);
             v[w8 * 4u + b] = dl * float(val) - mm;
@@ -451,7 +464,7 @@ void dqblk(uint gstart, out float v[32]) {
     float dl = d * float(int(lo | (hi << 4u)) - 32);
     uint qw = (bd + 8u + 16u * ib) >> 2u;
     for (uint w4 = 0u; w4 < 4u; w4++) {
-        uint q = nw[qw + w4];
+        uint q = NW(qw + w4);
         for (uint b = 0u; b < 4u; b++) {
             uint byte = (q >> (8u * b)) & 0xFFu;
             uint j = w4 * 4u + b;

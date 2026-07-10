@@ -5257,9 +5257,10 @@ impl<'a> Recorder<'a> {
     }
 
     /// [`linear_native_id`]'s paged twin: `w` is a `GpuPager` arena (fixed uniform slots, not one
-    /// contiguous per-expert tensor) and `lut` is that pager's device LUT buffer — the kernel does
-    /// `slot = lut[ids[slot_idx]]` before the usual `slot * stride` addressing (see
-    /// `shaders/native_gemv_id.comp`'s `-DPAGED` branch). Always the tree kernel — the SG variant
+    /// contiguous per-expert tensor) and `lut` is that pager's device LUT buffer — the kernel reads
+    /// `nw_base = lut[ids[slot_idx]]`, the slot's arena base in u32 WORDS, and adds it at the
+    /// final `nw[]` indexing step (see `shaders/native_gemv_id.comp`'s `-DPAGED` branch; `stride`
+    /// is unused in that build — the host baked it into the LUT). Always the tree kernel — the SG variant
     /// has no paged build (Q6_K/Q5_K only, gated off; see `native_id_sg_choice`'s doc — a paged
     /// model never reaches that gate today since MoE auto-fit picks the pager only on overflow,
     /// but this keeps the two builds from silently diverging if that changes).

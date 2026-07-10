@@ -67,7 +67,8 @@ pub fn native_idm_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
 }
 
 /// [`native_id_kernel_name`]'s paged twin (`infr_vulkan::pager::GpuPager` build — one extra LUT
-/// hop, `slot = lut[expert_id]`, see `shaders/native_gemv_id.comp`'s `-DPAGED` doc comment).
+/// hop, `nw_base = lut[expert_id]` (a u32-WORD arena base), see `shaders/native_gemv_id.comp`'s
+/// `-DPAGED` doc comment).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn native_id_paged_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
