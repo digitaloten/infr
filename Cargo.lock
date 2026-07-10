@@ -1310,6 +1310,7 @@ dependencies = [
  "infr-prof",
  "infr-prof-rt",
  "memmap2",
+ "rayon",
  "thiserror 2.0.18",
  "tracing",
 ]

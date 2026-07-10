@@ -5197,13 +5197,17 @@ impl<'a> Recorder<'a> {
     }
 
     /// [`Self::matmul_mmq_experts`]'s paged twin: `arena` is a `GpuPager` arena (uniform slots)
-    /// and `lut` its device LUT of arena WORD bases; the kernel resolves each bucket's weight
-    /// base as `lut[layer_base + expert]` instead of `w_base + expert·stride` (the shaders'
-    /// `-DPAGED` build — word-base indirection at the `rb()` chokepoint, same u32-overflow lesson
-    /// as the paged GEMVs). The caller must have made every ROUTED expert of this layer resident
-    /// (all of them simultaneously — buckets run in one dispatch) and flushed the LUT before this
-    /// records; buckets with count 0 exit before any LUT/weight read, so unrouted experts may be
-    /// absent. Covers every dtype `paged_mmq_ok` accepts — the FULL `MOE_MMQ_DTYPES` set, since
+    /// and `lut` a buffer of arena WORD bases; the kernel resolves each bucket's weight base as
+    /// `lut[lut_base + expert]` instead of `w_base + expert·stride` (the shaders' `-DPAGED`
+    /// build — word-base indirection at the `rb()` chokepoint, same u32-overflow lesson as the
+    /// paged GEMVs). `lut`/`lut_base` name a run of `n_expert` word bases for exactly this layer
+    /// — the session's write-once LUT tape window (`MoePagerSession::lut_window`), frozen at
+    /// record time so later staging can't mutate what an in-flight segment reads. The caller must
+    /// have staged every ROUTED expert of this layer resident (all of them simultaneously —
+    /// buckets run in one dispatch) before recording this; buckets with count 0 exit before any
+    /// LUT/weight read, so unrouted experts may be absent (their window entries are whatever the
+    /// mirror held — never dereferenced). Covers every dtype `paged_mmq_ok` accepts — the FULL
+    /// `MOE_MMQ_DTYPES` set, since
     /// `MOE_MMQ_PAGED_DTYPES` now mirrors it (see adapter.rs's drift-guard doc); `sact` is `Some`
     /// only for the min-carrying dtypes (Q4_K/Q5_K/Q5_1/Q4_1 — the rest are
     /// symmetric-or-self-summed, same `MOE_MMQ_SACT_DTYPES` split the resident twin uses). Tile
@@ -5218,7 +5222,7 @@ impl<'a> Recorder<'a> {
         sact: Option<&dyn Buffer>,
         arena: &dyn Buffer,
         lut: &dyn Buffer,
-        layer_base: usize,
+        lut_base: usize,
         counts: &dyn Buffer,
         offsets: &dyn Buffer,
         c: &dyn Buffer,
@@ -5364,10 +5368,10 @@ impl<'a> Recorder<'a> {
         let kern = self.be.kernel(name, spv, nb, 16);
         let mut push = [0u8; 16];
         // pc.m unused in the PAGED build (slot bases come from the LUT); pc.w_base carries the
-        // layer's global-id base.
+        // layer's LUT window base.
         push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
-        push[12..16].copy_from_slice(&(layer_base as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(lut_base as u32).to_ne_bytes());
         let gx = (rows.div_ceil(bm) * (n / 64)) as u32;
         let mut bufs = vec![Self::vkb(qa), Self::vkb(dact)];
         if let Some(sa) = sact {
@@ -5519,13 +5523,15 @@ impl<'a> Recorder<'a> {
     }
 
     /// [`linear_native_id`]'s paged twin: `w` is a `GpuPager` arena (fixed uniform slots, not one
-    /// contiguous per-expert tensor) and `lut` is that pager's device LUT buffer — the kernel reads
-    /// `nw_base = lut[ids[slot_idx]]`, the slot's arena base in u32 WORDS, and adds it at the
-    /// final `nw[]` indexing step (see `shaders/native_gemv_id.comp`'s `-DPAGED` branch; `stride`
-    /// is unused in that build — the host baked it into the LUT). Always the tree kernel — the SG variant
-    /// has no paged build (Q6_K/Q5_K only, gated off; see `native_id_sg_choice`'s doc — a paged
-    /// model never reaches that gate today since MoE auto-fit picks the pager only on overflow,
-    /// but this keeps the two builds from silently diverging if that changes).
+    /// contiguous per-expert tensor) and `lut` a run of per-expert arena WORD bases for exactly
+    /// this layer — the kernel reads `nw_base = lut[lut_base + ids[slot_idx]]` with the layer-
+    /// LOCAL expert ids moe_topk produced (no host global-id rewrite; see
+    /// `shaders/native_gemv_id.comp`'s `-DPAGED` branch — `lut_base` rides the otherwise-unused
+    /// `stride` push slot). `lut` is the session's write-once LUT tape window in the inline paths
+    /// (see `MoePagerSession::lut_window`). Always the tree kernel — the SG variant has no paged
+    /// build (Q6_K/Q5_K only, gated off; see `native_id_sg_choice`'s doc — a paged model never
+    /// reaches that gate today since MoE auto-fit picks the pager only on overflow, but this
+    /// keeps the two builds from silently diverging if that changes).
     #[allow(clippy::too_many_arguments)]
     pub fn linear_native_id_paged(
         &self,
@@ -5534,7 +5540,7 @@ impl<'a> Recorder<'a> {
         lut: &dyn Buffer,
         ids: &dyn Buffer,
         slot: usize,
-        stride: usize,
+        lut_base: usize,
         x: &dyn Buffer,
         y: &dyn Buffer,
         rows: usize,
@@ -5551,7 +5557,7 @@ impl<'a> Recorder<'a> {
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(slot as u32).to_ne_bytes());
-        push[16..20].copy_from_slice(&(stride as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(lut_base as u32).to_ne_bytes());
         // Binding order MUST match the shader's `-DPAGED` layout (`native_gemv_id.comp`) AND keep
         // `y` last: `dispatch3`'s hazard tracking treats the tail `n_out` buffers as writes and
         // everything before as reads (one contiguous split) — `y` bound before `lut` would get
@@ -5571,8 +5577,9 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// [`linear_native_id_multi`]'s paged twin — same LUT hop as [`linear_native_id_paged`], for
-    /// the decode/small-m all-`n_used`-experts-in-one-dispatch path. Always the tree kernel (see
+    /// [`linear_native_id_multi`]'s paged twin — same local-ids + LUT-window hop as
+    /// [`linear_native_id_paged`] (`nw_base = lut[lut_base + ids[slot]]`), for the decode/small-m
+    /// all-`n_used`-experts-in-one-dispatch path. Always the tree kernel (see
     /// [`linear_native_id_paged`]'s doc for why the SG fast path is skipped).
     #[allow(clippy::too_many_arguments)]
     pub fn linear_native_id_multi_paged(
@@ -5582,7 +5589,7 @@ impl<'a> Recorder<'a> {
         lut: &dyn Buffer,
         ids: &dyn Buffer,
         n_used: usize,
-        stride: usize,
+        lut_base: usize,
         x: &dyn Buffer,
         x_per_slot: bool,
         y: &dyn Buffer,
@@ -5594,7 +5601,7 @@ impl<'a> Recorder<'a> {
         push[0..4].copy_from_slice(&(in_f as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(out_f as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(n_used as u32).to_ne_bytes());
-        push[12..16].copy_from_slice(&(stride as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(lut_base as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(x_per_slot as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&(rows as u32).to_ne_bytes());
         // `y` last — see `linear_native_id_paged`'s doc on why binding order matters for
@@ -5978,6 +5985,80 @@ impl<'a> Recorder<'a> {
         Ok(())
     }
 
+    /// [`Self::finish`]'s pipelined twin: end recording and submit WITHOUT waiting, returning a
+    /// [`PendingSegment`] whose [`PendingSegment::wait`] blocks on a fence and releases the
+    /// command buffer / descriptor pools. The paged-MoE executor uses this to keep staging the
+    /// next segment's expert uploads on the CPU while the GPU chews the one just submitted
+    /// (`adapter::execute_paged_moe`'s ring rotation). Profiling recorders (INFR_PROF /
+    /// INFR_PROF2) degrade to the blocking [`Self::finish`] — their reports need completed
+    /// timestamps — and hand back an already-drained segment, so callers need no special case.
+    ///
+    /// The NEXT recorder on this queue must open with [`Self::seed_barrier`]: hazard tracking is
+    /// per-recorder, so cross-submission RAW/WAR ordering (scratch reuse, arena-slot rewrites vs
+    /// a prior segment's reads) is otherwise invisible to it.
+    pub fn finish_nowait(self) -> Result<PendingSegment> {
+        if self.prof || self.prof2 {
+            let shared = std::sync::Arc::clone(&self.be.shared);
+            self.finish()?;
+            return Ok(PendingSegment {
+                shared,
+                fence: None,
+                cmd: vk::CommandBuffer::null(),
+                pools: Vec::new(),
+            });
+        }
+        let device = &self.be.shared.device;
+        unsafe { device.end_command_buffer(self.cmd) }.map_err(|e| be(format!("end cmd: {e}")))?;
+        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
+            .map_err(|e| be(format!("create fence: {e}")))?;
+        let submit = unsafe {
+            device.queue_submit(
+                self.be.shared.queue,
+                &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.cmd))],
+                fence,
+            )
+        };
+        if let Err(e) = submit {
+            unsafe { device.destroy_fence(fence, None) };
+            return Err(be(format!("queue_submit: {e}")));
+        }
+        Ok(PendingSegment {
+            shared: std::sync::Arc::clone(&self.be.shared),
+            fence: Some(fence),
+            cmd: self.cmd,
+            pools: self.pools.borrow().clone(),
+        })
+    }
+
+    /// Unconditional global compute+transfer barrier — the mandatory FIRST command of a recorder
+    /// that continues a [`Self::finish_nowait`]-submitted stream. Hazard tracking starts empty per
+    /// recorder, so the ordering between this segment's dispatches/copies and the in-flight
+    /// previous segment's (pooled scratch reuse, pager arena-slot rewrites after reads) must be
+    /// seeded explicitly; `vkCmdPipelineBarrier`'s scope spans submission order on the queue, so
+    /// this one barrier orders the whole segment after everything already submitted.
+    pub fn seed_barrier(&self) {
+        let mb = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(
+                vk::AccessFlags::SHADER_READ
+                    | vk::AccessFlags::SHADER_WRITE
+                    | vk::AccessFlags::TRANSFER_READ
+                    | vk::AccessFlags::TRANSFER_WRITE,
+            );
+        unsafe {
+            self.be.shared.device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[mb],
+                &[],
+                &[],
+            );
+        }
+        *self.barriers.borrow_mut() += 1;
+    }
+
     /// End recording WITHOUT submitting, returning a [`RecordedCmd`] the caller can replay across
     /// tokens (skipping per-token re-recording). Only meaningful for a `new_persistent` recorder; the
     /// descriptor sets bind the (persistent) decode buffers, so replays stay valid as long as those
@@ -6134,6 +6215,48 @@ impl Drop for RecordedCmd {
                 device.destroy_descriptor_pool(*p, None);
             }
         }
+    }
+}
+
+/// A submitted-but-unwaited segment from [`Recorder::finish_nowait`]: holds the fence its submit
+/// signals plus the transient objects (command buffer, descriptor pools) that must outlive GPU
+/// execution. [`Self::wait`] blocks on the fence and releases everything; `Drop` does the same
+/// (best-effort) so an error path can never free a command buffer the GPU still owns.
+pub struct PendingSegment {
+    shared: std::sync::Arc<crate::VulkanShared>,
+    /// `None` = already drained (the profiling degrade path in `finish_nowait`, or after `wait`).
+    fence: Option<vk::Fence>,
+    cmd: vk::CommandBuffer,
+    pools: Vec<vk::DescriptorPool>,
+}
+
+impl PendingSegment {
+    /// Block until the segment's GPU work completes, then release its transient objects.
+    pub fn wait(mut self) -> Result<()> {
+        self.drain()
+    }
+
+    fn drain(&mut self) -> Result<()> {
+        let Some(fence) = self.fence.take() else {
+            return Ok(()); // already drained
+        };
+        let device = &self.shared.device;
+        let waited = unsafe { device.wait_for_fences(&[fence], true, u64::MAX) };
+        unsafe {
+            device.destroy_fence(fence, None);
+            let cmd_pool = *self.shared.cmd_pool.lock().unwrap();
+            device.free_command_buffers(cmd_pool, &[self.cmd]);
+            for p in self.pools.drain(..) {
+                device.destroy_descriptor_pool(p, None);
+            }
+        }
+        waited.map_err(|e| be(format!("wait segment fence: {e}")))
+    }
+}
+
+impl Drop for PendingSegment {
+    fn drop(&mut self) {
+        let _ = self.drain();
     }
 }
 

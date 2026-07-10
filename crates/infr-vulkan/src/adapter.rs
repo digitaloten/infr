@@ -3380,18 +3380,18 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     // recorder — hold them here so they drop only after `rec.finish()` submits.
     let mut transient: Vec<Box<dyn Buffer>> = Vec::new();
 
-    // `rec` is an `Option` (not a plain binding) because a PAGED `MoeFfn` op splits this graph
-    // into several submissions: everything before it, a tiny router+top-k segment whose ids the
-    // host must read back, the pager touch/upload/LUT-flush (no recorder involved — a handful of
-    // `one_shot` copies + a mapped-pointer memcpy), then a fresh segment for the paged expert
-    // GEMVs onward. `execute_paged_moe` owns that whole dance; here we just finish the segment
-    // before it and open a new one after. Every non-paged graph (the overwhelming common case)
-    // never takes this branch and records exactly like before — one recorder, one submit.
+    // `rec` is an `Option` (not a plain binding) because a PAGED `MoeFfn` op may hand the ambient
+    // segment off mid-graph: `execute_paged_moe` records the whole MoE op INLINE into it on the
+    // no-readback paths, and only rotates (pipelined `finish_nowait`, ring-half backpressure) or
+    // blocks (the small-m split's router readback) when residency actually demands it — see
+    // `PagedStream`'s doc. Every non-paged graph (the overwhelming common case) never touches any
+    // of this and records exactly like before — one recorder, one submit.
     let mut rec = Some(be_.recorder()?);
     let mode = RopeMode::Static(&rope_pos);
     let mut dyn_args: Vec<DynAttnCtx> = Vec::new();
     let mut pool: ScratchPool = HashMap::new();
     let mut mmv_memo: Option<(TensorId, usize, usize)> = None;
+    let mut pstream = PagedStream::default();
     for (op_idx, op) in graph.ops.iter().enumerate() {
         if skip_op.contains(&op_idx) {
             continue;
@@ -3405,15 +3405,16 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                 )
             });
             if paged {
-                for c in dyn_args.drain(..) {
-                    transient.extend([c.args, c.pm, c.pl, c.pacc]);
-                }
-                rec.take()
-                    .expect("segment always Some between ops")
-                    .finish()
-                    .map_err(|e| be(e.to_string()))?;
-                execute_paged_moe(be_, graph, op, &scratch, bindings, &mut pool)?;
-                rec = Some(be_.recorder()?);
+                execute_paged_moe(
+                    be_,
+                    graph,
+                    op,
+                    &scratch,
+                    bindings,
+                    &mut pool,
+                    &mut rec,
+                    &mut pstream,
+                )?;
                 continue;
             }
         }
@@ -3443,12 +3444,16 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         .expect("segment always Some at loop end")
         .finish()
         .map_err(|e| be(e.to_string()))?;
+    // The blocking finish above already waited the queue idle — draining just releases the
+    // pipelined segments' command buffers/fences (every buffer they referenced outlives this
+    // call: pooled scratch in `transient`, ring/tape/arenas on the session).
+    pstream.drain()?;
     Ok(())
 }
 
 /// Get-or-alloc a pooled buffer with an explicit `usage` (unlike [`pooled`], which is always
-/// `Activations`) — the paged MoE segment's `ids_global` scratch needs `Staging` (host-visible, so
-/// the global-id upload is a plain memcpy with no extra submit).
+/// `Activations`) — the paged MoE router-ids scratch needs `Staging` (host-visible, so the
+/// small-m split path's readback is a plain mapped memcpy with no extra submit).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn pooled_usage(
     pool: &mut ScratchPool,
@@ -3464,32 +3469,178 @@ fn pooled_usage(
     Ok(key)
 }
 
-/// Execute ONE paged `Op::MoeFfn` as a sequence of submissions with a host sync in between, so the
-/// pager can resolve/upload this layer's chosen experts before the id-indexed GEMV reads them.
+/// Host side of the paged-MoE execution stream, per `execute_static` call: the pipelined
+/// in-flight segments plus the cursors into the session's upload ring and LUT tape (the buffers
+/// live on `MoePagerSession`; every call ends fully drained, so cursors start at zero).
+///
+/// Ring rotation (`rotate_stream`): when the current ring half can't hold a miss, the ambient
+/// recorder is submitted WITHOUT waiting (`Recorder::finish_nowait`) and staging continues into
+/// the other half — the CPU's expert memcpys overlap the GPU's execution of the segment just
+/// submitted. Before reusing a half, its previous segment's fence is waited (`pending`), which
+/// is the whole ring-region-lifetime story: a region is never rewritten until the recording that
+/// read it has fully executed.
+#[derive(Default)]
+struct PagedStream {
+    /// Per-ring-half in-flight segment (the one whose recorded copies read that half).
+    pending: [Option<crate::recorder::PendingSegment>; 2],
+    /// Which ring half `cursor` allocates from.
+    half: usize,
+    /// Bytes used in the current half.
+    cursor: usize,
+    /// Words used in the session's LUT tape (reset only after full drains — `sync_stream`).
+    tape_cursor: usize,
+}
+
+impl PagedStream {
+    fn drain(&mut self) -> Result<()> {
+        for p in &mut self.pending {
+            if let Some(s) = p.take() {
+                s.wait().map_err(|e| be(e.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Submit the ambient segment without waiting and rotate to the other ring half (fencing out its
+/// previous occupant) — the pipelined flush `PagedStream`'s doc describes. The fresh recorder
+/// opens with `seed_barrier`: hazard tracking is per-recorder, so ordering against the in-flight
+/// segment (pooled-scratch reuse, arena-slot rewrites vs its reads) must be seeded explicitly.
+fn rotate_stream<'a>(
+    be_: &'a VulkanBackend,
+    rec: &mut Option<Recorder<'a>>,
+    ps: &mut PagedStream,
+) -> Result<()> {
+    let seg = rec
+        .take()
+        .expect("segment always Some between ops")
+        .finish_nowait()
+        .map_err(|e| be(e.to_string()))?;
+    ps.pending[ps.half] = Some(seg);
+    ps.half ^= 1;
+    ps.cursor = 0;
+    if let Some(prev) = ps.pending[ps.half].take() {
+        prev.wait().map_err(|e| be(e.to_string()))?;
+    }
+    let fresh = be_.recorder()?;
+    fresh.seed_barrier();
+    *rec = Some(fresh);
+    Ok(())
+}
+
+/// Blocking submit of the ambient segment (queue idle on return) + full stream drain — the ONE
+/// remaining host sync on the paged path, paid only by a small-m layer whose expert set is not
+/// fully resident (its router ids must be read back before its GEMVs can be staged). Both ring
+/// halves and the whole tape are reusable afterwards.
+fn sync_stream<'a>(
+    be_: &'a VulkanBackend,
+    rec: &mut Option<Recorder<'a>>,
+    ps: &mut PagedStream,
+) -> Result<()> {
+    rec.take()
+        .expect("segment always Some between ops")
+        .finish()
+        .map_err(|e| be(e.to_string()))?;
+    ps.drain()?; // fences already signaled (queue idle) — releases their transient objects
+    ps.cursor = 0;
+    ps.tape_cursor = 0;
+    *rec = Some(be_.recorder()?);
+    Ok(())
+}
+
+/// Stage `ids` (layer-LOCAL) of `buf_id`'s role — recorded ring→arena copies for the misses,
+/// rotating the stream whenever the ring half fills (`MoePagerSession::stage_role` never splits
+/// one expert across a rotation, so progress per iteration is guaranteed) — then freeze the
+/// layer's LUT window in the tape and return its word base. `ids` empty = residency already
+/// guaranteed by the caller (`touch_all_hits`); only the window is written.
+fn stage_and_window<'a>(
+    be_: &'a VulkanBackend,
+    rec: &mut Option<Recorder<'a>>,
+    ps: &mut PagedStream,
+    buf_id: usize,
+    ids: &[u32],
+    n_expert: usize,
+    scan: bool,
+) -> Result<u32> {
+    // One epoch batch per (layer, role) — spans ring rotations (the epoch, not LRU position, is
+    // what protects this batch's earlier ids from its later misses on the cold-insert path).
+    {
+        let mut guard = be_.moe_pager().lock().unwrap();
+        let sess = guard.as_mut().expect("paged execution requires a session");
+        sess.begin_batch(buf_id);
+    }
+    let mut start = 0;
+    while start < ids.len() {
+        let done = {
+            let mut guard = be_.moe_pager().lock().unwrap();
+            let sess = guard.as_mut().expect("paged execution requires a session");
+            let half_base = ps.half * sess.ring_half_bytes();
+            sess.stage_role(
+                rec.as_ref().expect("segment always Some between ops"),
+                half_base,
+                &mut ps.cursor,
+                buf_id,
+                &ids[start..],
+                scan,
+            )?
+        };
+        start += done;
+        if start < ids.len() {
+            rotate_stream(be_, rec, ps)?;
+        }
+    }
+    let mut guard = be_.moe_pager().lock().unwrap();
+    let sess = guard.as_mut().expect("paged execution requires a session");
+    sess.lut_window(&mut ps.tape_cursor, buf_id, n_expert)
+}
+
+/// Execute ONE paged `Op::MoeFfn`, recording INLINE into the ambient segment wherever residency
+/// allows — the host-orchestration rework that removed the old per-layer
+/// submit→readback→touch/upload→submit cadence (~4 full-pipeline syncs per layer per ubatch
+/// chunk; INFR_PROF2 measured the GPU ~89% idle on Scout pp512 under it). Three paths:
+///
+///   - BATCHED chunks (`rows·n_used >= 3·n_expert`): the router readback is dropped entirely —
+///     routing that wide touches every expert of the layer with overwhelming probability
+///     (P(expert unrouted) < 1e-8 at the 3x bound), so all `n_expert` are staged up front and
+///     the GPU-side bucket count/scan/scatter pipeline needs no host decision at all. The whole
+///     chunk records into one submission; misses ride recorded ring→arena copies whose only
+///     backpressure is the fenced ring-half rotation (`rotate_stream` — CPU staging overlaps GPU
+///     execution instead of serializing with it).
+///   - Small-m (decode) layers whose full expert set is resident: `touch_all_hits` (LRU upkeep,
+///     no residency/LUT mutation) + a frozen LUT window, recorded inline — zero host syncs.
+///   - Small-m layers with any absent expert: the ONE remaining blocking sync (`sync_stream`) to
+///     read the router's ids — a mapped memcpy, the ids buffer is `Staging` — then routed-only
+///     staging into the fresh ambient segment (which stays open for the next layer).
+///
+/// Every path reads layer-LOCAL expert ids against a frozen per-(layer, role) LUT window in the
+/// session's tape (`lut[window + local_id]` — see `MoePagerSession::lut_window`), never the live
+/// pool LUT, which later layers' staging keeps mutating while earlier recorded work is still in
+/// flight. Evicting a block an in-flight segment reads is safe by construction: the evictor's
+/// arena copy is recorded LATER on the same queue and the hazard barriers (or a rotation's
+/// `seed_barrier`) order it after every prior read.
+///
 /// Only reached from `execute_static`'s loop, and only for a `MoeFfn` whose `gate_exps` buffer is
 /// registered in the backend's `MoePagerSession` (see `pager.rs`'s module doc for why that check —
-/// not a graph-level flag — is the paging signal). Mirrors the non-batched small-m arm's math
-/// (`lower_op`'s `Op::MoeFfn` match, the `rows <= moe_small_m_threshold()` branch) exactly, just
-/// split around one readback and reading the pager's arena+LUT instead of a fully-resident bank.
-///
-/// Split AND fused gate/up: a fused `ffn_gate_up_exps` bank (gemma-4 MoE / DiffusionGemma) is
-/// registered under `Role::Gate` with a double-width ([ne, 2*nff]) slot (see
-/// `infr_vulkan::pager`'s MoE-session doc), so its GEMV/GEMM reads the same arena+LUT hop with
-/// `out_f = 2*nff` and the activation splits gate|up per row exactly like the resident fused
-/// arms (`silu_mul_fused`/`gelu_mul_fused`). `rows`/`n_used` are otherwise general (not
-/// hardcoded to llama4's rows=1/n_used=1), reusing the same shapes the existing small-m arm
-/// already supports.
+/// not a graph-level flag — is the paging signal). Mirrors the resident arms' math exactly
+/// (batched bucket-scatter mmq pipeline / small-m id-GEMV path), including the fused gate_up
+/// shape: a fused `ffn_gate_up_exps` bank (gemma-4 MoE / DiffusionGemma) is registered under
+/// `Role::Gate` with a double-width ([ne, 2*nff]) slot, so its GEMV/GEMM reads the same
+/// arena+window hop with `out_f = 2*nff` and the activation splits gate|up per row exactly like
+/// the resident fused arms. `rows`/`n_used` are general (not hardcoded to llama4's rows=1/
+/// n_used=1).
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-fn execute_paged_moe(
-    be_: &VulkanBackend,
+fn execute_paged_moe<'a>(
+    be_: &'a VulkanBackend,
     graph: &Graph,
     op: &Op,
     scratch: &[Option<Box<dyn Buffer>>],
     bindings: &Bindings,
     pool: &mut ScratchPool,
+    rec: &mut Option<Recorder<'a>>,
+    ps: &mut PagedStream,
 ) -> Result<()> {
-    use crate::pager::{buffer_identity, Role};
+    use crate::pager::buffer_identity;
     let Op::MoeFfn {
         x,
         router_x,
@@ -3527,8 +3678,6 @@ fn execute_paged_moe(
     // mirrors the resident arms' `gu_width` (`stride` is unused by the paged kernels themselves,
     // the LUT bakes the base; it still shapes the pooled scratch below).
     let gu_width = if *fused_gate_up { 2 * nff } else { nff };
-    let stride = gu_width * ne;
-    let down_stride = nff * ne;
     let (gdt, udt, ddt) = (
         graph.desc(*gate_exps).dtype,
         graph.desc(*up_exps).dtype,
@@ -3538,24 +3687,32 @@ fn execute_paged_moe(
     let n_slots = rows * n_used;
     let r = |id: TensorId| resolve(scratch, bindings, id);
 
-    // ── Segment 1: router GEMV + top-k, into a pooled ids/wts pair. Submits + waits on its own —
-    // the host needs `ids` back before the paged GEMVs can be recorded.
+    // ── Router GEMV + top-k, recorded into the AMBIENT segment (no dedicated submit). `ids` is
+    // `Staging` (ReBAR device-local host-visible): the ONE remaining readback — the small-m
+    // split path below — is then a mapped memcpy after `sync_stream`, no one-shot copy submit
+    // and no fresh readback allocation per layer.
     let logits = pooled(pool, be_, "moe_paged_logits", rows * n_expert * 4)?;
-    let ids_key = pooled(pool, be_, "moe_paged_ids", n_slots * 4)?;
+    let ids_key = pooled_usage(
+        pool,
+        be_,
+        "moe_paged_ids",
+        n_slots * 4,
+        BufferUsage::Staging,
+    )?;
     let wts = pooled(pool, be_, "moe_paged_wts", n_slots * 4)?;
     {
-        let rec1 = be_.recorder()?;
+        let rc = rec.as_ref().expect("segment always Some between ops");
         let rxb = r(*router_x)?;
         let rw = r(*router)?;
         let rdt = graph.desc(*router).dtype;
         if native_dense_supported(rdt) {
-            rec1.linear_native(rdt, rw, rxb, pool[&logits].as_ref(), rows, ne, n_expert);
+            rc.linear_native(rdt, rw, rxb, pool[&logits].as_ref(), rows, ne, n_expert);
         } else if matches!(rdt, infr_core::DType::F32) {
-            rec1.linear_f32(rw, rxb, pool[&logits].as_ref(), rows, ne, n_expert);
+            rc.linear_f32(rw, rxb, pool[&logits].as_ref(), rows, ne, n_expert);
         } else {
-            rec1.linear(rw, rxb, pool[&logits].as_ref(), rows, ne, n_expert);
+            rc.linear(rw, rxb, pool[&logits].as_ref(), rows, ne, n_expert);
         }
-        rec1.moe_topk(
+        rc.moe_topk(
             pool[&logits].as_ref(),
             pool[&ids_key].as_ref(),
             pool[&wts].as_ref(),
@@ -3566,17 +3723,7 @@ fn execute_paged_moe(
             gating_u32,
             *norm_w,
         );
-        rec1.finish().map_err(|e| be(e.to_string()))?;
     }
-
-    // ── Host round-trip: read back this layer's chosen (local) expert ids, resolve residency for
-    // all three roles (uploading misses through the pager's shared staging buffer), flush each
-    // role's LUT, then re-upload the GLOBAL ids (`layer_base`-shifted — see `ExpertSource`) the
-    // paged GEMV must index the shared LUT with.
-    let mut id_bytes = vec![0u8; n_slots * 4];
-    be_.download(pool[&ids_key].as_ref(), &mut id_bytes)
-        .map_err(|e| be(e.to_string()))?;
-    let local_ids: Vec<u32> = bytemuck::cast_slice(&id_bytes).to_vec();
 
     let gate_buf = r(*gate_exps)?;
     let up_buf = r(*up_exps)?;
@@ -3586,46 +3733,65 @@ fn execute_paged_moe(
         buffer_identity(up_buf),
         buffer_identity(down_buf),
     );
-    let global_ids = {
-        let mut guard = be_.moe_pager().lock().unwrap();
-        let sess = guard
-            .as_mut()
-            .expect("execute_static only reaches here when be_.moe_paged() is true");
-        let g = sess.touch_role(be_, Role::Gate, gate_id, &local_ids)?;
-        // Fused gate_up: `up_exps` is the SAME handle as `gate_exps` (never separately read, per
-        // `Op::MoeFfn`'s doc) and the bank was registered once under `Role::Gate` — there is no
-        // Up source to touch.
-        if !*fused_gate_up {
-            let u = sess.touch_role(be_, Role::Up, up_id, &local_ids)?;
-            debug_assert_eq!(g, u, "gate/up/down of one layer share the SAME layer_base");
-        }
-        let d = sess.touch_role(be_, Role::Down, down_id, &local_ids)?;
-        debug_assert_eq!(g, d, "gate/up/down of one layer share the SAME layer_base");
-        g
-    };
-    let ids_global_key = pooled_usage(
-        pool,
-        be_,
-        "moe_paged_ids_global",
-        n_slots * 4,
-        BufferUsage::Staging,
-    )?;
-    be_.upload(
-        pool[&ids_global_key].as_ref(),
-        bytemuck::cast_slice(&global_ids),
-    )
-    .map_err(|e| be(e.to_string()))?;
 
-    // ── Segment 2, BATCHED (rows > threshold, Scout's chunked prefill): the same GPU-resident
+    // ── Residency: pick the staging strategy (see the fn doc), ending with every needed expert
+    // resident-at-execution and a frozen per-role LUT window in the session tape.
+    let touch_all = rows * n_used >= 3 * n_expert;
+    // Layer-LOCAL ids to stage; empty = residency already guaranteed (all-resident inline path).
+    let mut stage_ids: Vec<u32> = Vec::new();
+    if touch_all {
+        stage_ids = (0..n_expert as u32).collect();
+    } else {
+        let inline_ok = {
+            let guard = be_.moe_pager().lock().unwrap();
+            let sess = guard
+                .as_ref()
+                .expect("execute_static only reaches here when be_.moe_paged() is true");
+            sess.all_resident(gate_id, n_expert)
+                // Fused gate_up: `up_exps` is the SAME handle as `gate_exps` (never separately
+                // read, per `Op::MoeFfn`'s doc) and the bank was registered once under
+                // `Role::Gate` — there is no Up source to check or touch.
+                && (*fused_gate_up || sess.all_resident(up_id, n_expert))
+                && sess.all_resident(down_id, n_expert)
+        };
+        if inline_ok {
+            let mut guard = be_.moe_pager().lock().unwrap();
+            let sess = guard.as_mut().expect("checked above");
+            sess.touch_all_hits(gate_id, n_expert);
+            if !*fused_gate_up {
+                sess.touch_all_hits(up_id, n_expert);
+            }
+            sess.touch_all_hits(down_id, n_expert);
+        } else {
+            // Split: the router's routing is host-unknown and some routed expert may be absent —
+            // block once, read the ids off the mapped Staging buffer, stage exactly the routed
+            // set into the fresh ambient segment (which then stays open for the layers after).
+            sync_stream(be_, rec, ps)?;
+            let mut id_bytes = vec![0u8; n_slots * 4];
+            be_.download(pool[&ids_key].as_ref(), &mut id_bytes)
+                .map_err(|e| be(e.to_string()))?;
+            stage_ids = bytemuck::cast_slice(&id_bytes).to_vec();
+        }
+    }
+    let gate_w = stage_and_window(be_, rec, ps, gate_id, &stage_ids, n_expert, touch_all)?;
+    let up_w = if *fused_gate_up {
+        gate_w // never dispatched (no Up GEMV on the fused shape) — placeholder
+    } else {
+        stage_and_window(be_, rec, ps, up_id, &stage_ids, n_expert, touch_all)?
+    };
+    let down_w = stage_and_window(be_, rec, ps, down_id, &stage_ids, n_expert, touch_all)?;
+
+    // ── BATCHED arm (rows > threshold, Scout's chunked prefill): the same GPU-resident
     // bucket count/scan/scatter → dp4a mmq expert-GEMM pipeline as the resident batched arm
-    // (`lower_op`'s `Op::MoeFfn`), with the GEMMs reading the pager arena through the word-base
-    // LUT (`matmul_mmq_experts_paged`) instead of a resident bank. All ROUTED experts of this
-    // layer are already resident and the LUT flushed (the `touch_role` calls above resolve every
-    // id in the chunk — up to `n_expert` distinct simultaneously, which the pager budget floor in
-    // `seam::mod` guarantees fits); buckets with count 0 never read the LUT. Gated on the exact
-    // dtype set that has `_xpg` kernel builds (`infr_core::tensor::MOE_MMQ_PAGED_DTYPES` — now
-    // the FULL `MOE_MMQ_DTYPES` set, mirror checked by `moe_mmq_drift_test`) + activation + dp4a
-    // support; anything else stays on the id-GEMV segment below, which is shape-general.
+    // (`lower_op`'s `Op::MoeFfn`), with the GEMMs reading the pager arena through the frozen
+    // tape window (`matmul_mmq_experts_paged`) instead of a resident bank — recorded INLINE
+    // into the ambient segment. Every ROUTED expert is resident-at-execution (the staging above
+    // covers all `n_expert` on the touch-all path, or exactly the readback's routed set — up to
+    // `n_expert` distinct simultaneously, which the pager budget floor in `seam::mod` guarantees
+    // fits); buckets with count 0 never read the window. Gated on the exact dtype set that has
+    // `_xpg` kernel builds (`infr_core::tensor::MOE_MMQ_PAGED_DTYPES` — the FULL
+    // `MOE_MMQ_DTYPES` set, mirror checked by `moe_mmq_drift_test`) + activation + dp4a
+    // support; anything else stays on the id-GEMV arm below, which is shape-general.
     {
         let paged_mmq_ok = infr_core::tensor::moe_paged_mmq_ok;
         let act_ok = if *fused_gate_up {
@@ -3642,8 +3808,6 @@ fn execute_paged_moe(
             && paged_mmq_ok(udt)
             && paged_mmq_ok(ddt)
         {
-            // gate/up/down of one layer share the SAME layer_base (asserted above).
-            let layer_base = (global_ids[0] - local_ids[0]) as usize;
             let n_pairs = n_slots;
             // The GEMM As stage reads up to 63 rows past a segment end — pad the packed row
             // dimension so the LAST expert's overread stays in-bounds (the resident arm's npad).
@@ -3671,7 +3835,7 @@ fn execute_paged_moe(
             let dsa = pooled(pool, be_, "moe_pgb_dsa", npad * (nff / 32) * 2)?;
             let ye = pooled(pool, be_, "moe_pgb_ye", npad * ne * 4)?;
 
-            let rec2 = be_.recorder()?;
+            let rec2 = rec.as_ref().expect("segment always Some between ops");
             let xb = r(*x)?;
             rec2.zero(pool[&counts].as_ref(), n_expert);
             rec2.moe_bucket_count(pool[&ids_key].as_ref(), pool[&counts].as_ref(), n_pairs);
@@ -3719,8 +3883,8 @@ fn execute_paged_moe(
                     pool[&qda].as_ref(),
                     gate_needs_sact.then(|| pool[&qsa].as_ref()),
                     sess.arena(gate_id),
-                    sess.lut(gate_id),
-                    layer_base,
+                    sess.tape(),
+                    gate_w as usize,
                     pool[&counts].as_ref(),
                     pool[&offsets].as_ref(),
                     pool[&ge].as_ref(),
@@ -3742,8 +3906,8 @@ fn execute_paged_moe(
                         pool[&qda].as_ref(),
                         up_needs_sact.then(|| pool[&qsa].as_ref()),
                         sess.arena(up_id),
-                        sess.lut(up_id),
-                        layer_base,
+                        sess.tape(),
+                        up_w as usize,
                         pool[&counts].as_ref(),
                         pool[&offsets].as_ref(),
                         pool[ue].as_ref(),
@@ -3811,8 +3975,8 @@ fn execute_paged_moe(
                     pool[&dda].as_ref(),
                     down_needs_sact.then(|| pool[&dsa].as_ref()),
                     sess.arena(down_id),
-                    sess.lut(down_id),
-                    layer_base,
+                    sess.tape(),
+                    down_w as usize,
                     pool[&counts].as_ref(),
                     pool[&offsets].as_ref(),
                     pool[&ye].as_ref(),
@@ -3833,15 +3997,15 @@ fn execute_paged_moe(
                 n_used,
                 *weight_before,
             );
-            rec2.finish().map_err(|e| be(e.to_string()))?;
-            return Ok(());
+            return Ok(()); // recorded inline — the ambient segment stays open
         }
     }
 
-    // ── Segment 2: the paged expert GEMVs (arena+LUT instead of a resident bank) through the rest
-    // of this MoeFfn's math — activation, down-projection, weighted accumulate — exactly mirroring
-    // the non-paged small-m arm (including its fused-gate_up shape: one double-width GEMV into a
-    // gate|up buffer, split by the fused activation kernel).
+    // ── Small-m id-GEMV arm: the paged expert GEMVs (arena + frozen tape window, LOCAL ids)
+    // through the rest of this MoeFfn's math — activation, down-projection, weighted accumulate —
+    // exactly mirroring the non-paged small-m arm (including its fused-gate_up shape: one
+    // double-width GEMV into a gate|up buffer, split by the fused activation kernel). Recorded
+    // inline into the ambient segment like the batched arm above.
     let gbuf = pooled(pool, be_, "moe_paged_g", n_slots * gu_width * 4)?;
     let ubuf = if *fused_gate_up {
         None
@@ -3851,7 +4015,7 @@ fn execute_paged_moe(
     let abuf = pooled(pool, be_, "moe_paged_a", n_slots * nff * 4)?;
     let ybuf = pooled(pool, be_, "moe_paged_y", n_slots * ne * 4)?;
     let n_act = n_slots * nff;
-    let rec2 = be_.recorder()?;
+    let rec2 = rec.as_ref().expect("segment always Some between ops");
     let xb = r(*x)?;
     {
         let guard = be_.moe_pager().lock().unwrap();
@@ -3859,10 +4023,10 @@ fn execute_paged_moe(
         rec2.linear_native_id_multi_paged(
             gdt,
             sess.arena(gate_id),
-            sess.lut(gate_id),
-            pool[&ids_global_key].as_ref(),
+            sess.tape(),
+            pool[&ids_key].as_ref(),
             n_used,
-            stride,
+            gate_w as usize,
             xb,
             false,
             pool[&gbuf].as_ref(),
@@ -3874,10 +4038,10 @@ fn execute_paged_moe(
             rec2.linear_native_id_multi_paged(
                 udt,
                 sess.arena(up_id),
-                sess.lut(up_id),
-                pool[&ids_global_key].as_ref(),
+                sess.tape(),
+                pool[&ids_key].as_ref(),
                 n_used,
-                stride,
+                up_w as usize,
                 xb,
                 false,
                 pool[ubuf].as_ref(),
@@ -3946,10 +4110,10 @@ fn execute_paged_moe(
         rec2.linear_native_id_multi_paged(
             ddt,
             sess.arena(down_id),
-            sess.lut(down_id),
-            pool[&ids_global_key].as_ref(),
+            sess.tape(),
+            pool[&ids_key].as_ref(),
             n_used,
-            down_stride,
+            down_w as usize,
             pool[&abuf].as_ref(),
             true,
             pool[&ybuf].as_ref(),
@@ -3965,8 +4129,7 @@ fn execute_paged_moe(
             pool[&ybuf].as_ref(),
             pool[&wts].as_ref(),
             // `down_scale[expert_id]` indexes by the LOCAL id (the layer's own [n_expert] scale
-            // array), not the global/LUT id — reuse the router's own `ids` buffer, not the
-            // re-uploaded global one.
+            // array) — the same local-ids buffer the windowed GEMVs read.
             pool[&ids_key].as_ref(),
             r(*ds)?,
             dstb,
@@ -3984,8 +4147,7 @@ fn execute_paged_moe(
             *weight_before,
         ),
     }
-    rec2.finish().map_err(|e| be(e.to_string()))?;
-    Ok(())
+    Ok(()) // recorded inline — the ambient segment stays open
 }
 
 #[cfg(test)]

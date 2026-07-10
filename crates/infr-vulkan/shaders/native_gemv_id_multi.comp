@@ -73,8 +73,12 @@ void main() {
     uint t = gl_LocalInvocationID.x;
 #ifdef PAGED
     // WORD base from the LUT (see nw_base's doc); wbase keeps only the small within-expert
-    // element offset. `pc.stride` is unused in this build — the host baked it into the LUT.
-    nw_base = lut[ids[slot_global]];
+    // element offset. `pc.stride` is repurposed in this build as the LUT WINDOW base: `ids` holds
+    // the layer-LOCAL expert ids straight from moe_topk (no host readback / global-id rewrite) and
+    // the host points `stride` at a run of per-expert word bases for exactly this layer — a
+    // write-once window in the session's LUT tape (see `MoePagerSession::lut_window` for why
+    // in-flight segments must read a frozen copy, not the live pool LUT).
+    nw_base = lut[pc.stride + ids[slot_global]];
     uint wbase = o * pc.in_f;
 #else
     uint wbase = ids[slot_global] * pc.stride + o * pc.in_f;

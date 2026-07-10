@@ -159,6 +159,80 @@ impl GpuPager {
         self.pager.slot_of(id).is_some()
     }
 
+    /// [`Self::ensure_resident`]'s RECORDED twin: on a miss, memcpy `bytes` into the caller's
+    /// staging ring at `ring_off` (a host-mapped write) and record the ring→arena slot copy
+    /// through `rec` instead of submitting an immediate one-shot — the caller batches many
+    /// misses (and whole layers of compute) into one submission. Contract: the ring region
+    /// `[ring_off, ring_off + slot_bytes)` must stay untouched until that recording's submit
+    /// completes (the adapter's fenced ring-half rotation enforces this). The HOST LUT mirror is
+    /// updated exactly like `ensure_resident`; the device-visible copy is the caller's frozen
+    /// tape window (see [`MoePagerSession::lut_window`]) — `flush_lut` is NOT required on this
+    /// path. Returns the ring bytes consumed (0 on a hit).
+    pub fn touch_staged(
+        &mut self,
+        rec: &crate::recorder::Recorder<'_>,
+        ring: &dyn Buffer,
+        ring_off: usize,
+        id: BlockId,
+        bytes: &[u8],
+        scan: bool,
+    ) -> Result<usize> {
+        debug_assert_eq!(
+            bytes.len(),
+            self.slot_bytes,
+            "block byte size must match the arena's slot size"
+        );
+        // `scan`: full-set sweep (batched prefill's touch-all) → the scan-resistant cold-end
+        // policy; otherwise classic LRU (decode's routed-only touches). See
+        // `infr_core::pager::Pager::touch_cold`.
+        let resolution = if scan {
+            self.pager.touch_cold(id)
+        } else {
+            self.pager.touch(id)
+        };
+        match resolution {
+            Resolution::Hit { .. } => Ok(0),
+            Resolution::Miss { slot, evicted } => {
+                // Safety: `ring` was allocated by this same backend (session-owned Staging).
+                let base = unsafe { as_vk_buf(ring) }
+                    .mapped_ptr()
+                    .ok_or_else(|| be("pager staging ring is not persistently mapped"))?;
+                par_copy_to_mapped(bytes, unsafe { base.add(ring_off) });
+                rec.copy(
+                    ring,
+                    ring_off,
+                    self.arena.as_ref(),
+                    slot as usize * self.slot_bytes,
+                    self.slot_bytes,
+                );
+                if let Some(e) = evicted {
+                    if let Some(v) = self.lut_host.get_mut(e as usize) {
+                        *v = NOT_RESIDENT;
+                    }
+                }
+                if let Some(v) = self.lut_host.get_mut(id as usize) {
+                    // Word base, not slot index — see `lut_host`'s doc.
+                    *v = slot * self.words_per_slot;
+                }
+                self.lut_dirty = true;
+                Ok(self.slot_bytes)
+            }
+        }
+    }
+
+    /// `n` host-mirror LUT words starting at block id `base` — the source a frozen tape window
+    /// copies from (see [`MoePagerSession::lut_window`]).
+    fn lut_words(&self, base: usize, n: usize) -> &[u32] {
+        &self.lut_host[base..base + n]
+    }
+
+    /// Open a touch batch — see `infr_core::pager::Pager::begin_batch`. One batch = one
+    /// (layer, role) residency resolution; blocks it touches are eviction-protected until the
+    /// next batch opens.
+    pub fn begin_batch(&mut self) {
+        self.pager.begin_batch();
+    }
+
     /// Ensure `id` is resident, uploading `bytes` (exactly `slot_bytes`) through `staging` if it's
     /// a miss. Updates the HOST lut mirror immediately; the device copy is deferred to
     /// [`flush_lut`](Self::flush_lut) so a caller resolving several ids for one batch (see
@@ -210,6 +284,25 @@ impl GpuPager {
         }
         Ok(())
     }
+}
+
+/// Parallel memcpy of one expert's bytes into the mapped staging ring. The single-thread copy is
+/// the staging bottleneck (the bandwidth probe's 22 GB/s is a hot-source best case; streaming
+/// distinct experts out of a 37 GB page-cache-backed mmap into write-combined ReBAR runs well
+/// below that) — chunked `copy_nonoverlapping` across the rayon pool recovers most of the
+/// PCIe/DRAM headroom. 4 MiB chunks: big enough for streaming stores, small enough to spread a
+/// 14-18 MB expert across several workers.
+fn par_copy_to_mapped(src: &[u8], dst: *mut u8) {
+    use rayon::prelude::*;
+    const CHUNK: usize = 4 << 20;
+    if src.len() <= CHUNK {
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) };
+        return;
+    }
+    let dst_addr = dst as usize; // Send-able; each chunk writes a disjoint range
+    src.par_chunks(CHUNK).enumerate().for_each(|(i, c)| unsafe {
+        std::ptr::copy_nonoverlapping(c.as_ptr(), (dst_addr + i * CHUNK) as *mut u8, c.len());
+    });
 }
 
 /// Device-to-device copy of `len` bytes from `src[0..len]` into `dst[slot*len .. (slot+1)*len]` —
@@ -345,6 +438,21 @@ pub struct MoePagerSession {
     /// resident-weight path.
     sources: HashMap<usize, (Role, usize, ExpertSource)>,
     staging: Box<dyn Buffer>,
+    /// Pinned staging RING for the recorded-upload path ([`GpuPager::touch_staged`]): two
+    /// fence-rotated halves of [`Self::ring_half_bytes`] each, so the CPU stages the next
+    /// segment's misses while the GPU executes the previous one (see
+    /// `adapter::execute_paged_moe`'s rotation). Sized by [`MoePagerLayout::ring_bytes`].
+    ring: Box<dyn Buffer>,
+    ring_half_bytes: usize,
+    /// LUT tape: an append-only run of frozen per-(layer, role) LUT windows (`n_expert` u32 word
+    /// bases each, written by [`Self::lut_window`]). Dispatches read `tape[window + local_id]`
+    /// instead of the live pool LUT, so host-side staging for LATER layers can keep mutating the
+    /// mirror while EARLIER layers' recorded-but-in-flight dispatches still read a consistent
+    /// view — the in-flight-LUT rule that a single mutable device LUT cannot satisfy once
+    /// several layers record into one submission. The cursor is the adapter's (reset only after
+    /// a full drain).
+    tape: Box<dyn Buffer>,
+    tape_words: usize,
     print_stats: bool,
 }
 
@@ -375,6 +483,30 @@ pub struct MoePagerLayout {
     /// it; other layers' entries stay `NOT_RESIDENT`).
     pub n_blocks: usize,
     pub pools: Vec<MoePoolSpec>,
+    /// Total bytes for the pinned upload ring (two fence-rotated halves — see
+    /// [`MoePagerSession`]'s `ring` field). `0` picks the default
+    /// ([`default_ring_bytes`]); either way each half is floored at the largest pool slot so one
+    /// miss always fits. The seam's budget math subtracts this before splitting arena shares.
+    pub ring_bytes: usize,
+}
+
+/// Upload-ring sizing policy: `INFR_PAGER_RING` (shared size grammar) wins; otherwise an eighth
+/// of the pager budget, clamped to [256 MiB, 2 GiB]. Bigger halves = fewer pipeline rotations,
+/// and each rotation stalls the CPU on the other half's fence — measured on Scout pp512 (miss-
+/// heavy steady state, ~22 GB staged/rep): 256 MiB → 224 t/s, 1 GiB → 324, 2 GiB → 404, flat
+/// beyond. The budget fraction keeps small explicit `INFR_CACHE` runs from spending most of
+/// their grant on staging instead of arena slots.
+pub fn ring_bytes_policy(pager_budget: u64) -> usize {
+    const MIB: u64 = 1024 * 1024;
+    if let Some(b) = std::env::var("INFR_PAGER_RING")
+        .ok()
+        .and_then(|v| infr_core::parse_size(&v))
+        .map(|s| s.resolve(0) as usize)
+        .filter(|&b| b > 0)
+    {
+        return b;
+    }
+    (pager_budget / 8).clamp(256 * MIB, 2048 * MIB) as usize
 }
 
 impl MoePagerSession {
@@ -390,10 +522,29 @@ impl MoePagerSession {
             staging_bytes = staging_bytes.max(spec.slot_bytes);
         }
         let staging = vk.alloc_uninit(staging_bytes, BufferUsage::Staging)?;
+        // Each ring half must hold the largest slot, or `touch_staged` could never make progress
+        // on that pool (the adapter rotates halves when one fills; a slot bigger than a half
+        // would fit in neither).
+        let ring_total = if layout.ring_bytes > 0 {
+            layout.ring_bytes
+        } else {
+            ring_bytes_policy(0) // 0 budget → the clamp floor (env override still wins)
+        };
+        let ring_half_bytes = (ring_total / 2).max(staging_bytes);
+        let ring = vk.alloc_uninit(2 * ring_half_bytes, BufferUsage::Staging)?;
+        // One graph's windows = paged layers x roles x n_expert words (Scout: 48 x 3 x 16 = 2.3k)
+        // — 64k words (256 KiB) leaves an order of magnitude of headroom; `lut_window` hard-errors
+        // on overflow rather than wrapping into a region an in-flight segment may still read.
+        let tape_words = 64 * 1024;
+        let tape = vk.alloc_uninit(tape_words * 4, BufferUsage::Staging)?;
         Ok(Self {
             pools,
             sources: HashMap::new(),
             staging,
+            ring,
+            ring_half_bytes,
+            tape,
+            tape_words,
             print_stats: std::env::var("INFR_PAGER_STATS").is_ok(),
         })
     }
@@ -461,6 +612,176 @@ impl MoePagerSession {
         }
         pager.flush_lut(vk)?;
         Ok(global)
+    }
+
+    /// The shared upload ring / its per-half capacity (see the `ring` field's doc). The CURSOR
+    /// into it lives with the adapter's per-execute stream state, not here.
+    pub fn ring(&self) -> &dyn Buffer {
+        self.ring.as_ref()
+    }
+
+    pub fn ring_half_bytes(&self) -> usize {
+        self.ring_half_bytes
+    }
+
+    /// The LUT tape buffer every windowed dispatch binds (see the `tape` field's doc).
+    pub fn tape(&self) -> &dyn Buffer {
+        self.tape.as_ref()
+    }
+
+    /// Whether ALL `n_expert` experts of `buf_id`'s layer are resident in its pool — the
+    /// no-readback inline gate for a small-m (decode) layer: when true, any routing the GPU
+    /// picks is covered, so the host needs no routing knowledge at all.
+    pub fn all_resident(&self, buf_id: usize, n_expert: usize) -> bool {
+        let (_, pool, src) = match self.sources.get(&buf_id) {
+            Some(s) => s,
+            None => return false,
+        };
+        let pager = &self.pools[*pool].pager;
+        (0..n_expert as u32).all(|e| pager.is_resident(src.layer_base + e))
+    }
+
+    /// LRU maintenance for an inline-recorded (no-readback) layer: mark all `n_expert` blocks
+    /// MRU. Callers gate on [`Self::all_resident`], so every touch is a hit — no uploads, no LUT
+    /// mutation (the property that makes inline recording safe while earlier segments are still
+    /// in flight).
+    pub fn touch_all_hits(&mut self, buf_id: usize, n_expert: usize) {
+        let (_, pool, src) = self
+            .sources
+            .get(&buf_id)
+            .expect("moe pager: touch on an unregistered buffer");
+        let layer_base = src.layer_base;
+        let pager = &mut self.pools[*pool].pager;
+        pager.begin_batch();
+        for e in 0..n_expert as u32 {
+            let r = pager.pager.touch(layer_base + e);
+            debug_assert!(
+                matches!(r, Resolution::Hit { .. }),
+                "touch_all_hits on a non-resident block (all_resident gate violated)"
+            );
+        }
+    }
+
+    /// Open a touch batch on `buf_id`'s pool — call once per (layer, role) residency resolution,
+    /// BEFORE the first [`Self::stage_role`] call of that batch (rotations re-call `stage_role`
+    /// WITHIN the same batch; the epoch protection must span them).
+    pub fn begin_batch(&mut self, buf_id: usize) {
+        let (_, pool, _) = self
+            .sources
+            .get(&buf_id)
+            .expect("moe pager: begin_batch on an unregistered buffer");
+        self.pools[*pool].pager.begin_batch();
+    }
+
+    /// Stage `local_ids`' residency for `buf_id`'s layer through `rec`-recorded ring→arena
+    /// copies: hits are marked MRU, misses memcpy into the ring at `half_base + *cursor` and
+    /// record the slot copy ([`GpuPager::touch_staged`]). Stops when the current ring half can't
+    /// hold the next miss and returns how many ids were FULLY staged — the caller rotates the
+    /// ring (submitting the recorder, fencing the half) and re-calls with the remainder; an
+    /// expert's bytes are never split across a rotation. Progress is guaranteed: a half holds at
+    /// least one slot of every pool (asserted at construction).
+    ///
+    /// Within-batch eviction safety (`infr_core::pager::Pager`'s invariant) holds across
+    /// rotations: a rotation performs no touches, and every id staged earlier in this batch is
+    /// MRU-protected from the batch's later touches exactly as in the one-shot path.
+    /// `scan` selects the residency policy: `true` = the touch-all full-set sweep (batched
+    /// prefill) → scan-resistant cold-end insertion; `false` = classic LRU (decode's routed-only
+    /// readback path). See `infr_core::pager::Pager::touch_cold`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_role(
+        &mut self,
+        rec: &crate::recorder::Recorder<'_>,
+        half_base: usize,
+        cursor: &mut usize,
+        buf_id: usize,
+        local_ids: &[u32],
+        scan: bool,
+    ) -> Result<usize> {
+        let (pool_idx, stride, layer_base, bytes_arc) = {
+            let (_, pool, src) = self
+                .sources
+                .get(&buf_id)
+                .ok_or_else(|| be("moe pager: stage on an unregistered buffer"))?;
+            (
+                *pool,
+                src.stride_bytes,
+                src.layer_base,
+                Arc::clone(&src.bytes),
+            )
+        };
+        // See `touch_role` for why the explicit deref-to-trait-object.
+        let inner: &(dyn AsRef<[u8]> + Send + Sync) = &*bytes_arc;
+        let bytes: &[u8] = inner.as_ref();
+        // Disjoint field borrows (the pool mutably, the ring by ref) — destructure once.
+        let Self {
+            pools,
+            ring,
+            ring_half_bytes,
+            ..
+        } = self;
+        let pager = &mut pools[pool_idx].pager;
+        let half_bytes = *ring_half_bytes;
+        debug_assert!(
+            half_bytes >= pager.slot_bytes(),
+            "ring half smaller than a slot (construction floor violated)"
+        );
+        for (i, &lid) in local_ids.iter().enumerate() {
+            let id = layer_base + lid;
+            if !pager.is_resident(id) && *cursor + pager.slot_bytes() > half_bytes {
+                return Ok(i); // half full — caller rotates and continues from here
+            }
+            let off = lid as usize * stride;
+            let slice = bytes
+                .get(off..off + stride)
+                .ok_or_else(|| be("moe pager: expert id out of range for this layer's bank"))?;
+            *cursor +=
+                pager.touch_staged(rec, ring.as_ref(), half_base + *cursor, id, slice, scan)?;
+        }
+        Ok(local_ids.len())
+    }
+
+    /// Freeze `buf_id`'s layer LUT window — `n_expert` word bases starting at its `layer_base`,
+    /// copied from the pool's host mirror into the tape at `*tape_cursor` — and return the tape
+    /// word offset the layer's dispatches pass as `lut_base` (`lut[base + local_id]`). Must be
+    /// called AFTER every `stage_role` call for that (layer, role) batch completed (the
+    /// within-batch LUT rule: the window must reflect every id the batch touched). Errors on
+    /// tape overflow instead of wrapping — a wrapped window could alias one an in-flight segment
+    /// still reads (the cursor only resets after a full drain; see the `tape` field's doc).
+    pub fn lut_window(
+        &mut self,
+        tape_cursor: &mut usize,
+        buf_id: usize,
+        n_expert: usize,
+    ) -> Result<u32> {
+        let (_, pool, src) = self
+            .sources
+            .get(&buf_id)
+            .ok_or_else(|| be("moe pager: lut_window on an unregistered buffer"))?;
+        if *tape_cursor + n_expert > self.tape_words {
+            return Err(be(format!(
+                "moe pager: LUT tape overflow ({} + {n_expert} > {} words) — one drain cycle \
+                 recorded more layer windows than the tape holds",
+                *tape_cursor, self.tape_words,
+            )));
+        }
+        let window = self.pools[*pool]
+            .pager
+            .lut_words(src.layer_base as usize, n_expert);
+        // Safety: the tape is session-owned Staging (persistently mapped) and the region written
+        // is fresh this drain cycle — no in-flight reader can see a partial window.
+        let base = unsafe { as_vk_buf(self.tape.as_ref()) }
+            .mapped_ptr()
+            .ok_or_else(|| be("pager LUT tape is not persistently mapped"))?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                window.as_ptr(),
+                base.add(*tape_cursor * 4).cast::<u32>(),
+                n_expert,
+            );
+        }
+        let w = *tape_cursor as u32;
+        *tape_cursor += n_expert;
+        Ok(w)
     }
 
     fn pool_of(&self, buf_id: usize) -> &Pool {

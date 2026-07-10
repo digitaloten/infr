@@ -312,6 +312,12 @@ pub(crate) fn vulkan_moe_binder<'a>(
         }
         if n_paged > 0 {
             let n_blocks = n_paged * n_expert;
+            // The session's pinned upload ring (two fence-rotated halves — see
+            // `MoePagerSession`'s `ring` doc) lives in the same VRAM the arenas do: subtract it
+            // from the budget BEFORE splitting arena shares so the paged footprint stays within
+            // what the caller granted (INFR_CACHE) / what the auto tier measured as free.
+            let ring_bytes = infr_vulkan::pager::ring_bytes_policy(pager_budget_bytes);
+            pager_budget_bytes = pager_budget_bytes.saturating_sub(ring_bytes as u64);
             let total_bytes: u64 = pool_blocks
                 .iter()
                 .map(|&(_, sb, nb)| (sb * nb) as u64)
@@ -376,8 +382,12 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 pool_desc.join(", "),
                 pager_budget_bytes as f64 / 1e9,
             );
-            vk.init_moe_pager(infr_vulkan::pager::MoePagerLayout { n_blocks, pools })
-                .map_err(|e| anyhow!("{e}"))?;
+            vk.init_moe_pager(infr_vulkan::pager::MoePagerLayout {
+                n_blocks,
+                pools,
+                ring_bytes,
+            })
+            .map_err(|e| anyhow!("{e}"))?;
         }
     }
 

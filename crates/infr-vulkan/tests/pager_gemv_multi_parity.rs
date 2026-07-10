@@ -122,13 +122,15 @@ fn multi_paged_gemv_chained_in_one_recorder_matches_host() {
     // `execute_paged_moe` uses. A missing barrier between either GEMV's write and silu_mul's read
     // would leave `abuf` with stale/garbage values despite `gbuf`/`ubuf` looking fine on their own.
     let rec = be.recorder().unwrap();
+    // `lut_base = 0`: this synthetic single-layer bank's local ids ARE its LUT indices (the
+    // adapter passes a frozen tape-window base here — `lut[base + local_id]`).
     rec.linear_native_id_multi_paged(
         DType::Q8_0,
         gate_pager.arena_buffer(),
         gate_pager.lut_buffer(),
         ids_buf.as_ref(),
         n_used,
-        stride_elems,
+        0,
         x_buf.as_ref(),
         false,
         gbuf.as_ref(),
@@ -142,7 +144,7 @@ fn multi_paged_gemv_chained_in_one_recorder_matches_host() {
         up_pager.lut_buffer(),
         ids_buf.as_ref(),
         n_used,
-        stride_elems,
+        0,
         x_buf.as_ref(),
         false,
         ubuf.as_ref(),

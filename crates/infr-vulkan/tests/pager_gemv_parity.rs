@@ -95,13 +95,14 @@ fn paged_gemv_matches_host_reference_under_eviction_churn() {
             .unwrap();
 
         let rec = be.recorder().unwrap();
+        // `lut_base = 0`: this synthetic single-layer bank's local ids ARE its LUT indices.
         rec.linear_native_id_paged(
             DType::Q8_0,
             pager.arena_buffer(),
             pager.lut_buffer(),
             ids_buf.as_ref(),
             0,
-            stride_elems,
+            0,
             x_buf.as_ref(),
             y_buf.as_ref(),
             1,

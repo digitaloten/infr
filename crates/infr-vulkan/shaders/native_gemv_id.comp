@@ -68,8 +68,10 @@ void main() {
     uint t = gl_LocalInvocationID.x;
 #ifdef PAGED
     // WORD base from the LUT (see nw_base's doc); wbase keeps only the small within-expert
-    // element offset. `pc.stride` is unused in this build — the host baked it into the LUT.
-    nw_base = lut[ids[pc.slot]];
+    // element offset. `pc.stride` is repurposed in this build as the LUT WINDOW base and `ids`
+    // holds layer-LOCAL expert ids — same contract as native_gemv_id_multi.comp's PAGED build
+    // (see its comment for the tape-window rationale).
+    nw_base = lut[pc.stride + ids[pc.slot]];
     uint wbase = o * pc.in_f;
 #else
     uint wbase = ids[pc.slot] * pc.stride + o * pc.in_f;
