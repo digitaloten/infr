@@ -274,15 +274,15 @@ prefill at 4096 KV depth (the multi-turn serve shape).
 | Qwen3.5-9B            | Q4_K_M      | **1.16×** | 0.96×     | 0.97×      | **1.32×** |
 | Qwen3.5-9B (MTP)²     | Q4_K_M      | **1.18×** | 0.93×     | 0.93×      | **1.39×** |
 | Qwen3.5-9B (MTP)²     | UD-Q4_K_XL  | **1.15×** | 0.93×     | 0.93×      | **1.22×** |
-| Gemma-3-12B           | Q4_K_M      | **1.25×** | 1.00×     | **1.03×**  | **1.39×** |
-| Gemma-4-12B           | Q4_K_M      | **1.27×** | **1.01×** | 1.00×      | **1.40×** |
+| Gemma-3-12B           | Q4_K_M      | **1.24×** | 1.00×     | **1.02×**  | **1.68×** |
+| Gemma-4-12B           | Q4_K_M      | **1.26×** | 1.00×     | 1.00×      | **1.66×** |
 | Qwen3-14B             | Q2_K¹       | **1.21×** | 0.74×     | 0.73×      | 0.96×     |
 | Qwen3-14B             | Q4_K_M      | **1.12×** | 0.92×     | 0.88×      | **1.21×** |
 | Qwen3-14B             | Q8_0¹       | **1.14×** | **1.02×** | 0.97×      | 0.93×     |
 | Gemma-4-26B-A4B (MoE) | UD-Q4_K_M   | 0.99×     | 0.92×     | 0.95×      | **1.16×** |
 | Qwen3.6-27B           | Q4_K_M      | **1.09×** | 0.94×     | 0.93×      | **1.14×** |
 | Qwen3-30B-A3B (MoE)   | Q4_K_M      | 0.96×     | 0.95×     | 0.93×      | **1.14×** |
-| Gemma-4-31B           | UD-Q5_K_XL³ | **0.98×** | 0.89×     | 0.08×      | 0.13×     |
+| Gemma-4-31B           | UD-Q5_K_XL³ | **0.97×** | 0.88×     | 0.90×      | 0.81×     |
 | Ornith-1.0-35B        | Q4_K_M¹     | 0.89×     | **1.01×** | **1.03×**  | **1.48×** |
 | Qwen3.6-35B-A3B (MoE) | UD-IQ3_S⁴   | 0.03×     | 0.50×     | 0.52×      | 0.35×     |
 | Qwen3.6-35B-A3B (MoE) | UD-Q4_K_M   | **1.03×** | 0.98×     | 0.99×      | **1.53×** |
@@ -308,14 +308,16 @@ mrow GEMV tier and a thresholded rollback-window reprime that keeps verify m ≤
 16 (+15% on the 9B). Plain (non-MTP) metrics for the same weights are the rows
 shown.
 
-³ Gemma-4-31B (21.9 GiB weights on the 24 GB card) runs **resident at default
-context** since `e2c0694` (try-resident-first dense placement with an honest
-activation reserve — the old MoE-sized 2 GiB headroom plus a phantom +1.6 GiB in
-the tied-lm-head accounting used to push it into streaming): pp512 0.98×, tg128
-0.89×. The `@d4096` columns still **stream**: infr sizes every layer's KV at
-full context while llama.cpp sizes sliding-window layers to the SWA window, and
-full-ctx KV (4.3 GB) doesn't fit beside the weights. Window-sized SWA KV is
-queued — it makes d4096 resident too.
+³ Gemma-4-31B (21.9 GiB weights on the 24 GB card) runs **fully resident,
+including at depth**, after two placement slices: try-resident-first dense
+placement (`e2c0694` — honest activation reserve + a phantom +1.6 GiB accounting
+fix) and **window-sized ring KV for sliding-window layers** (`35821b6`,
+llama.cpp-parity: 50 of its 60 layers are SWA with a 1024 window, so their
+caches are 2048-row rings instead of full-context — @8k that's 0.44 GiB instead
+of 5.5). The d4096 row went 0.08× → 0.90× (28 vs 31 t/s). The same slice also
+reuses empty KV slots instead of forking a duplicate (`f74556c` — was silently
+wasting a full KV per session, 6.25 GiB on a 14B), and lifted the gemma-family
+multi-turn rows (12B `pp4@d4096` 1.40× → 1.66×: less dead KV to re-scan).
 
 ⁴ Grid i-quant (IQ1–IQ3) expert banks are **correct but on the slow floor** (row
 measured post-`618cd3b`, which fixed a device-lost TDR: dynamically indexed GLSL
