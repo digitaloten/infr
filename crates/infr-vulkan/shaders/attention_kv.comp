@@ -67,6 +67,10 @@ void main() {
     uint lo = (pc.window > 0u && qpos + 1u > pc.window) ? (qpos + 1u - pc.window) : 0u;
     uint kvh = h / (pc.nh / pc.nkv);
     uint hd = pc.hd;
+    // SWA ring cache: row capacity = cap / row width. Key/value POSITION j lives at row j % rcap —
+    // the ring only ever recycles rows whose positions the sliding-window mask (lo) already
+    // excludes, so this is exact. On a full-context cache j < kv_len <= rcap: identity.
+    uint rcap = (pc.cap > 0u) ? pc.cap / (pc.nkv * hd) : 0u;
     // scale > 0 → caller-supplied (gemma4 uses 1.0, QK-norm controls magnitude); else 1/√hd default.
     float scale = pc.scale > 0.0 ? pc.scale : 1.0 / sqrt(float(hd));
 
@@ -91,7 +95,8 @@ void main() {
             if (j < lo) {
                 s = -3.0e38; // outside the sliding window → masked (exp → 0)
             } else {
-                uint kbase = (j * pc.nkv + kvh) * hd;
+                uint jr = (rcap > 0u) ? (j % rcap) : j;
+                uint kbase = (jr * pc.nkv + kvh) * hd;
                 float dotv = 0.0;
                 for (uint d = 0u; d < hd; d++) { dotv += q_sh[d] * KREAD(kbase + d); }
                 s = dotv * scale;
@@ -129,7 +134,10 @@ void main() {
             uint d = t + c * 64u;
             if (d < hd) {
                 float a = 0.0;
-                for (uint j = ts; j < te; j++) { a += sc[j - ts] * VREAD((j * pc.nkv + kvh) * hd + d); }
+                for (uint j = ts; j < te; j++) {
+                    uint jr = (rcap > 0u) ? (j % rcap) : j;
+                    a += sc[j - ts] * VREAD((jr * pc.nkv + kvh) * hd + d);
+                }
                 acc[c] = acc[c] * corr + a;
             }
         }

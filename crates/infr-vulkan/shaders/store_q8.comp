@@ -17,7 +17,7 @@
 
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
-layout(push_constant) uniform PC { uint n; uint off; uint cap; } pc;
+layout(push_constant) uniform PC { uint n; uint off; uint cap; uint src_off; } pc;
 #ifdef SRC_F16
 layout(binding = 0) readonly buffer SB { float16_t src[]; };
 #else
@@ -34,11 +34,16 @@ void main() {
     uint blk = gl_WorkGroupID.x;         // 0 .. n/32-1  (source block)
     uint t = gl_LocalInvocationID.x;     // 0 .. 31      (element within block)
 #ifdef USE_PARAMS
-    uint off = p_pos * pc.n;
+    // SWA ring cache: row capacity = cap/n (total elements / row width; decode writes one row, so
+    // n IS the row width here). The ring recycles rows the window mask already excludes, so the
+    // write row is pos % rows — an identity on a full-context cache (pos < rows always).
+    uint rows = pc.cap / pc.n;
+    uint row = (rows > 0u) ? (p_pos % rows) : p_pos;
+    uint off = row * pc.n;
 #else
     uint off = pc.off;
 #endif
-    float v = float(src[blk * 32u + t]);
+    float v = float(src[pc.src_off + blk * 32u + t]);
     float amax = subgroupMax(abs(v));
     float d = amax / 127.0;
     float inv = (amax > 0.0) ? 1.0 / d : 0.0;

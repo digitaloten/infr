@@ -393,11 +393,36 @@ impl SeamModel {
             .available
             .saturating_sub(fp.dense + fp.expert + act_headroom);
         // SeamKv pads its buffers past max_ctx by ~64 rows; mirror that.
-        Some(
-            ((free as f64 * FIT_FRACTION / kv_per_tok as f64) as usize)
-                .saturating_sub(64)
-                .max(MIN_CTX),
-        )
+        let fit_linear = ((free as f64 * FIT_FRACTION / kv_per_tok as f64) as usize)
+            .saturating_sub(64)
+            .max(MIN_CTX);
+        // SWA ring sizing (see `crate::seam::kv_rows`): past `ring_rows` a window layer's KV
+        // stops growing with ctx, so bytes(ctx) = full_per_tok*ctx + swa_fixed and the fit is
+        // (free - swa_fixed) / full_per_tok — a mostly-SWA model's default ctx clamp relaxes
+        // enormously. The linear fit stays authoritative while it lands BELOW ring_rows (no
+        // layer would actually ring there).
+        if crate::seam::kv_ring_wanted(&self.cfg) && fit_linear >= 1024 {
+            let ring_rows = (self.cfg.swa_window + crate::seam::ubatch_rows()).next_multiple_of(64);
+            if fit_linear >= ring_rows {
+                let (mut full_per_tok, mut swa_fixed) = (0f64, 0f64);
+                for l in 0..self.cfg.n_layer {
+                    let bytes =
+                        (self.cfg.layer_n_kv(l) * self.cfg.layer_head_dim(l)) as f64 * (kb + vb);
+                    if self.cfg.is_swa_layer(l) {
+                        swa_fixed += bytes * ring_rows as f64;
+                    } else {
+                        full_per_tok += bytes;
+                    }
+                }
+                if full_per_tok > 0.0 {
+                    let fit = (((free as f64 * FIT_FRACTION - swa_fixed) / full_per_tok) as usize)
+                        .saturating_sub(64)
+                        .max(MIN_CTX);
+                    return Some(fit.max(fit_linear));
+                }
+            }
+        }
+        Some(fit_linear)
     }
 
     /// Greedy generation on the Vulkan seam through a persistent session (see

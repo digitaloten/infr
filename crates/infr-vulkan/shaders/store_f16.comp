@@ -1,14 +1,18 @@
 #version 460
-// Cast-copy f32 src[0..n] -> f16 dst[off..off+n] (write f32 activations into an f16 cache).
+// Cast-copy f32 src[src_off..src_off+n] -> f16 dst[off..off+n] (write f32 activations into an f16
+// cache). `src_off` lets a ring-boundary-crossing KV write split into two dispatches whose second
+// half reads the source's tail (0 for every other caller).
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-layout(push_constant) uniform PC { uint n; uint off; } pc;
+layout(push_constant) uniform PC { uint n; uint off; uint src_off; uint cap; } pc;
 layout(binding = 0) readonly buffer SB { float src[]; };
 #ifdef USE_PARAMS
-// Record-once decode: the write offset is pos*n (one KV row at position pos), pos from a host-updated
+// Record-once decode: the write offset is row*n (one KV row at position pos), pos from a host-updated
 // params SSBO instead of the `pc.off` push constant. `dst` moves to binding 2 (params takes 1).
+// `cap` is the cache's ROW capacity: an SWA ring cache recycles rows the window mask already
+// excludes, so the row is pos % cap (identity on a full-context cache, where pos < cap always).
 layout(binding = 1) readonly buffer PB { uint p_pos; uint p_kvlen; };
 layout(binding = 2) buffer DB { float16_t dst[]; };
 #else
@@ -19,9 +23,10 @@ void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= pc.n) { return; }
 #ifdef USE_PARAMS
-    uint off = p_pos * pc.n;
+    uint row = (pc.cap > 0u) ? (p_pos % pc.cap) : p_pos;
+    uint off = row * pc.n;
 #else
     uint off = pc.off;
 #endif
-    dst[off + i] = float16_t(src[i]);
+    dst[off + i] = float16_t(src[pc.src_off + i]);
 }

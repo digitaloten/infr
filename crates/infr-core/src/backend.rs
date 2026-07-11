@@ -118,6 +118,14 @@ pub struct Capabilities {
     /// False = the runner keeps emitting the split pair (identical math, one extra
     /// read-after-write barrier on backends that have one).
     pub gated_rmsnorm: bool,
+    /// The backend treats every KV cache buffer as a RING over its allocated row count: `WriteKv`
+    /// lands row `pos % cap_rows` and `Attention` reads key/value position `j` at row
+    /// `j % cap_rows`, where `cap_rows = declared cache elements / row width`. A full-context
+    /// cache (`cap_rows >= every kv_len`) makes the modulo an identity, so setting this only
+    /// matters when the runner allocates a sliding-window layer's cache at window size instead of
+    /// full context (see the seam's SWA ring sizing). Backends whose kernels index rows directly
+    /// by position (Metal) leave this false and get full-context allocations for every layer.
+    pub kv_swa_ring: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

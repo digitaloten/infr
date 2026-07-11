@@ -338,6 +338,19 @@ pub(crate) fn generate_dense_backend(
         }
     }
 
+    // SWA ring KV: window layers allocate `min(want_ctx, window + ubatch)` rows and the backend
+    // writes/reads position p at row `p % rows` (see `crate::seam::kv_rows` for the sizing and
+    // the correctness argument, and `kv_ring_wanted` for the model/env gates). Requires the
+    // backend's ring semantics (Vulkan + CPU; Metal indexes rows by position) and f16/q8 caches
+    // on BOTH sides (the prepass formats keep full-context caches — documented scope gate).
+    // Everything downstream (alloc, graph decl, rewind guard, fork/seed) derives from this ONE
+    // flag; the env set is stable for the process, so warm sessions always recompute the same
+    // value their buffers were sized with.
+    let kv_ring = be.capabilities().kv_swa_ring
+        && crate::seam::kv_ring_wanted(c)
+        && matches!(k_fmt, DType::F16 | DType::Q8_0)
+        && matches!(v_fmt, DType::F16 | DType::Q8_0);
+
     // ── one-time session init: weights, KV cache, per-step IO (skipped when `state` is warm) ──
     if state.is_none() {
         // Weight-load progress: opened HERE — the single weight-upload funnel every runner path
@@ -672,16 +685,19 @@ pub(crate) fn generate_dense_backend(
                 continue;
             }
             let kvrow_l = c.layer_n_kv(l) * c.layer_head_dim(l);
+            // SWA ring: window layers hold only `window + ubatch` rows (the ring recycles rows
+            // the window mask already excludes — `crate::seam::kv_rows` has the argument).
+            let rows_l = crate::seam::kv_rows(c, l, want_ctx, kv_ring);
             kbufs.push(
                 be.alloc(
-                    kv_fmt_bytes(k_fmt, want_ctx * kvrow_l),
+                    kv_fmt_bytes(k_fmt, rows_l * kvrow_l),
                     BufferUsage::Activations,
                 )
                 .map_err(|e| anyhow!("{e}"))?,
             );
             vbufs.push(
                 be.alloc(
-                    kv_fmt_bytes(v_fmt, want_ctx * kvrow_l),
+                    kv_fmt_bytes(v_fmt, rows_l * kvrow_l),
                     BufferUsage::Activations,
                 )
                 .map_err(|e| anyhow!("{e}"))?,
@@ -734,6 +750,7 @@ pub(crate) fn generate_dense_backend(
             ipl_buf,
             logits_buf,
             max_ctx: want_ctx,
+            kv_ring,
             cached: Vec::new(),
             denoise_cache: None,
             self_cond_w: None,
@@ -763,6 +780,9 @@ pub(crate) fn generate_dense_backend(
         sc_ping_write,
         sc_temp_inv_buf,
         mtp_delta_ckpt: _,
+        // The env-derived local `kv_ring` above is this same value on every call (stable env),
+        // so the struct field is only read by fork/seed (which have no backend caps at hand).
+        kv_ring: _,
     } = state.as_mut().expect("seam state just initialized");
     let SeamWeights {
         wbufs,
@@ -824,6 +844,30 @@ pub(crate) fn generate_dense_backend(
         }
     } else {
         common_prefix_len(cached, prompt).min(prompt.len() - 1)
+    };
+    // SWA ring rewind guard: a ring layer RETAINS only its last `rows_l` positions — rows for
+    // positions older than `cached.len() - rows_l` were recycled by newer writes. Re-prefilling
+    // from `start` attends positions `[start - window, start)` on window layers, so a rewind
+    // deeper than the ring's retained tail would read recycled rows; fall back to a full
+    // re-prefill (start = 0 — correctness over reuse; the full cache never hits this). Extending
+    // turns (start == cached.len()) and the ≤1-token `.min(prompt.len()-1)` rewind stay safe:
+    // rows_l - window >= ubatch >= 1.
+    let start = if kv_ring && start > 0 && start < cached.len() {
+        let safe = (0..c.n_layer)
+            .filter(|&l| c.is_swa_layer(l))
+            .map(|l| crate::seam::kv_rows(c, l, max_ctx, true))
+            .filter(|&rows_l| rows_l < max_ctx) // a never-wrapping layer can't lose positions
+            .all(|rows_l| {
+                let live_from = cached.len().saturating_sub(rows_l);
+                start.saturating_sub(c.swa_window) >= live_from
+            });
+        if safe {
+            start
+        } else {
+            0
+        }
+    } else {
+        start
     };
     cached.truncate(start);
 
@@ -972,8 +1016,11 @@ pub(crate) fn generate_dense_backend(
                 continue;
             }
             let kvrow_l = c.layer_n_kv(l) * c.layer_head_dim(l);
-            k_cache.push(g.input(kd(max_ctx * kvrow_l)));
-            v_cache.push(g.input(vd(max_ctx * kvrow_l)));
+            // Declared rows MUST equal the allocation above: every backend derives the ring's
+            // row capacity from this declared element count (row = pos % (numel / row_width)).
+            let rows_l = crate::seam::kv_rows(c, l, max_ctx, kv_ring);
+            k_cache.push(g.input(kd(rows_l * kvrow_l)));
+            v_cache.push(g.input(vd(rows_l * kvrow_l)));
         }
 
         // Weights — declared in the SAME order as the upload loop, pulling (dtype, numel) from
@@ -3331,11 +3378,9 @@ pub(crate) fn generate_dense_backend(
         // prompt (an 8B p8000 prefill built a multi-second single submission whose tail work
         // tripped the amdgpu ring watchdog → device lost) and bakes a multi-second unpreemptible
         // submit; fixed-size chunks bound both, exactly like the bespoke path's ubatches.
-        let ubatch: usize = std::env::var("INFR_UBATCH")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&v| v > 0)
-            .unwrap_or(1024);
+        // Shared reader (`crate::seam::ubatch_rows`): the SWA ring sizing must cover exactly
+        // this chunk height — see `kv_rows`' correctness bound.
+        let ubatch: usize = crate::seam::ubatch_rows();
         let pf_end = prompt.len() - 1;
         let mut cstart = start;
         while cstart < pf_end {

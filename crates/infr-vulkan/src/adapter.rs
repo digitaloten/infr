@@ -568,14 +568,31 @@ fn kv_write_peephole(graph: &Graph) -> (HashMap<usize, (TensorId, usize)>, HashS
             continue;
         }
         if let Some(Op::WriteKv {
-            src, cache, pos, ..
+            src,
+            cache,
+            pos,
+            rows,
+            row_stride,
         }) = graph.ops.get(i + 1)
         {
             // A Q8_0 cache needs a real quantizing WriteKv (store_q8), so DON'T fuse the f16 rope
             // write into it — leave the standalone WriteKv to run.
             if src == kxx && matches!(graph.desc(*cache).dtype, infr_core::DType::F16) {
-                fused.insert(i, (*cache, *pos as usize));
-                skip.insert(i + 1);
+                // SWA ring cache (row capacity < full context): the write row is pos % cap_rows.
+                // The fused rope kernels write `rows` CONTIGUOUS rows from out_base, so a batched
+                // prefill write that would cross the ring's wrap boundary can't fuse — leave the
+                // standalone WriteKv, whose lowering splits the write at the wrap. Decode (rows
+                // == 1) always fuses; a full-context cache never wraps (pos < cap_rows).
+                let cap_rows = graph.desc(*cache).numel() / (*row_stride as usize).max(1);
+                let pos_r = if cap_rows > 0 {
+                    *pos as usize % cap_rows
+                } else {
+                    *pos as usize
+                };
+                if cap_rows == 0 || pos_r + *rows as usize <= cap_rows {
+                    fused.insert(i, (*cache, pos_r));
+                    skip.insert(i + 1);
+                }
             }
         }
     }
@@ -1555,8 +1572,28 @@ fn lower_op(
             let src_f16 = matches!(graph.desc(*src).dtype, infr_core::DType::F16);
             // Planar scales region begins at byte `cap` = total cache elements.
             let cap = graph.desc(*cache).numel();
+            // SWA ring cache: the write for position p lands at row p % cap_rows — the ring only
+            // recycles rows whose positions the window mask already excludes (see the runner's
+            // ring sizing). A batched prefill write crossing the wrap splits into two contiguous
+            // segments `(src_row, dst_row, n_rows)`; a full-context cache never wraps (pos <
+            // cap_rows), so segment 0 is exactly the old single write there. Only the f16 and Q8
+            // cache formats can be ring-sized (the runner's gate); the low-bit/dense-alt/turbo
+            // arms below keep the plain `pos * rs` offset, which is identical for their always-
+            // full-context caches.
+            let cap_rows = cap / rs.max(1);
+            let pos_r = if cap_rows > 0 { pos % cap_rows } else { pos };
+            let segs: [(usize, usize, usize); 2] = if cap_rows > 0 && pos_r + rows > cap_rows {
+                let r1 = cap_rows - pos_r;
+                [(0, pos_r, r1), (r1, 0, rows - r1)]
+            } else {
+                [(0, pos_r, rows), (0, 0, 0)]
+            };
             match mode {
-                RopeMode::Static(_) if cache_q8 => rec.store_q8(s, c, n, pos * rs, cap, src_f16),
+                RopeMode::Static(_) if cache_q8 => {
+                    for &(sr, dr, nr) in segs.iter().filter(|&&(_, _, nr)| nr > 0) {
+                        rec.store_q8(s, c, nr * rs, dr * rs, cap, src_f16, sr * rs);
+                    }
+                }
                 RopeMode::Dynamic(params) if cache_q8 => {
                     rec.store_q8_dyn(s, *params, c, n, cap, src_f16)
                 }
@@ -1573,17 +1610,23 @@ fn lower_op(
                 RopeMode::Static(_) if is_turbo(cache_dt) => {
                     rec.quant_turbo(cache_dt, s, c, n, pos * rs, src_f16)
                 }
-                RopeMode::Static(_) => match graph.desc(*src).dtype {
-                    infr_core::DType::F16 => rec.copy(s, 0, c, pos * rs * 2, n * 2),
-                    _ => rec.store_f16(s, c, n, pos * rs),
-                },
+                RopeMode::Static(_) => {
+                    for &(sr, dr, nr) in segs.iter().filter(|&&(_, _, nr)| nr > 0) {
+                        match graph.desc(*src).dtype {
+                            infr_core::DType::F16 => {
+                                rec.copy(s, sr * rs * 2, c, dr * rs * 2, nr * rs * 2)
+                            }
+                            _ => rec.store_f16_off(s, c, nr * rs, dr * rs, sr * rs),
+                        }
+                    }
+                }
                 RopeMode::Dynamic(params) => match graph.desc(*src).dtype {
                     // The only f16 WriteKv (K) is always fused into the QkNormRope and skipped, so a
                     // standalone f16 WriteKv shouldn't reach the record-once path.
                     infr_core::DType::F16 => {
                         return Err(be("vulkan adapter: dynamic decode f16 WriteKv unexpected"))
                     }
-                    _ => rec.store_f16_dyn(s, *params, c, n),
+                    _ => rec.store_f16_dyn(s, *params, c, n, cap_rows),
                 },
             }
         }
@@ -1606,10 +1649,15 @@ fn lower_op(
             x_stride,
             ..
         } => {
-            let (out_buf, fused) = if let Some(&(cache, pos)) = fused_kv_write.get(&op_idx) {
-                (r(cache)?, Some(pos))
+            // `fused` carries the WRITE ROW (already `pos % cap_rows` for an SWA ring cache —
+            // see `kv_write_peephole`); `kcap` is the fused cache's row capacity for the DYNAMIC
+            // path, where the row must be derived from the live params pos in-kernel (the ring
+            // modulo rides the same params channel as the pos itself — never a baked constant).
+            let (out_buf, fused, kcap) = if let Some(&(cache, pos)) = fused_kv_write.get(&op_idx) {
+                let row = (*n_head as usize) * (*head_dim as usize);
+                (r(cache)?, Some(pos), graph.desc(cache).numel() / row.max(1))
             } else {
-                (r(*dst)?, None)
+                (r(*dst)?, None, 0)
             };
             match mode {
                 RopeMode::Static(rope_pos) => {
@@ -1689,6 +1737,7 @@ fn lower_op(
                             *theta,
                             out_base_mul,
                             *eps,
+                            if out_base_mul > 0 { kcap } else { 0 },
                         );
                     } // x_stride > 0
                 }
@@ -1803,6 +1852,14 @@ fn lower_op(
             let kv_q8 = k_q8 && v_q8; // coupled (the Dynamic-branch kernels' q8 variant)
                                       // Planar Q8 scales region base = total cache elements (K and V caches share numel).
             let cap = graph.desc(*k_cache).numel();
+            // Row capacity of the bound cache. An SWA layer's cache may be a RING of fewer rows
+            // than the live kv_len (window + ubatch, see the runner's ring sizing): position j
+            // then lives at row j % att_cap_rows — the scalar/split kernels derive the same
+            // mapping from their `cap` push constant; the coopmat tile kernels (flash/nonfa) and
+            // the rows-batched mrows tier don't, so they're gated back to the split path once
+            // kv_len (padded, for nonfa's 256-row tiles) outruns the rows actually present. On a
+            // full-context cache kv_len <= att_cap_rows always, so none of these gates move.
+            let att_cap_rows = cap / (nkv * hd).max(1);
             if let RopeMode::Dynamic(params) = mode {
                 // Eligibility guarantees rows==1. Scale rides a push constant (gemma4 uses 1.0;
                 // 0.0 → kernel default 1/√hd) and SWA windows ride the window-aware prologue +
@@ -1911,7 +1968,10 @@ fn lower_op(
                 let vdt = graph.desc(*v_cache).dtype;
                 let deq_k = (k_q8 && rows > 1) || is_kv_prepass(kdt);
                 let deq_v = (v_q8 && rows > 1) || is_kv_prepass(vdt);
-                let ne = kv_len * nkv * hd;
+                // Ring cache: only att_cap_rows rows exist — dequant the WHOLE ring (element i →
+                // element i keeps the ring layout, so the f16 scratch is read with the same
+                // row-modulo mapping as the cache itself). Identity on full-context caches.
+                let ne = kv_len.min(att_cap_rows) * nkv * hd;
                 // Expand a KV side into the f16 scratch: native Q8 (planar), f32 cast (store_f16),
                 // else the shared quant/bf16 dequant (dequant_kv_f16).
                 let kc_key = if deq_k {
@@ -1972,6 +2032,7 @@ fn lower_op(
                 // row-count ceiling, so they're a correct (if slower) fallback for ANY `rows`.
                 let flash_ok = (rows >= 64 || (rows >= flash_min_rows && kv_len >= 8192))
                     && hd == 128
+                    && kv_len <= att_cap_rows // never a ring cache (Causal implies full-ctx)
                     && matches!(mask, AttnMask::Causal)
                     && (*scale - 1.0 / (hd as f32).sqrt()).abs() < 1e-6
                     && !(k_q8_eff || v_q8_eff)
@@ -1995,6 +2056,12 @@ fn lower_op(
                 let nonfa_ok = !flash_ok
                     && canvas_lo.is_none()
                     && rows >= 64
+                    // attn_qk reads K tiles up to ceil(kv_len/256)*256 rows (masked in softmax) —
+                    // a ring cache past its wrap has neither those rows nor a direct position →
+                    // row mapping the tile loads could use, so fall to the split path (which has
+                    // the row-modulo mapping). Full-context caches only hit this within 256 rows
+                    // of their very end, where the split path is equally correct.
+                    && kv_len.div_ceil(256) * 256 <= att_cap_rows
                     && hd % 64 == 0
                     && hd <= 512
                     && !(k_q8_eff || v_q8_eff)
@@ -2020,6 +2087,7 @@ fn lower_op(
                 // A/B), INFR_NO_MROWS_ATTN forces it off.
                 let batched_attn = rows >= 2
                     && hd <= 128
+                    && kv_len <= att_cap_rows // the mrows kernel has no ring row mapping
                     && canvas_lo.is_none()
                     && !(k_q8_eff || v_q8_eff)
                     && std::env::var("INFR_NO_MROWS_ATTN").is_err()
@@ -2066,6 +2134,11 @@ fn lower_op(
                     0
                 };
                 let span = kv_len - swa_base;
+                // SWA ring layer past its wrap (kv_len outran the ring's rows): the coopmat
+                // prefill tiers were gated off above (no ring row mapping in their tile loads),
+                // so the split-K path must take EVERY row count here — the scalar attention_kv
+                // fallback at prefill row counts (1024 rows x deep kv) is a guaranteed TDR.
+                let ring_past = swa_window > 0 && kv_len > att_cap_rows;
                 let chunk = if canvas_lo.is_some() && kv_len >= 2 {
                     let n = std::env::var("INFR_CANVAS_CHUNK_N")
                         .ok()
@@ -2075,12 +2148,19 @@ fn lower_op(
                     kv_len.div_ceil(n).min(kv_len - 1).max(1)
                 } else if batched_attn {
                     256
+                } else if ring_past && rows >= 64 {
+                    // Large-rows ring prefill: the pm/pl/pacc partials are [rows, nh, n_chunks,
+                    // hd] — the ordinary ~32-chunk policy would balloon them (1024 rows x 32
+                    // chunks x hd 256 ≈ 1 GB), and the span is already bounded by window + rows,
+                    // so a few big chunks keep the scratch ~100s of MB with plenty of workgroups
+                    // (nh * n_chunks * rows).
+                    512
                 } else {
                     (span / 32).clamp(64, 512)
                 };
                 // Canvas forces the split-K tier regardless of row count (see `canvas_lo` above) —
                 // `attn_partial` carries the fixed `lo` override this mask needs; flash/nonfa don't.
-                let split_ok = (rows < 64 || canvas_lo.is_some())
+                let split_ok = (rows < 64 || canvas_lo.is_some() || ring_past)
                     && span > chunk
                     && hd % 4 == 0
                     && hd <= 512

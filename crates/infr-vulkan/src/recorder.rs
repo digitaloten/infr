@@ -3022,12 +3022,27 @@ impl<'a> Recorder<'a> {
 
     /// Cast-copy f32 `src[0..n]` → f16 `dst[off..off+n]` (write f32 activations into the f16 cache).
     pub fn store_f16(&self, src: &dyn Buffer, dst: &dyn Buffer, n: usize, off: usize) {
+        self.store_f16_off(src, dst, n, off, 0)
+    }
+
+    /// [`Self::store_f16`] with a SOURCE element offset — the second half of a KV write that
+    /// crosses an SWA ring cache's wrap boundary reads the source's tail (`src[src_off..]`).
+    pub fn store_f16_off(
+        &self,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        n: usize,
+        off: usize,
+        src_off: usize,
+    ) {
         let k = self
             .be
-            .kernel("store_f16", crate::gemm::store_f16_spv(), 2, 8);
-        let mut push = [0u8; 8];
+            .kernel("store_f16", crate::gemm::store_f16_spv(), 2, 16);
+        let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(src_off as u32).to_ne_bytes());
+        // [12..16] cap: dyn-only (ring row modulo), zero here.
         self.dispatch(
             k,
             &[Self::vkb(src), Self::vkb(dst)],
@@ -3037,10 +3052,12 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// Quantize `src[0..n]` → the Vulkan planar Q8_0 KV cache at element offset `off`. `cap` = total
-    /// cache elements (the scales region begins at byte `cap`). `src_f16` selects the f16-source
-    /// variant (the un-fused roped K staging); f32 otherwise (the V projection). `n`/`off` are
-    /// block-aligned (KV row width is a multiple of 32).
+    /// Quantize `src[src_off..src_off+n]` → the Vulkan planar Q8_0 KV cache at element offset
+    /// `off`. `cap` = total cache elements (the scales region begins at byte `cap`). `src_f16`
+    /// selects the f16-source variant (the un-fused roped K staging); f32 otherwise (the V
+    /// projection). `n`/`off`/`src_off` are block-aligned (KV row width is a multiple of 32);
+    /// `src_off` > 0 only for the second half of a write crossing an SWA ring cache's wrap.
+    #[allow(clippy::too_many_arguments)]
     pub fn store_q8(
         &self,
         src: &dyn Buffer,
@@ -3049,17 +3066,19 @@ impl<'a> Recorder<'a> {
         off: usize,
         cap: usize,
         src_f16: bool,
+        src_off: usize,
     ) {
         let (name, spv) = if src_f16 {
             ("store_q8_f16", crate::gemm::store_q8_f16_spv())
         } else {
             ("store_q8", crate::gemm::store_q8_spv())
         };
-        let k = self.be.kernel(name, spv, 2, 12);
-        let mut push = [0u8; 12];
+        let k = self.be.kernel(name, spv, 2, 16);
+        let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(cap as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(src_off as u32).to_ne_bytes());
         // One workgroup (32 lanes) per 32-element block.
         self.dispatch(
             k,
@@ -3086,10 +3105,11 @@ impl<'a> Recorder<'a> {
         } else {
             ("store_q8_dyn", crate::gemm::store_q8_dyn_spv())
         };
-        let k = self.be.kernel(name, spv, 3, 12);
-        let mut push = [0u8; 12];
+        let k = self.be.kernel(name, spv, 3, 16);
+        let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
-        // [4..8] off: unused (from params)
+        // [4..8] off: unused (from params). [12..16] src_off: always 0 here (a single decode row
+        // never crosses the ring wrap). The kernel derives the ring row capacity from cap/n.
         push[8..12].copy_from_slice(&(cap as u32).to_ne_bytes());
         self.dispatch(
             k,
@@ -3258,7 +3278,9 @@ impl<'a> Recorder<'a> {
         // RoPE (qwen3 / gemma3 / gemma4 SWA layers).
         freq_factors: Option<&dyn Buffer>,
     ) {
-        let mut push = [0u8; 32];
+        // 36 bytes: the trailing `kcap` (ring row capacity) is dyn-only and stays 0 here — the
+        // STATIC fused-K cache write pre-mods its baked `out_base` row in the adapter instead.
+        let mut push = [0u8; 36];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(nheads as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(hd as u32).to_ne_bytes());
@@ -3271,7 +3293,7 @@ impl<'a> Recorder<'a> {
             Some(ff) => {
                 let k =
                     self.be
-                        .kernel("qk_norm_rope_ff", crate::gemm::qk_norm_rope_ff_spv(), 4, 32);
+                        .kernel("qk_norm_rope_ff", crate::gemm::qk_norm_rope_ff_spv(), 4, 36);
                 self.dispatch(
                     k,
                     &[Self::vkb(x), Self::vkb(nw), Self::vkb(ff), Self::vkb(y)],
@@ -3283,7 +3305,7 @@ impl<'a> Recorder<'a> {
             None => {
                 let k = self
                     .be
-                    .kernel("qk_norm_rope", crate::gemm::qk_norm_rope_spv(), 3, 32);
+                    .kernel("qk_norm_rope", crate::gemm::qk_norm_rope_spv(), 3, 36);
                 self.dispatch(
                     k,
                     &[Self::vkb(x), Self::vkb(nw), Self::vkb(y)],
@@ -3549,6 +3571,9 @@ impl<'a> Recorder<'a> {
         theta: f32,
         out_base_mul: usize,
         eps: f32,
+        // Fused-K cache write only: the cache's ROW capacity — an SWA ring cache writes row
+        // `pos % kcap` (identity on a full-context cache). 0 (no modulo) for the Q write.
+        kcap: usize,
     ) {
         // With freq_factors (gemma4 full-attention layers) `ff` binds at 3 and the output shifts
         // to 4 — same PC layout either way.
@@ -3557,16 +3582,16 @@ impl<'a> Recorder<'a> {
                 "qk_norm_rope_dyn_ff",
                 crate::gemm::qk_norm_rope_dyn_ff_spv(),
                 5,
-                32,
+                36,
             ),
             None => self.be.kernel(
                 "qk_norm_rope_dyn",
                 crate::gemm::qk_norm_rope_dyn_spv(),
                 4,
-                32,
+                36,
             ),
         };
-        let mut push = [0u8; 32];
+        let mut push = [0u8; 36];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(nheads as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(hd as u32).to_ne_bytes());
@@ -3575,6 +3600,7 @@ impl<'a> Recorder<'a> {
         // [20..24] rope_pos: unused (from params)
         push[24..28].copy_from_slice(&(out_base_mul as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&eps.to_ne_bytes());
+        push[32..36].copy_from_slice(&(kcap as u32).to_ne_bytes());
         match ff {
             Some(f) => self.dispatch(
                 k,
@@ -3599,14 +3625,24 @@ impl<'a> Recorder<'a> {
         }
     }
 
-    /// Cast-copy f32 `src[0..n]` → f16 `dst[pos*n..]` (one KV row at position pos from `params`).
-    pub fn store_f16_dyn(&self, src: &dyn Buffer, params: &dyn Buffer, dst: &dyn Buffer, n: usize) {
+    /// Cast-copy f32 `src[0..n]` → f16 `dst[row*n..]` (one KV row at position pos from `params`;
+    /// `cap_rows` = the cache's row capacity, so an SWA ring cache writes row `pos % cap_rows` —
+    /// identity on a full-context cache).
+    pub fn store_f16_dyn(
+        &self,
+        src: &dyn Buffer,
+        params: &dyn Buffer,
+        dst: &dyn Buffer,
+        n: usize,
+        cap_rows: usize,
+    ) {
         let k = self
             .be
-            .kernel("store_f16_dyn", crate::gemm::store_f16_dyn_spv(), 3, 8);
-        let mut push = [0u8; 8];
+            .kernel("store_f16_dyn", crate::gemm::store_f16_dyn_spv(), 3, 16);
+        let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
-        // [4..8] off: unused (computed as pos*n from params)
+        // [4..8] off: unused (computed as (pos % cap)*n from params). [8..12] src_off: 0.
+        push[12..16].copy_from_slice(&(cap_rows as u32).to_ne_bytes());
         self.dispatch(
             k,
             &[Self::vkb(src), Self::vkb(params), Self::vkb(dst)],

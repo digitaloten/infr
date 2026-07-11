@@ -152,6 +152,10 @@ pub(crate) struct SeamKv {
     pub(super) ipl_buf: Option<Box<dyn Buffer>>,
     pub(super) logits_buf: Box<dyn Buffer>,
     pub(super) max_ctx: usize,
+    /// Whether this session's SWA layers were allocated as window-sized RINGS (see
+    /// `crate::seam::kv_rows`): fork must size its buffers identically, and seed must respect
+    /// that a wrapped ring no longer retains the early prefix rows a seed would copy.
+    pub(super) kv_ring: bool,
     /// Token ids whose KV rows are materialized (prompt + generated of the last turn).
     pub(super) cached: Vec<u32>,
     /// Phase-A perf: DiffusionGemma canvas-denoise plan + staging buffers, `None` for every
@@ -347,16 +351,19 @@ impl SeamKv {
                 continue;
             }
             let kvrow_l = cfg.layer_n_kv(l) * cfg.layer_head_dim(l);
+            // Same per-layer geometry as the original allocation: SWA layers ring at
+            // window+ubatch rows when this session was ring-sized (see `crate::seam::kv_rows`).
+            let rows_l = crate::seam::kv_rows(cfg, l, self.max_ctx, self.kv_ring);
             kbufs.push(
                 be.alloc(
-                    kv_fmt_bytes(self.k_fmt, self.max_ctx * kvrow_l),
+                    kv_fmt_bytes(self.k_fmt, rows_l * kvrow_l),
                     BufferUsage::Activations,
                 )
                 .map_err(|e| anyhow!("{e}"))?,
             );
             vbufs.push(
                 be.alloc(
-                    kv_fmt_bytes(self.v_fmt, self.max_ctx * kvrow_l),
+                    kv_fmt_bytes(self.v_fmt, rows_l * kvrow_l),
                     BufferUsage::Activations,
                 )
                 .map_err(|e| anyhow!("{e}"))?,
@@ -386,6 +393,7 @@ impl SeamKv {
                 .alloc(cfg.vocab * 4, BufferUsage::Readback)
                 .map_err(|e| anyhow!("{e}"))?,
             max_ctx: self.max_ctx,
+            kv_ring: self.kv_ring,
             cached: Vec::new(),
             // The forked slot's KV/weight buffers are new objects, so a cached plan's bindings
             // (which point at the OLD slot's buffers) don't carry over — rebuild lazily on this
@@ -428,6 +436,22 @@ impl SeamKv {
         let p = p.min(src.cached.len()).min(self.max_ctx);
         if p == 0 {
             return Ok(());
+        }
+        // SWA ring caches: positions [0, p) sit at rows [0, p) ONLY while the source hasn't
+        // wrapped (cached_len <= ring rows) — a wrapped ring recycled exactly those early rows,
+        // so the plain prefix copy below would seed stale data. Skipping the seed is the CORRECT
+        // fallback (the slot just re-prefills the shared prefix); only cross-conversation KV
+        // reuse on long conversations is lost. (Seeding a wrapped source's window TAIL would be
+        // exact too, but needs two-segment copies per side per layer + a tail-only `cached`
+        // semantics — deferred until serve traffic shows it matters.)
+        if self.kv_ring {
+            let wrapped = (0..cfg.n_layer)
+                .filter(|&l| cfg.is_swa_layer(l))
+                .map(|l| crate::seam::kv_rows(cfg, l, self.max_ctx, true))
+                .any(|rows_l| src.cached.len() > rows_l);
+            if wrapped {
+                return Ok(());
+            }
         }
         for l in 0..cfg.n_layer {
             let elems = p * cfg.layer_n_kv(l) * cfg.layer_head_dim(l);

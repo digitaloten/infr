@@ -154,6 +154,12 @@ void main() {
     uint j1 = min(base + c * pc.chunk + pc.chunk, qpos1);
 #endif
 
+    // SWA ring cache: row capacity = cap / row width (cap = total cache ELEMENTS, always pushed).
+    // Key/value POSITION j lives at row j % rcap — the ring only ever recycles rows whose
+    // positions the sliding-window mask (lo/j0) already excludes, so this mapping is exact. On a
+    // full-context cache every processed j < kv_len <= rcap, so RROW is an identity there.
+    uint rcap = (pc.cap > 0u) ? pc.cap / (pc.nkv * hd) : 0u;
+#define RROW(j) ((rcap > 0u) ? ((j) % rcap) : (j))
     // QK via subgroup reduction (one key per subgroup-iteration; vec4 coalesced K reads). Each lane's
     // query vec4(s) are loop-invariant across keys → hold in registers (no q_sh, no barrier).
     uint sg = gl_SubgroupID;            // 0..1
@@ -177,10 +183,10 @@ void main() {
         uint q4b = h * 32u;
         uint kb = (pc.nkv * 32u);
         for (; j + 3u * nsg < j1; j += 4u * nsg) {
-            vec4 a0 = KVEC4(j * kb + kvh * 32u + lane);
-            vec4 a1 = KVEC4((j + nsg) * kb + kvh * 32u + lane);
-            vec4 a2 = KVEC4((j + 2u * nsg) * kb + kvh * 32u + lane);
-            vec4 a3 = KVEC4((j + 3u * nsg) * kb + kvh * 32u + lane);
+            vec4 a0 = KVEC4(RROW(j) * kb + kvh * 32u + lane);
+            vec4 a1 = KVEC4(RROW(j + nsg) * kb + kvh * 32u + lane);
+            vec4 a2 = KVEC4(RROW(j + 2u * nsg) * kb + kvh * 32u + lane);
+            vec4 a3 = KVEC4(RROW(j + 3u * nsg) * kb + kvh * 32u + lane);
             float d0 = subgroupAdd(dot(qreg[0], a0)) * scale;
             float d1 = subgroupAdd(dot(qreg[0], a1)) * scale;
             float d2 = subgroupAdd(dot(qreg[0], a2)) * scale;
@@ -204,10 +210,12 @@ void main() {
         uint kb = pc.nkv * 64u;
         uint kh = kvh * 64u + lane;
         for (; j + nsg < j1; j += 2u * nsg) {
-            vec4 a0 = KVEC4(j * kb + kh);
-            vec4 a1 = KVEC4(j * kb + kh + 32u);
-            vec4 b0 = KVEC4((j + nsg) * kb + kh);
-            vec4 b1 = KVEC4((j + nsg) * kb + kh + 32u);
+            uint jr0 = RROW(j) * kb;
+            uint jr1 = RROW(j + nsg) * kb;
+            vec4 a0 = KVEC4(jr0 + kh);
+            vec4 a1 = KVEC4(jr0 + kh + 32u);
+            vec4 b0 = KVEC4(jr1 + kh);
+            vec4 b1 = KVEC4(jr1 + kh + 32u);
             float d0 = subgroupAdd(dot(qreg[0], a0) + dot(qreg[1], a1)) * scale;
             float d1 = subgroupAdd(dot(qreg[0], b0) + dot(qreg[1], b1)) * scale;
             if (lane == 0u) {
@@ -220,14 +228,16 @@ void main() {
         uint kb = pc.nkv * 128u;
         uint kh = kvh * 128u + lane;
         for (; j + nsg < j1; j += 2u * nsg) {
-            vec4 a0 = KVEC4(j * kb + kh);
-            vec4 a1 = KVEC4(j * kb + kh + 32u);
-            vec4 a2 = KVEC4(j * kb + kh + 64u);
-            vec4 a3 = KVEC4(j * kb + kh + 96u);
-            vec4 b0 = KVEC4((j + nsg) * kb + kh);
-            vec4 b1 = KVEC4((j + nsg) * kb + kh + 32u);
-            vec4 b2 = KVEC4((j + nsg) * kb + kh + 64u);
-            vec4 b3 = KVEC4((j + nsg) * kb + kh + 96u);
+            uint jr0 = RROW(j) * kb;
+            uint jr1 = RROW(j + nsg) * kb;
+            vec4 a0 = KVEC4(jr0 + kh);
+            vec4 a1 = KVEC4(jr0 + kh + 32u);
+            vec4 a2 = KVEC4(jr0 + kh + 64u);
+            vec4 a3 = KVEC4(jr0 + kh + 96u);
+            vec4 b0 = KVEC4(jr1 + kh);
+            vec4 b1 = KVEC4(jr1 + kh + 32u);
+            vec4 b2 = KVEC4(jr1 + kh + 64u);
+            vec4 b3 = KVEC4(jr1 + kh + 96u);
             float d0 = subgroupAdd(dot(qreg[0], a0) + dot(qreg[1], a1)
                                    + dot(qreg[2], a2) + dot(qreg[3], a3)) * scale;
             float d1 = subgroupAdd(dot(qreg[0], b0) + dot(qreg[1], b1)
@@ -241,7 +251,7 @@ void main() {
     }
 #endif
     for (; j < j1; j += nsg) {
-        uint kbase4 = (j * pc.nkv + kvh) * hd4;
+        uint kbase4 = (RROW(j) * pc.nkv + kvh) * hd4;
         float part = 0.0;
         for (uint i = 0u; i < 4u; i++) {
             uint r = lane + 32u * i;
@@ -288,13 +298,13 @@ void main() {
             uint stride = pc.nkv * hd4;
             uint j = j0 + sg;
             for (; j + nsg < j1; j += 2u * nsg) {
-                vec4 b0 = VVEC4(j * stride + base);
-                vec4 b1 = VVEC4((j + nsg) * stride + base);
+                vec4 b0 = VVEC4(RROW(j) * stride + base);
+                vec4 b1 = VVEC4(RROW(j + nsg) * stride + base);
                 acc += sc[j - j0] * b0;
                 acc += sc[j + nsg - j0] * b1;
             }
             for (; j < j1; j += nsg) {
-                acc += sc[j - j0] * VVEC4(j * stride + base);
+                acc += sc[j - j0] * VVEC4(RROW(j) * stride + base);
             }
         }
         if (sg == 1u && lane < hd4) { vsh[lane] = acc; }
@@ -318,12 +328,12 @@ void main() {
         vec4 acc = vec4(0.0);
         uint jv = j0;
         for (; jv + 1u < j1; jv += 2u) {
-            vec4 b0 = VVEC4(jv * stride + vb);
-            vec4 b1 = VVEC4((jv + 1u) * stride + vb);
+            vec4 b0 = VVEC4(RROW(jv) * stride + vb);
+            vec4 b1 = VVEC4(RROW(jv + 1u) * stride + vb);
             acc += sc[jv - j0] * b0;
             acc += sc[jv + 1u - j0] * b1;
         }
-        if (jv < j1) { acc += sc[jv - j0] * VVEC4(jv * stride + vb); }
+        if (jv < j1) { acc += sc[jv - j0] * VVEC4(RROW(jv) * stride + vb); }
         pacc[pbase + 4u * t] = acc.x;
         pacc[pbase + 4u * t + 1u] = acc.y;
         pacc[pbase + 4u * t + 2u] = acc.z;
@@ -334,8 +344,9 @@ void main() {
         vec4 acc0 = vec4(0.0);
         vec4 acc1 = vec4(0.0);
         for (uint jv = j0; jv < j1; jv++) {
-            vec4 b0 = VVEC4(jv * stride + vb);
-            vec4 b1 = VVEC4(jv * stride + vb + 64u);
+            uint jvr = RROW(jv) * stride;
+            vec4 b0 = VVEC4(jvr + vb);
+            vec4 b1 = VVEC4(jvr + vb + 64u);
             float s = sc[jv - j0];
             acc0 += s * b0;
             acc1 += s * b1;
@@ -355,7 +366,7 @@ void main() {
         for (uint g = t; g < hd4; g += 64u) {
             vec4 acc = vec4(0.0);
             for (uint j = j0; j < j1; j += 1u) {
-                acc += sc[j - j0] * VVEC4((j * pc.nkv + kvh) * hd4 + g);
+                acc += sc[j - j0] * VVEC4((RROW(j) * pc.nkv + kvh) * hd4 + g);
             }
             pacc[pbase + 4u * g] = acc.x;
             pacc[pbase + 4u * g + 1u] = acc.y;

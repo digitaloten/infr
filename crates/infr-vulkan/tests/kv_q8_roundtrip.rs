@@ -23,7 +23,7 @@ fn planar_q8_store_dequant_roundtrip() {
     let dst = be.alloc(n * 2, BufferUsage::Activations).unwrap(); // f16 out
 
     let rec = be.recorder().unwrap();
-    rec.store_q8(sbuf.as_ref(), cache.as_ref(), n, 0, cap, false);
+    rec.store_q8(sbuf.as_ref(), cache.as_ref(), n, 0, cap, false, 0);
     rec.dequant_q8_f16(cache.as_ref(), dst.as_ref(), n, cap);
     rec.finish().unwrap();
 
@@ -193,8 +193,8 @@ fn planar_q8_attn_partial_matches_f16() {
     let oq = be.alloc(nh * hd * 4, BufferUsage::Activations).unwrap();
     let (pm2, pl2, pacc2) = mk();
     let rec = be.recorder().unwrap();
-    rec.store_q8(kf.as_ref(), kq.as_ref(), n, 0, cap, true);
-    rec.store_q8(vf.as_ref(), vq.as_ref(), n, 0, cap, true);
+    rec.store_q8(kf.as_ref(), kq.as_ref(), n, 0, cap, true, 0);
+    rec.store_q8(vf.as_ref(), vq.as_ref(), n, 0, cap, true, 0);
     rec.attention_kv_split(
         qb.as_ref(),
         kq.as_ref(),
@@ -280,10 +280,10 @@ fn planar_q8_attn_partial_mixed_kv() {
             .unwrap();
         let rec = be.recorder().unwrap();
         if k_q8 {
-            rec.store_q8(kf.as_ref(), kq.as_ref(), n, 0, cap, true);
+            rec.store_q8(kf.as_ref(), kq.as_ref(), n, 0, cap, true, 0);
         }
         if v_q8 {
-            rec.store_q8(vf.as_ref(), vq.as_ref(), n, 0, cap, true);
+            rec.store_q8(vf.as_ref(), vq.as_ref(), n, 0, cap, true, 0);
         }
         rec.attention_kv_split(
             qb.as_ref(),
@@ -408,8 +408,8 @@ fn planar_q8_dynac_matches_f16() {
     let oq = be.alloc(nh * hd * 4, BufferUsage::Activations).unwrap();
     let (pm2, pl2, pacc2, args2) = mk();
     let rec = be.recorder().unwrap();
-    rec.store_q8(kf.as_ref(), kq.as_ref(), n, 0, cap, true);
-    rec.store_q8(vf.as_ref(), vq.as_ref(), n, 0, cap, true);
+    rec.store_q8(kf.as_ref(), kq.as_ref(), n, 0, cap, true, 0);
+    rec.store_q8(vf.as_ref(), vq.as_ref(), n, 0, cap, true, 0);
     rec.attn_live_prologue(params.as_ref(), args2.as_ref(), nh, chunk, 0);
     rec.attention_kv_split_dynac(
         qb.as_ref(),
@@ -515,8 +515,8 @@ fn planar_q8_store_replay_tape_matches_static() {
         be.upload(kf.as_ref(), &to_f16_bytes(&row)).unwrap();
         be.upload(vf.as_ref(), bytemuck::cast_slice(&row)).unwrap();
         let rec = be.recorder().unwrap();
-        rec.store_q8(kf.as_ref(), kq_st.as_ref(), rs, t * rs, cap, true);
-        rec.store_q8(vf.as_ref(), vq_st.as_ref(), rs, t * rs, cap, false);
+        rec.store_q8(kf.as_ref(), kq_st.as_ref(), rs, t * rs, cap, true, 0);
+        rec.store_q8(vf.as_ref(), vq_st.as_ref(), rs, t * rs, cap, false, 0);
         rec.finish().unwrap();
     }
 

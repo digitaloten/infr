@@ -7,6 +7,11 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC {
     uint rows; uint nheads; uint hd; uint rope_dim; float theta; uint rope_pos; uint out_base; float eps;
+    // Fused-K cache write, dyn mode only: the cache's ROW capacity (an SWA ring cache recycles
+    // rows the window mask already excludes — the write row is pos % kcap, identity on a
+    // full-context cache where pos < kcap always). 0 = no modulo. Static mode ignores it (the
+    // adapter pre-mods the baked out_base row instead).
+    uint kcap;
 } pc;
 layout(binding = 0) readonly buffer XB { float x[]; };
 layout(binding = 1) readonly buffer NB { float nw[]; };
@@ -54,7 +59,9 @@ void main() {
 
 #ifdef USE_PARAMS
     uint rope_pos = p_pos;
-    uint out_base = pc.out_base * p_pos; // pc.out_base is the 0/1 multiplier in dyn mode
+    // Cache write row: pos % kcap (ring; see PC.kcap). RoPE keeps the ABSOLUTE position.
+    uint krow = (pc.kcap > 0u) ? (p_pos % pc.kcap) : p_pos;
+    uint out_base = pc.out_base * krow; // pc.out_base is the 0/1 multiplier in dyn mode
 #else
     uint rope_pos = pc.rope_pos;
     uint out_base = pc.out_base;

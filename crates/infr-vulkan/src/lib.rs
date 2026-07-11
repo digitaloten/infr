@@ -832,6 +832,9 @@ impl VulkanBackend {
             // read-after-write barrier into one dispatch. INFR_NO_GATED_RMSNORM forces the split
             // form for A/B.
             gated_rmsnorm: true,
+            // Every KV write/read kernel maps position -> row modulo the cache's row capacity
+            // (identity on full-context caches), so SWA layers may get window-sized ring caches.
+            kv_swa_ring: true,
         };
 
         // One-line device banner (stderr) — the first thing to check on a portability bug report:

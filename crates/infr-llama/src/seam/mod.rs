@@ -169,16 +169,94 @@ pub(crate) fn generate_dense_vulkan_session(
 /// `weight_footprint`. Deliberately a slight over-reserve: under-reserving makes the alloc-time
 /// VRAM guard error a live request mid-prefill, over-reserving only streams a borderline model.
 pub(crate) fn dense_act_reserve(cfg: &Config, want_ctx: usize) -> u64 {
-    let ubatch: usize = std::env::var("INFR_UBATCH")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(1024);
+    dense_act_reserve_at(cfg, want_ctx, ubatch_rows())
+}
+
+/// [`dense_act_reserve`] at an EXPLICIT chunk height (the try-resident sweep).
+pub(crate) fn dense_act_reserve_at(cfg: &Config, want_ctx: usize, ubatch: usize) -> u64 {
     // Prefill GEMM outputs pad rows to 64 (see the Vulkan adapter's `alloc_scratch`).
     let rows = ubatch.min(want_ctx).max(1).next_multiple_of(64) as u64;
     let per_row = (2 * cfg.vocab + 12 * cfg.n_ff + 96 * cfg.n_embd) as u64;
     const FIXED: u64 = 256 * 1024 * 1024;
     FIXED + rows * per_row * 5 / 4
+}
+
+/// Batched-prefill micro-batch: rows per prefill chunk (INFR_UBATCH, default 1024). ONE reader
+/// funnel — the prefill loop, the activation reserve, and the SWA ring sizing below all derive
+/// from this, because the ring's correctness bound is "window + one whole prefill chunk".
+pub(crate) fn ubatch_rows() -> usize {
+    std::env::var("INFR_UBATCH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or_else(|| PINNED_UBATCH.get().copied().unwrap_or(1024))
+}
+
+/// Placement-pinned prefill chunk (rows): set ONCE by the dense try-resident sweep when a smaller
+/// chunk is what makes a big model fully resident (see `vulkan_moe_binder`'s dense tier —
+/// residency at a 512-row chunk decodes ~10x faster than streaming at the PCIe ceiling). Read by
+/// [`ubatch_rows`] when INFR_UBATCH is unset, so the prefill loop, the activation reserve, and
+/// the SWA ring sizing all agree on the same height. Set BEFORE the runner's first KV allocation
+/// (placement runs first in the same call), never changed after.
+static PINNED_UBATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// [`kv_rows`] at an EXPLICIT chunk height (the try-resident sweep prices candidate heights
+/// before pinning one; everyone else goes through `kv_rows`/`ubatch_rows`).
+pub(crate) fn kv_rows_at(
+    cfg: &Config,
+    l: usize,
+    want_ctx: usize,
+    ring: bool,
+    ubatch: usize,
+) -> usize {
+    if ring && cfg.is_swa_layer(l) {
+        want_ctx.min((cfg.swa_window + ubatch).next_multiple_of(64))
+    } else {
+        want_ctx
+    }
+}
+
+/// Row capacity of layer `l`'s K/V cache at context `want_ctx`. With `ring` (SWA ring sizing on
+/// for this session — see [`kv_ring_wanted`] + the backend's `Capabilities::kv_swa_ring`), a
+/// sliding-window layer allocates only `min(want_ctx, round64(window + ubatch))` rows and the
+/// backends write/read position `p` at row `p % rows` (WriteKv/Attention ring semantics).
+///
+/// Correctness bound: during one forward of `B <= ubatch` rows starting at position `p0`, the
+/// oldest position any query's window reaches is `p0 + 1 - window` and the newest written is
+/// `p0 + B - 1` — at most `window + B - 1 <= window + ubatch` distinct live positions, so a ring
+/// of `window + ubatch` rows never recycles a row the sliding-window mask hasn't ALREADY excluded
+/// (that mask discards everything older than `pos - window`); attention output is therefore
+/// identical to the full-context cache. Global (non-SWA) layers keep full `want_ctx` rows.
+pub(crate) fn kv_rows(cfg: &Config, l: usize, want_ctx: usize, ring: bool) -> usize {
+    kv_rows_at(cfg, l, want_ctx, ring, ubatch_rows())
+}
+
+/// Config/env-level gate for SWA ring KV sizing, shared by the runner's allocation and the
+/// KV-footprint ESTIMATES (ctx clamp, dense/MoE placement) so they price the same allocation the
+/// runner will make. The runner additionally requires the backend capability
+/// (`Capabilities::kv_swa_ring`) and the FINAL per-side KV formats; this checks the env-requested
+/// formats (a format the runner gates back to f16 stays ring-capable, so the estimate is only
+/// ever conservative). Gated OFF for:
+///   - non-SWA models (no window — nothing to ring);
+///   - DiffusionGemma (its canvas denoise attends a fixed bidirectional `[lo, kv_len)` range that
+///     is NOT a per-query sliding window, so the ring's mask-already-excludes-it argument doesn't
+///     hold there);
+///   - non-f16/q8 KV formats (the low-bit block quants / bf16 / f32 / turbo read the cache
+///     through a dequant-the-prefix prepass sized in positions, and their static-only writes
+///     never learned the ring split — they keep full-context caches, documented scope gate);
+///   - INFR_NO_KV_RING=1 (A/B and escape hatch).
+pub(crate) fn kv_ring_wanted(cfg: &Config) -> bool {
+    let fmt_ok = |var: &str| {
+        matches!(
+            std::env::var(var).ok().as_deref(),
+            None | Some("f16") | Some("F16") | Some("q8_0") | Some("q8") | Some("Q8_0")
+        )
+    };
+    cfg.swa_window > 0
+        && !cfg.diffusion_gemma
+        && std::env::var("INFR_NO_KV_RING").is_err()
+        && fmt_ok("INFR_KV_TYPE_K")
+        && fmt_ok("INFR_KV_TYPE_V")
 }
 
 /// Decide this model's MoE expert placement, install the pager session when the decision pages
@@ -250,10 +328,15 @@ pub(crate) fn vulkan_moe_binder<'a>(
             None => {
                 let fp = crate::weights::weight_footprint(g);
                 let vram = vk.vram();
+                // Per-layer rows: SWA layers ring at window+ubatch rows (see `kv_rows`), so a
+                // mostly-SWA model's KV prices far below n_layer * ctx. +64 rows/layer slop.
+                let ring = kv_ring_wanted(cfg);
                 let kv_bytes: u64 = (0..cfg.n_layer)
-                    .map(|l| (cfg.layer_n_kv(l) * cfg.layer_head_dim(l) * 2 * 2) as u64)
-                    .sum::<u64>()
-                    * (want_ctx as u64 + 64);
+                    .map(|l| {
+                        (cfg.layer_n_kv(l) * cfg.layer_head_dim(l) * 2 * 2) as u64
+                            * (kv_rows(cfg, l, want_ctx, ring) as u64 + 64)
+                    })
+                    .sum::<u64>();
                 // 2 GiB: covers activation scratch (pooled, but per-tag sizes scale with n_embd/
                 // n_ff and this budget calc's `fp`/`kv_bytes` are estimates, not the exact bytes
                 // `alloc`/gpu-allocator's 256 MiB block granularity ends up committing) plus the
@@ -531,10 +614,16 @@ pub(crate) fn vulkan_moe_binder<'a>(
             .sum();
         let fp = crate::weights::weight_footprint(g);
         let vram = vk.vram();
+        // Per-layer rows: SWA layers ring at window+ubatch rows (see `kv_rows`) — this is what
+        // lets a mostly-SWA model (gemma-4-31B: 50/60 layers SWA) price its KV small enough to
+        // take the try-resident tier at real contexts instead of streaming. +64 rows/layer slop.
+        let ring = kv_ring_wanted(cfg);
         let kv_bytes: u64 = (0..cfg.n_layer)
-            .map(|l| (cfg.layer_n_kv(l) * cfg.layer_head_dim(l) * 2 * 2) as u64)
-            .sum::<u64>()
-            * (want_ctx as u64 + 64);
+            .map(|l| {
+                (cfg.layer_n_kv(l) * cfg.layer_head_dim(l) * 2 * 2) as u64
+                    * (kv_rows(cfg, l, want_ctx, ring) as u64 + 64)
+            })
+            .sum::<u64>();
         // Try-resident-first: a dense model goes FULLY RESIDENT (the exact pre-streaming fast
         // path) whenever weights + this session's KV + an HONEST dense activation estimate fit
         // the live free VRAM; only a genuine miss streams. The MoE tier's 2 GiB ACT_HEADROOM is
@@ -545,9 +634,51 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // guard fails that request cleanly — INFR_CACHE=<size> is the escape hatch that forces
         // streaming.
         let act_reserve = dense_act_reserve(cfg, want_ctx);
+        // Residency sweep: when the FULL-chunk reserve is what tips a big model into streaming,
+        // try smaller prefill chunks — a smaller chunk shrinks BOTH the activation reserve
+        // (whole-chunk logits/gate_up scratch scale with rows) and the SWA ring rows
+        // (window + chunk). Resident-with-a-512-row-chunk decodes ~10x faster than streaming at
+        // the PCIe ceiling (gemma-4-31B @ d4096: 27.6 vs 2.9 t/s), so trading prefill chunk
+        // height for residency is strictly the right call. Pinned process-wide (PINNED_UBATCH)
+        // so the prefill loop and the runner's ring sizing use exactly the priced height; an
+        // explicit INFR_UBATCH disables the sweep (the user's height is authoritative).
+        let mut resident = fp.total() + kv_bytes + act_reserve <= vram.available;
+        if !resident && std::env::var("INFR_UBATCH").is_err() && cache_override.is_none() {
+            for cand in [512usize, 256, 128] {
+                let kv_c: u64 = (0..cfg.n_layer)
+                    .map(|l| {
+                        (cfg.layer_n_kv(l) * cfg.layer_head_dim(l) * 2 * 2) as u64
+                            * (kv_rows_at(cfg, l, want_ctx, ring, cand) as u64 + 64)
+                    })
+                    .sum();
+                if fp.total() + kv_c + dense_act_reserve_at(cfg, want_ctx, cand) <= vram.available {
+                    let _ = PINNED_UBATCH.set(cand);
+                    // Re-read through the pin (a racing earlier set wins — use whatever stuck).
+                    if fp.total()
+                        + (0..cfg.n_layer)
+                            .map(|l| {
+                                (cfg.layer_n_kv(l) * cfg.layer_head_dim(l) * 2 * 2) as u64
+                                    * (kv_rows(cfg, l, want_ctx, ring) as u64 + 64)
+                            })
+                            .sum::<u64>()
+                        + dense_act_reserve(cfg, want_ctx)
+                        <= vram.available
+                    {
+                        eprintln!(
+                            "dense placement: resident with a {}-row prefill chunk (the default \
+                             1024-row chunk's activation reserve wouldn't fit); set INFR_UBATCH \
+                             to override",
+                            ubatch_rows().min(want_ctx),
+                        );
+                        resident = true;
+                    }
+                    break;
+                }
+            }
+        }
         let budget = match cache_override {
             Some(spec) => Some(spec.resolve(vram.available)),
-            None if fp.total() + kv_bytes + act_reserve <= vram.available => None,
+            None if resident => None,
             None => Some(
                 vram.available
                     .saturating_sub((fp.total() - streamable_resident) + kv_bytes + act_reserve),

@@ -326,6 +326,9 @@ impl Backend for CpuBackend {
             // `QkNorm`→`GatedAct` pair here — no GPU barrier to save on a scalar interpreter, and
             // it keeps the CPU oracle's op sequence matching the pre-fusion baseline.
             gated_rmsnorm: false,
+            // The interpreter's WriteKv/Attention honor ring KV caches (row = pos % cap_rows), so
+            // the runner may window-size SWA layers' caches here.
+            kv_swa_ring: true,
         }
     }
 
@@ -936,72 +939,90 @@ impl Backend for CpuBackend {
                     // GPU and halve memory, or f32) is read from the graph; cast on write.
                     let buf = bindings.get(cache).expect("cpu backend: unbound KV cache");
                     let mut d = cpu_buf(buf).owned();
-                    let base = pos * rs;
-                    let n = rows * rs;
-                    match g.desc(cache).dtype {
-                        DType::F16 => {
-                            let df: &mut [u16] = bytemuck::cast_slice_mut(&mut d);
-                            for i in 0..n {
-                                df[base + i] = half::f16::from_f32(s[i]).to_bits();
-                            }
-                        }
-                        DType::Q8_0 => {
-                            // Q8_0 blocks (34 B / 32 elems): d = amax/127 (stored f16), q =
-                            // round(x/d) — the llama.cpp quantize_row_q8_0 reference formula.
-                            // `base`/`n` are element counts and rows are 32-aligned (the runner
-                            // gates on it), so blocks never straddle a write.
-                            debug_assert!(base % 32 == 0 && n % 32 == 0);
-                            for b in 0..n / 32 {
-                                let src32 = &s[b * 32..b * 32 + 32];
-                                let amax = src32.iter().fold(0f32, |m, &v| m.max(v.abs()));
-                                let dq = amax / 127.0;
-                                let id = if dq != 0.0 { 1.0 / dq } else { 0.0 };
-                                let off = (base / 32 + b) * 34;
-                                let dh = half::f16::from_f32(dq).to_bits().to_le_bytes();
-                                d[off] = dh[0];
-                                d[off + 1] = dh[1];
-                                for (i, &v) in src32.iter().enumerate() {
-                                    d[off + 2 + i] = (v * id).round_ties_even() as i32 as i8 as u8;
+                    // SWA ring cache: position p lands at row p % cap_rows — the ring only ever
+                    // recycles rows whose positions the sliding-window mask already excludes (see
+                    // the seam runner's ring sizing), so this is exact. A write crossing the wrap
+                    // splits into two contiguous segments `(src_row, dst_row, n_rows)`; on a
+                    // full-context cache pos < cap_rows and segment 0 is the old single write.
+                    let cap_rows = g.desc(cache).numel() / rs.max(1);
+                    let pos_r = if cap_rows > 0 { pos % cap_rows } else { pos };
+                    let segs: [(usize, usize, usize); 2] =
+                        if cap_rows > 0 && pos_r + rows > cap_rows {
+                            let r1 = cap_rows - pos_r;
+                            [(0, pos_r, r1), (r1, 0, rows - r1)]
+                        } else {
+                            [(0, pos_r, rows), (0, 0, 0)]
+                        };
+                    for &(sr, dr, nr) in segs.iter().filter(|&&(_, _, nr)| nr > 0) {
+                        let s = &s[sr * rs..sr * rs + nr * rs];
+                        let base = dr * rs;
+                        let n = nr * rs;
+                        match g.desc(cache).dtype {
+                            DType::F16 => {
+                                let df: &mut [u16] = bytemuck::cast_slice_mut(&mut d);
+                                for i in 0..n {
+                                    df[base + i] = half::f16::from_f32(s[i]).to_bits();
                                 }
                             }
-                        }
-                        DType::Bf16 => {
-                            let df: &mut [u16] = bytemuck::cast_slice_mut(&mut d);
-                            for i in 0..n {
-                                df[base + i] = half::bf16::from_f32(s[i]).to_bits();
+                            DType::Q8_0 => {
+                                // Q8_0 blocks (34 B / 32 elems): d = amax/127 (stored f16), q =
+                                // round(x/d) — the llama.cpp quantize_row_q8_0 reference formula.
+                                // `base`/`n` are element counts and rows are 32-aligned (the runner
+                                // gates on it), so blocks never straddle a write.
+                                debug_assert!(base % 32 == 0 && n % 32 == 0);
+                                for b in 0..n / 32 {
+                                    let src32 = &s[b * 32..b * 32 + 32];
+                                    let amax = src32.iter().fold(0f32, |m, &v| m.max(v.abs()));
+                                    let dq = amax / 127.0;
+                                    let id = if dq != 0.0 { 1.0 / dq } else { 0.0 };
+                                    let off = (base / 32 + b) * 34;
+                                    let dh = half::f16::from_f32(dq).to_bits().to_le_bytes();
+                                    d[off] = dh[0];
+                                    d[off + 1] = dh[1];
+                                    for (i, &v) in src32.iter().enumerate() {
+                                        d[off + 2 + i] =
+                                            (v * id).round_ties_even() as i32 as i8 as u8;
+                                    }
+                                }
                             }
-                        }
-                        dt @ (DType::Turbo2 | DType::Turbo3 | DType::Turbo4) => {
-                            // TurboQuant: each 128-elem group (a head_dim slice) → one block
-                            // (L2-norm + WHT + 2/3/4-bit PolarQuant). base/n are 128-aligned (the
-                            // runner gates head_dim%128), so blocks never straddle a write.
-                            debug_assert!(base % 128 == 0 && n % 128 == 0);
-                            let bb = crate::turbo::block_bytes(dt);
-                            let blk0 = base / 128;
-                            for b in 0..n / 128 {
-                                let off = (blk0 + b) * bb;
-                                crate::turbo::quantize_block(
+                            DType::Bf16 => {
+                                let df: &mut [u16] = bytemuck::cast_slice_mut(&mut d);
+                                for i in 0..n {
+                                    df[base + i] = half::bf16::from_f32(s[i]).to_bits();
+                                }
+                            }
+                            dt @ (DType::Turbo2 | DType::Turbo3 | DType::Turbo4) => {
+                                // TurboQuant: each 128-elem group (a head_dim slice) → one block
+                                // (L2-norm + WHT + 2/3/4-bit PolarQuant). base/n are 128-aligned (the
+                                // runner gates head_dim%128), so blocks never straddle a write.
+                                debug_assert!(base % 128 == 0 && n % 128 == 0);
+                                let bb = crate::turbo::block_bytes(dt);
+                                let blk0 = base / 128;
+                                for b in 0..n / 128 {
+                                    let off = (blk0 + b) * bb;
+                                    crate::turbo::quantize_block(
+                                        dt,
+                                        &s[b * 128..b * 128 + 128],
+                                        &mut d[off..off + bb],
+                                    );
+                                }
+                            }
+                            dt if crate::kvquant::supported(dt) => {
+                                // Mainline low-bit KV quants (q4_0/q4_1/q5_0/q5_1/iq4_nl): quantize the
+                                // f32 activations into 32-elem blocks. base/n are 32-aligned (kv_align_ok).
+                                debug_assert!(base % 32 == 0 && n % 32 == 0);
+                                let bb = infr_gguf::nbytes(dt, 32);
+                                let off = (base / 32) * bb;
+                                crate::kvquant::quantize_row(
                                     dt,
-                                    &s[b * 128..b * 128 + 128],
-                                    &mut d[off..off + bb],
+                                    &s[..n],
+                                    &mut d[off..off + n / 32 * bb],
                                 );
                             }
-                        }
-                        dt if crate::kvquant::supported(dt) => {
-                            // Mainline low-bit KV quants (q4_0/q4_1/q5_0/q5_1/iq4_nl): quantize the
-                            // f32 activations into 32-elem blocks. base/n are 32-aligned (kv_align_ok).
-                            debug_assert!(base % 32 == 0 && n % 32 == 0);
-                            let bb = infr_gguf::nbytes(dt, 32);
-                            let off = (base / 32) * bb;
-                            crate::kvquant::quantize_row(
-                                dt,
-                                &s[..n],
-                                &mut d[off..off + n / 32 * bb],
-                            );
-                        }
-                        _ => {
-                            let df: &mut [f32] = bytemuck::cast_slice_mut(&mut d);
-                            df[base..base + n].copy_from_slice(&s[..n]);
+                            _ => {
+                                let df: &mut [f32] = bytemuck::cast_slice_mut(&mut d);
+                                df[base..base + n].copy_from_slice(&s[..n]);
+                            }
                         }
                     }
                 }
@@ -1033,10 +1054,17 @@ impl Backend for CpuBackend {
                     let vbuf = bindings.get(v_cache).expect("cpu backend: unbound v_cache");
                     let kguard = cpu_buf(kbuf).read();
                     let vguard = cpu_buf(vbuf).read();
-                    // Materialize the valid KV prefix (`kv_len` rows) as f32. K and V pick their
-                    // cache dtype INDEPENDENTLY (f16 matches the GPU's f16 KV; Q8_0 blocks dequant
-                    // via y = d*q) — the inner dot then runs in f32 either way.
-                    let need = kv_len * nkv * hd;
+                    // Materialize the valid KV rows as f32. K and V pick their cache dtype
+                    // INDEPENDENTLY (f16 matches the GPU's f16 KV; Q8_0 blocks dequant via
+                    // y = d*q) — the inner dot then runs in f32 either way.
+                    //
+                    // SWA ring cache: the cache holds only `cap_rows` rows (window + ubatch — see
+                    // the seam runner's ring sizing) and position j lives at row j % cap_rows.
+                    // The ring only ever recycles rows whose positions the sliding-window mask
+                    // (`lo`) already excludes, so the mapping is exact; on a full-context cache
+                    // kv_len <= cap_rows and everything below is the old identity indexing.
+                    let cap_rows = g.desc(k_cache).numel() / (nkv * hd).max(1);
+                    let need = kv_len.min(cap_rows) * nkv * hd;
                     let deq = |b: &[u8], dt: DType| -> Vec<f32> {
                         match dt {
                             DType::F16 => bytemuck::cast_slice::<u8, u16>(b)[..need]
@@ -1104,7 +1132,8 @@ impl Backend for CpuBackend {
                         let qrow = &qs[qb..qb + hd];
                         for (jj, scj) in sc.iter_mut().enumerate() {
                             let j = lo + jj;
-                            let kb = (j * nkv + kvh) * hd;
+                            let jr = if cap_rows > 0 { j % cap_rows } else { j };
+                            let kb = (jr * nkv + kvh) * hd;
                             // 8-accumulator SIMD dot (was a serial per-element f32 chain — kept
                             // scalar in an earlier campaign only because the reassociation
                             // flipped a golden hash; the numerics policy now allows it).
@@ -1117,8 +1146,9 @@ impl Backend for CpuBackend {
                         }
                         for (jj, &s) in sc.iter().enumerate() {
                             let j = lo + jj;
+                            let jr = if cap_rows > 0 { j % cap_rows } else { j };
                             let p = (s - mx).exp() / l;
-                            let vb = (j * nkv + kvh) * hd;
+                            let vb = (jr * nkv + kvh) * hd;
                             // Independent lanes — vectorizes to FMA.
                             for (o, &v) in ob_slice.iter_mut().zip(&vs[vb..vb + hd]) {
                                 *o = v.mul_add(p, *o);

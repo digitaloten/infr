@@ -248,6 +248,9 @@ impl Backend for MetalBackend {
             // campaign) — the runner keeps the split QkNorm→GatedAct pair on Metal. See the
             // Op::GatedRmsNorm exec arm's Unsupported note.
             gated_rmsnorm: false,
+            // Metal's KV kernels index rows directly by position — no ring mapping; the runner
+            // keeps full-context KV allocations for SWA layers here.
+            kv_swa_ring: false,
         }
     }
 
