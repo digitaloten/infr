@@ -2402,7 +2402,11 @@ impl VulkanBackend {
         n: usize,
     ) -> Result<Vec<f32>> {
         assert!(m.is_multiple_of(16) && n.is_multiple_of(16) && k.is_multiple_of(16));
-        let kern = self.kernel("gemm_coopmat", gemm_spv(), 3, 12);
+        // Pin subgroup size 32: the shader computes one subgroup-scope coopmat tile per
+        // 32-thread workgroup, and an unpinned compute pipeline may get wave64 on RDNA3 — a
+        // workgroup that's a fraction of a subgroup, which the spec forbids for subgroup-scope
+        // cooperative matrices (VUID-VkPipelineShaderStageCreateInfo-module-08987).
+        let kern = self.kernel_sg("gemm_coopmat", gemm_spv(), 3, 12, 32);
         self.run_gemm(kern, a, b, m, k, n, (n / 16) as u32, (m / 16) as u32)
     }
 
