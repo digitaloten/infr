@@ -1669,6 +1669,40 @@ fn main() {
             "native_gemm_warp_iq4xs_sk_ag",
             &["-DFMT_IQ4XS", "-DNARROW_N", "-DSPLIT_K", "-DA_GLOBAL"],
         ),
+        (
+            // IQ4_NL was the only codebook-4bit format without a warp family, so unsloth mixed
+            // quants that put ffn_up/gate + attn_q on IQ4_NL (gemma-3-1b "Q2_K": 1152×13824 at
+            // m=512) fell to the 64×64 native_gemm tile at ~8 TF while the same file's Q3_K
+            // tensors ran the sk_ag warptile at ~48 TF — pp512 0.37× vs llama.cpp from this arm.
+            "native_gemm_warp",
+            "native_gemm_warp_iq4nl",
+            &["-DFMT_IQ4NL"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_iq4nl_n128",
+            &["-DFMT_IQ4NL", "-DNARROW_N"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_iq4nl_sk",
+            &["-DFMT_IQ4NL", "-DNARROW_N", "-DSPLIT_K"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_iq4nl_ag",
+            &["-DFMT_IQ4NL", "-DA_GLOBAL"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_iq4nl_n128_ag",
+            &["-DFMT_IQ4NL", "-DNARROW_N", "-DA_GLOBAL"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_iq4nl_sk_ag",
+            &["-DFMT_IQ4NL", "-DNARROW_N", "-DSPLIT_K", "-DA_GLOBAL"],
+        ),
         ("native_gemm_warp", "native_gemm_warp_q2k", &["-DFMT_Q2K"]),
         (
             "native_gemm_warp",

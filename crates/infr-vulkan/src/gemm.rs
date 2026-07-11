@@ -958,6 +958,7 @@ pub(crate) fn native_gemm_warp_build_spv(dtype: infr_core::DType) -> Option<&'st
     }
     Some(match dtype {
         Bf16 => v!("native_gemm_warp_bf16"),
+        Iq4Nl => v!("native_gemm_warp_iq4nl"),
         Iq4Xs => v!("native_gemm_warp_iq4xs"),
         Q2K => v!("native_gemm_warp_q2k"),
         Q3K => v!("native_gemm_warp_q3k"),
@@ -988,6 +989,7 @@ pub(crate) fn native_gemm_warp_n128_build_spv(dtype: infr_core::DType) -> Option
     }
     Some(match dtype {
         Bf16 => v!("native_gemm_warp_bf16_n128"),
+        Iq4Nl => v!("native_gemm_warp_iq4nl_n128"),
         Iq4Xs => v!("native_gemm_warp_iq4xs_n128"),
         Q2K => v!("native_gemm_warp_q2k_n128"),
         Q3K => v!("native_gemm_warp_q3k_n128"),
@@ -1021,6 +1023,7 @@ pub(crate) fn native_gemm_warp_ag_build_spv(
         }};
     }
     Some(match dtype {
+        Iq4Nl => ("native_gemm_warp_iq4nl_ag", v!("native_gemm_warp_iq4nl_ag")),
         Iq4Xs => ("native_gemm_warp_iq4xs_ag", v!("native_gemm_warp_iq4xs_ag")),
         Q2K => ("native_gemm_warp_q2k_ag", v!("native_gemm_warp_q2k_ag")),
         Q3K => ("native_gemm_warp_q3k_ag", v!("native_gemm_warp_q3k_ag")),
@@ -1049,6 +1052,10 @@ pub(crate) fn native_gemm_warp_n128_ag_build_spv(
         }};
     }
     Some(match dtype {
+        Iq4Nl => (
+            "native_gemm_warp_iq4nl_n128_ag",
+            v!("native_gemm_warp_iq4nl_n128_ag"),
+        ),
         Iq4Xs => (
             "native_gemm_warp_iq4xs_n128_ag",
             v!("native_gemm_warp_iq4xs_n128_ag"),
@@ -1101,6 +1108,10 @@ pub(crate) fn native_gemm_warp_sk_ag_build_spv(
         }};
     }
     Some(match dtype {
+        Iq4Nl => (
+            "native_gemm_warp_iq4nl_sk_ag",
+            v!("native_gemm_warp_iq4nl_sk_ag"),
+        ),
         Iq4Xs => (
             "native_gemm_warp_iq4xs_sk_ag",
             v!("native_gemm_warp_iq4xs_sk_ag"),
@@ -1233,6 +1244,7 @@ pub(crate) fn native_gemm_warp_sk_build_spv(dtype: infr_core::DType) -> Option<&
         // exists ONLY for the adapter's targeted deep-k narrow-n F16 route (the DiffusionGemma
         // SC soft-embedding GEMM); see the matching arm in `matmul_native_splitk`.
         F16 => v!("native_gemm_warp_f16_sk"),
+        Iq4Nl => v!("native_gemm_warp_iq4nl_sk"),
         Iq4Xs => v!("native_gemm_warp_iq4xs_sk"),
         Q2K => v!("native_gemm_warp_q2k_sk"),
         Q3K => v!("native_gemm_warp_q3k_sk"),

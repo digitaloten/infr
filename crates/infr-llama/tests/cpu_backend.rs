@@ -795,6 +795,47 @@ fn gpu_seam_matches_cpu_gemma3() {
     seam_vulkan_matches_cpu(&path, "What is the capital of France? Answer briefly.", 16);
 }
 
+/// gemma3 Q2_K — unsloth's Q2_K here is a MIXED quant whose ffn up/gate and attn_q are IQ4_NL
+/// (down/o/kv are Q3_K, embeddings Q2_K/Q5_0): the only in-tree model file exercising the IQ4_NL
+/// warp-GEMM family (native_gemm_warp_iq4nl_{,n128,sk,ag,n128_ag,sk_ag}) and the word-parallel
+/// IQ4_NL `dqblk` in the decode GEMV end-to-end.
+///
+/// NOT the strict token-for-token compare: at 2-bit this 1B model near-ties its greedy argmax
+/// within a handful of tokens on every prompt tried ("Paris"+"."-vs-"\n", "One"+","-vs-" ") and
+/// the f16-GPU/f32-CPU split forks it into an equally-coherent alternative — verified forking
+/// IDENTICALLY on the pre-IQ4_NL-warp tree, so it's the model, not the kernels. A real dequant
+/// or GEMM bug corrupts the context and diverges immediately; assert a substantial common prefix
+/// instead (the `flash_prefill_seam_matches_cpu` precedent).
+#[test]
+fn gpu_seam_matches_cpu_gemma3_q2k_iq4nl() {
+    let path = need_model!(gemma3_1b_q2k(), "gemma-3-1b Q2_K");
+    need_gpu!();
+    let _tlk = test_serial_lock();
+    std::env::set_var("INFR_TEMP", "0");
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
+    let rendered = model
+        .render_chat("Count from one to five, digits only.")
+        .expect("render chat");
+    let mut cpu_txt = String::new();
+    model
+        .generate_cpu(&rendered, 16, |p| cpu_txt.push_str(p))
+        .expect("cpu gen");
+    let gpu_txt = model
+        .generate_dense_vulkan(&rendered, 16)
+        .expect("vulkan seam gen");
+    let (ct, gt) = (cpu_txt.trim(), gpu_txt.trim());
+    let common = ct
+        .char_indices()
+        .zip(gt.chars())
+        .take_while(|((_, a), b)| a == b)
+        .count();
+    assert!(
+        common >= 16,
+        "gemma3 Q2_K (IQ4_NL) seam diverged from the CPU oracle too early \
+         (common prefix {common} chars):\ncpu: {ct:?}\ngpu: {gt:?}"
+    );
+}
+
 /// llama (no qk-norm: standalone INTERLEAVED RoPE — llama.cpp's ROPE_TYPE_NORM — through the
 /// f16-out Rope shape, fused KV write, and the rope_f16_dyn record-once replay).
 #[test]
@@ -949,6 +990,10 @@ fn cpu_golden_qwen3_quants() {
 
 fn gemma3_1b() -> Option<PathBuf> {
     find_gguf("unsloth--gemma-3-1b-it-GGUF", "gemma-3-1b-it-Q4_K_M.gguf")
+}
+
+fn gemma3_1b_q2k() -> Option<PathBuf> {
+    find_gguf("unsloth--gemma-3-1b-it-GGUF", "gemma-3-1b-it-Q2_K.gguf")
 }
 
 // ─── Llama (plain interleaved RoPE, no qk-norm) ────────────────────────────────

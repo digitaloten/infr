@@ -986,6 +986,7 @@ impl<'a> Recorder<'a> {
             (Some((spv, 256)), infr_core::DType::Q3K) => ("native_gemm_warp_q3k", spv),
             (Some((spv, 256)), infr_core::DType::Q5_0) => ("native_gemm_warp_q5_0", spv),
             (Some((spv, 256)), infr_core::DType::Q5_1) => ("native_gemm_warp_q5_1", spv),
+            (Some((spv, 256)), infr_core::DType::Iq4Nl) => ("native_gemm_warp_iq4nl", spv),
             (Some((spv, 256)), infr_core::DType::Iq4Xs) => ("native_gemm_warp_iq4xs", spv),
             (Some((spv, 256)), infr_core::DType::Q2K) => ("native_gemm_warp_q2k", spv),
             (Some((spv, 256)), infr_core::DType::Q4_0) => ("native_gemm_warp_q4_0", spv),
@@ -997,6 +998,7 @@ impl<'a> Recorder<'a> {
             (Some((spv, _)), infr_core::DType::Q3K) => ("native_gemm_warp_q3k_n128", spv),
             (Some((spv, _)), infr_core::DType::Q5_0) => ("native_gemm_warp_q5_0_n128", spv),
             (Some((spv, _)), infr_core::DType::Q5_1) => ("native_gemm_warp_q5_1_n128", spv),
+            (Some((spv, _)), infr_core::DType::Iq4Nl) => ("native_gemm_warp_iq4nl_n128", spv),
             (Some((spv, _)), infr_core::DType::Iq4Xs) => ("native_gemm_warp_iq4xs_n128", spv),
             (Some((spv, _)), infr_core::DType::Q2K) => ("native_gemm_warp_q2k_n128", spv),
             (Some((spv, _)), infr_core::DType::Q4_0) => ("native_gemm_warp_q4_0_n128", spv),
@@ -1153,6 +1155,7 @@ impl<'a> Recorder<'a> {
             let spv = crate::gemm::native_gemm_warp_sk_build_spv(dtype).expect("split-k spv");
             let name = match dtype {
                 infr_core::DType::F16 => "native_gemm_warp_f16_sk",
+                infr_core::DType::Iq4Nl => "native_gemm_warp_iq4nl_sk",
                 infr_core::DType::Iq4Xs => "native_gemm_warp_iq4xs_sk",
                 infr_core::DType::Q2K => "native_gemm_warp_q2k_sk",
                 infr_core::DType::Q4_0 => "native_gemm_warp_q4_0_sk",
@@ -7388,6 +7391,141 @@ mod tests {
         }
         println!("matmul_native_splitk f16 max_err={e:e}");
         assert!(e < 5e-2, "matmul_native_splitk f16 mismatch: {e}"); // f16 A rounding at k=2048
+    }
+
+    /// The IQ4_NL warp-GEMM family vs a CPU dequant reference — wide (BN=256), n128, n128_ag,
+    /// sk, and sk_ag tiles. Synthetic IQ4_NL blocks ([f16 d][u8 qs[16]] = 18 bytes / 32 elems,
+    /// value = d·kvalues[nibble]); m=70 (not %64) exercises padded rows, k=1024 gives split-K
+    /// multiple BK stages, n=16384 fills the wide-tile grid gate (ceil(70/64)·(16384/256) = 128).
+    /// The host reference rounds A to f16 first — every warp tile does (stage or A_GLOBAL cast).
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn native_gemm_warp_iq4nl_matches_cpu() {
+        const KV: [i32; 16] = [
+            -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+        ];
+        let be = VulkanBackend::new().unwrap();
+        let (m, k, n_max) = (70usize, 1024usize, 16384usize);
+        let mpad = m.div_ceil(64) * 64;
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| half::f16::from_f32(((i % 23) as f32 - 11.0) * 0.04).to_f32())
+            .collect();
+        // weight element g = col*k + kk; blocks packed col-major contiguous
+        let q: Vec<u32> = (0..n_max * k).map(|i| (i * 7 % 16) as u32).collect();
+        let nblk = n_max * k / 32;
+        let d: Vec<half::f16> = (0..nblk)
+            .map(|b| half::f16::from_f32(0.01 + (b % 7) as f32 * 0.002))
+            .collect();
+        let mut blk = vec![0u8; nblk * 18];
+        for b in 0..nblk {
+            let db = d[b].to_bits().to_le_bytes();
+            blk[b * 18] = db[0];
+            blk[b * 18 + 1] = db[1];
+            for j in 0..16 {
+                blk[b * 18 + 2 + j] = (q[b * 32 + j] | (q[b * 32 + 16 + j] << 4)) as u8;
+            }
+        }
+        let dq = |g: usize| -> f32 { d[g / 32].to_f32() * KV[q[g] as usize] as f32 };
+
+        let ba = be.alloc(a.len() * 4, BufferUsage::Staging).unwrap();
+        be.upload(ba.as_ref(), bytemuck::cast_slice(&a)).unwrap();
+        let bw = be.upload_weight_bytes(&blk).unwrap();
+        let a16 = be.alloc(mpad * k * 2, BufferUsage::Activations).unwrap();
+        {
+            let rec = be.recorder().unwrap();
+            rec.store_f16(ba.as_ref(), a16.as_ref(), m * k, 0);
+            rec.finish().unwrap();
+        }
+        let check = |bc: &dyn Buffer, n: usize, label: &str| {
+            let mut bytes = vec![0u8; mpad * n * 4];
+            be.download(bc, &mut bytes).unwrap();
+            let got: &[f32] = bytemuck::cast_slice(&bytes);
+            let mut e = 0f32;
+            for r in 0..m {
+                for col in 0..n {
+                    let want: f32 = (0..k).map(|x| a[r * k + x] * dq(col * k + x)).sum();
+                    e = e.max((got[r * n + col] - want).abs());
+                }
+            }
+            println!("native_gemm_warp_iq4nl {label} max_err={e:e}");
+            assert!(e < 5e-2, "native_gemm_warp_iq4nl {label} mismatch: {e}");
+        };
+
+        // wide BN=256 tile (grid gate: ceil(70/64)·(16384/256) = 128 ≥ 128)
+        let bc = be.alloc(mpad * n_max * 4, BufferUsage::Readback).unwrap();
+        {
+            let rec = be.recorder().unwrap();
+            rec.matmul_native(
+                infr_core::DType::Iq4Nl,
+                ba.as_ref(),
+                bw.as_ref(),
+                bc.as_ref(),
+                m,
+                k,
+                n_max,
+            );
+            rec.finish().unwrap();
+        }
+        check(bc.as_ref(), n_max, "wide");
+        // n128 tile (n=128: below the wide gate, n%128==0)
+        let n = 128usize;
+        let bc = be.alloc(mpad * n * 4, BufferUsage::Readback).unwrap();
+        {
+            let rec = be.recorder().unwrap();
+            rec.matmul_native(
+                infr_core::DType::Iq4Nl,
+                ba.as_ref(),
+                bw.as_ref(),
+                bc.as_ref(),
+                m,
+                k,
+                n,
+            );
+            rec.finish().unwrap();
+        }
+        check(bc.as_ref(), n, "n128");
+        // n128_ag (A pre-cast to f16)
+        let bc = be.alloc(mpad * n * 4, BufferUsage::Readback).unwrap();
+        {
+            let rec = be.recorder().unwrap();
+            rec.matmul_native_f16a(
+                infr_core::DType::Iq4Nl,
+                a16.as_ref(),
+                bw.as_ref(),
+                0,
+                bc.as_ref(),
+                m,
+                k,
+                n,
+            );
+            rec.finish().unwrap();
+        }
+        check(bc.as_ref(), n, "n128_ag");
+        // sk (split-K, f32 A) and sk_ag (split-K, f16 A)
+        let splits = 4usize;
+        let pk = be
+            .alloc(splits * mpad * n * 4, BufferUsage::Activations)
+            .unwrap();
+        for (a_is_f16, label) in [(false, "sk"), (true, "sk_ag")] {
+            let bc = be.alloc(mpad * n * 4, BufferUsage::Readback).unwrap();
+            let ab: &dyn Buffer = if a_is_f16 { a16.as_ref() } else { ba.as_ref() };
+            let rec = be.recorder().unwrap();
+            rec.matmul_native_splitk(
+                infr_core::DType::Iq4Nl,
+                ab,
+                bw.as_ref(),
+                0,
+                pk.as_ref(),
+                bc.as_ref(),
+                m,
+                k,
+                n,
+                splits,
+                a_is_f16,
+            );
+            rec.finish().unwrap();
+            check(bc.as_ref(), n, label);
+        }
     }
 
     #[test]

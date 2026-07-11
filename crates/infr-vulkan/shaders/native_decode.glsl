@@ -451,6 +451,24 @@ float dq(uint g) {
     uint idx = (j < 16u) ? (rb(bd + 2u + j) & 0xFu) : (rb(bd + 2u + j - 16u) >> 4u);
     return d * float(kv_iq4nl(idx));
 }
+#define HAVE_DQBLK
+// One 32-elem sub-block = exactly one whole IQ4_NL block (gstart is 32-aligned). Decode d ONCE
+// and load the 16 qs bytes as 4 (unaligned — 18-byte block stride) u32s instead of 32 rb()
+// byte-extract chains; low nibble → v[0..16), high nibble → v[16..32). Same d*KV[nibble] value
+// as the scalar loop — bit-identical. The warptile GEMM's staging loop is decode-ALU-bound,
+// so this is directly visible in prefill GEMM throughput.
+void dqblk(uint gstart, out float v[32]) {
+    uint bd = (gstart / 32u) * 18u;
+    float d = f16tof32(ru16(bd));
+    for (uint w8 = 0u; w8 < 4u; w8++) {
+        uint q = ru32u(bd + 2u + w8 * 4u);
+        for (uint b = 0u; b < 4u; b++) {
+            uint byteq = (q >> (8u * b)) & 0xFFu;
+            v[w8 * 4u + b] = d * float(kv_iq4nl(byteq & 0xFu));
+            v[w8 * 4u + b + 16u] = d * float(kv_iq4nl(byteq >> 4u));
+        }
+    }
+}
 #endif
 
 #if defined(FMT_IQ4XS)
