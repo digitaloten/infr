@@ -144,6 +144,7 @@ pub(crate) fn generate_dense_vulkan_session(
     // model is loaded. Printed every call rather than gated to "last call only" since neither the
     // CLI's run/serve loop nor this function know which call is the process's last one.
     vk.print_moe_pager_stats();
+    vk.print_dense_pager_stats();
     Ok(out)
 }
 
@@ -238,6 +239,20 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 // (found empirically sizing Scout's 48-layer, 37 GB Q2_K pager placement — 512 MiB
                 // undershot by a few hundred MiB and the guard rightly refused to over-commit).
                 const ACT_HEADROOM: u64 = 2 * 1024 * 1024 * 1024;
+                // Mixed oversize (an MoE model whose DENSE part alone doesn't fit) is out of
+                // scope for dense layer streaming — fail with a clear message instead of letting
+                // a degenerate expert budget stumble into the alloc-time VRAM guard's generic
+                // over-commit error.
+                if vram.available < fp.dense + kv_bytes {
+                    return Err(anyhow!(
+                        "this MoE model's dense weights ({:.2} GB) + KV cache ({:.2} GB) exceed \
+                         available VRAM ({:.2} GB) — dense layer streaming does not cover MoE \
+                         models' dense parts; reduce ctx or run on the CPU backend (INFR_CPU=1)",
+                        fp.dense as f64 / 1e9,
+                        kv_bytes as f64 / 1e9,
+                        vram.available as f64 / 1e9,
+                    ));
+                }
                 let budget = vram
                     .available
                     .saturating_sub(fp.dense + kv_bytes + ACT_HEADROOM);
@@ -408,6 +423,203 @@ pub(crate) fn vulkan_moe_binder<'a>(
         }
     }
 
+    // ── Dense layer streaming placement ──────────────────────────────────────────────────────
+    // The DENSE twin of the MoE tiers above (`infr_vulkan::pager::DensePagerSession`): when a
+    // dense model's per-layer weights (minus what must stay resident) exceed the budget, stream
+    // them through per-(dtype, stride) arena pools driven by the exact cyclic-sweep policy
+    // (`infr_core::pager::Pager::schedule`). One block = one weight GROUP exactly as `wload`
+    // uploads it (fused qkv / gate_up concats are one block — the shared `fuse_*_decision`
+    // helpers keep this enumeration and the runner's upload order from drifting). Embeddings,
+    // lm_head, norms and biases stay resident: norms/biases are consumed by ops without weight
+    // offsets and are tiny; token_embd/lm_head are read at every token edge, so streaming them
+    // adds their full bytes to every token's PCIe bill with zero locality to exploit.
+    //
+    //   1. `INFR_CACHE=<size>` on a DENSE model — force EVERY streamable block through the
+    //      streamer with that byte budget (deterministic test hook, same grammar as the MoE tier).
+    //   2. Auto (unset): fully resident (the fast path, zero change) when everything fits;
+    //      otherwise stream with budget = remaining VRAM after resident-weights+KV+headroom.
+    // Streamable = the per-layer Linear projection groups whose dtype has offset-capable native
+    // kernels (`native_dense_supported`, F16/F32 excluded — `matmul_proj`/`linear_f32` take no
+    // weight offset) and whose bytes upload unmodified from the mmap (the qwen2 NEOX q/k row
+    // permute rewrites bytes at load, so those tensors stay resident).
+    let mut dense_plan: std::collections::HashMap<String, (usize, u32, Vec<String>)> =
+        std::collections::HashMap::new();
+    if first_load && cfg.moe.is_none() {
+        let fuse_gu = runner::fuse_gu_decision(vk.capabilities().combined_gu, g, cfg);
+        let fuse_qkv = runner::fuse_qkv_decision(vk.capabilities().combined_gu, g, cfg);
+        // Candidate groups in LAYER ORDER — the cyclic-sweep schedule key. Key = names[0] (what
+        // `bind_weight` receives for the group).
+        let mut groups: Vec<Vec<String>> = Vec::new();
+        for l in 0..cfg.n_layer {
+            let p = |s: &str| format!("blk.{l}.{s}");
+            if !cfg.permute_qk_neox {
+                if fuse_qkv {
+                    groups.push(vec![
+                        p("attn_q.weight"),
+                        p("attn_k.weight"),
+                        p("attn_v.weight"),
+                    ]);
+                } else {
+                    groups.push(vec![p("attn_q.weight")]);
+                    groups.push(vec![p("attn_k.weight")]);
+                    groups.push(vec![p("attn_v.weight")]);
+                }
+            } else if !fuse_qkv {
+                // Permuted q/k stay resident (their upload bytes are load-time rewrites of the
+                // mmap); v uploads raw and can still stream.
+                groups.push(vec![p("attn_v.weight")]);
+            }
+            groups.push(vec![p("attn_output.weight")]);
+            if fuse_gu {
+                groups.push(vec![p("ffn_gate.weight"), p("ffn_up.weight")]);
+            } else {
+                groups.push(vec![p("ffn_gate.weight")]);
+                groups.push(vec![p("ffn_up.weight")]);
+            }
+            groups.push(vec![p("ffn_down.weight")]);
+        }
+        let tinfo = |n: &str| g.tensors().iter().find(|t| t.name == n);
+        // Eligible groups with their (dtype, raw bytes, numel) — a group whose tensors are
+        // missing (DeltaNet layers, gemma4 V-less layers) or whose dtype lacks offset-capable
+        // kernels simply stays resident.
+        let eligible: Vec<(Vec<String>, infr_core::DType, usize, usize)> = groups
+            .into_iter()
+            .filter_map(|comps| {
+                let infos: Vec<_> = comps.iter().map(|n| tinfo(n)).collect::<Option<_>>()?;
+                let dt = infos[0].dtype;
+                if !infos.iter().all(|t| t.dtype == dt)
+                    || !infr_vulkan::linear::native_dense_supported(dt)
+                {
+                    return None;
+                }
+                let raw: usize = infos.iter().map(|t| t.nbytes).sum();
+                let numel: usize = infos.iter().map(|t| t.shape.iter().product::<usize>()).sum();
+                Some((comps, dt, raw, numel))
+            })
+            .collect();
+        let streamable_resident: u64 = eligible
+            .iter()
+            .map(|(_, dt, raw, numel)| crate::weights::tensor_resident_bytes(*dt, *numel, *raw))
+            .sum();
+        let fp = crate::weights::weight_footprint(g);
+        let vram = vk.vram();
+        let kv_bytes: u64 = (0..cfg.n_layer)
+            .map(|l| (cfg.layer_n_kv(l) * cfg.layer_head_dim(l) * 2 * 2) as u64)
+            .sum::<u64>()
+            * (want_ctx as u64 + 64);
+        const ACT_HEADROOM: u64 = 2 * 1024 * 1024 * 1024; // same rationale as the MoE tier's
+        let budget = match cache_override {
+            Some(spec) => Some(spec.resolve(vram.available)),
+            None if fp.total() + kv_bytes + ACT_HEADROOM <= vram.available => None,
+            None => Some(vram.available.saturating_sub(
+                (fp.total() - streamable_resident) + kv_bytes + ACT_HEADROOM,
+            )),
+        };
+        if let (Some(mut budget), false) = (budget, eligible.is_empty()) {
+            // Slot stride: the group's raw bytes padded to a whole number of quant blocks AND
+            // u32 words, so every slot base is block-aligned (the kernels' element-offset weight
+            // addressing needs `slot_byte_base = whole blocks`) and the arena binds as
+            // `array<u32>`.
+            let lcm = |a: usize, b: usize| {
+                let gcd = {
+                    let (mut x, mut y) = (a, b);
+                    while y != 0 {
+                        (x, y) = (y, x % y);
+                    }
+                    x
+                };
+                a / gcd * b
+            };
+            // Pools keyed by (dtype, stride); blocks assigned ids in layer order per pool.
+            let mut pools: Vec<(infr_core::DType, usize, u64, usize)> = Vec::new(); // (dt, stride, elems_per_slot, n_blocks)
+            let mut planned: Vec<(Vec<String>, usize, u32)> = Vec::new(); // (comps, pool, block_id)
+            for (comps, dt, raw, _numel) in &eligible {
+                let (blk_e, blk_b) = infr_gguf::block_layout(*dt);
+                let stride = raw.next_multiple_of(lcm(blk_b, 4));
+                let eps = (stride / blk_b * blk_e) as u64;
+                let pool = match pools
+                    .iter()
+                    .position(|&(d, s, ..)| d == *dt && s == stride)
+                {
+                    Some(i) => i,
+                    None => {
+                        pools.push((*dt, stride, eps, 0));
+                        pools.len() - 1
+                    }
+                };
+                let block_id = pools[pool].3 as u32;
+                pools[pool].3 += 1;
+                planned.push((comps.clone(), pool, block_id));
+            }
+            // The pinned upload ring lives in the same VRAM the arenas do — subtract it first.
+            let ring_bytes = infr_vulkan::pager::ring_bytes_policy(budget);
+            budget = budget.saturating_sub(ring_bytes as u64);
+            let total_bytes: u64 = pools
+                .iter()
+                .map(|&(_, s, _, nb)| (s * nb) as u64)
+                .sum::<u64>()
+                .max(1);
+            let arena_cap = infr_vulkan::pager::GpuPager::max_arena_bytes(vk);
+            let specs: Vec<infr_vulkan::pager::DensePoolSpec> = pools
+                .iter()
+                .map(|&(_, stride, eps, nb)| {
+                    // Proportional budget split (byte share == access share: every block is read
+                    // exactly once per sweep). Floor 2 slots so the next block's upload can
+                    // overlap the previous block's dispatch instead of serializing on one slot.
+                    let share = (budget as u128 * (stride * nb) as u128 / total_bytes as u128)
+                        as u64;
+                    let floor = 2.min(nb).max(1);
+                    // Caps: one SSBO binding per arena (device range), AND the kernels' u32
+                    // ELEMENT reach — `n_slots * elems_per_slot + one block's numel` must fit
+                    // u32 (a Q4_K pool's elements outnumber its bytes 1.78:1, so this cap can
+                    // bind before the byte cap does).
+                    let cap_bytes = ((arena_cap / stride as u64) as usize).max(1);
+                    let cap_elems = ((u32::MAX as u64 / eps).saturating_sub(1) as usize).max(1);
+                    let budget_slots =
+                        ((share / stride as u64) as usize).clamp(floor, nb);
+                    infr_vulkan::pager::DensePoolSpec {
+                        slot_bytes: stride,
+                        n_slots: budget_slots.min(cap_bytes).min(cap_elems),
+                        n_blocks: nb,
+                        elems_per_slot: eps,
+                    }
+                })
+                .collect();
+            let alloc: u64 = specs
+                .iter()
+                .map(|s| (s.n_slots * s.slot_bytes) as u64)
+                .sum();
+            if alloc > budget.max(1) && cache_override.is_none() {
+                // Auto tier only: the floors overran what's actually free — streaming can't help.
+                return Err(anyhow!(
+                    "dense weights exceed VRAM and the leftover budget ({:.2} GB) can't hold \
+                     even the streaming floor ({:.2} GB) — reduce ctx or run on the CPU backend \
+                     (INFR_CPU=1)",
+                    budget as f64 / 1e9,
+                    alloc as f64 / 1e9,
+                ));
+            }
+            let cached: usize = specs.iter().map(|s| s.n_slots).sum();
+            let n_blocks: usize = specs.iter().map(|s| s.n_blocks).sum();
+            eprintln!(
+                "dense streaming: {n_blocks} weight blocks across {} pools, {cached} slots \
+                 cached ({:.2} GB arena + {:.2} GB ring; budget {:.2} GB; ctx={want_ctx})",
+                specs.len(),
+                alloc as f64 / 1e9,
+                ring_bytes as f64 / 1e9,
+                (budget + ring_bytes as u64) as f64 / 1e9,
+            );
+            vk.init_dense_pager(infr_vulkan::pager::DensePagerLayout {
+                pools: specs,
+                ring_bytes,
+            })
+            .map_err(|e| anyhow!("{e}"))?;
+            for (comps, pool, block_id) in planned {
+                dense_plan.insert(comps[0].clone(), (pool, block_id, comps));
+            }
+        }
+    }
+
     Ok(Box::new(move |name, tb, dt, _n| {
         // Raw upload for EVERY dtype — the file's bytes go straight to VRAM (u32-padded) and the
         // kernel reads/dequants the native dtype in-shader. F16 → f16 coopmat GEMM / f16 GEMV;
@@ -420,6 +632,44 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // placeholder's identity (see `infr_vulkan::pager`'s module doc) and diverts to the
         // paged executor split at execute time. `down_scale`/router/every other tensor of a
         // paged layer is unaffected — only the `_exps` weight banks divert here.
+        // Dense layer streaming: bind a tiny placeholder and register the group's ZERO-COPY mmap
+        // segments with the dense session instead of uploading (the adapter recognizes the
+        // placeholder's identity at execute time and dispatches against the pool arena — see
+        // `infr_vulkan::pager`'s dense-session doc). The `tb` byte-length check is the drift
+        // guard between this plan's group enumeration and the runner's actual upload grouping
+        // (`fuse_*_decision` keeps them aligned; a mismatch here is a bug, caught loudly).
+        if let Some((pool, block_id, comps)) = dense_plan.get(name) {
+            let segments: Vec<std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>> = comps
+                .iter()
+                .map(|c| {
+                    Ok(std::sync::Arc::new(
+                        g.tensor_bytes_arc(c).map_err(|e| anyhow!("{e}"))?,
+                    ) as std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>)
+                })
+                .collect::<AResult<_>>()?;
+            let seg_total: usize = segments.iter().map(|s| s.as_ref().as_ref().len()).sum();
+            if seg_total != tb.len() {
+                return Err(anyhow!(
+                    "dense streaming plan out of sync with the upload order for {name}: plan \
+                     bytes {seg_total} != uploaded bytes {}",
+                    tb.len()
+                ));
+            }
+            let placeholder = vk
+                .alloc_uninit(4, BufferUsage::Weights)
+                .map_err(|e| anyhow!("{e}"))?;
+            let buf_id = infr_vulkan::pager::buffer_identity(placeholder.as_ref());
+            vk.register_dense_stream(
+                *pool,
+                buf_id,
+                infr_vulkan::pager::DenseSource {
+                    segments,
+                    block_id: *block_id,
+                },
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+            return Ok((placeholder, dt));
+        }
         if let Some(l) = exps_layer(name).filter(|&l| l < n_paged) {
             if let (WBytes::Mmap(bytes), Some(role)) = (&tb, moe_role_of(name)) {
                 let n_expert = cfg

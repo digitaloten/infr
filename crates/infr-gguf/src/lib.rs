@@ -237,8 +237,11 @@ fn ggml_type_to_dtype(t: u32) -> Result<DType> {
 ///
 /// Sizes taken from llama.cpp `ggml/src/ggml.c` `type_traits[]` `.blck_size` / `.type_size`.
 /// GGUF dim order: `ne[0]` is the fastest-varying axis (innermost / columns).
+/// Public so placement code (dense layer streaming) can align streamed slot strides to whole
+/// quant blocks — a slot base that isn't a whole number of blocks breaks the kernels'
+/// element-offset weight addressing.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-fn block_layout(dtype: DType) -> (usize, usize) {
+pub fn block_layout(dtype: DType) -> (usize, usize) {
     match dtype {
         DType::F32 => (1, 4),
         DType::F16 => (1, 2),

@@ -15,6 +15,54 @@ use infr_core::tensor::{DType, TensorDesc, TensorId};
 use infr_core::WeightSource;
 use infr_gguf::Gguf;
 
+/// Combined gate+up FFN upload decision (one GEMV/GEMM + GatedActFused instead of two Linears +
+/// GatedAct). Requires the backend to opt in (`Capabilities::combined_gu` — Vulkan; the CPU keeps
+/// zero-copy separate tensors) AND every dense layer's gate/up to share a dtype (the concat is
+/// one [2*nff, ne] tensor). Extracted from the runner's inline form so the seam's dense
+/// layer-streaming plan enumerates blocks EXACTLY as `wload` uploads them (a drift between the
+/// two would register a block whose bytes don't match the graph's handle — caught loudly at pool
+/// registration, but the shared decision removes the drift class entirely). NOT gated on
+/// `c.moe.is_none()`: a pure MoE arch has no `ffn_gate.weight` at all, so the `.all()` is false
+/// for it regardless; see the original comment block at the call site for the DiffusionGemma
+/// rationale.
+pub(crate) fn fuse_gu_decision(combined_gu: bool, g: &Gguf, c: &Config) -> bool {
+    combined_gu
+        && (0..c.n_layer).all(|l| {
+            let dt = |s: &str| {
+                let name = format!("blk.{l}.{s}");
+                g.tensors().iter().find(|t| t.name == name).map(|t| t.dtype)
+            };
+            dt("ffn_gate.weight").is_some() && dt("ffn_gate.weight") == dt("ffn_up.weight")
+        })
+}
+
+/// Combined QKV upload decision (one wide prefill GEMM; decode keeps three offset GEMVs via
+/// `Op::Linear.w_off`). Needs every layer to own all three projections in ONE native-supported
+/// dtype, uniform dims, and a backend that opted into combined weights — mixed-precision GGUFs
+/// (llama.cpp's Q4_K_M bumps attn_v to Q6_K on alternating layers) fail the uniform-dtype gate
+/// and keep the split form. `INFR_NO_QKV_FUSE` forces the split form for A/B. Shared with the
+/// seam's dense-streaming plan — see [`fuse_gu_decision`].
+pub(crate) fn fuse_qkv_decision(combined_gu: bool, g: &Gguf, c: &Config) -> bool {
+    combined_gu
+        && std::env::var("INFR_NO_QKV_FUSE").is_err()
+        && (0..c.n_layer).all(|l| {
+            let dt = |s: &str| {
+                let name = format!("blk.{l}.{s}");
+                g.tensors().iter().find(|t| t.name == name).map(|t| t.dtype)
+            };
+            let q = dt("attn_q.weight");
+            q.is_some()
+                && q == dt("attn_k.weight")
+                && q == dt("attn_v.weight")
+                && q.is_some_and(|d| {
+                    infr_vulkan::linear::native_dense_supported(d) && d != DType::F16
+                })
+                && c.layer_head_dim(l) == c.head_dim
+                && c.layer_n_kv(l) == c.n_kv
+                && c.has_own_kv(l)
+        })
+}
+
 /// Handles into one freshly-built decode graph that the driver re-binds each step.
 pub(super) struct DecodeHandles {
     hidden: TensorId,
@@ -185,14 +233,7 @@ pub(crate) fn generate_dense_backend(
     // dense "shared expert" branch, separate from the MoE bank) and its dense n_ff=2112 out_f clears
     // neither warp-tile gate on its own (%256 nor %128) so it fell to the slower mmq path — fused
     // out_f=2*2112=4224 clears %128. See `FfnW::DiffusionMoe::fused_gu`.
-    let fuse_gu = be.capabilities().combined_gu
-        && (0..c.n_layer).all(|l| {
-            let dt = |s: &str| {
-                let name = format!("blk.{l}.{s}");
-                g.tensors().iter().find(|t| t.name == name).map(|t| t.dtype)
-            };
-            dt("ffn_gate.weight").is_some() && dt("ffn_gate.weight") == dt("ffn_up.weight")
-        });
+    let fuse_gu = fuse_gu_decision(be.capabilities().combined_gu, g, c);
     // Combined QKV: one [qrow+2·kvrow, ne] weight → prefill runs ONE wide GEMM (the separate
     // q/k/v GEMMs are narrow-n and underfill a big GPU — the pp512 sweep's dominant cost), and
     // decode keeps three offset GEMVs into the same buffer (`Op::Linear.w_off`), so its dispatch
@@ -203,24 +244,7 @@ pub(crate) fn generate_dense_backend(
     // GGUFs (e.g. Qwen3-8B Q4_K_M: v = 18×Q4K + 18×Q6K) fail the uniform-dtype gate and keep the
     // split form. INFR_NO_QKV_FUSE forces the split form for A/B (default unset = fuse; the split
     // form is bit-identical — same dots, same fixed-order sums).
-    let fuse_qkv = be.capabilities().combined_gu
-        && std::env::var("INFR_NO_QKV_FUSE").is_err()
-        && (0..c.n_layer).all(|l| {
-            let dt = |s: &str| {
-                let name = format!("blk.{l}.{s}");
-                g.tensors().iter().find(|t| t.name == name).map(|t| t.dtype)
-            };
-            let q = dt("attn_q.weight");
-            q.is_some()
-                && q == dt("attn_k.weight")
-                && q == dt("attn_v.weight")
-                && q.is_some_and(|d| {
-                    infr_vulkan::linear::native_dense_supported(d) && d != DType::F16
-                })
-                && c.layer_head_dim(l) == c.head_dim
-                && c.layer_n_kv(l) == c.n_kv
-                && c.has_own_kv(l)
-        });
+    let fuse_qkv = fuse_qkv_decision(be.capabilities().combined_gu, g, c);
 
     // qwen35 DeltaNet silu-gated RMSNorm fusion (decode op-fusion campaign): QkNorm's per-head
     // rmsnorm write is immediately read-after-write by the z-gate GatedAct — a real barrier on
@@ -3438,8 +3462,11 @@ pub(crate) fn generate_dense_backend(
     // adapter's own `execute`/`execute_chain` already refuse to replay one (belt-and-suspenders,
     // the actual correctness guarantee), but skipping `dyn_replay` here too avoids building the
     // (then-never-used) replay plan's persistent scratch/self-advancing params machinery at all.
+    // Dense layer streaming forces static per-execute decode for the same replay-can't-express-it
+    // reason (per-token ring staging + per-slot weight offsets — see `Backend::dense_paged`).
     let dyn_replay = be.capabilities().decode_replay
         && !be.moe_paged()
+        && !be.dense_paged()
         && std::env::var("INFR_SEAM_NO_REPLAY").is_err()
         && (qk_norm || rope_freqs.is_none())
         // Quantized/dense-alt KV caches force the per-execute STATIC decode (see the adapter's
