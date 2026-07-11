@@ -1670,6 +1670,46 @@ impl<'a> Recorder<'a> {
         self.dispatch(kern, &bufs, 1, &push, groups);
     }
 
+    /// Non-coopmat float-weight prefill GEMM (the "fma-warp" tier): `c = a·W[w_base]ᵀ`, `a` f32
+    /// activations, `w` raw f16/bf16/f32 words read NATIVELY (bf16 keeps its full exponent
+    /// range — bits shifted `<<16` into f32 registers, no f16 clamp and no upconverted weight
+    /// copy). Shared-memory fma warptile (BM=64×BN=64×BK=32, 256 threads, TM=TN=4 register
+    /// block — see `native_gemm_fma.comp` for the Intel Arc design constraints: no subgroup
+    /// ops, no f16 extensions, 16.5 KB LDS, modest registers). Selected by the adapter's
+    /// non-coopmat tier (`nc_fma`, `!caps.f16_coopmat`); beats the per-row scalar GEMVs by
+    /// amortizing each weight element across the 64-row tile, does NOT need to beat coopmat.
+    /// `c` is `ceil(m/64)*64` rows (the usual padded-GEMM convention). Requires `n%64`, `k%32`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_fma(
+        &self,
+        dtype: infr_core::DType,
+        a: &dyn Buffer,
+        w: &dyn Buffer,
+        w_base: usize,
+        c: &dyn Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        let (name, spv) = crate::gemm::native_gemm_fma_build_spv(dtype)
+            .expect("matmul_fma: dtype gated by native_gemm_fma_build_spv");
+        self.label_gemm(name, m, k, n);
+        let kern = self.be.kernel(name, spv, 3, 16);
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        let groups = (m.div_ceil(64) * (n / 64)) as u32;
+        self.dispatch(
+            kern,
+            &[Self::vkb(a), Self::vkb(w), Self::vkb(c)],
+            1,
+            &push,
+            groups,
+        );
+    }
+
     /// Integer (dp4a) u4 projection GEMM — the mmq path. Quantizes activations to int8 (Q8 per
     /// 32-block) via `quant_q8`, then runs the dp4a matmul keeping weights quantized (no per-GEMM
     /// dequant). Scratch (caller-allocated): `qa` = m*k bytes (int8), `dact`/`sact` = m*(k/32)*2

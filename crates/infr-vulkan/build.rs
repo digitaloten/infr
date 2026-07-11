@@ -1112,6 +1112,13 @@ fn main() {
         ("native_gemm_mmq_iq4_xs", "native_gemm_mmq_iq4_xs", &[]),
         ("native_gemm_mmq_mxfp4", "native_gemm_mmq_mxfp4", &[]),
         ("native_gemm_mmq_nvfp4", "native_gemm_mmq_nvfp4", &[]),
+        // Non-coopmat float-weight prefill GEMM ("fma-warp" tier, see native_gemm_fma.comp): the
+        // shared-memory fma warptile for f16/bf16/f32 weights on devices without a usable f16
+        // coopmat (adapter.rs `nc_fma`). No subgroup ops, no f16 extensions — dispatchable on
+        // any device the backend accepts.
+        ("native_gemm_fma", "native_gemm_fma_f16", &["-DFMT_F16"]),
+        ("native_gemm_fma", "native_gemm_fma_bf16", &["-DFMT_BF16"]),
+        ("native_gemm_fma", "native_gemm_fma_f32", &["-DFMT_F32"]),
         // int8 coopmat (WMMA) prefill GEMM, Q8_0 only — measurement kernel gated behind
         // INFR_I8_COOPMAT=1 (see adapter.rs / docs in the .comp file). Default-off; correctness
         // validated against native_gemm_mmq_q8_0/native_gemm_warp_q8_0.

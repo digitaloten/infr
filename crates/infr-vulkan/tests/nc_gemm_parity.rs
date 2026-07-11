@@ -1,15 +1,18 @@
 //! Parity + determinism for the NON-COOPMAT prefill GEMM tier's kernels (adapter.rs
-//! `nc_mmq` — the Intel Arc route, exercisable anywhere since these kernels use no
+//! `nc_mmq`/`nc_fma` — the Intel Arc route, exercisable anywhere since these kernels use no
 //! coopmat):
 //!
 //!  • the 12 NEWLY WIRED dense (non-expert-grid) dp4a mmq GEMM builds (`matmul_mmq` over every
 //!    `MOE_MMQ_DTYPES` member — Q4_K/Q6_K's dense builds pre-existed but ride the same dispatch
 //!    here, so all 14 run);
+//!  • the 3 fma-warp float GEMMs (`matmul_fma`: f16/bf16/f32 weights, native_gemm_fma.comp).
+//!
 //! Each config dispatches the SAME GEMM three times in one submission — bitwise-identical
 //! outputs required (the mmq barrier-race lesson: goldens can't catch intra-dispatch races; see
 //! `mmq_wide_bn_determinism.rs`, the template) — and checks the first output against a host
 //! reference: `infr_gguf::dequant::dequant_block` weights × the GPU's own downloaded int8
-//! activation codes (the exact-reference trick from `moe_mmq_fp4_parity.rs`). Min-carrying dtypes
+//! activation codes for mmq (the exact-reference trick from `moe_mmq_fp4_parity.rs`), plain f32
+//! dot for fma (whose weights are bit-exact on both sides). Min-carrying mmq dtypes
 //! (Q4_K/Q5_K/Q4_1/Q5_1 via the f16 `sact` Σx term, Q2_K via its self-computed one) keep the
 //! coarser tolerance the other mmq parity tests carry; symmetric dtypes decompose exactly.
 //!
@@ -224,6 +227,87 @@ fn run_mmq(be: &VulkanBackend, dt: DType) {
     println!("{label}: OK");
 }
 
+fn run_fma(be: &VulkanBackend, dt: DType, w_base: usize) {
+    let label = format!("{dt:?} fma-warp (w_base={w_base})");
+    let mut rng = Rng(0xfab ^ dt as u64);
+    // Weight values built directly in the storage format — bit-exact on both sides.
+    let n_w = w_base + N * K;
+    let (bytes, w_host): (Vec<u8>, Vec<f32>) = match dt {
+        DType::F16 => {
+            let mut by = Vec::with_capacity(n_w * 2);
+            let mut ho = Vec::with_capacity(n_w);
+            for _ in 0..n_w {
+                // sign | exp 11..14 of 31 (2^-4..2^-1) | mantissa
+                let bits: u16 = (((rng.byte() & 1) as u16) << 15)
+                    | ((11 + (rng.byte() & 3) as u16) << 10)
+                    | ((rng.byte() as u16) << 2 | (rng.byte() & 3) as u16);
+                by.extend_from_slice(&bits.to_le_bytes());
+                ho.push(half::f16::from_bits(bits).to_f32());
+            }
+            (by, ho)
+        }
+        DType::Bf16 => {
+            let mut by = Vec::with_capacity(n_w * 2);
+            let mut ho = Vec::with_capacity(n_w);
+            for _ in 0..n_w {
+                // sign | exp 0x7B..0x7E (2^-4..2^-1) | mantissa(7)
+                let bits: u16 = (((rng.byte() & 1) as u16) << 15)
+                    | (((0x7B + (rng.byte() & 3) as u16) & 0xFF) << 7)
+                    | (rng.byte() & 0x7F) as u16;
+                by.extend_from_slice(&bits.to_le_bytes());
+                ho.push(f32::from_bits((bits as u32) << 16));
+            }
+            (by, ho)
+        }
+        DType::F32 => {
+            let mut by = Vec::with_capacity(n_w * 4);
+            let mut ho = Vec::with_capacity(n_w);
+            for _ in 0..n_w {
+                let v = ((rng.byte() as f32) - 127.5) * 0.004;
+                by.extend_from_slice(&v.to_le_bytes());
+                ho.push(v);
+            }
+            (by, ho)
+        }
+        other => panic!("no fma build for {other:?}"),
+    };
+    let w = be.alloc(bytes.len(), BufferUsage::Weights).unwrap();
+    be.upload(w.as_ref(), &bytes).unwrap();
+
+    let x: Vec<f32> = (0..M * K)
+        .map(|i| (i as f32 * 0.13).sin() * 0.2 - 0.01)
+        .collect();
+    let xbuf = be.alloc(M * K * 4, BufferUsage::Activations).unwrap();
+    be.upload(xbuf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+
+    let mpad = M.div_ceil(64) * 64;
+    let outs: Vec<_> = (0..3)
+        .map(|_| be.alloc(mpad * N * 4, BufferUsage::Activations).unwrap())
+        .collect();
+
+    let rec = be.recorder().unwrap();
+    for out in &outs {
+        rec.matmul_fma(dt, xbuf.as_ref(), w.as_ref(), w_base, out.as_ref(), M, K, N);
+    }
+    rec.finish().unwrap();
+
+    assert_deterministic(be, &outs, mpad, &label);
+
+    let mut want = vec![0f32; M * N];
+    for r in 0..M {
+        for o in 0..N {
+            want[r * N + o] = w_host[w_base + o * K..w_base + (o + 1) * K]
+                .iter()
+                .zip(&x[r * K..(r + 1) * K])
+                .map(|(a, b)| a * b)
+                .sum();
+        }
+    }
+    let got = download_rows(be, outs[0].as_ref(), mpad);
+    assert_parity(&got, &want, 1e-3, &label);
+    println!("{label}: OK");
+}
+
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn nc_mmq_dense_gemm_parity_and_determinism() {
@@ -235,4 +319,18 @@ fn nc_mmq_dense_gemm_parity_and_determinism() {
     for &dt in infr_core::tensor::MOE_MMQ_DTYPES {
         run_mmq(&be, dt);
     }
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn nc_fma_gemm_parity_and_determinism() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    run_fma(&be, DType::F16, 0);
+    run_fma(&be, DType::Bf16, 0);
+    run_fma(&be, DType::F32, 0);
+    // Non-zero element base (a bf16 fused-QKV slice / streamed-slot offset rides `w_base`).
+    run_fma(&be, DType::Bf16, K);
 }

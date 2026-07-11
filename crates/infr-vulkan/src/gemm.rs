@@ -703,6 +703,29 @@ pub(crate) fn native_gemm_mmq_dense_spv(
         _ => return None,
     })
 }
+/// SPIR-V for the non-coopmat float-weight prefill GEMM (the "fma-warp" tier, see
+/// `native_gemm_fma.comp`): shared-memory fma warptile for f16/bf16/f32 weights on devices
+/// without a usable f16 coopmat (adapter.rs `nc_fma`). Returns `(kernel_cache_name, spv)`;
+/// `None` for any other dtype.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_fma_build_spv(
+    dtype: infr_core::DType,
+) -> Option<(&'static str, &'static [u32])> {
+    macro_rules! spv {
+        ($name:literal) => {{
+            const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"));
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            ($name, S.get_or_init(|| spv_words(BYTES)).as_slice())
+        }};
+    }
+    use infr_core::DType::*;
+    Some(match dtype {
+        F16 => spv!("native_gemm_fma_f16"),
+        Bf16 => spv!("native_gemm_fma_bf16"),
+        F32 => spv!("native_gemm_fma_f32"),
+        _ => return None,
+    })
+}
 /// SPIR-V for the int8 cooperative-matrix (WMMA) prefill GEMM, Q8_0 only — measurement kernel
 /// gated behind `INFR_I8_COOPMAT=1` (see `native_gemm_i8cm_q8_0.comp` for the design doc).
 #[cfg_attr(infr_profile, infr_prof::instrument)]

@@ -943,8 +943,8 @@ fn lower_op(
             // GEMM) dispatches ONLY coopmat SPIR-V — RADV still executes it on hardware without
             // the feature (silent, no fault), so gating is required, not optional (issue: coopmat
             // dispatch on a device that lacks VK_KHR_cooperative_matrix segfaults on some
-            // drivers). `!caps.f16_coopmat` routes to the NON-COOPMAT GEMM tier below
-            // (`nc_mmq` — a real tiled GEMM with no coopmat SPIR-V), and only past that to the
+            // drivers). `!caps.f16_coopmat` routes to the NON-COOPMAT GEMM tier below (`nc_mmq`/
+            // `nc_fma` — real tiled GEMMs with no coopmat SPIR-V), and only past that to the
             // scalar `else` arms (`linear_native_off`/`linear`/`linear_f32` — the SAME scalar
             // dequant-in-shader kernels the m==1 decode GEMV already uses, generalized to
             // `rows=m`; they dispatch `rows*out_f` (or row-tiled) workgroups with no upper bound
@@ -958,12 +958,14 @@ fn lower_op(
             // only at M=8,N=8,K=16 — `caps.f16_coopmat` is false there (see lib.rs) — but HAS
             // packed int8 dot, and prefill GEMMs previously fell all the way to the per-row
             // scalar GEMVs (the field-measured 10-30x prefill gap; decode was already at parity).
-            // First arm (the fma-warp float arm lands separately), same padded-dst
-            // convention as `is_gemm`:
+            // Two arms, same padded-dst convention as `is_gemm`:
             //  • `nc_mmq`: weight dtype in `infr_core::tensor::MOE_MMQ_DTYPES` + `caps.i8_dot` →
             //    the DENSE dp4a mmq GEMM family (`matmul_mmq` — the same shader code the batched
             //    MoE expert path already gates on `i8_dot` alone, base-grid build), fed by the
             //    same `quant_q8` activation prepass the coopmat tier's Q4_K-mmq arm uses.
+            //  • `nc_fma`: f16/bf16/f32 weights (no integer codes to dp4a) → the shared-memory
+            //    fma warptile (`matmul_fma`, native_gemm_fma.comp — no subgroup ops, no f16
+            //    exts; bf16 reads stay native, no f32 upconvert).
             // Exercisable on coopmat hardware via INFR_NO_COOPMAT=1 (lib.rs's force-disable test
             // knob — drops the device feature itself, a faithful simulation). INFR_NO_MMQ_FALLBACK=1
             // disables the WHOLE tier (both arms) for A/B against the scalar floor.
@@ -971,6 +973,7 @@ fn lower_op(
                 && !be_.caps().f16_coopmat
                 && std::env::var("INFR_NO_MMQ_FALLBACK").is_err();
             let nc_mmq = nc_tier && be_.caps().i8_dot && infr_core::tensor::moe_mmq_ok(dt);
+            let nc_fma = nc_tier && !nc_mmq && crate::gemm::native_gemm_fma_build_spv(dt).is_some();
             if is_gemm {
                 // GEMM writes ceil(m/64)*64 rows. Internal `dst` is row-padded → write direct;
                 // a non-Internal dst (e.g. the lm_head `logits` Output, unpadded) gets a padded
@@ -1290,7 +1293,7 @@ fn lower_op(
                     rec.copy(t.as_ref(), 0, y, 0, m * out_f * eb);
                     transient.push(t);
                 }
-            } else if nc_mmq {
+            } else if nc_mmq || nc_fma {
                 // Non-coopmat prefill GEMM tier (see the `nc_tier` doc above). Same padded-dst
                 // dance as `is_gemm`: the GEMM writes ceil(m/64)*64 rows — Internal dsts are
                 // row-padded up front, a non-Internal dst (the lm_head `logits` Output) gets a
@@ -1309,7 +1312,7 @@ fn lower_op(
                     Some(t) => t.as_ref(),
                     None => y,
                 };
-                {
+                if nc_mmq {
                     // Same pooled scratch tags/sizes as the coopmat tier's Q4_K-mmq arm — the
                     // two arms are mutually exclusive per device, so the tags never collide.
                     let nblk = in_f / 32;
@@ -1336,6 +1339,8 @@ fn lower_op(
                         in_f,
                         out_f,
                     );
+                } else {
+                    rec.matmul_fma(dt, xb, w, w_off, out, m, in_f, out_f);
                 }
                 if let Some(t) = tmp {
                     rec.copy(t.as_ref(), 0, y, 0, m * out_f * eb);
