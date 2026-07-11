@@ -1092,6 +1092,26 @@ fn main() {
         ),
         ("native_gemm_mmq_q4k", "native_gemm_mmq_q4k", &[]),
         ("native_gemm_mmq_q6k", "native_gemm_mmq_q6k", &[]),
+        // DENSE (non-expert-grid) builds of the remaining mmq dtypes — the non-coopmat prefill
+        // GEMM tier (adapter.rs `nc_mmq`): on a device without a usable 16x16x16 f16 coopmat
+        // (Intel Arc/ANV) but WITH packed int8 dot, dense prefill GEMMs of every
+        // `infr_core::tensor::MOE_MMQ_DTYPES` member route through these instead of the per-row
+        // scalar GEMVs. Same shader sources as the `_xp` expert-grid builds below — only the
+        // grid mapping differs (base compile, no defines), so the dp4a math is the already
+        // parity-proven code. Q4_K/Q6_K dense builds pre-existed above (the coopmat tier's
+        // Q4_K-mmq arm); these 12 complete the set.
+        ("native_gemm_mmq_q8_0", "native_gemm_mmq_q8_0", &[]),
+        ("native_gemm_mmq_q5_0", "native_gemm_mmq_q5_0", &[]),
+        ("native_gemm_mmq_q5k", "native_gemm_mmq_q5k", &[]),
+        ("native_gemm_mmq_q5_1", "native_gemm_mmq_q5_1", &[]),
+        ("native_gemm_mmq_q2_k", "native_gemm_mmq_q2_k", &[]),
+        ("native_gemm_mmq_q3_k", "native_gemm_mmq_q3_k", &[]),
+        ("native_gemm_mmq_q4_0", "native_gemm_mmq_q4_0", &[]),
+        ("native_gemm_mmq_q4_1", "native_gemm_mmq_q4_1", &[]),
+        ("native_gemm_mmq_iq4_nl", "native_gemm_mmq_iq4_nl", &[]),
+        ("native_gemm_mmq_iq4_xs", "native_gemm_mmq_iq4_xs", &[]),
+        ("native_gemm_mmq_mxfp4", "native_gemm_mmq_mxfp4", &[]),
+        ("native_gemm_mmq_nvfp4", "native_gemm_mmq_nvfp4", &[]),
         // int8 coopmat (WMMA) prefill GEMM, Q8_0 only — measurement kernel gated behind
         // INFR_I8_COOPMAT=1 (see adapter.rs / docs in the .comp file). Default-off; correctness
         // validated against native_gemm_mmq_q8_0/native_gemm_warp_q8_0.

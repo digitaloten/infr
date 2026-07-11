@@ -943,15 +943,34 @@ fn lower_op(
             // GEMM) dispatches ONLY coopmat SPIR-V — RADV still executes it on hardware without
             // the feature (silent, no fault), so gating is required, not optional (issue: coopmat
             // dispatch on a device that lacks VK_KHR_cooperative_matrix segfaults on some
-            // drivers). `!caps.f16_coopmat` routes to the `else` arms below instead
-            // (`linear_native_off`/`linear`/`linear_f32` — the SAME scalar dequant-in-shader
-            // kernels the m==1 decode GEMV already uses, generalized to `rows=m`; they dispatch
-            // `rows*out_f` (or row-tiled) workgroups with no upper bound on `rows`, so they are a
-            // drop-in, just without the coopmat tile's weight-reuse-across-64-rows win). This is
-            // the coopmat->scalar fallback tier; bit-identical to before when caps are all true.
+            // drivers). `!caps.f16_coopmat` routes to the NON-COOPMAT GEMM tier below
+            // (`nc_mmq` — a real tiled GEMM with no coopmat SPIR-V), and only past that to the
+            // scalar `else` arms (`linear_native_off`/`linear`/`linear_f32` — the SAME scalar
+            // dequant-in-shader kernels the m==1 decode GEMV already uses, generalized to
+            // `rows=m`; they dispatch `rows*out_f` (or row-tiled) workgroups with no upper bound
+            // on `rows`, so they are a drop-in, just without any weight-reuse-across-rows win).
+            // Bit-identical to before when caps are all true.
             let is_gemm = gemm_ok
                 && be_.caps().f16_coopmat
                 && (native_dense_supported(dt) || matches!(dt, infr_core::DType::F16));
+            // ── NON-COOPMAT prefill GEMM tier (never taken when `caps.f16_coopmat` — zero effect
+            // on coopmat-capable defaults). The Intel Arc A770 (Mesa ANV) enumerates f16 coopmat
+            // only at M=8,N=8,K=16 — `caps.f16_coopmat` is false there (see lib.rs) — but HAS
+            // packed int8 dot, and prefill GEMMs previously fell all the way to the per-row
+            // scalar GEMVs (the field-measured 10-30x prefill gap; decode was already at parity).
+            // First arm (the fma-warp float arm lands separately), same padded-dst
+            // convention as `is_gemm`:
+            //  • `nc_mmq`: weight dtype in `infr_core::tensor::MOE_MMQ_DTYPES` + `caps.i8_dot` →
+            //    the DENSE dp4a mmq GEMM family (`matmul_mmq` — the same shader code the batched
+            //    MoE expert path already gates on `i8_dot` alone, base-grid build), fed by the
+            //    same `quant_q8` activation prepass the coopmat tier's Q4_K-mmq arm uses.
+            // Exercisable on coopmat hardware via INFR_NO_COOPMAT=1 (lib.rs's force-disable test
+            // knob — drops the device feature itself, a faithful simulation). INFR_NO_MMQ_FALLBACK=1
+            // disables the WHOLE tier (both arms) for A/B against the scalar floor.
+            let nc_tier = gemm_ok
+                && !be_.caps().f16_coopmat
+                && std::env::var("INFR_NO_MMQ_FALLBACK").is_err();
+            let nc_mmq = nc_tier && be_.caps().i8_dot && infr_core::tensor::moe_mmq_ok(dt);
             if is_gemm {
                 // GEMM writes ceil(m/64)*64 rows. Internal `dst` is row-padded → write direct;
                 // a non-Internal dst (e.g. the lm_head `logits` Output, unpadded) gets a padded
@@ -1266,6 +1285,57 @@ fn lower_op(
                         // f16 coopmat GEMM (dummy scales/mins unused at bits=16).
                         rec.matmul_proj(xb, w, dummy, dummy, out, m, in_f, out_f, 16, 0);
                     }
+                }
+                if let Some(t) = tmp {
+                    rec.copy(t.as_ref(), 0, y, 0, m * out_f * eb);
+                    transient.push(t);
+                }
+            } else if nc_mmq {
+                // Non-coopmat prefill GEMM tier (see the `nc_tier` doc above). Same padded-dst
+                // dance as `is_gemm`: the GEMM writes ceil(m/64)*64 rows — Internal dsts are
+                // row-padded up front, a non-Internal dst (the lm_head `logits` Output) gets a
+                // padded temp + copy of the m real rows.
+                let dst_internal =
+                    matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal);
+                let eb = graph.desc(*dst).dtype.dense_bytes(1).unwrap_or(4);
+                let tmp = if dst_internal {
+                    None
+                } else {
+                    let mpad = m.div_ceil(64) * 64;
+                    // alloc_uninit: the GEMM writes all mpad rows before the copy reads m.
+                    Some(be_.alloc_uninit((mpad * out_f * eb).max(4), BufferUsage::Activations)?)
+                };
+                let out: &dyn Buffer = match &tmp {
+                    Some(t) => t.as_ref(),
+                    None => y,
+                };
+                {
+                    // Same pooled scratch tags/sizes as the coopmat tier's Q4_K-mmq arm — the
+                    // two arms are mutually exclusive per device, so the tags never collide.
+                    let nblk = in_f / 32;
+                    let qa = pooled(pool, be_, "mmq_qa", m * in_f)?;
+                    let dact = pooled(pool, be_, "mmq_dact", m * nblk * 2)?;
+                    let sact = pooled(pool, be_, "mmq_sact", m * nblk * 2)?;
+                    rec.quant_q8(
+                        xb,
+                        pool[&qa].as_ref(),
+                        pool[&dact].as_ref(),
+                        pool[&sact].as_ref(),
+                        m,
+                        in_f,
+                    );
+                    rec.matmul_mmq(
+                        dt,
+                        pool[&qa].as_ref(),
+                        pool[&dact].as_ref(),
+                        pool[&sact].as_ref(),
+                        w,
+                        w_off,
+                        out,
+                        m,
+                        in_f,
+                        out_f,
+                    );
                 }
                 if let Some(t) = tmp {
                     rec.copy(t.as_ref(), 0, y, 0, m * out_f * eb);

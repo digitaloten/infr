@@ -666,6 +666,43 @@ pub(crate) fn native_gemm_mmq_q6k_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// Dense (non-expert-grid) dp4a mmq GEMM SPIR-V for every `infr_core::tensor::MOE_MMQ_DTYPES`
+/// member — the non-coopmat prefill tier's kernel table (see adapter.rs `nc_mmq`: devices
+/// without a usable 16x16x16 f16 coopmat but WITH packed int8 dot, e.g. Intel Arc/ANV). Returns
+/// `(kernel_cache_name, spv)`; `None` for non-mmq dtypes. Same shader sources as the
+/// parity-proven `_xp` expert-grid builds — base compile, dense grid. Whether the kernel binds
+/// the activation `sact` buffer follows `infr_core::tensor::moe_mmq_needs_sact` (the SSOT the
+/// `_xp` dispatch uses too).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_dense_spv(
+    dtype: infr_core::DType,
+) -> Option<(&'static str, &'static [u32])> {
+    macro_rules! spv {
+        ($name:literal) => {{
+            const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"));
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            ($name, S.get_or_init(|| spv_words(BYTES)).as_slice())
+        }};
+    }
+    use infr_core::DType::*;
+    Some(match dtype {
+        Q4K => ("native_gemm_mmq_q4k", native_gemm_mmq_q4k_spv()),
+        Q6K => ("native_gemm_mmq_q6k", native_gemm_mmq_q6k_spv()),
+        Q8_0 => spv!("native_gemm_mmq_q8_0"),
+        Q5_0 => spv!("native_gemm_mmq_q5_0"),
+        Q5K => spv!("native_gemm_mmq_q5k"),
+        Q5_1 => spv!("native_gemm_mmq_q5_1"),
+        Q2K => spv!("native_gemm_mmq_q2_k"),
+        Q3K => spv!("native_gemm_mmq_q3_k"),
+        Q4_0 => spv!("native_gemm_mmq_q4_0"),
+        Q4_1 => spv!("native_gemm_mmq_q4_1"),
+        Iq4Nl => spv!("native_gemm_mmq_iq4_nl"),
+        Iq4Xs => spv!("native_gemm_mmq_iq4_xs"),
+        Mxfp4 => spv!("native_gemm_mmq_mxfp4"),
+        Nvfp4 => spv!("native_gemm_mmq_nvfp4"),
+        _ => return None,
+    })
+}
 /// SPIR-V for the int8 cooperative-matrix (WMMA) prefill GEMM, Q8_0 only — measurement kernel
 /// gated behind `INFR_I8_COOPMAT=1` (see `native_gemm_i8cm_q8_0.comp` for the design doc).
 #[cfg_attr(infr_profile, infr_prof::instrument)]

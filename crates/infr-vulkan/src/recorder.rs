@@ -1626,6 +1626,50 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Dtype-generic DENSE dp4a (mmq) tiled GEMM: `c = qa·W[w_base]ᵀ` for ANY
+    /// `infr_core::tensor::MOE_MMQ_DTYPES` member — the non-coopmat prefill tier's GEMM
+    /// (adapter.rs `nc_mmq`: no usable f16 coopmat, packed int8 dot present — Intel Arc/ANV).
+    /// Same kernels/conventions as [`Self::matmul_mmq_q4k`]/[`Self::matmul_mmq_q6k`] (which it
+    /// delegates to for those dtypes' names), extended to the full dense build set
+    /// (`native_gemm_mmq_dense_spv`): activations pre-quantized via `quant_q8`, `c` is
+    /// `ceil(m/64)*64` rows, requires `n%64`, `k%32`. `sact` (the per-32-block Σx term) is
+    /// always passed but bound ONLY for the min-carrying dtypes
+    /// (`infr_core::tensor::moe_mmq_needs_sact` — the same SSOT the `_xp` expert dispatch uses;
+    /// Q2_K self-computes its narrower Σx in-shader).
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_mmq(
+        &self,
+        dtype: infr_core::DType,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: &dyn Buffer,
+        w: &dyn Buffer,
+        w_base: usize,
+        c: &dyn Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        let (name, spv) = crate::gemm::native_gemm_mmq_dense_spv(dtype)
+            .expect("matmul_mmq: dtype gated by native_gemm_mmq_dense_spv");
+        let needs_sact = infr_core::tensor::moe_mmq_needs_sact(dtype);
+        self.label_gemm(name, m, k, n);
+        let nb = if needs_sact { 5 } else { 4 };
+        let kern = self.be.kernel(name, spv, nb, 16);
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        let groups = (m.div_ceil(64) * (n / 64)) as u32;
+        let mut bufs = vec![Self::vkb(qa), Self::vkb(dact)];
+        if needs_sact {
+            bufs.push(Self::vkb(sact));
+        }
+        bufs.extend_from_slice(&[Self::vkb(w), Self::vkb(c)]);
+        self.dispatch(kern, &bufs, 1, &push, groups);
+    }
+
     /// Integer (dp4a) u4 projection GEMM — the mmq path. Quantizes activations to int8 (Q8 per
     /// 32-block) via `quant_q8`, then runs the dp4a matmul keeping weights quantized (no per-GEMM
     /// dequant). Scratch (caller-allocated): `qa` = m*k bytes (int8), `dact`/`sact` = m*(k/32)*2
