@@ -581,6 +581,22 @@ pub struct Graph {
     pub inputs: Vec<TensorId>,
     pub weights: Vec<TensorId>,
     pub outputs: Vec<TensorId>,
+    /// Producer-set opt-out of the Vulkan record-once decode replay: `true` forces the
+    /// per-execute STATIC path even for an otherwise replay-eligible single-token decode.
+    ///
+    /// The replay tape lowers the pos-dependent ops through a DIFFERENT kernel family (the
+    /// params-driven `_dyn` kernels, with worst-case-capacity split-K chunking) than the static
+    /// recording — same math, different float-accumulation order, so the two paths agree only to
+    /// reassociation-level noise (~1 f16 ULP on the KV row a decode writes). Autoregressive
+    /// decode tolerates that (greedy/top-k sampling is robust to sub-ULP logit noise), but
+    /// DiffusionGemma's entropy-bound denoise loop is chaotic in it: the committed-prefix KV row
+    /// the seam's decode loop writes (the prefill frontier token) seeds EVERY canvas row's
+    /// attention, and a 128-expert top-8 MoE amplifies a ~1e-3 f16 KV delta into flipped
+    /// argmax/acceptance decisions — replay-mode text visibly diverges from the static path the
+    /// CPU reference/goldens validate. The seam sets this on diffusion-gemma graphs so both
+    /// execution modes run the SAME (static) kernels bit-identically; everything else keeps the
+    /// replay fast path. See `infr-vulkan`'s `decode_eligible`.
+    pub no_decode_replay: bool,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]

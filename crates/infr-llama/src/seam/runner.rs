@@ -895,6 +895,16 @@ pub(crate) fn generate_dense_backend(
                  use_ids: bool|
      -> (Graph, DecodeHandles) {
         let mut g = Graph::new();
+        // DiffusionGemma: force the per-execute STATIC path for every graph of this model (see
+        // `Graph::no_decode_replay`). The record-once replay's `_dyn` kernels agree with the
+        // static recording only to float-reassociation noise; the entropy-bound denoise loop
+        // chaotically amplifies that noise on the ONE committed-prefix KV row the decode loop
+        // writes per prefill call (the frontier token) into different accepted tokens — default
+        // and `INFR_SEAM_NO_REPLAY=1` runs produced different text. Only the rows==1 decode
+        // graph is ever replay-eligible anyway (batched prefill/denoise are rows>1), and DG has
+        // no autoregressive decode loop — its per-prefill decode is exactly one token — so this
+        // costs nothing while making both modes bit-identical.
+        g.no_decode_replay = c.diffusion_gemma;
         let f32d = |n: usize| TensorDesc::new(vec![n], DType::F32);
         // KV cache dtype: f16 by default (halves memory vs f32, tightens CPU↔GPU parity); Q8_0
         // per-side when the runner enabled it (see `k_fmt`/`v_fmt` at the cache alloc). ONLY the
@@ -3468,6 +3478,11 @@ pub(crate) fn generate_dense_backend(
         && !be.moe_paged()
         && !be.dense_paged()
         && std::env::var("INFR_SEAM_NO_REPLAY").is_err()
+        // DiffusionGemma graphs opt out of the replay tape entirely (`Graph::no_decode_replay`,
+        // set in `build` above — the adapter's `decode_eligible` rejects them, this mirror just
+        // skips building the then-unused replay plan). Keeps this gate a strict subset of the
+        // adapter's eligibility.
+        && !c.diffusion_gemma
         && (qk_norm || rope_freqs.is_none())
         // Quantized/dense-alt KV caches force the per-execute STATIC decode (see the adapter's
         // `decode_eligible`: the low-bit block quants / bf16 / f32 / turbo ride a dequant→f16

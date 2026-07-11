@@ -2508,6 +2508,90 @@ fn gpu_seam_matches_cpu_diffusion_gemma_denoise() {
     );
 }
 
+/// Regression (`Graph::no_decode_replay`): a DG session's prefill+denoise must produce
+/// BIT-IDENTICAL denoise logits whether the seam runs in its default mode or under
+/// `INFR_SEAM_NO_REPLAY=1` (the forced-static path the CPU reference/goldens track).
+///
+/// Before the fix, the default mode sent the prefill FRONTIER token — the one token every DG
+/// prefill call feeds through the per-token decode loop — through the record-once replay tape's
+/// `_dyn` kernels, whose float-accumulation order differs from the static recording by ~1 f16
+/// ULP on that token's KV row (verified: rows 0..P-2 bit-identical between modes, only the
+/// frontier row differed, maxabs 5e-4..8e-3 growing through layers). DiffusionGemma's
+/// entropy-bound 128-expert MoE denoise chaotically amplifies that single-row delta — measured
+/// on this prompt: ALL 67.1M logit elements differing, maxabs 18.4, 111/256 canvas argmax flips,
+/// min row cosine 0.68 → visibly different generated text between the two modes. The fix tags
+/// every DG graph `no_decode_replay` so both modes run the SAME static kernels; two separate
+/// same-kernel sessions are bit-deterministic (also verified), hence the exact assert.
+#[test]
+fn gpu_diffusion_gemma_denoise_replay_matches_static() {
+    let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
+    need_gpu!();
+    let _tlk = test_serial_lock();
+    std::env::set_var("INFR_TEMP", "0");
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
+    let vocab = model.config().vocab;
+    let canvas_len = model.config().canvas_length;
+    let mask_id = model.config().mask_token_id;
+    let tokens = model
+        .encode("What is the capital of France?")
+        .expect("encode");
+    let canvas: Vec<u32> = vec![mask_id; canvas_len];
+
+    let run = |no_replay: bool| -> Vec<f32> {
+        if no_replay {
+            std::env::set_var("INFR_SEAM_NO_REPLAY", "1");
+        } else {
+            std::env::remove_var("INFR_SEAM_NO_REPLAY");
+        }
+        let mut sess = model
+            .diffusion_gemma_vulkan_session(tokens.len() + canvas_len + 8)
+            .expect("vulkan session");
+        sess.prefill(&model, &tokens).expect("vulkan prefill");
+        let outcome = sess
+            .denoise(&model, &canvas, None, 1.0, 1.0, None)
+            .expect("vulkan denoise");
+        std::env::remove_var("INFR_SEAM_NO_REPLAY");
+        match outcome {
+            infr_llama::seam::DenoiseOutcome::Logits(v) => v,
+            infr_llama::seam::DenoiseOutcome::Reduced(_) => {
+                panic!("u: None must always take the full-logits path")
+            }
+        }
+    };
+
+    let replay = run(false);
+    let statc = run(true);
+    assert_eq!(replay.len(), canvas_len * vocab);
+    assert_eq!(statc.len(), canvas_len * vocab);
+
+    let mut ndiff = 0usize;
+    let mut maxabs = 0f32;
+    for (x, y) in replay.iter().zip(&statc) {
+        if x != y {
+            ndiff += 1;
+            maxabs = maxabs.max((x - y).abs());
+        }
+    }
+    let mut argmax_flips = 0usize;
+    for row in 0..canvas_len {
+        let r = top_k(&replay[row * vocab..(row + 1) * vocab], 1)[0].0;
+        let s = top_k(&statc[row * vocab..(row + 1) * vocab], 1)[0].0;
+        if r != s {
+            argmax_flips += 1;
+        }
+    }
+    println!(
+        "default vs INFR_SEAM_NO_REPLAY: {ndiff}/{} elements differ, maxabs={maxabs}, \
+         argmax flips {argmax_flips}/{canvas_len}",
+        replay.len()
+    );
+    assert_eq!(
+        ndiff, 0,
+        "DG denoise logits diverge between the default and forced-static execution modes \
+         (maxabs={maxabs}, argmax flips {argmax_flips}/{canvas_len})"
+    );
+}
+
 // ─── DiffusionGemma Phase 3: entropy-bound decode loop vs the oracle ────────────────────────────
 //
 // The full block-diffusion decode (`infr_llama::diffusion::diffusion_generate`) driven on the

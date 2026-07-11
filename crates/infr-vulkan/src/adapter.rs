@@ -161,6 +161,13 @@ fn decode_eligible(graph: &Graph) -> bool {
     if std::env::var("INFR_SEAM_NO_REPLAY").is_ok() {
         return false;
     }
+    // Producer opt-out (see `Graph::no_decode_replay`): the replay tape's `_dyn` kernels are only
+    // reassociation-equivalent to the static recording, and some consumers (DiffusionGemma's
+    // entropy-bound denoise, which chaotically amplifies a 1-ULP KV delta on the prefill frontier
+    // row into different committed text) need the static path's exact arithmetic every execute.
+    if graph.no_decode_replay {
+        return false;
+    }
     let mut has_rope = false;
     let mut has_attn = false;
     // Record-once replay drives ALL pos-dependent ops (QkNormRope/WriteKv/Attention) from ONE shared
