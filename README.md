@@ -300,8 +300,12 @@ scan kernel (4.6× slower than llama.cpp's fused GDN, queued). Other Q8_0/Q2_K
 rows in the table predate these fixes and can only have improved.
 
 ² The MTP repos ship a `mtp-*.gguf` draft head; their `mtp128`
-speculative-decode ratio is 0.63–0.68× (4B) / 0.52–0.55× (9B) — see the MTP
-paragraph below. Plain (non-MTP) metrics for the same weights are the rows
+speculative-decode ratio is 0.69–0.78× (4B) / 0.63–0.71× (9B), re-measured
+2026-07-12 after (a) the compare harness was fixed to decode the SAME
+un-templated prompt on both engines (α is content-sensitive; the old asymmetric
+row manufactured phantom gap) and (b) two low-α fixes landed: an m 9–16 int8
+mrow GEMV tier and a thresholded rollback-window reprime that keeps verify m ≤
+16 (+15% on the 9B). Plain (non-MTP) metrics for the same weights are the rows
 shown.
 
 ³ Gemma-4-31B (21.9 GiB weights on the 24 GB card) runs **resident at default
@@ -345,10 +349,12 @@ dense (8B–27B at 0.88–0.96×) and MoE (0.92–0.96×), all bounded by the
 memory-bandwidth wall (decode GEMVs run at 77–88% of DRAM peak). The quant
 spread is new in this sweep: Q4/Q5/Q6/IQ4_XS rows track the Q4_K_M story
 everywhere, while the Q2_K/Q8_0 extremes expose the footnote-¹ gaps now queued.
-The **MTP speculative path** trails at 0.52–0.68× (`mtp128`) — drafted-token
-throughput not yet matching llama.cpp's batched-speculative path (verify-kernel
-efficiency at m≈6–8 is the known lever). **DiffusionGemma** (`dg-step`) beats
-the reference fork at 1.20× (53.1 vs 46.3 t/s e2e at matched-ish 24/23 steps).
+The **MTP speculative path** trails at 0.63–0.78× (`mtp128`, same-content regime
+both engines) — llama.cpp's spec self-speedup survives low accept rates better
+(its batched verify amortizes further); the remaining levers are wide-n small-m
+GEMM efficiency and verifying the lm_head only over the rows whose logits are
+kept. **DiffusionGemma** (`dg-step`) beats the reference fork at 1.20× (53.1 vs
+46.3 t/s e2e at matched-ish 24/23 steps).
 
 **Llama-4-Scout** (109B-A17B, Q2_K, 37 GB) is deliberately absent from the table
 above (its per-token small-m dispatch shape isn't comparable to the batched
