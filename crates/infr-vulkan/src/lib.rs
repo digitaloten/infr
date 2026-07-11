@@ -121,12 +121,6 @@ struct VulkanShared {
     /// VK_EXT_memory_budget is absent — the live per-heap budget is preferred when present
     /// (it also sees other processes' VRAM).
     device_used: AtomicU64,
-    /// Paged MoE expert cache (see `pager::MoePagerSession`) — `Some` only when the loaded model's
-    /// expert banks don't fit VRAM and the seam's placement policy chose paging over the legacy
-    /// host-visible split (see `infr-llama`'s `generate_dense_vulkan_session`). `None` is the
-    /// overwhelming common case (fits resident) and costs nothing beyond one `Mutex` lock check
-    /// per `Backend::moe_paged` call.
-    moe_pager: crate::pager::MoePagerCell,
 }
 
 // ash Instances/Devices/handles are Send+Sync per the Vulkan spec when
@@ -341,6 +335,24 @@ impl WeightArena {
 
 /// Vulkan device + allocator + pipeline cache.
 pub struct VulkanBackend {
+    // NOTE: `moe_pager` is declared before `shared` so the session's buffers are freed first on
+    // drop (each holds its own `Arc<VulkanShared>` clone, so the device outlives them either way).
+    /// Paged MoE expert cache (see `pager::MoePagerSession`) — `Some` only when the loaded model's
+    /// expert banks don't fit VRAM and the seam's placement policy chose paging over the legacy
+    /// host-visible split (see `infr-llama`'s `generate_dense_vulkan_session`). `None` is the
+    /// overwhelming common case (fits resident) and costs nothing beyond one `Mutex` lock check
+    /// per `Backend::moe_paged` call.
+    ///
+    /// Owned by the BACKEND handle, NOT `VulkanShared`: the session's arena/LUT/ring buffers each
+    /// hold an `Arc<VulkanShared>` clone, so parking the session on `VulkanShared` formed an Arc
+    /// CYCLE — the shared state (device, allocator, weight arena, the pager arenas themselves:
+    /// ~23 GiB after a Scout load) never dropped until process exit, and every LATER model load
+    /// in the same process hit the VRAM budget guard with "N GiB already in use" (the
+    /// `cpu_backend` gpu_ test-suite flake; see `backend_drop_frees_device_after_moe_pager`).
+    /// The session still lives exactly as long as a loaded paged model can be generated with:
+    /// `infr-llama`'s sessions own the `VulkanBackend`, and a new backend is a new device whose
+    /// buffers couldn't read the old session anyway.
+    moe_pager: crate::pager::MoePagerCell,
     shared: Arc<VulkanShared>,
 }
 
@@ -868,6 +880,7 @@ impl VulkanBackend {
             has_push_descriptor.then(|| ash::khr::push_descriptor::Device::new(&instance, &device));
 
         Ok(Self {
+            moe_pager: Mutex::new(None),
             shared: Arc::new(VulkanShared {
                 _entry: entry,
                 instance,
@@ -887,7 +900,6 @@ impl VulkanBackend {
                 pcache,
                 weight_pb: Mutex::new(None),
                 device_used: AtomicU64::new(0),
-                moe_pager: Mutex::new(None),
             }),
         })
     }
@@ -916,7 +928,7 @@ impl VulkanBackend {
     /// previous session (there is only ever one loaded model per process today).
     pub fn init_moe_pager(&self, layout: crate::pager::MoePagerLayout) -> Result<()> {
         let session = crate::pager::MoePagerSession::new(self, layout)?;
-        *self.shared.moe_pager.lock().unwrap() = Some(session);
+        *self.moe_pager.lock().unwrap() = Some(session);
         Ok(())
     }
 
@@ -930,8 +942,7 @@ impl VulkanBackend {
         buf_id: usize,
         source: crate::pager::ExpertSource,
     ) -> Result<()> {
-        self.shared
-            .moe_pager
+        self.moe_pager
             .lock()
             .unwrap()
             .as_mut()
@@ -941,7 +952,7 @@ impl VulkanBackend {
 
     /// `INFR_PAGER_STATS=1` reporting hook — a no-op when no paged model is loaded.
     pub fn print_moe_pager_stats(&self) {
-        if let Some(s) = self.shared.moe_pager.lock().unwrap().as_ref() {
+        if let Some(s) = self.moe_pager.lock().unwrap().as_ref() {
             s.print_stats_if_enabled();
         }
     }
@@ -950,7 +961,7 @@ impl VulkanBackend {
     /// (only `adapter.rs` reaches into this); see `pager.rs`'s module doc for why this lives
     /// outside the `Graph`/`Bindings` seam instead of a per-op flag.
     pub(crate) fn moe_pager(&self) -> &crate::pager::MoePagerCell {
-        &self.shared.moe_pager
+        &self.moe_pager
     }
 
     // ── internal helpers ──────────────────────────────────────────────────────
@@ -1536,7 +1547,7 @@ impl Backend for VulkanBackend {
     }
 
     fn moe_paged(&self) -> bool {
-        self.shared.moe_pager.lock().unwrap().is_some()
+        self.moe_pager.lock().unwrap().is_some()
     }
 
     /// DiffusionGemma perf slice 3 (docs/DIFFUSIONGEMMA.md): one eager dispatch of
@@ -1617,6 +1628,40 @@ mod tests {
         assert_eq!(
             back0[1], 1u8,
             "first arena buffer corrupted by later allocs"
+        );
+    }
+
+    /// Dropping the backend must actually drop `VulkanShared` (device, allocator, weight arena —
+    /// i.e. free the VRAM) even after a paged-MoE session was installed. The session's arena/LUT/
+    /// ring buffers each hold an `Arc<VulkanShared>` clone, so parking the session ON
+    /// `VulkanShared` formed an Arc cycle that leaked the whole device (~23 GiB after the Scout
+    /// paged test) until process exit — every later model load in the same process then hit the
+    /// VRAM budget guard with "N GiB already in use" (the cpu_backend gpu_ suite flake).
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn backend_drop_frees_device_after_moe_pager() {
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan GPU");
+                return;
+            }
+        };
+        be.init_moe_pager(crate::pager::MoePagerLayout {
+            n_blocks: 4,
+            pools: vec![crate::pager::MoePoolSpec {
+                role: crate::pager::Role::Gate,
+                slot_bytes: 4096,
+                n_slots: 2,
+            }],
+            ring_bytes: 1 << 20,
+        })
+        .expect("init_moe_pager");
+        let weak = Arc::downgrade(&be.shared);
+        drop(be);
+        assert!(
+            weak.upgrade().is_none(),
+            "VulkanShared leaked after dropping the backend (Arc cycle via the paged-MoE session)"
         );
     }
 

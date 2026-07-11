@@ -432,9 +432,12 @@ struct Pool {
 
 /// One model's whole paged-MoE session: the `(role, slot_bytes)` arena pools + the shared
 /// persistent staging buffer their uploads reuse (the bandwidth probe's headline finding — see
-/// `pager.rs`'s module doc and `tests/bandwidth_probe.rs`). Lives on `VulkanShared` for the
-/// process's lifetime once a paged model is loaded (`VulkanBackend::init_moe_pager`); `None` for
-/// every non-paged model — zero cost, zero behavior change on the common (fits-in-VRAM) path.
+/// `pager.rs`'s module doc and `tests/bandwidth_probe.rs`). Lives on the `VulkanBackend` HANDLE
+/// (NOT `VulkanShared` — the session's buffers hold `Arc<VulkanShared>` clones, and parking it on
+/// the shared state made an Arc cycle that leaked the device's whole VRAM footprint until process
+/// exit; see the `moe_pager` field doc in lib.rs) for as long as the backend that loaded the
+/// paged model lives (`VulkanBackend::init_moe_pager`); `None` for every non-paged model — zero
+/// cost, zero behavior change on the common (fits-in-VRAM) path.
 pub struct MoePagerSession {
     pools: Vec<Pool>,
     /// `buffer_identity(placeholder)` -> (role, pool index, this layer's expert source), for
@@ -844,6 +847,6 @@ impl MoePagerSession {
     }
 }
 
-/// `VulkanShared::moe_pager`'s field type — a `Mutex` since `touch_role` mutates the LRU/arena and
+/// `VulkanBackend::moe_pager`'s field type — a `Mutex` since `touch_role` mutates the LRU/arena and
 /// the adapter calls it from `execute_static` (`&VulkanBackend`, not `&mut`).
 pub type MoePagerCell = Mutex<Option<MoePagerSession>>;
