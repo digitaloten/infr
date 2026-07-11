@@ -502,7 +502,11 @@ mod tests {
                 p.begin_batch();
                 p.schedule(id);
             }
-            assert_eq!(record(&p), first, "stable-prefix slots moved between passes");
+            assert_eq!(
+                record(&p),
+                first,
+                "stable-prefix slots moved between passes"
+            );
         }
         // And the prefix really is resident (blocks 0..n_slots-1 minus the churn slot).
         assert!(p.slot_of(0).is_some());

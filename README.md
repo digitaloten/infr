@@ -201,6 +201,31 @@ Gemma-4 MoE — one double-width slot per expert), and mixed-dtype roles
 one arena pool per (role, byte size)). `INFR_PAGER_STATS=1` prints each pool's
 hit/miss/eviction counts.
 
+**Dense layer streaming**: DENSE models bigger than VRAM stream their per-layer
+projection weights (attn q/k/v/o + FFN gate/up/down, as the same fused
+qkv/gate_up groups the loader uploads) through the same paged VRAM machinery —
+but schedule-driven, not LRU: a dense forward visits layers in one fixed order,
+so residency uses an exact cyclic-sweep policy (Belady-parity — a stable
+resident prefix plus one churn slot per pool) and there are NO readbacks
+anywhere (every "miss" is known in advance; misses ride recorded ring→arena
+copies on the same pipelined fenced-half staging ring the MoE path uses, so CPU
+memcpys for later layers overlap GPU execution of earlier ones). Streamed
+dispatches are the ordinary dense kernels reading the pool arena at a slot
+element offset (the `w_off` convention) — no kernel variants, so streamed output
+is token-identical to the resident run. Embeddings, lm_head, norms and biases
+stay resident (lm_head is read at every token edge — streaming it adds its full
+bytes to every token's PCIe bill with zero locality to exploit). Placement is
+automatic (resident when everything fits — zero change); `INFR_CACHE=<size>`
+forces streaming with that budget. Honest expectations: prefill amortizes
+uploads across the whole batch (Qwen3-14B Q8_0, ~15.7 GB, at `INFR_CACHE=8g`:
+pp512 987 t/s vs 1505 resident = 0.66×); decode has no locality to exploit, so
+it is capped at PCIe_bw ÷ overflow_bytes per token — physics, not a bug (same
+setup: ~7.0 GB re-uploaded per token ÷ ~22 GB/s ≈ 3.1 t/s ceiling, measured 3.1
+t/s; the CPU backend does 4.4 t/s at that ~45% overflow, so streaming only beats
+CPU when the overflow is smaller — measured crossover on this box is around a
+quarter of the model overflowing). An MoE model whose DENSE part also doesn't
+fit is out of scope and errors clearly.
+
 **Size grammar** — `INFR_CACHE` and `INFR_CTX` share one value grammar
 (`infr_core::parse_size`): a plain number is the base unit (bytes for
 `INFR_CACHE`, tokens for `INFR_CTX`), `k`/`m`/`g`/`t` suffixes scale by 1024

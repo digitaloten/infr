@@ -743,7 +743,9 @@ fn lower_op(
                 // filter was bypassed — fail loudly, slot 0's `elem_base == 0` would otherwise
                 // slip through the w_off check below.
                 if wsub.is_some() {
-                    return Err(be("vulkan adapter: streamed Linear reached the fused-add path"));
+                    return Err(be(
+                        "vulkan adapter: streamed Linear reached the fused-add path",
+                    ));
                 }
                 if w_off != 0 {
                     return Err(be("vulkan adapter: Linear w_off with fused residual"));
@@ -3486,8 +3488,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         // so every miss is known the moment the op is reached.
         if be_.dense_paged() {
             if let Op::Linear { weight, .. } = op {
-                let wid =
-                    crate::pager::buffer_identity(resolve(&scratch, bindings, *weight)?);
+                let wid = crate::pager::buffer_identity(resolve(&scratch, bindings, *weight)?);
                 let streamed = be_
                     .dense_pager()
                     .lock()

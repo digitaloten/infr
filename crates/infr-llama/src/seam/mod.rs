@@ -493,7 +493,10 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     return None;
                 }
                 let raw: usize = infos.iter().map(|t| t.nbytes).sum();
-                let numel: usize = infos.iter().map(|t| t.shape.iter().product::<usize>()).sum();
+                let numel: usize = infos
+                    .iter()
+                    .map(|t| t.shape.iter().product::<usize>())
+                    .sum();
                 Some((comps, dt, raw, numel))
             })
             .collect();
@@ -511,9 +514,10 @@ pub(crate) fn vulkan_moe_binder<'a>(
         let budget = match cache_override {
             Some(spec) => Some(spec.resolve(vram.available)),
             None if fp.total() + kv_bytes + ACT_HEADROOM <= vram.available => None,
-            None => Some(vram.available.saturating_sub(
-                (fp.total() - streamable_resident) + kv_bytes + ACT_HEADROOM,
-            )),
+            None => Some(
+                vram.available
+                    .saturating_sub((fp.total() - streamable_resident) + kv_bytes + ACT_HEADROOM),
+            ),
         };
         if let (Some(mut budget), false) = (budget, eligible.is_empty()) {
             // Slot stride: the group's raw bytes padded to a whole number of quant blocks AND
@@ -537,10 +541,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 let (blk_e, blk_b) = infr_gguf::block_layout(*dt);
                 let stride = raw.next_multiple_of(lcm(blk_b, 4));
                 let eps = (stride / blk_b * blk_e) as u64;
-                let pool = match pools
-                    .iter()
-                    .position(|&(d, s, ..)| d == *dt && s == stride)
-                {
+                let pool = match pools.iter().position(|&(d, s, ..)| d == *dt && s == stride) {
                     Some(i) => i,
                     None => {
                         pools.push((*dt, stride, eps, 0));
@@ -566,8 +567,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     // Proportional budget split (byte share == access share: every block is read
                     // exactly once per sweep). Floor 2 slots so the next block's upload can
                     // overlap the previous block's dispatch instead of serializing on one slot.
-                    let share = (budget as u128 * (stride * nb) as u128 / total_bytes as u128)
-                        as u64;
+                    let share =
+                        (budget as u128 * (stride * nb) as u128 / total_bytes as u128) as u64;
                     let floor = 2.min(nb).max(1);
                     // Caps: one SSBO binding per arena (device range), AND the kernels' u32
                     // ELEMENT reach — `n_slots * elems_per_slot + one block's numel` must fit
@@ -575,8 +576,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     // bind before the byte cap does).
                     let cap_bytes = ((arena_cap / stride as u64) as usize).max(1);
                     let cap_elems = ((u32::MAX as u64 / eps).saturating_sub(1) as usize).max(1);
-                    let budget_slots =
-                        ((share / stride as u64) as usize).clamp(floor, nb);
+                    let budget_slots = ((share / stride as u64) as usize).clamp(floor, nb);
                     infr_vulkan::pager::DensePoolSpec {
                         slot_bytes: stride,
                         n_slots: budget_slots.min(cap_bytes).min(cap_elems),
@@ -642,9 +642,10 @@ pub(crate) fn vulkan_moe_binder<'a>(
             let segments: Vec<std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>> = comps
                 .iter()
                 .map(|c| {
-                    Ok(std::sync::Arc::new(
-                        g.tensor_bytes_arc(c).map_err(|e| anyhow!("{e}"))?,
-                    ) as std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>)
+                    Ok(
+                        std::sync::Arc::new(g.tensor_bytes_arc(c).map_err(|e| anyhow!("{e}"))?)
+                            as std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>,
+                    )
                 })
                 .collect::<AResult<_>>()?;
             let seg_total: usize = segments.iter().map(|s| s.as_ref().as_ref().len()).sum();
