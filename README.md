@@ -282,7 +282,7 @@ prefill at 4096 KV depth (the multi-turn serve shape).
 | Gemma-4-26B-A4B (MoE) | UD-Q4_K_M   | 0.99×     | 0.92×     | 0.95×      | **1.16×** |
 | Qwen3.6-27B           | Q4_K_M      | **1.09×** | 0.94×     | 0.93×      | **1.14×** |
 | Qwen3-30B-A3B (MoE)   | Q4_K_M      | 0.96×     | 0.95×     | 0.93×      | **1.14×** |
-| Gemma-4-31B           | UD-Q5_K_XL³ | 0.89×     | 0.09×     | 0.07×      | 0.11×     |
+| Gemma-4-31B           | UD-Q5_K_XL³ | **0.98×** | 0.89×     | 0.08×      | 0.13×     |
 | Ornith-1.0-35B        | Q4_K_M      | 0.83×     | **1.01×** | **1.03×**  | **1.27×** |
 | Qwen3.6-35B-A3B (MoE) | UD-IQ3_S⁴   | 0.03×     | 0.50×     | 0.52×      | 0.35×     |
 | Qwen3.6-35B-A3B (MoE) | UD-Q4_K_M   | 0.94×     | 0.95×     | 0.96×      | **1.46×** |
@@ -297,11 +297,14 @@ speculative-decode ratio is 0.63–0.68× (4B) / 0.52–0.55× (9B) — see the 
 paragraph below. Plain (non-MTP) metrics for the same weights are the rows
 shown.
 
-³ Gemma-4-31B (21.92 GiB weights) is a **placement** comparison, not a kernel
-one: llama.cpp squeezes it fully resident on the 24 GB card, while infr's
-auto-placement reserves activation/guard headroom and **streams** the overflow
-through the pager — decode then sits at the PCIe ceiling (~3 t/s). Fix queued:
-try-resident-first placement for dense models at small context.
+³ Gemma-4-31B (21.9 GiB weights on the 24 GB card) runs **resident at default
+context** since `e2c0694` (try-resident-first dense placement with an honest
+activation reserve — the old MoE-sized 2 GiB headroom plus a phantom +1.6 GiB in
+the tied-lm-head accounting used to push it into streaming): pp512 0.98×, tg128
+0.89×. The `@d4096` columns still **stream**: infr sizes every layer's KV at
+full context while llama.cpp sizes sliding-window layers to the SWA window, and
+full-ctx KV (4.3 GB) doesn't fit beside the weights. Window-sized SWA KV is
+queued — it makes d4096 resident too.
 
 ⁴ Grid i-quant (IQ1–IQ3) expert banks are **correct but on the slow floor** (row
 measured post-`618cd3b`, which fixed a device-lost TDR: dynamically indexed GLSL
