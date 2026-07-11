@@ -44,21 +44,19 @@ pub(crate) fn tensor_resident_bytes(dtype: infr_core::DType, numel: usize, nbyte
 
 /// Sum the resident weight footprint across all tensors (MoE-aware). Enumerating every tensor means
 /// stacked expert tensors are counted in full, so this is correct for MoE the moment the arch is
-/// supported. `token_embd` is excluded (it lives in host RAM for the CPU embedding gather) unless
-/// the lm head is tied to it (no `output.weight`), where an f16 copy is uploaded to VRAM.
+/// supported. `token_embd` counts at its NATIVE upload size like every other tensor: the runner
+/// uploads it raw-quant — as the lm head for tied models (no `output.weight`), and as the GPU
+/// embed-gather table for untied ones (task #28). This used to count the tied case as a dequanted
+/// f16 copy (`numel*2`), overstating a big-vocab model by GiBs — gemma-4-31B (262k vocab, Q6_K
+/// embd) carried a phantom +1.6 GiB that alone pushed the dense placement into streaming a model
+/// whose weights fit resident. (The rare host-embed fallback paths keep the table off-VRAM, so
+/// counting it is the safe over-estimate direction there.)
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn weight_footprint(g: &Gguf) -> WeightFootprint {
-    let has_output = g.tensors().iter().any(|t| t.name == "output.weight");
     let mut dense = 0u64;
     let mut expert = 0u64;
     for t in g.tensors() {
         let numel: usize = t.shape.iter().product();
-        if t.name == "token_embd.weight" {
-            if !has_output {
-                dense += (numel * 2) as u64; // tied lm head, uploaded as f16
-            }
-            continue;
-        }
         let bytes = tensor_resident_bytes(t.dtype, numel, t.nbytes);
         if t.name.contains("_exps") {
             expert += bytes;

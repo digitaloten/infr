@@ -148,6 +148,39 @@ pub(crate) fn generate_dense_vulkan_session(
     Ok(out)
 }
 
+/// Honest activation/scratch reservation for a DENSE model's placement decision: the transient
+/// VRAM a resident session needs BEYOND weights + KV, at the largest shape it will ever run — a
+/// full prefill chunk of `rows = min(ubatch, want_ctx)` rows (the runner chunks batched prefill at
+/// INFR_UBATCH, default 1024; decode's single row is dwarfed by this).
+///
+/// Derivation — measured on gemma-4-31B UD-Q5_K_XL (n_embd 5376, n_ff 32768, vocab 262144) on a
+/// 24 GiB 7900 XTX by tracing the live-VRAM watermark at every alloc-guard check on a forced
+/// -resident run: a 1024-row prefill chunk at ctx 2064 committed ~1.1 GB of activation pools
+/// (dominant single allocs: 512 MiB = rows*vocab*2 whole-chunk f16 logits, 256 MiB = rows*2*n_ff*4
+/// fused gate_up f32, 168 MiB = rows*8*n_embd*4 fused qkv f32, 128 MiB = rows*n_ff*4) and needed
+/// at least 1.7 GB before the guard cut it off; a 528-row chunk fit in ~0.6 GB. Per-row model:
+/// `2*vocab` (whole-chunk f16 logits, the largest term on a 262k-vocab model) + `12*n_ff` (fused
+/// gate_up out `8*n_ff` + activated intermediate `4*n_ff`, f32) + `96*n_embd` (qkv/attn-out/norm/
+/// residual f32 temps: measured `32*n_embd`, 3x for pool variety across graph shapes —
+/// m1/m2..m8/prefill each pool their own tags). All times a 1.25 margin for unmeasured tails
+/// (flash partials, per-shape pool duplicates), plus a fixed
+/// 256 MiB for what shapes don't scale: gpu-allocator's block granularity, retained upload
+/// staging (device-local under ReBAR), and the weight-buffer u32/dedicated-alloc padding not in
+/// `weight_footprint`. Deliberately a slight over-reserve: under-reserving makes the alloc-time
+/// VRAM guard error a live request mid-prefill, over-reserving only streams a borderline model.
+pub(crate) fn dense_act_reserve(cfg: &Config, want_ctx: usize) -> u64 {
+    let ubatch: usize = std::env::var("INFR_UBATCH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(1024);
+    // Prefill GEMM outputs pad rows to 64 (see the Vulkan adapter's `alloc_scratch`).
+    let rows = ubatch.min(want_ctx).max(1).next_multiple_of(64) as u64;
+    let per_row = (2 * cfg.vocab + 12 * cfg.n_ff + 96 * cfg.n_embd) as u64;
+    const FIXED: u64 = 256 * 1024 * 1024;
+    FIXED + rows * per_row * 5 / 4
+}
+
 /// Decide this model's MoE expert placement, install the pager session when the decision pages
 /// (FIRST load only), and return the Vulkan weight binder that implements it. Shared by every
 /// Vulkan weight-uploading session — [`generate_dense_vulkan_session`] and the DiffusionGemma
@@ -425,8 +458,11 @@ pub(crate) fn vulkan_moe_binder<'a>(
     //
     //   1. `INFR_CACHE=<size>` on a DENSE model — force EVERY streamable block through the
     //      streamer with that byte budget (deterministic test hook, same grammar as the MoE tier).
-    //   2. Auto (unset): fully resident (the fast path, zero change) when everything fits;
-    //      otherwise stream with budget = remaining VRAM after resident-weights+KV+headroom.
+    //   2. Auto (unset): TRY RESIDENT FIRST — fully resident (the fast path, zero change) when
+    //      weights + KV + the honest dense activation reserve (`dense_act_reserve`) fit live
+    //      VRAM; otherwise stream with budget = remaining VRAM after resident-weights+KV+reserve.
+    //      An explicit oversized INFR_CTX whose KV can't sit beside resident weights falls back
+    //      to streaming the same way (never clamped here — the ctx the caller asked for is kept).
     // Streamable = the per-layer Linear projection groups whose dtype has offset-capable native
     // kernels (`native_dense_supported`, F16/F32 excluded — `matmul_proj`/`linear_f32` take no
     // weight offset) and whose bytes upload unmodified from the mmap (the qwen2 NEOX q/k row
@@ -499,13 +535,22 @@ pub(crate) fn vulkan_moe_binder<'a>(
             .map(|l| (cfg.layer_n_kv(l) * cfg.layer_head_dim(l) * 2 * 2) as u64)
             .sum::<u64>()
             * (want_ctx as u64 + 64);
-        const ACT_HEADROOM: u64 = 2 * 1024 * 1024 * 1024; // same rationale as the MoE tier's
+        // Try-resident-first: a dense model goes FULLY RESIDENT (the exact pre-streaming fast
+        // path) whenever weights + this session's KV + an HONEST dense activation estimate fit
+        // the live free VRAM; only a genuine miss streams. The MoE tier's 2 GiB ACT_HEADROOM is
+        // sized for pager arenas/staging that a dense-resident session doesn't have — reusing it
+        // here streamed gemma-4-31B (21.9 GB weights on a 24 GB card, decode 33 t/s resident vs
+        // ~3 t/s streamed at the PCIe ceiling). If residency is chosen but a later activation
+        // alloc still misses (fragmentation, another process grabbing VRAM), the alloc-time VRAM
+        // guard fails that request cleanly — INFR_CACHE=<size> is the escape hatch that forces
+        // streaming.
+        let act_reserve = dense_act_reserve(cfg, want_ctx);
         let budget = match cache_override {
             Some(spec) => Some(spec.resolve(vram.available)),
-            None if fp.total() + kv_bytes + ACT_HEADROOM <= vram.available => None,
+            None if fp.total() + kv_bytes + act_reserve <= vram.available => None,
             None => Some(
                 vram.available
-                    .saturating_sub((fp.total() - streamable_resident) + kv_bytes + ACT_HEADROOM),
+                    .saturating_sub((fp.total() - streamable_resident) + kv_bytes + act_reserve),
             ),
         };
         if let (Some(mut budget), false) = (budget, eligible.is_empty()) {

@@ -351,7 +351,18 @@ impl SeamModel {
         // total/12) — ~2 GiB on a 24 GiB card, 1 GiB floor on small ones. Over-clamping is safe;
         // under-clamping errors requests.
         let vram = vk.vram();
-        let act_headroom: u64 = (vram.total / 12).max(1024 * 1024 * 1024);
+        let mut act_headroom: u64 = (vram.total / 12).max(1024 * 1024 * 1024);
+        // Keep the clamp CONSISTENT with the dense placement decision (`vulkan_moe_binder`'s
+        // try-resident tier): reserve at least what placement will demand as its activation
+        // estimate at this ctx, so a DEFAULT ctx this fit math hands out always lands RESIDENT
+        // instead of clamping to a window the placement then streams anyway. MoE models keep the
+        // plain heuristic (their placement reserves pager arenas separately from this).
+        if self.cfg.moe.is_none() {
+            act_headroom = act_headroom.max(crate::seam::dense_act_reserve(
+                &self.cfg,
+                self.cfg.n_ctx_train,
+            ));
+        }
         // Bytes per token across all layers, K side + V side (bytes-per-element from the same
         // env the runner honors; formats it would gate back to f16 are an estimate only — the
         // alloc guard catches a resulting overflow).
@@ -412,6 +423,13 @@ impl SeamModel {
         let mut printed = 0usize;
         let slot = session.pool.pick(&session.vk, &self.cfg, &prompt_tokens)?;
         let max_ctx = session.max_ctx;
+        // Cap the reply to the context that's actually left ("a turn also caps to remaining
+        // context" — the CLI's generation ceiling is a default, not a demand): a VRAM-clamped
+        // default session (e.g. a 21.9 GB model on a 24 GB card clamps 262k -> ~1.7k) would
+        // otherwise hard-error on `infr run`'s default max_new=2048 before generating a single
+        // token. EOS ends almost every reply long before this cap; an over-long PROMPT still
+        // errors cleanly in the runner (its `prompt + gen + 1 > max_ctx` guard stays).
+        let max_new = max_new.min(max_ctx.saturating_sub(prompt_tokens.len() + 1));
         let (_generated, stats) = crate::seam::generate_dense_vulkan_session(
             &session.vk,
             &self.gguf,
