@@ -506,14 +506,19 @@ impl VulkanBackend {
         rope_dim: usize,
         theta: f32,
     ) -> Result<Vec<f32>> {
-        let k = self.kernel("rope", crate::gemm::rope_spv(), 2, 24);
-        let mut push = [0u8; 24];
+        // push_size 28 must match rope.comp's full PC block (…, pos_offset, out_base) AND the
+        // recorder's `kernel("rope", …, 28)` — the kernel cache is shared by name, so a smaller
+        // range here would create a pipeline layout that doesn't contain the shader's block
+        // (VUID-VkComputePipelineCreateInfo-layout-10069).
+        let k = self.kernel("rope", crate::gemm::rope_spv(), 2, 28);
+        let mut push = [0u8; 28];
         push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n_heads as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(hd as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(rope_dim as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&theta.to_ne_bytes());
         push[20..24].copy_from_slice(&0u32.to_ne_bytes()); // pos_offset
+        push[24..28].copy_from_slice(&0u32.to_ne_bytes()); // out_base (eager: write at row 0)
         self.run_kernel(k, &[x], t * n_heads * hd, &push, (t * n_heads) as u32)
     }
 
