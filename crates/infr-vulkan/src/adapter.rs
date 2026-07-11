@@ -618,6 +618,15 @@ fn lower_op(
     // invalidates the memo by construction.
     mmv_memo: &mut Option<(TensorId, usize, usize)>,
     dummy: &dyn Buffer,
+    // Dense layer streaming (see `pager::DensePagerSession`): `Some((arena, elem_base))` when
+    // this op is an `Op::Linear` whose weight is a streamed block — the weight binds the pool's
+    // ARENA buffer instead of the (4-byte placeholder) bound at the TensorId, and `elem_base`
+    // (the resident slot's element offset) adds to the op's own `w_off`. Every other op — and
+    // every non-streamed model — passes `None` (zero change). Only the `Op::Linear` arm reads it;
+    // the seam's placement guarantees a streamed weight's dtype rides the offset-capable native
+    // paths (`native_dense_supported`) and never the fused-residual peephole (filtered by
+    // `execute_static` before the loop).
+    wsub: Option<(&dyn Buffer, usize)>,
 ) -> Result<()> {
     let memo_prev = mmv_memo.take();
     let r = |id: TensorId| resolve(scratch, bindings, id);
@@ -704,6 +713,23 @@ fn lower_op(
             }
             let (w, xb, y) = (r(*weight)?, r(*x)?, r(*dst)?);
             let dt = graph.desc(*weight).dtype;
+            // Dense layer streaming: the weight is the pool ARENA at the staged slot's element
+            // base (see the `wsub` param doc) — the op's own `w_off` (a fused-qkv slice offset,
+            // usually 0) rides on top, exactly the stacked-MoE-tensor convention every offset
+            // path below already implements.
+            let (w, w_off) = match wsub {
+                Some((arena, elem_base)) => {
+                    // Placement guarantees an offset-capable dtype (the f16/f32 fallback arms and
+                    // `matmul_proj` take no weight offset) — a violation here would silently read
+                    // arena slot 0's bytes as this weight.
+                    if !native_dense_supported(dt) {
+                        return Err(be("vulkan adapter: streamed Linear weight of a dtype \
+                                       without offset-capable kernels"));
+                    }
+                    (arena, w_off + elem_base)
+                }
+                None => (w, w_off),
+            };
             // `w_off` (fused-QKV slices) only rides the offset-capable native paths — the runner
             // gates fusion on `native_dense_supported`, so the f16/f32 fallbacks never see it.
             if w_off != 0 && !native_dense_supported(dt) {
@@ -712,6 +738,13 @@ fn lower_op(
             // Fused Linear+Add (decode residual): one GEMV with the residual added in-kernel —
             // see linear_add_peephole. `y` (the Linear's scratch dst) is never written.
             if let Some((residual, final_dst)) = fused_add.get(&op_idx) {
+                // Streamed weights are filtered OUT of `fused_add` before the op loop (the fused
+                // kernels bake a zero weight offset); reaching here with a substitution means the
+                // filter was bypassed — fail loudly, slot 0's `elem_base == 0` would otherwise
+                // slip through the w_off check below.
+                if wsub.is_some() {
+                    return Err(be("vulkan adapter: streamed Linear reached the fused-add path"));
+                }
                 if w_off != 0 {
                     return Err(be("vulkan adapter: Linear w_off with fused residual"));
                 }
@@ -3119,7 +3152,11 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
     // with no host round-trip built in — can't express. `Backend::moe_paged`'s doc has the full
     // rationale; the seam's `dyn_replay` gate mirrors this so a paged model never even BUILDS the
     // (then-unused) replay plan, but this check is what actually guarantees correctness.
-    if !plan.eligible || be_.moe_paged() {
+    // Dense layer streaming forces the static path for a different reason than MoE (no readback
+    // exists — layer order is deterministic — but the per-token ring staging + per-slot weight
+    // offsets can't live inside a record-once tape whose descriptor sets and push constants are
+    // frozen at record time).
+    if !plan.eligible || be_.moe_paged() || be_.dense_paged() {
         return execute_static(be_, &plan.graph, bindings);
     }
 
@@ -3160,7 +3197,7 @@ pub(crate) fn execute_chain(
     let Some(plan) = plan.as_any().downcast_ref::<VkDecodePlan>() else {
         return Ok(None);
     };
-    if !plan.eligible || n == 0 || n > 64 || be_.moe_paged() {
+    if !plan.eligible || n == 0 || n > 64 || be_.moe_paged() || be_.dense_paged() {
         return Ok(None);
     }
     let mut guard = plan.replay.lock().unwrap();
@@ -3301,6 +3338,7 @@ fn record_decode_replay(
             &mut pool,
             &mut mmv_memo,
             dummy.as_ref(),
+            None,
         )?;
     }
     for c in dyn_args.drain(..) {
@@ -3373,7 +3411,28 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     }
 
     let (fused_kv_write, mut skip_op) = kv_write_peephole(graph);
-    let (fused_add, skip_add) = linear_add_peephole(graph);
+    let (mut fused_add, mut skip_add) = linear_add_peephole(graph);
+    // Dense layer streaming: the fused Linear+Add kernels bake a ZERO weight offset, so un-fuse
+    // any pair whose Linear weight is a streamed block — the standalone Add op runs instead
+    // (bit-identical math: the fused kernel only moves the same exact add in-kernel).
+    if be_.dense_paged() {
+        let guard = be_.dense_pager().lock().unwrap();
+        if let Some(sess) = guard.as_ref() {
+            let mut unfuse: Vec<usize> = Vec::new();
+            for &idx in fused_add.keys() {
+                if let Op::Linear { weight, .. } = &graph.ops[idx] {
+                    let w = resolve(&scratch, bindings, *weight)?;
+                    if sess.is_streamed(crate::pager::buffer_identity(w)) {
+                        unfuse.push(idx);
+                    }
+                }
+            }
+            for idx in unfuse {
+                fused_add.remove(&idx);
+                skip_add.remove(&(idx + 1));
+            }
+        }
+    }
     skip_op.extend(skip_add);
 
     // Transient buffers allocated inside the op loop (GEMM/attention/MoE scratch) must outlive the
@@ -3418,6 +3477,49 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                 continue;
             }
         }
+        // Dense layer streaming: a `Op::Linear` whose weight buffer is a registered streamed
+        // block stages its residency (recorded ring→arena copy, pipelined via the same
+        // `PagedStream` rotation the MoE path uses — the CPU's memcpys for later layers overlap
+        // the GPU's execution of already-submitted segments), then lowers through the ORDINARY
+        // Linear arm with the pool arena + slot element base substituted for the placeholder
+        // (see `lower_op`'s `wsub` param). No readbacks anywhere: layer order is deterministic,
+        // so every miss is known the moment the op is reached.
+        if be_.dense_paged() {
+            if let Op::Linear { weight, .. } = op {
+                let wid =
+                    crate::pager::buffer_identity(resolve(&scratch, bindings, *weight)?);
+                let streamed = be_
+                    .dense_pager()
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|s| s.is_streamed(wid));
+                if streamed {
+                    let elem_base = stage_dense_linear(be_, &mut rec, &mut pstream, wid)?;
+                    let guard = be_.dense_pager().lock().unwrap();
+                    let sess = guard.as_ref().expect("dense_paged() checked above");
+                    lower_op(
+                        be_,
+                        graph,
+                        op_idx,
+                        op,
+                        rec.as_ref().expect("segment always Some between ops"),
+                        &scratch,
+                        bindings,
+                        &fused_kv_write,
+                        &fused_add,
+                        &mode,
+                        &mut transient,
+                        &mut dyn_args,
+                        &mut pool,
+                        &mut mmv_memo,
+                        dummy.as_ref(),
+                        Some((sess.arena(wid)?, elem_base)),
+                    )?;
+                    continue;
+                }
+            }
+        }
         lower_op(
             be_,
             graph,
@@ -3434,6 +3536,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
             &mut pool,
             &mut mmv_memo,
             dummy.as_ref(),
+            None,
         )?;
     }
     for c in dyn_args.drain(..) {
@@ -3546,6 +3649,39 @@ fn sync_stream<'a>(
     ps.tape_cursor = 0;
     *rec = Some(be_.recorder()?);
     Ok(())
+}
+
+/// Ensure a streamed dense Linear weight (`wid` — see `pager::buffer_identity`) is resident,
+/// staging a miss through the session ring into the ambient segment and rotating the stream
+/// (pipelined `finish_nowait` + fenced ring-half swap, exactly `rotate_stream`'s contract) when
+/// the current half can't hold it. Returns the slot's weight ELEMENT base for the dispatch's
+/// `w_off`. Progress is guaranteed: a ring half holds at least the largest pool slot (asserted
+/// at session construction).
+fn stage_dense_linear<'a>(
+    be_: &'a VulkanBackend,
+    rec: &mut Option<Recorder<'a>>,
+    ps: &mut PagedStream,
+    wid: usize,
+) -> Result<usize> {
+    loop {
+        let staged = {
+            let mut guard = be_.dense_pager().lock().unwrap();
+            let sess = guard
+                .as_mut()
+                .expect("dense streamed execution requires a session");
+            let half_base = ps.half * sess.ring_half_bytes();
+            sess.stage(
+                rec.as_ref().expect("segment always Some between ops"),
+                half_base,
+                &mut ps.cursor,
+                wid,
+            )?
+        };
+        match staged {
+            Some(elem_base) => return Ok(elem_base),
+            None => rotate_stream(be_, rec, ps)?,
+        }
+    }
 }
 
 /// Stage `ids` (layer-LOCAL) of `buf_id`'s role — recorded ring→arena copies for the misses,

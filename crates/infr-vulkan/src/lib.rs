@@ -353,6 +353,12 @@ pub struct VulkanBackend {
     /// `infr-llama`'s sessions own the `VulkanBackend`, and a new backend is a new device whose
     /// buffers couldn't read the old session anyway.
     moe_pager: crate::pager::MoePagerCell,
+    /// Dense layer-streaming cache (see `pager::DensePagerSession`) — `Some` only when the loaded
+    /// DENSE model's per-layer weights don't fit VRAM and the seam's placement chose streaming.
+    /// Same drop-ordering/ownership story as `moe_pager` (declared before `shared` so its
+    /// arena/ring buffers free first; owned by the backend HANDLE, never `VulkanShared` — the Arc
+    /// cycle lesson on `moe_pager`'s doc applies unchanged).
+    dense_pager: crate::pager::DensePagerCell,
     shared: Arc<VulkanShared>,
 }
 
@@ -886,6 +892,7 @@ impl VulkanBackend {
 
         Ok(Self {
             moe_pager: Mutex::new(None),
+            dense_pager: Mutex::new(None),
             shared: Arc::new(VulkanShared {
                 _entry: entry,
                 instance,
@@ -967,6 +974,44 @@ impl VulkanBackend {
     /// outside the `Graph`/`Bindings` seam instead of a per-op flag.
     pub(crate) fn moe_pager(&self) -> &crate::pager::MoePagerCell {
         &self.moe_pager
+    }
+
+    /// Install this model's dense layer-streaming session (see `pager::DensePagerSession`) —
+    /// `init_moe_pager`'s dense twin, same call-order contract (BEFORE the seam's weight-load
+    /// closure binds the first placeholder, so `Backend::dense_paged` already reads true).
+    pub fn init_dense_pager(&self, layout: crate::pager::DensePagerLayout) -> Result<()> {
+        let session = crate::pager::DensePagerSession::new(self, layout)?;
+        *self.dense_pager.lock().unwrap() = Some(session);
+        Ok(())
+    }
+
+    /// Register one streamed dense block with the session `init_dense_pager` installed — called
+    /// from the seam's weight-load closure instead of uploading the block's full bytes. Panics if
+    /// no session is installed (a caller bug: `init_dense_pager` must run first).
+    pub fn register_dense_stream(
+        &self,
+        pool: usize,
+        buf_id: usize,
+        source: crate::pager::DenseSource,
+    ) -> Result<()> {
+        self.dense_pager
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("register_dense_stream called before init_dense_pager")
+            .register(pool, buf_id, source)
+    }
+
+    /// `INFR_PAGER_STATS=1` reporting hook — a no-op when no dense-streamed model is loaded.
+    pub fn print_dense_pager_stats(&self) {
+        if let Some(s) = self.dense_pager.lock().unwrap().as_ref() {
+            s.print_stats_if_enabled();
+        }
+    }
+
+    /// [`Self::moe_pager`]'s dense twin — locked access for the adapter's `execute_static`.
+    pub(crate) fn dense_pager(&self) -> &crate::pager::DensePagerCell {
+        &self.dense_pager
     }
 
     // ── internal helpers ──────────────────────────────────────────────────────
@@ -1553,6 +1598,10 @@ impl Backend for VulkanBackend {
 
     fn moe_paged(&self) -> bool {
         self.moe_pager.lock().unwrap().is_some()
+    }
+
+    fn dense_paged(&self) -> bool {
+        self.dense_pager.lock().unwrap().is_some()
     }
 
     /// DiffusionGemma perf slice 3 (docs/DIFFUSIONGEMMA.md): one eager dispatch of

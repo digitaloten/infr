@@ -231,6 +231,72 @@ impl GpuPager {
         &self.lut_host[base..base + n]
     }
 
+    /// [`Self::touch_staged`]'s DENSE-STREAMING twin: residency via the exact cyclic-sweep policy
+    /// (`infr_core::pager::Pager::schedule` — dense layer order is deterministic, so every miss
+    /// is known in advance and no LUT/readback machinery is involved) and the block's bytes given
+    /// as SEGMENTS (a fused qkv/gate_up block keeps its component tensors' zero-copy mmap slices;
+    /// materializing the concat would double the streamed model's host RAM). Returns
+    /// `(slot, ring_bytes_consumed)` — 0 consumed on a hit; a miss memcpys the segments
+    /// back-to-back into the ring at `ring_off` and records the ring→arena slot copy, exactly
+    /// like `touch_staged` (same ring-region-lifetime contract). The segments' total may be up to
+    /// `slot_bytes - 3` short of the slot (the stride is padded to the pool's block/word
+    /// alignment); the pad tail is never read by a dispatch (every kernel read stays within the
+    /// block's `numel`). The caller must have verified the current ring half fits `slot_bytes`
+    /// BEFORE calling (a miss here always consumes a full slot stride of ring accounting).
+    ///
+    /// The host LUT mirror is kept coherent (eviction/insert) so a pager can't be silently
+    /// half-adopted by a LUT-reading path later, but dense dispatch never reads it — the slot
+    /// index returned here is baked into the dispatch's weight element offset instead.
+    pub fn schedule_staged(
+        &mut self,
+        rec: &crate::recorder::Recorder<'_>,
+        ring: &dyn Buffer,
+        ring_off: usize,
+        id: BlockId,
+        segments: &[&[u8]],
+    ) -> Result<(u32, usize)> {
+        match self.pager.schedule(id) {
+            Resolution::Hit { slot } => Ok((slot, 0)),
+            Resolution::Miss { slot, evicted } => {
+                let total: usize = segments.iter().map(|s| s.len()).sum();
+                debug_assert!(
+                    total <= self.slot_bytes,
+                    "dense block bytes ({total}) exceed the pool's slot stride ({})",
+                    self.slot_bytes
+                );
+                // Safety: `ring` was allocated by this same backend (session-owned Staging).
+                let base = unsafe { as_vk_buf(ring) }
+                    .mapped_ptr()
+                    .ok_or_else(|| be("pager staging ring is not persistently mapped"))?;
+                let mut off = ring_off;
+                for s in segments {
+                    par_copy_to_mapped(s, unsafe { base.add(off) });
+                    off += s.len();
+                }
+                // Word-align the copy length (the ring pad bytes it may carry are never read —
+                // see the fn doc); `total <= slot_bytes` and `slot_bytes % 4 == 0` keep it in
+                // the slot.
+                rec.copy(
+                    ring,
+                    ring_off,
+                    self.arena.as_ref(),
+                    slot as usize * self.slot_bytes,
+                    total.next_multiple_of(4),
+                );
+                if let Some(e) = evicted {
+                    if let Some(v) = self.lut_host.get_mut(e as usize) {
+                        *v = NOT_RESIDENT;
+                    }
+                }
+                if let Some(v) = self.lut_host.get_mut(id as usize) {
+                    *v = slot * self.words_per_slot;
+                }
+                self.lut_dirty = true;
+                Ok((slot, self.slot_bytes))
+            }
+        }
+    }
+
     /// Open a touch batch — see `infr_core::pager::Pager::begin_batch`. One batch = one
     /// (layer, role) residency resolution; blocks it touches are eviction-protected until the
     /// next batch opens.
@@ -850,3 +916,242 @@ impl MoePagerSession {
 /// `VulkanBackend::moe_pager`'s field type — a `Mutex` since `touch_role` mutates the LRU/arena and
 /// the adapter calls it from `execute_static` (`&VulkanBackend`, not `&mut`).
 pub type MoePagerCell = Mutex<Option<MoePagerSession>>;
+
+// ─── Dense layer-streaming session ─────────────────────────────────────────────────────────────
+//
+// The MoE session above is demand-driven (routing is GPU-decided, residency resolves per touch);
+// dense streaming is the SCHEDULE-driven policy `infr_core::pager`'s module doc names: a dense
+// forward visits layers in one fixed order every pass, so the host knows every "miss" in advance
+// and needs NO readbacks, NO LUT hop and NO paged kernel twins at all. One block = one per-layer
+// weight tensor GROUP exactly as the seam uploads it (a fused qkv or gate_up concat is one
+// block; split tensors are one block each) — every dense kernel already reads its weight from a
+// `w_off` ELEMENT offset (the stacked-MoE-tensor convention), so a streamed dispatch binds the
+// pool's arena as the weight buffer and adds `slot * elems_per_slot` to the op's own `w_off`.
+// Pools are keyed per (dtype, padded byte stride) tensor class — same reasoning as the MoE
+// per-(role, slot_bytes) pools (fixed slot offsets require uniform strides; mixed-precision GGUFs
+// bump a subset of layers' tensors to a wider format).
+//
+// Rejected alternatives (design notes for the seam this replaces):
+//   - Descriptor-level (buffer, offset) rebinding: `Recorder::bind_descriptors` binds
+//     `(buffer, 0, WHOLE_SIZE)` through ~seventy dispatch helpers — threading a per-binding
+//     offset through every signature is a much bigger, riskier diff than reusing the `w_off`
+//     element offset the kernels already take, and buys nothing (same descriptor write count).
+//   - `-DPAGED` LUT twins of the dense kernels (the MoE route): pointless indirection — the host
+//     knows the slot at record time, so the offset can be baked directly; a LUT hop would add a
+//     device dependency for information the host already has.
+//   - Embeddings / lm_head / norms / biases stay RESIDENT: norms and biases are consumed by ops
+//     with no weight-offset support and are tiny (a few KB/layer); token_embd/lm_head are read at
+//     every token edge — streaming lm_head would add its full bytes to every token's PCIe bill
+//     with zero locality to exploit, a strict loss.
+
+/// Where one streamed dense block's bytes live: one or more consecutive zero-copy views into the
+/// GGUF mmap (SEGMENTS, in upload order — a fused qkv/gate_up block lists its component tensors
+/// so the concat never materializes in host RAM), plus the block's schedule id within its pool
+/// (ascending layer order — the cyclic-sweep key `infr_core::pager::Pager::schedule` expects).
+pub struct DenseSource {
+    pub segments: Vec<Arc<dyn AsRef<[u8]> + Send + Sync>>,
+    pub block_id: u32,
+}
+
+/// One dense pool's fixed layout: every block in it shares `slot_bytes` (the PADDED stride —
+/// a multiple of 4 (u32 arena) AND of the pool dtype's block byte size, so a slot base is always
+/// a whole number of quant blocks) and `elems_per_slot` (the stride in LOGICAL elements — the
+/// `w_off` unit; `slot_bytes / block_bytes * block_elems`, computed by the seam which owns the
+/// dtype tables). The seam caps `n_slots` so `n_slots * elems_per_slot + block numel` fits the
+/// kernels' u32 element reach — [`DensePagerSession::stage`] debug-asserts it.
+pub struct DensePoolSpec {
+    pub slot_bytes: usize,
+    pub n_slots: usize,
+    pub n_blocks: usize,
+    pub elems_per_slot: u64,
+}
+
+struct DensePool {
+    spec: DensePoolSpec,
+    pager: GpuPager,
+}
+
+/// Layout for [`DensePagerSession::new`] — like [`MoePagerLayout`], sized up front so the session
+/// exists (and `Backend::dense_paged` answers truthy) BEFORE the seam's weight-load closure binds
+/// the first placeholder.
+pub struct DensePagerLayout {
+    pub pools: Vec<DensePoolSpec>,
+    /// Pinned upload ring total bytes (two fence-rotated halves); `0` = [`ring_bytes_policy`]'s
+    /// floor. Each half is floored at the largest pool slot so one miss always fits.
+    pub ring_bytes: usize,
+}
+
+/// One model's whole dense layer-streaming session: per-(dtype, stride) arena pools + the shared
+/// pinned upload ring. Same ownership story as [`MoePagerSession`] (lives on the `VulkanBackend`
+/// handle, `None` for every non-streamed model — zero cost on the resident path). A model is
+/// either MoE-paged or dense-streamed, never both (the seam errors on the mixed case).
+pub struct DensePagerSession {
+    pools: Vec<DensePool>,
+    /// `buffer_identity(placeholder)` -> (pool index, source) for every streamed block. A
+    /// resident tensor's buffer is never registered here — the adapter's lookup misses and the
+    /// op lowers through the ordinary resident path.
+    sources: HashMap<usize, (usize, DenseSource)>,
+    ring: Box<dyn Buffer>,
+    ring_half_bytes: usize,
+    print_stats: bool,
+}
+
+impl DensePagerSession {
+    pub fn new(vk: &VulkanBackend, layout: DensePagerLayout) -> Result<Self> {
+        let mut pools = Vec::with_capacity(layout.pools.len());
+        let mut max_slot = 4usize;
+        for spec in layout.pools {
+            max_slot = max_slot.max(spec.slot_bytes);
+            pools.push(DensePool {
+                pager: GpuPager::new(vk, spec.n_blocks, spec.n_slots, spec.slot_bytes)?,
+                spec,
+            });
+        }
+        let ring_total = if layout.ring_bytes > 0 {
+            layout.ring_bytes
+        } else {
+            ring_bytes_policy(0)
+        };
+        // Each half must hold the largest slot or `stage` could never make progress on that pool.
+        let ring_half_bytes = (ring_total / 2).max(max_slot);
+        let ring = vk.alloc_uninit(2 * ring_half_bytes, BufferUsage::Staging)?;
+        Ok(Self {
+            pools,
+            sources: HashMap::new(),
+            ring,
+            ring_half_bytes,
+            print_stats: std::env::var("INFR_PAGER_STATS").is_ok(),
+        })
+    }
+
+    /// Register one streamed block — called from the seam's weight-load closure (once per
+    /// streamed weight group) instead of uploading it. `pool` indexes [`DensePagerLayout::pools`]
+    /// (the seam enumerates the layout and the registrations from the same plan, so a mismatch is
+    /// a seam bug — validated loudly here).
+    pub fn register(&mut self, pool: usize, buf_id: usize, source: DenseSource) -> Result<()> {
+        let p = self
+            .pools
+            .get(pool)
+            .ok_or_else(|| be(format!("dense pager: pool index {pool} out of range")))?;
+        let total: usize = source
+            .segments
+            .iter()
+            .map(|s| {
+                let inner: &(dyn AsRef<[u8]> + Send + Sync) = &**s;
+                inner.as_ref().len()
+            })
+            .sum();
+        if total > p.spec.slot_bytes {
+            return Err(be(format!(
+                "dense pager: block bytes ({total}) exceed pool {pool}'s slot stride ({})",
+                p.spec.slot_bytes
+            )));
+        }
+        if source.block_id as usize >= p.spec.n_blocks {
+            return Err(be(format!(
+                "dense pager: block id {} out of range for pool {pool} ({} blocks)",
+                source.block_id, p.spec.n_blocks
+            )));
+        }
+        self.sources.insert(buf_id, (pool, source));
+        Ok(())
+    }
+
+    /// Whether `buf_id` (see [`buffer_identity`]) is a registered streamed block — the adapter's
+    /// per-`Op::Linear` dispatch check.
+    pub fn is_streamed(&self, buf_id: usize) -> bool {
+        self.sources.contains_key(&buf_id)
+    }
+
+    /// Ensure `buf_id`'s block is resident, staging a miss through `rec`-recorded ring→arena
+    /// copies at `half_base + *cursor`. Returns the block's arena WEIGHT ELEMENT BASE (the value
+    /// the dispatch adds to the op's own `w_off`), or `None` when the current ring half can't
+    /// hold the miss — the caller rotates the ring (pipelined submit) and re-calls. Residency
+    /// rides the exact cyclic-sweep policy (`infr_core::pager::Pager::schedule`); one block = one
+    /// touch batch (the epoch guard protects it across the caller's rotations).
+    pub fn stage(
+        &mut self,
+        rec: &crate::recorder::Recorder<'_>,
+        half_base: usize,
+        cursor: &mut usize,
+        buf_id: usize,
+    ) -> Result<Option<usize>> {
+        let Self {
+            pools,
+            sources,
+            ring,
+            ring_half_bytes,
+            ..
+        } = self;
+        let (pool_idx, src) = sources
+            .get(&buf_id)
+            .ok_or_else(|| be("dense pager: stage on an unregistered buffer"))?;
+        let pool = &mut pools[*pool_idx];
+        let id = src.block_id;
+        if !pool.pager.is_resident(id) && *cursor + pool.spec.slot_bytes > *ring_half_bytes {
+            return Ok(None); // half full — caller rotates and re-calls
+        }
+        pool.pager.begin_batch();
+        // See `MoePagerSession::touch_role` for why the explicit deref-to-trait-object.
+        let seg_refs: Vec<&[u8]> = src
+            .segments
+            .iter()
+            .map(|s| {
+                let inner: &(dyn AsRef<[u8]> + Send + Sync) = &**s;
+                inner.as_ref()
+            })
+            .collect();
+        let (slot, consumed) =
+            pool.pager
+                .schedule_staged(rec, ring.as_ref(), half_base + *cursor, id, &seg_refs)?;
+        *cursor += consumed;
+        let elem_base = slot as u64 * pool.spec.elems_per_slot;
+        // The seam's slot cap guarantees this (see `DensePoolSpec::elems_per_slot`); a violation
+        // here means coherent-but-wrong u32 wraparound in the kernel, so assert loudly.
+        debug_assert!(
+            elem_base + pool.spec.elems_per_slot <= u32::MAX as u64,
+            "dense pager: slot element base overflows the kernels' u32 element reach"
+        );
+        Ok(Some(elem_base as usize))
+    }
+
+    /// The arena buffer `buf_id`'s pool dispatches against (callers gate on [`Self::is_streamed`]
+    /// first — errors on an unregistered buffer).
+    pub fn arena(&self, buf_id: usize) -> Result<&dyn Buffer> {
+        let (pool, _) = self
+            .sources
+            .get(&buf_id)
+            .ok_or_else(|| be("dense pager: arena lookup on an unregistered buffer"))?;
+        Ok(self.pools[*pool].pager.arena_buffer())
+    }
+
+    pub fn ring_half_bytes(&self) -> usize {
+        self.ring_half_bytes
+    }
+
+    /// `INFR_PAGER_STATS=1`: per-pool hit/miss/eviction counters (cyclic-sweep hit rate =
+    /// `(n_slots-1) / n_blocks` per pass at steady state — the honest expectation to check
+    /// against).
+    pub fn print_stats_if_enabled(&self) {
+        if !self.print_stats {
+            return;
+        }
+        for (i, p) in self.pools.iter().enumerate() {
+            let s = p.pager.stats();
+            eprintln!(
+                "[dense pager] pool{i}/{:.1}MB: hits={} misses={} evictions={} hit_rate={:.3} \
+                 slots={}/{}",
+                p.spec.slot_bytes as f64 / 1e6,
+                s.hits,
+                s.misses,
+                s.evictions,
+                s.hit_rate(),
+                p.spec.n_slots,
+                p.spec.n_blocks,
+            );
+        }
+    }
+}
+
+/// `VulkanBackend::dense_pager`'s field type — same locking story as [`MoePagerCell`].
+pub type DensePagerCell = Mutex<Option<DensePagerSession>>;
