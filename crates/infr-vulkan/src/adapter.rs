@@ -397,52 +397,57 @@ fn mmv_decode_enabled() -> bool {
 ///   `Qwen3-14B-GGUF:Q4_K_M` tg64 78.3 → 80.1 t/s (**+2.3%**), tg128 78.0 → 79.8 (+2.3%), tg64@d4096
 ///   68.2 → 69.3 (+1.6%) — int8 Q4_K now genuinely beats infr's own f32 path in isolation.
 ///
-///   **Still NOT flipped on by default on AMD**, despite that win: turning it on breaks
+///   **NOW FLIPPED ON by default on AMD** (was off): turning it on used to break
 ///   `mtp_spec_matches_target_only_greedy` (`crates/infr-llama/tests/cpu_backend.rs`) — the m=1
-///   decode stream (`mmv_mw`, this fix) and the m>=3 verify stream (`mrow`, unconditionally int8
-///   for Q4_K already — see `mrow_int8_dtype_ok`) disagree on the occasional greedy token even
-///   though BOTH are now int8. This is NOT something this session introduced: it reproduces on the
-///   unmodified pre-fix code too via the pre-existing `INFR_MMV_MW=1` escape — nobody had run the
-///   MTP symmetry test against that escape before. The two kernels are different code (warp-per-row
-///   subgroupAdd vs row-tile accumulation) that both quantize activations to int8 and both dot in
-///   the same integers, so per-sub-block terms match exactly, but the cross-sub-block SUMMATION
-///   ORDER differs — the same reassociation class `mmv_mw_parity` already tolerates at the 5e-3
-///   level for throughput purposes, but apparently wide enough here to occasionally flip a greedy
-///   argmax across the two streams. "Both streams int8" (the Q2_K/Q3_K symmetry story below) is
-///   necessary but NOT sufficient for token-identity — it also needs the two kernels to be
-///   bit-identical for the same position, which mmv_mw/mrow are not. Making them so is a real
-///   kernel project, out of scope here. Until then Q4_K decode stays OFF by default on AMD; the
-///   throughput fix + WARPS=1 remain reachable via `INFR_MMV_MW=1 INFR_MMV_MW_WARPS=1` for A/B
-///   measurement on non-MTP workloads, where the win is real and unconditional. **Q6_K/Q3_K**
-///   are UNMEASURED on AMD (no mid/large Q6_K and no Q3_K model in the validated local cache) —
-///   left OFF rather than assumed; this also matches llama.cpp's own carve-out (their table
-///   excludes Q6_K off-Intel entirely — 2-byte alignment is an Intel-only win). Re-measure with a
-///   real model before flipping either on.
+///   decode stream (`mmv_mw`) and the m>=3 verify stream (`mrow`, unconditionally int8 for Q4_K
+///   already — see `mrow_int8_dtype_ok`) disagreed on the occasional greedy token even though BOTH
+///   were int8. Root cause: the two kernels were different code (warp-per-row subgroupAdd vs
+///   row-tile accumulation) that both quantized activations to int8 and both dotted the same
+///   integers per sub-block, but the cross-sub-block SUMMATION ORDER differed — the same
+///   reassociation class `mmv_mw_parity` tolerates at 5e-3 for throughput purposes, but wide enough
+///   to occasionally flip a greedy argmax. "Both streams int8" is necessary but not sufficient for
+///   token-identity — it also needs the two kernels bit-identical at the same position. THE FIX:
+///   AMD's m=1 decode no longer dispatches `native_mmv_mw.comp` at all for these dtypes — it
+///   dispatches [`crate::Recorder::linear_mmv_mrow`] with `rows=1`, i.e. the literal same
+///   shader/reduction the m>=3 verify tier uses (see [`unified_mmv_row1`] and
+///   `native_mmv_mrow.comp`'s header). A row's math depends only on its own activation slice, never
+///   on `rows`, so decode and verify are bit-identical by construction — proved by
+///   `mmv_row1_bit_identical` (`tests/mmv_row1_bit_identical.rs`). Intel is UNCHANGED (still
+///   `native_mmv_mw.comp`, SG=16-pinned, WARPS-tuned) — no Intel GPU in this validation
+///   environment, so its already-shipped, already-tuned kernel is left alone rather than swapped
+///   blind; see [`unified_mmv_row1`]. **Q6_K/Q3_K** stay UNMEASURED on AMD (no mid/large Q6_K and
+///   no Q3_K model in the validated local cache) — left OFF rather than assumed; this also matches
+///   llama.cpp's own carve-out (their table excludes Q6_K off-Intel entirely — 2-byte alignment is
+///   an Intel-only win). Both are now bit-identical-safe to flip (same unified kernel path) the
+///   moment they're measured; re-measure with a real model first.
 ///
 /// Symmetry: this policy set is ALSO what gates Q2_K/Q3_K's entry into the m>=3 int8 `mrow`
 /// verify/prefill tier (see [`mrow_int8_dtype_ok`]) — a dtype added here is int8 in BOTH streams
 /// or in NEITHER. That is the invariant whose violation broke Q5_K token-identity (decode int8,
 /// verify f32-exact, or vice versa: the occasional greedy argmax flips between the spec and
-/// non-spec streams). Concretely on AMD today: Q2_K int8 in both, Q3_K f32-exact in both, Q4_K
-/// f32-exact at m=1 / int8 at m>=3 (the pre-existing, deliberately untouched wart — see
-/// `mrow_int8_dtype_ok`'s doc — which the paragraph above found is not merely a wart: even fully
-/// symmetric-by-dtype Q4_K still isn't symmetric-by-VALUE across these two particular kernels).
+/// non-spec streams). Concretely on AMD today: Q2_K int8 in both (unified kernel), Q3_K f32-exact
+/// in both, Q4_K int8 in both via the SAME unified kernel (the pre-existing m>=3-only wart is
+/// closed for Q4_K — see [`unified_mmv_row1`]; Q6_K's mrow tier is still unconditional per
+/// `mrow_int8_dtype_ok` while its decode tier stays off, so Q6_K's wart is untouched, deliberately,
+/// pending a measurement).
 ///
 /// `INFR_MMV_MW=1` force-enables the FULL measured-safe dtype set {Q4_K, Q6_K, Q2_K, Q3_K} on ANY
-/// vendor (including the known-MTP-breaking AMD Q4_K case, opt-in only) for A/B measurement;
-/// `INFR_MMV_MW=0` force-off everywhere. Both flow through [`mmv_int8_decode_dtypes`], so the A/B
-/// escapes stay symmetric too. `INFR_MMV_MW_WARPS` ∈ {1,2,4,8,16} — {1,2,16} are Q4_K-only
-/// dispatch-shape sweep builds (see `native_mmv_mw_build_spv`), not shipped for Q6_K/Q2_K/Q3_K.
+/// vendor for A/B measurement; `INFR_MMV_MW=0` force-off everywhere. Both flow through
+/// [`mmv_int8_decode_dtypes`], so the A/B escapes stay symmetric too. `INFR_MMV_MW_WARPS` ∈
+/// {1,2,4,8,16} only affects Intel now (AMD's decode tier no longer reads WARPS — see
+/// [`unified_mmv_row1`]); {1,2,16} are Q4_K-only dispatch-shape sweep builds (see
+/// `native_mmv_mw_build_spv`), not shipped for Q6_K/Q2_K/Q3_K.
 fn mmv_int8_decode_dtypes(caps: &infr_core::backend::Capabilities) -> &'static [infr_core::DType] {
     use infr_core::DType::{Q2K, Q3K, Q4K, Q6K};
     match std::env::var("INFR_MMV_MW").ok().as_deref() {
         Some("0") => &[],                                   // force-off everywhere
         Some(_) => &[Q4K, Q6K, Q2K, Q3K], // explicit opt-in: full set, any vendor (A/B)
         None if caps.vendor_intel => &[Q4K, Q6K, Q2K, Q3K], // Intel: all four measured wins
-        // AMD default: only the measured-safe win. Q4_K measures faster than f32 now (see doc) but
-        // stays OFF — it breaks MTP token-identity (mtp_spec_matches_target_only_greedy) against
-        // the pre-existing always-int8 mrow verify tier. INFR_MMV_MW=1 opt-in only.
-        None => &[Q2K],
+        // AMD default: Q2_K (measured +20.4%) and Q4_K (measured +2.3% tg128 in isolation, and now
+        // bit-identical to its mrow verify twin via the unified rows=1 kernel — see
+        // `unified_mmv_row1` — so mtp_spec_matches_target_only_greedy holds). Q6_K/Q3_K stay OFF:
+        // unmeasured on AMD, not unsafe.
+        None => &[Q2K, Q4K],
     }
 }
 
@@ -450,8 +455,12 @@ fn mmv_int8_decode_dtypes(caps: &infr_core::backend::Capabilities) -> &'static [
 ///
 /// - **Q4_K / Q6_K / IQ4_XS**: YES, unconditionally on any `i8_dot` device — the PRE-EXISTING
 ///   behavior (predates the decode policy table; load-bearing for the E2B `pp4@d4096` numbers).
-///   Note this IS asymmetric with the m=1 decode tier on AMD (int8 at m>=3, f32-exact at m=1) —
-///   a known, deliberately untouched wart, not something to extend.
+///   This is VALUE-asymmetric with the m=1 decode tier on AMD only for the dtypes decode still
+///   keeps off ([`mmv_int8_decode_dtypes`]: Q6_K, IQ4_XS have no decode int8 tier at all) — a
+///   known, deliberately untouched wart for those two. Q4_K is no longer part of that wart: its
+///   decode tier is now on AND dispatches the same unified `linear_mmv_mrow(rows=1)` kernel this
+///   m>=3 tier uses (see [`unified_mmv_row1`]), so the two streams are bit-identical, not just
+///   both-int8.
 /// - **Q2_K / Q3_K**: only when [`mmv_int8_decode_dtypes`] also gives them the int8 DECODE tier on
 ///   this device. These two dtypes' mrow kernels exist solely to keep the decode policy symmetric;
 ///   letting them run int8 at m>=3 while decode stays f32-exact at m=1 would recreate the exact
@@ -463,6 +472,24 @@ fn mrow_int8_dtype_ok(caps: &infr_core::backend::Capabilities, dt: infr_core::DT
         Q2K | Q3K => mmv_int8_decode_dtypes(caps).contains(&dt),
         _ => false, // no int8 mrow kernel exists (native_mmv_mrow_build_spv returns None)
     }
+}
+
+/// Does the m=1 decode tier dispatch through the unified `linear_mmv_mrow(rows=1)` kernel (the
+/// SAME reduction as the m>=3 verify tier — bit-identical at the same position by construction,
+/// see `native_mmv_mrow.comp`'s header) instead of the legacy `native_mmv_mw.comp`
+/// (warp-per-row, reassociation-tolerant only)?
+///
+/// AMD: YES, always, for every dtype `mmv_mw_choice` gates on — this is the fix for the
+/// mmv_mw/mrow gap (README footnote 3) and what makes flipping Q4_K's decode tier on safe for
+/// `mtp_spec_matches_target_only_greedy`.
+///
+/// Intel: NO — kept on the pre-existing `native_mmv_mw.comp` route (SG=16 pinning, WARPS-tuned
+/// occupancy) unconditionally. Intel has no MTP-symmetry requirement driving this task (Intel
+/// isn't gated into `mrow_int8_dtype_ok`'s asymmetric set the way AMD's Q4_K/Q6_K/IQ4_XS are) and
+/// there is no Intel GPU in this validation environment to re-measure the unified path on, so the
+/// already-shipped, already-tuned Intel kernel is left untouched rather than swapped blind.
+fn unified_mmv_row1(caps: &infr_core::backend::Capabilities) -> bool {
+    !caps.vendor_intel
 }
 
 fn mmv_mw_choice(
@@ -885,19 +912,39 @@ fn lower_op(
                             1,
                             in_f,
                         );
-                        rec.linear_mmv_mw(
-                            dt,
-                            warps,
-                            w,
-                            0,
-                            pool[&qa].as_ref(),
-                            pool[&dact].as_ref(),
-                            pool[&sact].as_ref(),
-                            Some(rr),
-                            yf,
-                            in_f,
-                            out_f,
-                        );
+                        if unified_mmv_row1(be_.caps()) {
+                            // Decode (m=1) dispatches the SAME kernel/reduction as the m>=3 verify
+                            // tier (`linear_mmv_mrow`, rows=1) — see `unified_mmv_row1`'s doc. This
+                            // is the fix for the mmv_mw/mrow reassociation gap (README footnote 3):
+                            // bit-identical to `mmv_mw_choice`'s m>=3 twin at the same position.
+                            rec.linear_mmv_mrow(
+                                dt,
+                                w,
+                                0,
+                                pool[&qa].as_ref(),
+                                pool[&dact].as_ref(),
+                                pool[&sact].as_ref(),
+                                Some(rr),
+                                yf,
+                                1,
+                                in_f,
+                                out_f,
+                            );
+                        } else {
+                            rec.linear_mmv_mw(
+                                dt,
+                                warps,
+                                w,
+                                0,
+                                pool[&qa].as_ref(),
+                                pool[&dact].as_ref(),
+                                pool[&sact].as_ref(),
+                                Some(rr),
+                                yf,
+                                in_f,
+                                out_f,
+                            );
+                        }
                     } else if mmv_decode_enabled()
                         && be_.caps().i8_dot
                         && in_f % 32 == 0
@@ -1028,6 +1075,7 @@ fn lower_op(
                         pool[&qa].as_ref(),
                         pool[&dact].as_ref(),
                         pool[&sact].as_ref(),
+                        None,
                         y,
                         m,
                         in_f,
@@ -1489,19 +1537,37 @@ fn lower_op(
                         1,
                         in_f,
                     );
-                    rec.linear_mmv_mw(
-                        dt,
-                        warps,
-                        w,
-                        w_off,
-                        pool[&qa].as_ref(),
-                        pool[&dact].as_ref(),
-                        pool[&sact].as_ref(),
-                        None,
-                        y,
-                        in_f,
-                        out_f,
-                    );
+                    if unified_mmv_row1(be_.caps()) {
+                        // Same kernel/reduction as the m>=3 verify tier, dispatched at rows=1 — see
+                        // the fused-add branch above and `unified_mmv_row1`'s doc.
+                        rec.linear_mmv_mrow(
+                            dt,
+                            w,
+                            w_off,
+                            pool[&qa].as_ref(),
+                            pool[&dact].as_ref(),
+                            pool[&sact].as_ref(),
+                            None,
+                            y,
+                            1,
+                            in_f,
+                            out_f,
+                        );
+                    } else {
+                        rec.linear_mmv_mw(
+                            dt,
+                            warps,
+                            w,
+                            w_off,
+                            pool[&qa].as_ref(),
+                            pool[&dact].as_ref(),
+                            pool[&sact].as_ref(),
+                            None,
+                            y,
+                            in_f,
+                            out_f,
+                        );
+                    }
                 } else if m == 1
                     && mmv_decode_enabled()
                     && be_.caps().i8_dot
@@ -4708,16 +4774,23 @@ mod tests {
         assert!(mrow_int8_dtype_ok(&amd, DType::Q2K));
         assert!(!mmv_int8_decode_dtypes(&amd).contains(&DType::Q3K));
         assert!(!mrow_int8_dtype_ok(&amd, DType::Q3K));
-        // Q4_K stays OFF the AMD decode default despite measuring a real throughput win in
-        // isolation (README footnote 3 / mmv_int8_decode_dtypes's doc): flipping it broke
-        // mtp_spec_matches_target_only_greedy against the pre-existing always-int8 mrow tier below
-        // (both streams int8 is necessary but not sufficient for token-identity — the two kernels
-        // aren't bit-identical for the same position). INFR_MMV_MW=1 opt-in only.
-        assert!(!mmv_int8_decode_dtypes(&amd).contains(&DType::Q4K));
+        // Q4_K is NOW ON the AMD decode default (was off): the throughput win (README footnote 3)
+        // is real AND, since decode now dispatches the unified `linear_mmv_mrow(rows=1)` kernel
+        // (see `unified_mmv_row1`) instead of the legacy `native_mmv_mw.comp`, it is bit-identical
+        // to the m>=3 mrow verify tier at the same position — `mtp_spec_matches_target_only_greedy`
+        // holds. `mmv_row1_bit_identical` (tests/mmv_row1_bit_identical.rs) is the numeric guard.
+        assert!(mmv_int8_decode_dtypes(&amd).contains(&DType::Q4K));
+        assert!(
+            unified_mmv_row1(&amd),
+            "AMD must take the unified rows=1 path for Q4_K safety"
+        );
         // The exempt pre-existing set stays unconditional (not something this policy may weaken).
         for dt in [DType::Q4K, DType::Q6K, DType::Iq4Xs] {
             assert!(mrow_int8_dtype_ok(&amd, dt), "{dt:?} mrow must stay on");
         }
+        // Intel is untouched by this task (no Intel GPU in this environment to re-validate the
+        // unified path on) — still the legacy per-vendor mmv_mw route.
+        assert!(!unified_mmv_row1(&intel));
     }
 
     /// The drift guard the SSOT lists promise (`infr_core::tensor::MOE_MMQ_DTYPES`'s doc): every

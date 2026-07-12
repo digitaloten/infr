@@ -2036,11 +2036,19 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// Multi-row int8 dp4a GEMV (`2 <= rows <= 8`): [`Self::linear_native_mrow`]'s shape with
+    /// Multi-row int8 dp4a GEMV (`1 <= rows <= 16`): [`Self::linear_native_mrow`]'s shape with
     /// `native_mmv.comp`'s integer-dot math — the weight sub-block is unpacked once into packed
     /// int8 words and dp4a'd against every row's pre-quantized activation block (`qa`/`dact`/
     /// `sact` from [`Self::quant_q8`] over `rows` rows). NUM_ROWS=2 outputs per workgroup
     /// (grid = ceil(out_f/2)). Caller gates on [`crate::gemm::native_mmv_mrow_build_spv`].
+    ///
+    /// `rows == 1` is not a special case: it is THE m=1 decode kernel now (see
+    /// `native_mmv_mrow.comp`'s header). A row's math depends only on its own `qa`/`dact`/`sact`
+    /// slice and is bit-identical whether `rows` is 1 or 16 — same threads, same sub-block
+    /// striding, same accumulation order, same subgroupAdd width — which is exactly the guarantee
+    /// `mmv_row1_bit_identical` proves and MTP token-identity needs. `residual`: fused
+    /// `y = residual + x·Wᵀ` (only legal at `rows == 1`, the decode Linear+Add fusion — asserted)
+    /// or `None` for the plain `y = x·Wᵀ` write used at every `rows`.
     #[allow(clippy::too_many_arguments)]
     pub fn linear_mmv_mrow(
         &self,
@@ -2050,12 +2058,17 @@ impl<'a> Recorder<'a> {
         qa: &dyn Buffer,
         dact: &dyn Buffer,
         sact: &dyn Buffer,
+        residual: Option<&dyn Buffer>,
         y: &dyn Buffer,
         rows: usize,
         in_f: usize,
         out_f: usize,
     ) {
-        debug_assert!((2..=16).contains(&rows));
+        debug_assert!((1..=16).contains(&rows));
+        debug_assert!(
+            residual.is_none() || rows == 1,
+            "fused residual is decode-only (rows=1)"
+        );
         self.label_gemv("mmvr", rows, in_f, out_f);
         // Small-in_f shape (in_f < 2048 → fewer than 64 32-elem sub-blocks): the 2-output wg
         // leaves 64−nsub lanes idle (E2B's in_f=1536: 25% dead, single loop iteration) — the
@@ -2066,11 +2079,14 @@ impl<'a> Recorder<'a> {
         // serve shape — -DMRV=4 halves it (and the acc registers). INFR_NO_MMV_M4 forces MR=8
         // (A/B). o4+m4 together (with the uvec4 activation loads): E2B pp4@d4096 1536x24576
         // 37.8 → 34.7us/op, pp4 467.6 → 474.9 t/s vs both escapes set — modest; the shape is
-        // ~600 GB/s and mostly weight-stream bound, o4 alone measured neutral.
+        // ~600 GB/s and mostly weight-stream bound, o4 alone measured neutral. rows=1 (decode)
+        // always takes m4=true — the smallest register footprint and the only half of the matrix
+        // with a -DUSE_RES twin.
         let m4 = rows <= 4 && std::env::var("INFR_NO_MMV_M4").is_err();
+        let res = residual.is_some();
         // rows 9..=16 tier (-DMRV=16, always the 2-output layout — no OUTS4 twin; see
         // `native_mmv_mrow_m16_spv`): the MTP verify batch above the m<=8 tier. Caller gates on
-        // the m16 SPIR-V existing for `dtype`.
+        // the m16 SPIR-V existing for `dtype`. Never fused-residual (rows=1 only).
         let (name, spv) = if rows > 8 {
             (
                 crate::gemm::native_mmv_mrow_m16_name(dtype),
@@ -2078,31 +2094,30 @@ impl<'a> Recorder<'a> {
             )
         } else {
             (
-                crate::gemm::native_mmv_mrow_variant_name(dtype, o4, m4),
-                crate::gemm::native_mmv_mrow_variant_spv(dtype, o4, m4)
+                crate::gemm::native_mmv_mrow_variant_name(dtype, o4, m4, res),
+                crate::gemm::native_mmv_mrow_variant_spv(dtype, o4, m4, res)
                     .expect("native mmv mrow spv"),
             )
         };
         let groups = (out_f as u32).div_ceil(if o4 && rows <= 8 { 4 } else { 2 });
-        let k = self.be.kernel(name, spv, 5, 16);
+        let nbind = if res { 6 } else { 5 };
+        let k = self.be.kernel(name, spv, nbind, 16);
         let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
-        self.dispatch_wide(
-            k,
-            &[
-                Self::vkb(w),
-                Self::vkb(qa),
-                Self::vkb(dact),
-                Self::vkb(sact),
-                Self::vkb(y),
-            ],
-            1,
-            &push,
-            groups,
-        );
+        let mut bufs = vec![
+            Self::vkb(w),
+            Self::vkb(qa),
+            Self::vkb(dact),
+            Self::vkb(sact),
+        ];
+        if let Some(r) = residual {
+            bufs.push(Self::vkb(r));
+        }
+        bufs.push(Self::vkb(y));
+        self.dispatch_wide(k, &bufs, 1, &push, groups);
     }
 
     /// Native-block dequant GEMV with fused residual add: `y = residual + x·Wᵀ`.

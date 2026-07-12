@@ -1152,6 +1152,30 @@ fn main() {
             "native_mmv_mrow_q6k_o4",
             &["-DFMT_Q6K", "-DOUTS4"],
         ),
+        // rows=1 DECODE builds (-DUSE_RES, always -DMRV=4 since decode's rows is always 1): the fix
+        // for the mmv_mw/mrow reassociation gap (README footnote 3) — on AMD, decode (m=1) now
+        // dispatches THIS shader, not native_mmv_mw.comp, for the dtypes that need decode/verify
+        // bit-identity (see adapter.rs; Intel keeps mmv_mw, unchanged, untested here).
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q4k_m4_res",
+            &["-DFMT_Q4K", "-DMRV=4", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q4k_o4_m4_res",
+            &["-DFMT_Q4K", "-DOUTS4", "-DMRV=4", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q6k_m4_res",
+            &["-DFMT_Q6K", "-DMRV=4", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q6k_o4_m4_res",
+            &["-DFMT_Q6K", "-DOUTS4", "-DMRV=4", "-DUSE_RES"],
+        ),
         // IQ4_XS multi-row (m=2..8): codebook-gather-then-dp4a, Q4_K-style single-dp accumulation.
         ("native_mmv_mrow", "native_mmv_mrow_iq4xs", &["-DFMT_IQ4XS"]),
         (
@@ -1204,6 +1228,29 @@ fn main() {
             "native_mmv_mrow",
             "native_mmv_mrow_q3k_o4_m4",
             &["-DFMT_Q3K", "-DOUTS4", "-DMRV=4"],
+        ),
+        // rows=1 DECODE builds (-DUSE_RES) — see the Q4_K/Q6_K -DUSE_RES block above; same
+        // reasoning, needed here too since Q2_K/Q3_K's decode tier is policy-gated symmetric with
+        // their mrow tier (`mmv_int8_decode_dtypes`/`mrow_int8_dtype_ok`).
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q2k_m4_res",
+            &["-DFMT_Q2K", "-DMRV=4", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q2k_o4_m4_res",
+            &["-DFMT_Q2K", "-DOUTS4", "-DMRV=4", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q3k_m4_res",
+            &["-DFMT_Q3K", "-DMRV=4", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q3k_o4_m4_res",
+            &["-DFMT_Q3K", "-DOUTS4", "-DMRV=4", "-DUSE_RES"],
         ),
         // rows 9..=16 tier (-DMRV=16, 2-output layout only): the MTP spec-verify batch when the
         // rollback window has a few committed rows on top of the n_max drafts — these previously

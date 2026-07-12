@@ -1,11 +1,24 @@
 #version 460
-// Multi-row int8 dp4a GEMV: y[r] = x[r]·Wᵀ for r in 0..rows (rows ≤ 8) — `native_mmv.comp`'s
-// integer-dot math on `native_gemv_mrow.comp`'s weight-streamed-once multi-row shape. The m = 2..8
-// small-batch tier (spec-verify rows / a short chat-turn suffix, e.g. the pp4-at-depth serve
-// shape) previously rode the DEQUANT mrow kernel, whose per-sub-block cost is dominated by the
-// scalar byte-extract dequant-to-f32 + m·8 vec4 FMAs; here the weight sub-block is unpacked ONCE
-// into 8 packed-int8 words and each row costs just 8 dp4a + 8 L2-resident activation-word loads
-// (activations pre-quantized per 32-block by `quant_q8`: qa/dact/sact, layout [m, nblk]).
+// Multi-row int8 dp4a GEMV: y[r] = x[r]·Wᵀ for r in 0..rows (1 <= rows <= 8, or up to 16 with
+// -DMRV=16) — `native_mmv.comp`'s integer-dot math on `native_gemv_mrow.comp`'s
+// weight-streamed-once multi-row shape. The m = 2..8 small-batch tier (spec-verify rows / a short
+// chat-turn suffix, e.g. the pp4-at-depth serve shape) previously rode the DEQUANT mrow kernel,
+// whose per-sub-block cost is dominated by the scalar byte-extract dequant-to-f32 + m·8 vec4 FMAs;
+// here the weight sub-block is unpacked ONCE into 8 packed-int8 words and each row costs just 8
+// dp4a + 8 L2-resident activation-word loads (activations pre-quantized per 32-block by
+// `quant_q8`: qa/dact/sact, layout [m, nblk]).
+//
+// rows = 1 (`-DUSE_RES` optionally set): THIS is also the m=1 DECODE kernel now — the single-row
+// case is not a separate code path, it is this shader with pc.rows=1 (see `Recorder::
+// linear_mmv_mrow`'s doc). A row's contribution depends only on its own qa/dact/sact slice, never
+// on `rows`, so decode (m=1) and verify (m=2..16) are bit-identical at the same weight/activation/
+// position by construction — same threads, same sub-block striding, same accumulation order, same
+// subgroupAdd width, whether `rows` is 1 or 16. This is the fix for the mmv_mw/mrow reassociation
+// gap README footnote 3 described (mmv_mw is retired from the AMD decode path for the dtypes that
+// need the symmetry guarantee; Intel keeps mmv_mw, untouched, see adapter.rs). `-DUSE_RES` fuses a
+// residual add (`y = residual + x·Wᵀ`) — only ever dispatched at rows=1 (the decode Linear+Add
+// fusion); the shader does not special-case this, it just adds `r_buf` unconditionally, which is
+// only reached by row 0 when rows=1.
 // Measured (E2B pp4@d4096, 7900 XTX): the GEMV class 21.0 → 17.0us/op, pp4 366 → 383 t/s (the
 // adapter gates it to >= 8M-element non-vocab weights — see the Linear lowering's gate doc).
 // NUM_ROWS=2: one workgroup per 2 consecutive outputs (grid = ceil(out_f/2)), the activation
@@ -34,7 +47,12 @@ layout(binding = 0) readonly buffer WB { uint nw[]; };          // raw GGUF weig
 layout(binding = 1) readonly buffer QA { uvec4 qa4[]; };        // int8 activations [m, in_f/16]
 layout(binding = 2) readonly buffer DA { float16_t dact[]; };   // per-block scale [m, nblk]
 layout(binding = 3) readonly buffer SA { float16_t sact[]; };   // per-block Σ dequant a [m, nblk]
+#ifdef USE_RES
+layout(binding = 4) readonly buffer RB2 { float r_buf[]; };     // residual [out_f] — rows=1 only
+layout(binding = 5) buffer YB { float y_buf[]; };
+#else
 layout(binding = 4) buffer YB { float y_buf[]; };
+#endif
 
 // Row-tile cap: -DMRV=4 builds the rows<=4 specialization (half the dead per-sub-block row
 // iterations + acc registers at the pp4-at-depth serve shape); default 8 covers rows 5..8.
@@ -326,7 +344,14 @@ void main() {
         barrier();
     }
     if (sl < pc.rows && live) {
+#ifdef USE_RES
+        // USE_RES is only ever dispatched at pc.rows=1 (the decode Linear+Add fusion), so this
+        // branch is only reached by sl==0 — add the residual unconditionally rather than
+        // special-casing sl, keeping the code identical to the non-res path plus one term.
+        y_buf[sl * pc.out_f + o0 + ot] = r_buf[o0 + ot] + part4[(ot * MR + sl) * 16u];
+#else
         y_buf[sl * pc.out_f + o0 + ot] = part4[(ot * MR + sl) * 16u];
+#endif
     }
 }
 #else
@@ -427,8 +452,15 @@ void main() {
             t0 += part[t * MAX_SG + s];
             t1 += part[(MR + t) * MAX_SG + s];
         }
+#ifdef USE_RES
+        // Same reasoning as the OUTS4 write above: USE_RES only ever dispatches at pc.rows=1, so
+        // this is only reached by t==0.
+        y_buf[t * pc.out_f + o0] = r_buf[o0] + t0;
+        if (has1) { y_buf[t * pc.out_f + o0 + 1u] = r_buf[o0 + 1u] + t1; }
+#else
         y_buf[t * pc.out_f + o0] = t0;
         if (has1) { y_buf[t * pc.out_f + o0 + 1u] = t1; }
+#endif
     }
 }
 #endif

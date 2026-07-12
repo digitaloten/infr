@@ -601,13 +601,16 @@ pub(crate) fn native_mmv_mrow_kernel_name(dtype: infr_core::DType) -> &'static s
     }
 }
 /// SPIR-V for a multi-row int8 dp4a GEMV layout variant: `o4` = the small-in_f 4-outputs ×
-/// 16-K-lanes workgroup split (-DOUTS4), `m4` = the rows<=4 MR specialization (-DMRV=4) — see
-/// `Recorder::linear_mmv_mrow`'s gates.
+/// 16-K-lanes workgroup split (-DOUTS4), `m4` = the rows<=4 MR specialization (-DMRV=4), `res` =
+/// the fused-residual decode build (-DUSE_RES, only ever paired with rows=1, hence requires
+/// `m4=true`; see `Recorder::linear_mmv_mrow`'s gates and its doc on the rows=1 decode/verify
+/// unification).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_mmv_mrow_variant_spv(
     dtype: infr_core::DType,
     o4: bool,
     m4: bool,
+    res: bool,
 ) -> Option<&'static [u32]> {
     use infr_core::DType::*;
     macro_rules! v {
@@ -619,27 +622,35 @@ pub(crate) fn native_mmv_mrow_variant_spv(
             .as_slice()
         }};
     }
-    Some(match (dtype, o4, m4) {
-        (Q4K, false, false) => v!("native_mmv_mrow_q4k"),
-        (Q4K, false, true) => v!("native_mmv_mrow_q4k_m4"),
-        (Q4K, true, false) => v!("native_mmv_mrow_q4k_o4"),
-        (Q4K, true, true) => v!("native_mmv_mrow_q4k_o4_m4"),
-        (Q6K, false, false) => v!("native_mmv_mrow_q6k"),
-        (Q6K, false, true) => v!("native_mmv_mrow_q6k_m4"),
-        (Q6K, true, false) => v!("native_mmv_mrow_q6k_o4"),
-        (Q6K, true, true) => v!("native_mmv_mrow_q6k_o4_m4"),
-        (Iq4Xs, false, false) => v!("native_mmv_mrow_iq4xs"),
-        (Iq4Xs, false, true) => v!("native_mmv_mrow_iq4xs_m4"),
-        (Iq4Xs, true, false) => v!("native_mmv_mrow_iq4xs_o4"),
-        (Iq4Xs, true, true) => v!("native_mmv_mrow_iq4xs_o4_m4"),
-        (Q2K, false, false) => v!("native_mmv_mrow_q2k"),
-        (Q2K, false, true) => v!("native_mmv_mrow_q2k_m4"),
-        (Q2K, true, false) => v!("native_mmv_mrow_q2k_o4"),
-        (Q2K, true, true) => v!("native_mmv_mrow_q2k_o4_m4"),
-        (Q3K, false, false) => v!("native_mmv_mrow_q3k"),
-        (Q3K, false, true) => v!("native_mmv_mrow_q3k_m4"),
-        (Q3K, true, false) => v!("native_mmv_mrow_q3k_o4"),
-        (Q3K, true, true) => v!("native_mmv_mrow_q3k_o4_m4"),
+    Some(match (dtype, o4, m4, res) {
+        (Q4K, false, false, false) => v!("native_mmv_mrow_q4k"),
+        (Q4K, false, true, false) => v!("native_mmv_mrow_q4k_m4"),
+        (Q4K, true, false, false) => v!("native_mmv_mrow_q4k_o4"),
+        (Q4K, true, true, false) => v!("native_mmv_mrow_q4k_o4_m4"),
+        (Q4K, false, true, true) => v!("native_mmv_mrow_q4k_m4_res"),
+        (Q4K, true, true, true) => v!("native_mmv_mrow_q4k_o4_m4_res"),
+        (Q6K, false, false, false) => v!("native_mmv_mrow_q6k"),
+        (Q6K, false, true, false) => v!("native_mmv_mrow_q6k_m4"),
+        (Q6K, true, false, false) => v!("native_mmv_mrow_q6k_o4"),
+        (Q6K, true, true, false) => v!("native_mmv_mrow_q6k_o4_m4"),
+        (Q6K, false, true, true) => v!("native_mmv_mrow_q6k_m4_res"),
+        (Q6K, true, true, true) => v!("native_mmv_mrow_q6k_o4_m4_res"),
+        (Iq4Xs, false, false, false) => v!("native_mmv_mrow_iq4xs"),
+        (Iq4Xs, false, true, false) => v!("native_mmv_mrow_iq4xs_m4"),
+        (Iq4Xs, true, false, false) => v!("native_mmv_mrow_iq4xs_o4"),
+        (Iq4Xs, true, true, false) => v!("native_mmv_mrow_iq4xs_o4_m4"),
+        (Q2K, false, false, false) => v!("native_mmv_mrow_q2k"),
+        (Q2K, false, true, false) => v!("native_mmv_mrow_q2k_m4"),
+        (Q2K, true, false, false) => v!("native_mmv_mrow_q2k_o4"),
+        (Q2K, true, true, false) => v!("native_mmv_mrow_q2k_o4_m4"),
+        (Q2K, false, true, true) => v!("native_mmv_mrow_q2k_m4_res"),
+        (Q2K, true, true, true) => v!("native_mmv_mrow_q2k_o4_m4_res"),
+        (Q3K, false, false, false) => v!("native_mmv_mrow_q3k"),
+        (Q3K, false, true, false) => v!("native_mmv_mrow_q3k_m4"),
+        (Q3K, true, false, false) => v!("native_mmv_mrow_q3k_o4"),
+        (Q3K, true, true, false) => v!("native_mmv_mrow_q3k_o4_m4"),
+        (Q3K, false, true, true) => v!("native_mmv_mrow_q3k_m4_res"),
+        (Q3K, true, true, true) => v!("native_mmv_mrow_q3k_o4_m4_res"),
         _ => return None,
     })
 }
@@ -649,29 +660,38 @@ pub(crate) fn native_mmv_mrow_variant_name(
     dtype: infr_core::DType,
     o4: bool,
     m4: bool,
+    res: bool,
 ) -> &'static str {
     use infr_core::DType::*;
-    match (dtype, o4, m4) {
-        (Q4K, false, false) => "native_mmv_mrow_q4k",
-        (Q4K, false, true) => "native_mmv_mrow_q4k_m4",
-        (Q4K, true, false) => "native_mmv_mrow_q4k_o4",
-        (Q4K, true, true) => "native_mmv_mrow_q4k_o4_m4",
-        (Q6K, false, false) => "native_mmv_mrow_q6k",
-        (Q6K, false, true) => "native_mmv_mrow_q6k_m4",
-        (Q6K, true, false) => "native_mmv_mrow_q6k_o4",
-        (Q6K, true, true) => "native_mmv_mrow_q6k_o4_m4",
-        (Iq4Xs, false, false) => "native_mmv_mrow_iq4xs",
-        (Iq4Xs, false, true) => "native_mmv_mrow_iq4xs_m4",
-        (Iq4Xs, true, false) => "native_mmv_mrow_iq4xs_o4",
-        (Iq4Xs, true, true) => "native_mmv_mrow_iq4xs_o4_m4",
-        (Q2K, false, false) => "native_mmv_mrow_q2k",
-        (Q2K, false, true) => "native_mmv_mrow_q2k_m4",
-        (Q2K, true, false) => "native_mmv_mrow_q2k_o4",
-        (Q2K, true, true) => "native_mmv_mrow_q2k_o4_m4",
-        (Q3K, false, false) => "native_mmv_mrow_q3k",
-        (Q3K, false, true) => "native_mmv_mrow_q3k_m4",
-        (Q3K, true, false) => "native_mmv_mrow_q3k_o4",
-        (Q3K, true, true) => "native_mmv_mrow_q3k_o4_m4",
+    match (dtype, o4, m4, res) {
+        (Q4K, false, false, false) => "native_mmv_mrow_q4k",
+        (Q4K, false, true, false) => "native_mmv_mrow_q4k_m4",
+        (Q4K, true, false, false) => "native_mmv_mrow_q4k_o4",
+        (Q4K, true, true, false) => "native_mmv_mrow_q4k_o4_m4",
+        (Q4K, false, true, true) => "native_mmv_mrow_q4k_m4_res",
+        (Q4K, true, true, true) => "native_mmv_mrow_q4k_o4_m4_res",
+        (Q6K, false, false, false) => "native_mmv_mrow_q6k",
+        (Q6K, false, true, false) => "native_mmv_mrow_q6k_m4",
+        (Q6K, true, false, false) => "native_mmv_mrow_q6k_o4",
+        (Q6K, true, true, false) => "native_mmv_mrow_q6k_o4_m4",
+        (Q6K, false, true, true) => "native_mmv_mrow_q6k_m4_res",
+        (Q6K, true, true, true) => "native_mmv_mrow_q6k_o4_m4_res",
+        (Iq4Xs, false, false, false) => "native_mmv_mrow_iq4xs",
+        (Iq4Xs, false, true, false) => "native_mmv_mrow_iq4xs_m4",
+        (Iq4Xs, true, false, false) => "native_mmv_mrow_iq4xs_o4",
+        (Iq4Xs, true, true, false) => "native_mmv_mrow_iq4xs_o4_m4",
+        (Q2K, false, false, false) => "native_mmv_mrow_q2k",
+        (Q2K, false, true, false) => "native_mmv_mrow_q2k_m4",
+        (Q2K, true, false, false) => "native_mmv_mrow_q2k_o4",
+        (Q2K, true, true, false) => "native_mmv_mrow_q2k_o4_m4",
+        (Q2K, false, true, true) => "native_mmv_mrow_q2k_m4_res",
+        (Q2K, true, true, true) => "native_mmv_mrow_q2k_o4_m4_res",
+        (Q3K, false, false, false) => "native_mmv_mrow_q3k",
+        (Q3K, false, true, false) => "native_mmv_mrow_q3k_m4",
+        (Q3K, true, false, false) => "native_mmv_mrow_q3k_o4",
+        (Q3K, true, true, false) => "native_mmv_mrow_q3k_o4_m4",
+        (Q3K, false, true, true) => "native_mmv_mrow_q3k_m4_res",
+        (Q3K, true, true, true) => "native_mmv_mrow_q3k_o4_m4_res",
         _ => unreachable!("native_mmv_mrow_variant_name: gated by native_mmv_mrow_build_spv"),
     }
 }

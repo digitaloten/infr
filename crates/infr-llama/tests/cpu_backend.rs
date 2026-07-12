@@ -318,19 +318,31 @@ fn cpu_kv_mainline_quants_coherent() {
 
 // Captured + verified coherent on the Vulkan backend via the agnostic compute seam (the SAME dense
 // `Graph` the CPU oracle builds, mapped op-for-op to GPU kernels). Should reproduce the production
-// GPU path (QWEN3_GPU_GOLDEN) — the France case shares its hash (0xfd63781ea3bfa785), confirming the
-// seam matches the hand-written Recorder forward token-for-token.
+// GPU path (QWEN3_GPU_GOLDEN).
 const QWEN3_SEAM_GOLDEN: &[(&str, usize, u64)] = &[
-    ("The capital of France is", 32, 0xfd63781ea3bfa785),
+    (
+        "The capital of France is",
+        32,
+        // RE-BLESSED: Q4_K decode flipped default-on for AMD (the mmv_mw/mrow bit-identity fix —
+        // see adapter.rs's `unified_mmv_row1` / README footnote 3). This 0.6B model's gate_up/down
+        // projections cross the int8-decode tier's 2M-element gate, so their decode GEMV switched
+        // from f32-exact dequant to int8 dp4a — a real numerics change, not a bug: verified
+        // coherent, "<think>\nOkay, the user is asking about the capital of France. Let me think.
+        // I know that France is a country in Europe, and its capital is" (cut off by the 32-token
+        // budget mid-think; the previous golden's shorter think block answered "…Paris" within
+        // budget — same topic, different token path, both correct).
+        0xe91c03c96815974c,
+    ),
     (
         "Explain how a computer works in simple terms.",
         48,
-        // Re-blessed for the int8 dp4a decode GEMV (mmv): the Q6_K lm_head (this model's only
-        // >=48M-element weight) now integer-dots quantized activations, shifting logits within
-        // quant noise. Verified coherent: "…breaking down the basic components. First, there's
-        // the hardware, like the CPU, RAM, and storage. Then the software," (the France case is
-        // untouched and still shares the CPU-path hash).
-        0x4a034e88df0dbb84,
+        // RE-BLESSED for the same reason as the France case above. Verified coherent: "<think>
+        // \nOkay, the user wants an explanation of how a computer works in simple terms. Let me
+        // start by breaking down the basic components. First, there's the hardware, like the CPU,
+        // RAM, and storage. Then the software," (coincidentally now bit-for-bit the same trajectory
+        // as the CPU-only oracle's QWEN3_GOLDEN second case, 0xcf56ba8c4bb5c455 — not required to
+        // match, just a real outcome of the shifted numerics).
+        0xcf56ba8c4bb5c455,
     ),
 ];
 

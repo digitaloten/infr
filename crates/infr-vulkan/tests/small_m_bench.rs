@@ -238,6 +238,7 @@ fn mmv_mrow_matches_single_row_mmv() {
                     qa.as_ref(),
                     dact.as_ref(),
                     sact.as_ref(),
+                    None,
                     y_mmv.as_ref(),
                     m,
                     k,
