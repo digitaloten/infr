@@ -802,36 +802,78 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 }
             }
         }
+        // Slot stride: the group's raw bytes padded to a whole number of quant blocks AND
+        // u32 words, so every slot base is block-aligned (the kernels' element-offset weight
+        // addressing needs `slot_byte_base = whole blocks`) and the arena binds as
+        // `array<u32>`. Hoisted above the budget decision so the streaming-chunk sweep below
+        // can price the full-arena need with the exact strides the pools use.
+        let lcm = |a: usize, b: usize| {
+            let gcd = {
+                let (mut x, mut y) = (a, b);
+                while y != 0 {
+                    (x, y) = (y, x % y);
+                }
+                x
+            };
+            a / gcd * b
+        };
+        let stride_of = |dt: infr_core::DType, raw: usize| {
+            raw.next_multiple_of(lcm(infr_gguf::block_layout(dt).1, 4))
+        };
         let budget = match cache_override {
             Some(spec) => Some(spec.resolve(vram.available)),
             None if resident => None,
-            None => Some(vram.available.saturating_sub(
-                (fp.total() - streamable_resident)
-                    + kv_total_at(ubatch_rows(), kv_auto_q8())
-                    + dense_act_reserve_at(cfg, want_ctx, ubatch_rows()),
-            )),
+            None => {
+                // Streaming is inevitable. Edge-aware chunk sweep — the STREAMING twin of the
+                // residency sweep above: a smaller prefill chunk shrinks the activation reserve
+                // and the SWA ring rows, and every byte freed is a byte of streaming budget →
+                // more resident slots, fewer PCIe refetches per weight sweep. But a taller
+                // chunk prefills faster (fewer whole-model weight sweeps per prompt), so don't
+                // shrink past the point of gain: pick the TALLEST chunk whose budget already
+                // holds EVERY streamable block resident (extra budget past that buys nothing);
+                // if no chunk reaches that, take the floor — 128 rows, the maximum-budget
+                // choice. An explicit INFR_UBATCH is authoritative and skips the sweep; the
+                // INFR_CACHE tier above is untouched (its budget is the caller's, not derived
+                // from the reserve). Pinned via PINNED_UBATCH like the residency sweep, so the
+                // prefill loop, the runner's ring sizing, and this budget all agree.
+                let q8 = kv_auto_q8();
+                let base = fp.total() - streamable_resident;
+                let budget_at = |ub: usize| {
+                    vram.available.saturating_sub(
+                        base + kv_total_at(ub, q8) + dense_act_reserve_at(cfg, want_ctx, ub),
+                    )
+                };
+                if std::env::var("INFR_UBATCH").is_err() && !eligible.is_empty() {
+                    let need: u64 = eligible
+                        .iter()
+                        .map(|(_, dt, raw, _)| stride_of(*dt, *raw) as u64)
+                        .sum();
+                    // "Covers": the budget minus its own upload-ring share holds every block.
+                    let covers = |b: u64| {
+                        b.saturating_sub(infr_vulkan::pager::ring_bytes_policy(b) as u64) >= need
+                    };
+                    let ub_now = ubatch_rows();
+                    let mut cands = vec![ub_now];
+                    cands.extend([512usize, 256, 128].into_iter().filter(|&c| c < ub_now));
+                    let pick = cands
+                        .iter()
+                        .copied()
+                        .find(|&c| covers(budget_at(c)))
+                        .unwrap_or(*cands.last().expect("cands is never empty"));
+                    if pick != ub_now {
+                        let _ = PINNED_UBATCH.set(pick);
+                    }
+                }
+                Some(budget_at(ubatch_rows()))
+            }
         };
         if let (Some(mut budget), false) = (budget, eligible.is_empty()) {
-            // Slot stride: the group's raw bytes padded to a whole number of quant blocks AND
-            // u32 words, so every slot base is block-aligned (the kernels' element-offset weight
-            // addressing needs `slot_byte_base = whole blocks`) and the arena binds as
-            // `array<u32>`.
-            let lcm = |a: usize, b: usize| {
-                let gcd = {
-                    let (mut x, mut y) = (a, b);
-                    while y != 0 {
-                        (x, y) = (y, x % y);
-                    }
-                    x
-                };
-                a / gcd * b
-            };
             // Pools keyed by (dtype, stride); blocks assigned ids in layer order per pool.
             let mut pools: Vec<(infr_core::DType, usize, u64, usize)> = Vec::new(); // (dt, stride, elems_per_slot, n_blocks)
             let mut planned: Vec<(Vec<String>, usize, u32)> = Vec::new(); // (comps, pool, block_id)
             for (comps, dt, raw, _numel) in &eligible {
                 let (blk_e, blk_b) = infr_gguf::block_layout(*dt);
-                let stride = raw.next_multiple_of(lcm(blk_b, 4));
+                let stride = stride_of(*dt, *raw);
                 let eps = (stride / blk_b * blk_e) as u64;
                 let pool = match pools.iter().position(|&(d, s, ..)| d == *dt && s == stride) {
                     Some(i) => i,
@@ -895,11 +937,13 @@ pub(crate) fn vulkan_moe_binder<'a>(
             let n_blocks: usize = specs.iter().map(|s| s.n_blocks).sum();
             eprintln!(
                 "dense streaming: {n_blocks} weight blocks across {} pools, {cached} slots \
-                 cached ({:.2} GB arena + {:.2} GB ring; budget {:.2} GB; ctx={want_ctx})",
+                 cached ({:.2} GB arena + {:.2} GB ring; budget {:.2} GB; ctx={want_ctx}; \
+                 chunk={})",
                 specs.len(),
                 alloc as f64 / 1e9,
                 ring_bytes as f64 / 1e9,
                 (budget + ring_bytes as u64) as f64 / 1e9,
+                ubatch_rows().min(want_ctx),
             );
             vk.init_dense_pager(infr_vulkan::pager::DensePagerLayout {
                 pools: specs,
