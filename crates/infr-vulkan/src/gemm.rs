@@ -211,14 +211,17 @@ pub(crate) fn native_rm_variant_spv(
 }
 
 /// SPIR-V + kernel-cache name for the reassociation-tolerant subgroup+NUM_ROWS decode GEMV
-/// (`native_gemv_sg.comp`, wave32 + subgroupAdd). NOT bit-identical to the tree GEMV — reordered
-/// accumulation; the caller must gate to the projection band and re-bless any changed golden. Only
-/// Q6_K has an SG build (on Q4_K the tree/RM kernel already saturates — SG regressed). `nr` ∈ {2,4,8}.
+/// (`native_gemv_sg.comp`, one pinned subgroup per workgroup + subgroupAdd). NOT bit-identical to
+/// the tree GEMV — reordered accumulation; the caller must gate to the projection band and
+/// re-bless any changed golden. Only Q6_K has an SG build (on Q4_K the tree/RM kernel already
+/// saturates — SG regressed). `nr` ∈ {2,4,8}. `sg16` selects the `-DSG=16` twin (Intel,
+/// `caps.sg_pref == 16` — pass false everywhere else for the byte-identical SG=32 build).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_sg_build_spv(
     dtype: infr_core::DType,
     res: bool,
     nr: u32,
+    sg16: bool,
 ) -> Option<(&'static str, &'static [u32])> {
     use infr_core::DType::*;
     macro_rules! v {
@@ -232,13 +235,19 @@ pub(crate) fn native_sg_build_spv(
             Some(($name, s))
         }};
     }
-    match (dtype, res, nr) {
-        (Q6K, false, 2) => v!("native_q6k_sg2"),
-        (Q6K, true, 2) => v!("native_q6k_sg2_res"),
-        (Q6K, false, 4) => v!("native_q6k_sg4"),
-        (Q6K, true, 4) => v!("native_q6k_sg4_res"),
-        (Q6K, false, 8) => v!("native_q6k_sg8"),
-        (Q6K, true, 8) => v!("native_q6k_sg8_res"),
+    match (dtype, res, nr, sg16) {
+        (Q6K, false, 2, false) => v!("native_q6k_sg2"),
+        (Q6K, true, 2, false) => v!("native_q6k_sg2_res"),
+        (Q6K, false, 4, false) => v!("native_q6k_sg4"),
+        (Q6K, true, 4, false) => v!("native_q6k_sg4_res"),
+        (Q6K, false, 8, false) => v!("native_q6k_sg8"),
+        (Q6K, true, 8, false) => v!("native_q6k_sg8_res"),
+        (Q6K, false, 2, true) => v!("native_q6k_sg2_sg16"),
+        (Q6K, true, 2, true) => v!("native_q6k_sg2_res_sg16"),
+        (Q6K, false, 4, true) => v!("native_q6k_sg4_sg16"),
+        (Q6K, true, 4, true) => v!("native_q6k_sg4_res_sg16"),
+        (Q6K, false, 8, true) => v!("native_q6k_sg8_sg16"),
+        (Q6K, true, 8, true) => v!("native_q6k_sg8_res_sg16"),
         _ => None,
     }
 }
@@ -426,6 +435,7 @@ pub(crate) fn native_idm_paged_build_spv(dtype: infr_core::DType) -> Option<&'st
 pub(crate) fn native_idm_sg_build_spv(
     dtype: infr_core::DType,
     nr: u32,
+    sg16: bool,
 ) -> Option<(&'static str, &'static [u32])> {
     use infr_core::DType::*;
     macro_rules! v {
@@ -439,13 +449,19 @@ pub(crate) fn native_idm_sg_build_spv(
             Some(($name, s))
         }};
     }
-    match (dtype, nr) {
-        (Q6K, 2) => v!("native_idm_q6k_sg2"),
-        (Q6K, 4) => v!("native_idm_q6k_sg4"),
-        (Q6K, 8) => v!("native_idm_q6k_sg8"),
-        (Q5K, 2) => v!("native_idm_q5k_sg2"),
-        (Q5K, 4) => v!("native_idm_q5k_sg4"),
-        (Q5K, 8) => v!("native_idm_q5k_sg8"),
+    match (dtype, nr, sg16) {
+        (Q6K, 2, false) => v!("native_idm_q6k_sg2"),
+        (Q6K, 4, false) => v!("native_idm_q6k_sg4"),
+        (Q6K, 8, false) => v!("native_idm_q6k_sg8"),
+        (Q5K, 2, false) => v!("native_idm_q5k_sg2"),
+        (Q5K, 4, false) => v!("native_idm_q5k_sg4"),
+        (Q5K, 8, false) => v!("native_idm_q5k_sg8"),
+        (Q6K, 2, true) => v!("native_idm_q6k_sg2_sg16"),
+        (Q6K, 4, true) => v!("native_idm_q6k_sg4_sg16"),
+        (Q6K, 8, true) => v!("native_idm_q6k_sg8_sg16"),
+        (Q5K, 2, true) => v!("native_idm_q5k_sg2_sg16"),
+        (Q5K, 4, true) => v!("native_idm_q5k_sg4_sg16"),
+        (Q5K, 8, true) => v!("native_idm_q5k_sg8_sg16"),
         _ => None,
     }
 }
@@ -475,13 +491,15 @@ pub(crate) fn native_mmv_build_spv(dtype: infr_core::DType, res: bool) -> Option
     })
 }
 /// SPIR-V + cache name for the multi-warp int8 dp4a decode GEMV (`native_mmv_mw.comp`, warp-per-row
-/// subgroupAdd, `warps` rows/block). Wave32-native GPUs only (see the recorder's `mmv_mw_choice`).
-/// `warps` ∈ {4, 8}. `None` for formats/warp counts without a build.
+/// subgroupAdd, `warps` rows/block). Gated by the adapter's `mmv_mw_choice` (default-on Intel,
+/// opt-in elsewhere). `warps` ∈ {4, 8}. `sg16` selects the `-DSG=16` twin (`caps.sg_pref == 16`).
+/// `None` for formats/warp counts without a build.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_mmv_mw_build_spv(
     dtype: infr_core::DType,
     res: bool,
     warps: u32,
+    sg16: bool,
 ) -> Option<(&'static str, &'static [u32])> {
     use infr_core::DType::*;
     macro_rules! v {
@@ -495,15 +513,39 @@ pub(crate) fn native_mmv_mw_build_spv(
             Some(($name, s))
         }};
     }
-    match (dtype, res, warps) {
-        (Q4K, false, 4) => v!("native_mmv_mw_q4k_w4"),
-        (Q4K, true, 4) => v!("native_mmv_mw_q4k_w4_res"),
-        (Q4K, false, 8) => v!("native_mmv_mw_q4k_w8"),
-        (Q4K, true, 8) => v!("native_mmv_mw_q4k_w8_res"),
-        (Q6K, false, 4) => v!("native_mmv_mw_q6k_w4"),
-        (Q6K, true, 4) => v!("native_mmv_mw_q6k_w4_res"),
-        (Q6K, false, 8) => v!("native_mmv_mw_q6k_w8"),
-        (Q6K, true, 8) => v!("native_mmv_mw_q6k_w8_res"),
+    match (dtype, res, warps, sg16) {
+        (Q4K, false, 4, false) => v!("native_mmv_mw_q4k_w4"),
+        (Q4K, true, 4, false) => v!("native_mmv_mw_q4k_w4_res"),
+        (Q4K, false, 8, false) => v!("native_mmv_mw_q4k_w8"),
+        (Q4K, true, 8, false) => v!("native_mmv_mw_q4k_w8_res"),
+        (Q6K, false, 4, false) => v!("native_mmv_mw_q6k_w4"),
+        (Q6K, true, 4, false) => v!("native_mmv_mw_q6k_w4_res"),
+        (Q6K, false, 8, false) => v!("native_mmv_mw_q6k_w8"),
+        (Q6K, true, 8, false) => v!("native_mmv_mw_q6k_w8_res"),
+        (Q2K, false, 4, false) => v!("native_mmv_mw_q2k_w4"),
+        (Q2K, true, 4, false) => v!("native_mmv_mw_q2k_w4_res"),
+        (Q2K, false, 8, false) => v!("native_mmv_mw_q2k_w8"),
+        (Q2K, true, 8, false) => v!("native_mmv_mw_q2k_w8_res"),
+        (Q3K, false, 4, false) => v!("native_mmv_mw_q3k_w4"),
+        (Q3K, true, 4, false) => v!("native_mmv_mw_q3k_w4_res"),
+        (Q3K, false, 8, false) => v!("native_mmv_mw_q3k_w8"),
+        (Q3K, true, 8, false) => v!("native_mmv_mw_q3k_w8_res"),
+        (Q4K, false, 4, true) => v!("native_mmv_mw_q4k_w4_sg16"),
+        (Q4K, true, 4, true) => v!("native_mmv_mw_q4k_w4_res_sg16"),
+        (Q4K, false, 8, true) => v!("native_mmv_mw_q4k_w8_sg16"),
+        (Q4K, true, 8, true) => v!("native_mmv_mw_q4k_w8_res_sg16"),
+        (Q6K, false, 4, true) => v!("native_mmv_mw_q6k_w4_sg16"),
+        (Q6K, true, 4, true) => v!("native_mmv_mw_q6k_w4_res_sg16"),
+        (Q6K, false, 8, true) => v!("native_mmv_mw_q6k_w8_sg16"),
+        (Q6K, true, 8, true) => v!("native_mmv_mw_q6k_w8_res_sg16"),
+        (Q2K, false, 4, true) => v!("native_mmv_mw_q2k_w4_sg16"),
+        (Q2K, true, 4, true) => v!("native_mmv_mw_q2k_w4_res_sg16"),
+        (Q2K, false, 8, true) => v!("native_mmv_mw_q2k_w8_sg16"),
+        (Q2K, true, 8, true) => v!("native_mmv_mw_q2k_w8_res_sg16"),
+        (Q3K, false, 4, true) => v!("native_mmv_mw_q3k_w4_sg16"),
+        (Q3K, true, 4, true) => v!("native_mmv_mw_q3k_w4_res_sg16"),
+        (Q3K, false, 8, true) => v!("native_mmv_mw_q3k_w8_sg16"),
+        (Q3K, true, 8, true) => v!("native_mmv_mw_q3k_w8_res_sg16"),
         _ => None,
     }
 }
@@ -757,13 +799,20 @@ pub(crate) fn native_gemm_i8cm_q8_0_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
-/// SPIR-V for the row-wise (whole-K) activation quant pass — int8-coopmat GEMM "Idea 2"
-/// measurement variant (see `quant_q8_row.comp`), gated behind `INFR_I8_ROW_SCALE=1`.
+/// SPIR-V + cache name for the row-wise (whole-K) activation quant pass — int8-coopmat GEMM
+/// "Idea 2" measurement variant (see `quant_q8_row.comp`), gated behind `INFR_I8_ROW_SCALE=1`.
+/// `sg16` selects the `-DSG=16` twin (`caps.sg_pref == 16`).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn quant_q8_row_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quant_q8_row.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
+pub(crate) fn quant_q8_row_build_spv(sg16: bool) -> (&'static str, &'static [u32]) {
+    if sg16 {
+        const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quant_q8_row_sg16.spv"));
+        static S: OnceLock<Vec<u32>> = OnceLock::new();
+        ("quant_q8_row_sg16", S.get_or_init(|| spv_words(BYTES)))
+    } else {
+        const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quant_q8_row.spv"));
+        static S: OnceLock<Vec<u32>> = OnceLock::new();
+        ("quant_q8_row", S.get_or_init(|| spv_words(BYTES)))
+    }
 }
 /// SPIR-V for the fp8 (E4M3) cooperative-matrix (WMMA) prefill GEMM, Q8_0 only, WIDE tile
 /// (BM=64xBN=256, same warptile shape as `native_gemm_warp`) — gated behind `INFR_F8_COOPMAT=1` +
@@ -2634,15 +2683,55 @@ pub(crate) fn attn_live_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(ATTN_LIVE_SPV_BYTES))
 }
-/// SPIR-V for the subgroup decode GEMV (`y=x·Wᵀ`). `bits`=4/8 picks the quant variant; `res` adds
-/// a fused residual. Used by the recorder's `linear_q` / `linear_add_q`.
+/// SPIR-V + cache name for the subgroup decode GEMV (`y=x·Wᵀ`). `bits`=4/8 picks the quant
+/// variant; `res` adds a fused residual; `sg16` selects the `-DSG=16` twin (`caps.sg_pref == 16`).
+/// Used by the recorder's `linear_q` / `linear_add_q`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn mul_mat_vec_q_spv(bits: u32, res: bool) -> &'static [u32] {
-    match (bits, res) {
-        (4, false) => MMV_Q4_SPV.get_or_init(|| spv_words(MMV_Q4_SPV_BYTES)),
-        (8, false) => MMV_Q8_SPV.get_or_init(|| spv_words(MMV_Q8_SPV_BYTES)),
-        (4, true) => MMV_Q4_RES_SPV.get_or_init(|| spv_words(MMV_Q4_RES_SPV_BYTES)),
-        (8, true) => MMV_Q8_RES_SPV.get_or_init(|| spv_words(MMV_Q8_RES_SPV_BYTES)),
+pub(crate) fn mul_mat_vec_q_spv(
+    bits: u32,
+    res: bool,
+    sg16: bool,
+) -> (&'static str, &'static [u32]) {
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            let s = S
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice();
+            ($name, s)
+        }};
+    }
+    match (bits, res, sg16) {
+        (4, false, false) => (
+            "mul_mat_vec_q4",
+            MMV_Q4_SPV
+                .get_or_init(|| spv_words(MMV_Q4_SPV_BYTES))
+                .as_slice(),
+        ),
+        (8, false, false) => (
+            "mul_mat_vec_q8",
+            MMV_Q8_SPV
+                .get_or_init(|| spv_words(MMV_Q8_SPV_BYTES))
+                .as_slice(),
+        ),
+        (4, true, false) => (
+            "mul_mat_vec_q4_res",
+            MMV_Q4_RES_SPV
+                .get_or_init(|| spv_words(MMV_Q4_RES_SPV_BYTES))
+                .as_slice(),
+        ),
+        (8, true, false) => (
+            "mul_mat_vec_q8_res",
+            MMV_Q8_RES_SPV
+                .get_or_init(|| spv_words(MMV_Q8_RES_SPV_BYTES))
+                .as_slice(),
+        ),
+        (4, false, true) => v!("mul_mat_vec_q4_sg16"),
+        (8, false, true) => v!("mul_mat_vec_q8_sg16"),
+        (4, true, true) => v!("mul_mat_vec_q4_res_sg16"),
+        (8, true, true) => v!("mul_mat_vec_q8_res_sg16"),
         _ => panic!("mul_mat_vec_q: unsupported bits={bits}"),
     }
 }

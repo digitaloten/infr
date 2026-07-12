@@ -6,8 +6,12 @@
 //   * NUM_ROWS register blocking → the activation vec is loaded once and reused across NUM_ROWS rows
 //   * vec4 activation loads + word-wide weight unpack (8 nibbles / 4 bytes per u32)
 //   * QBITS specialized at compile time (no per-element branch); compiled as q4 / q8 variants
-// Requires requiredSubgroupSize=32. in_f must be a multiple of the elements-per-word (8 for q4, 4
+// Requires requiredSubgroupSize=SG. in_f must be a multiple of the elements-per-word (8 for q4, 4
 // for q8); all qwen3 projections satisfy this (in_f ∈ {1024, 3072}).
+//
+// -DSG=16|32 (default 32): pinned subgroup width — one subgroup per workgroup, lanes stride SG
+// words, subgroupAdd spans SG lanes (same reduction, reassociated summation order). SG=16 is the
+// Intel build (see caps.sg_pref); the SG=32 SPIR-V is bit-identical to the pre-SG code.
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
@@ -20,8 +24,11 @@
 #ifndef NUM_ROWS
 #define NUM_ROWS 1
 #endif
+#ifndef SG
+#define SG 32
+#endif
 
-layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = SG, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC { uint rows; uint in_f; uint out_f; uint bits; uint blk_shift; } pc;
 layout(binding = 0) readonly buffer QB { uint quants[]; };
@@ -42,7 +49,7 @@ const uint EPW = 4u;
 #endif
 
 void main() {
-    uint lane = gl_SubgroupInvocationID;            // 0..31
+    uint lane = gl_SubgroupInvocationID;            // 0..SG-1
     uint groups_per_row = (pc.out_f + NUM_ROWS - 1u) / NUM_ROWS;
     // Flat-index recovery for a possibly-2-D dispatch grid — see linear_f16.comp's main() for why.
     // Unlike the `o < pc.out_f` guard already present below, a padding workgroup's ROW `r` (not
@@ -58,7 +65,7 @@ void main() {
     float acc[NUM_ROWS];
     [[unroll]] for (uint n = 0u; n < NUM_ROWS; n++) { acc[n] = 0.0; }
 
-    for (uint w = lane; w < nwords; w += 32u) {
+    for (uint w = lane; w < nwords; w += uint(SG)) {
         uint xb = xbase + w * EPW;
         vec4 x0 = vec4(x_buf[xb], x_buf[xb + 1u], x_buf[xb + 2u], x_buf[xb + 3u]);
 #if QBITS == 4

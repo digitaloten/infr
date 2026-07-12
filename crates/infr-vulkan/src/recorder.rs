@@ -718,6 +718,17 @@ impl<'a> Recorder<'a> {
         unsafe { as_vk_buf(b) }.buffer
     }
 
+    /// Pinned subgroup size for the decode GEMV/reduction family (`caps.sg_pref`: 16 on Intel,
+    /// 32 everywhere else — see the caps field doc). Every other pinned kernel stays at 32.
+    fn sgp(&self) -> u32 {
+        self.be.caps().sg_pref
+    }
+
+    /// Whether the decode GEMV family should use its `-DSG=16` SPIR-V twins (`sg_pref == 16`).
+    fn sg16(&self) -> bool {
+        self.sgp() == 16
+    }
+
     /// `y[rows,out] = x[rows,in] · Wᵀ` (W stored `[out,in]`).
     pub fn linear(
         &self,
@@ -1573,9 +1584,8 @@ impl<'a> Recorder<'a> {
         m: usize,
         k: usize,
     ) {
-        let kq = self
-            .be
-            .kernel_sg("quant_q8_row", crate::gemm::quant_q8_row_spv(), 3, 8, 32);
+        let (name, spv) = crate::gemm::quant_q8_row_build_spv(self.sg16());
+        let kq = self.be.kernel_sg(name, spv, 3, 8, self.sgp());
         let mut p = [0u8; 8];
         p[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
         p[4..8].copy_from_slice(&(k as u32).to_ne_bytes());
@@ -1810,15 +1820,10 @@ impl<'a> Recorder<'a> {
         ];
         if let Some(epw) = mmv_epw(bits) {
             if in_f.is_multiple_of(epw) {
-                // subgroup GEMV: NUM_ROWS outputs/workgroup, one wave32 each (no shared reduction)
-                let name = if bits == 4 {
-                    "mul_mat_vec_q4"
-                } else {
-                    "mul_mat_vec_q8"
-                };
-                let k =
-                    self.be
-                        .kernel_sg(name, crate::gemm::mul_mat_vec_q_spv(bits, false), 5, 20, 32);
+                // subgroup GEMV: NUM_ROWS outputs/workgroup, one pinned subgroup each (no shared
+                // reduction). sg_pref picks the SG=16 twin on Intel (SIMD8/16 EUs).
+                let (name, spv) = crate::gemm::mul_mat_vec_q_spv(bits, false, self.sg16());
+                let k = self.be.kernel_sg(name, spv, 5, 20, self.sgp());
                 let groups = (out_f as u32).div_ceil(MMV_NUM_ROWS);
                 self.dispatch_wide(k, &bufs, 1, &push, rows as u32 * groups);
                 return;
@@ -1864,9 +1869,11 @@ impl<'a> Recorder<'a> {
         // takes precedence over the bit-identical RM path where it saturates DRAM better.
         if rows == 1 {
             if let Some(nr) = native_sg_choice(dtype, in_f, out_f) {
-                if let Some((name, spv)) = crate::gemm::native_sg_build_spv(dtype, false, nr) {
+                if let Some((name, spv)) =
+                    crate::gemm::native_sg_build_spv(dtype, false, nr, self.sg16())
+                {
                     self.label_gemv("gemv", rows, in_f, out_f);
-                    let k = self.be.kernel_sg(name, spv, 3, 16, 32);
+                    let k = self.be.kernel_sg(name, spv, 3, 16, self.sgp());
                     let mut push = [0u8; 16];
                     push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
                     push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
@@ -2085,8 +2092,10 @@ impl<'a> Recorder<'a> {
         // Reassociation-tolerant subgroup route (see linear_native_off) — precedence over RM.
         if rows == 1 {
             if let Some(nr) = native_sg_choice(dtype, in_f, out_f) {
-                if let Some((name, spv)) = crate::gemm::native_sg_build_spv(dtype, true, nr) {
-                    let k = self.be.kernel_sg(name, spv, 4, 16, 32);
+                if let Some((name, spv)) =
+                    crate::gemm::native_sg_build_spv(dtype, true, nr, self.sg16())
+                {
+                    let k = self.be.kernel_sg(name, spv, 4, 16, self.sgp());
                     self.dispatch_wide(k, &bufs, 1, &push, (out_f as u32).div_ceil(nr));
                     return;
                 }
@@ -2252,10 +2261,10 @@ impl<'a> Recorder<'a> {
     ) {
         self.label_gemv("mmv", 1, in_f, out_f);
         let res = residual.is_some();
-        let (name, spv) =
-            crate::gemm::native_mmv_mw_build_spv(dtype, res, warps).expect("native mmv_mw spv");
+        let (name, spv) = crate::gemm::native_mmv_mw_build_spv(dtype, res, warps, self.sg16())
+            .expect("native mmv_mw spv");
         let nbind = if res { 6 } else { 5 };
-        let k = self.be.kernel_sg(name, spv, nbind, 16, 32);
+        let k = self.be.kernel_sg(name, spv, nbind, 16, self.sgp());
         let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&1u32.to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
@@ -2306,14 +2315,8 @@ impl<'a> Recorder<'a> {
         ];
         if let Some(epw) = mmv_epw(bits) {
             if in_f.is_multiple_of(epw) {
-                let name = if bits == 4 {
-                    "mul_mat_vec_q4_res"
-                } else {
-                    "mul_mat_vec_q8_res"
-                };
-                let k =
-                    self.be
-                        .kernel_sg(name, crate::gemm::mul_mat_vec_q_spv(bits, true), 6, 20, 32);
+                let (name, spv) = crate::gemm::mul_mat_vec_q_spv(bits, true, self.sg16());
+                let k = self.be.kernel_sg(name, spv, 6, 20, self.sgp());
                 let groups = (out_f as u32).div_ceil(MMV_NUM_ROWS);
                 self.dispatch_wide(k, &bufs, 1, &push, rows as u32 * groups);
                 return;
@@ -5748,8 +5751,10 @@ impl<'a> Recorder<'a> {
         // (rows == 1); the small-m prefill widening stays on the bit-consistent tree path.
         if rows == 1 {
             if let Some(nr) = native_id_sg_choice(dtype, in_f, out_f) {
-                if let Some((name, spv)) = crate::gemm::native_idm_sg_build_spv(dtype, nr) {
-                    let k = self.be.kernel_sg(name, spv, 4, 24, 32);
+                if let Some((name, spv)) =
+                    crate::gemm::native_idm_sg_build_spv(dtype, nr, self.sg16())
+                {
+                    let k = self.be.kernel_sg(name, spv, 4, 24, self.sgp());
                     // grid = n_used slots × ceil(out_f/NR) output-groups per slot (the shader splits
                     // its flat workgroup id back into slot / o0 using this same per-slot group count).
                     let groups = (n_used * out_f.div_ceil(nr as usize)) as u32;

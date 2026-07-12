@@ -310,6 +310,8 @@ impl Backend for CpuBackend {
             bf16_coopmat: false,
             subgroup_min: 0,
             subgroup_max: 0,
+            sg_pref: 0, // no subgroup pinning on the scalar interpreter
+            vendor_intel: false,
             max_buffer_bytes: u64::MAX,
             max_shared_memory_bytes: u32::MAX, // scalar interpreter: no shared-memory tiling
             unified_memory: true,

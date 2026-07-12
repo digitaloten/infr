@@ -972,8 +972,9 @@ fn main() {
             "native_mmv_q6k_res",
             &["-DFMT_Q6K", "-DUSE_RES"],
         ),
-        // Multi-warp int8 dp4a decode GEMV (llama mul_mat_vec_q block, warp-per-row subgroupAdd) for
-        // wave32-native GPUs. WARPS ∈ {4,8} rows/block × {plain,res}. Gated to subgroup_max==32.
+        // Multi-warp int8 dp4a decode GEMV (llama mul_mat_vec_q block, warp-per-row subgroupAdd).
+        // WARPS ∈ {4,8} rows/block × {plain,res}. Gated by adapter.rs `mmv_mw_choice`
+        // (default-on Intel, INFR_MMV_MW=1 opt-in elsewhere).
         (
             "native_mmv_mw",
             "native_mmv_mw_q4k_w4",
@@ -1013,6 +1014,49 @@ fn main() {
             "native_mmv_mw",
             "native_mmv_mw_q6k_w8_res",
             &["-DFMT_Q6K", "-DWARPS=8", "-DUSE_RES"],
+        ),
+        // Q2_K / Q3_K mmv_mw (Intel R3, llama.cpp's measured Intel MMVQ table: Xe2 always-MMVQ for
+        // Q2/Q3/Q6_K). Q2_K adds a per-16 min term (dp4a vs packed ones); Q3_K is symmetric after
+        // the −4 rebias. Same {plain,res} × WARPS∈{4,8} set as Q4K/Q6K above.
+        (
+            "native_mmv_mw",
+            "native_mmv_mw_q2k_w4",
+            &["-DFMT_Q2K", "-DWARPS=4"],
+        ),
+        (
+            "native_mmv_mw",
+            "native_mmv_mw_q2k_w4_res",
+            &["-DFMT_Q2K", "-DWARPS=4", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mw",
+            "native_mmv_mw_q2k_w8",
+            &["-DFMT_Q2K", "-DWARPS=8"],
+        ),
+        (
+            "native_mmv_mw",
+            "native_mmv_mw_q2k_w8_res",
+            &["-DFMT_Q2K", "-DWARPS=8", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mw",
+            "native_mmv_mw_q3k_w4",
+            &["-DFMT_Q3K", "-DWARPS=4"],
+        ),
+        (
+            "native_mmv_mw",
+            "native_mmv_mw_q3k_w4_res",
+            &["-DFMT_Q3K", "-DWARPS=4", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mw",
+            "native_mmv_mw_q3k_w8",
+            &["-DFMT_Q3K", "-DWARPS=8"],
+        ),
+        (
+            "native_mmv_mw",
+            "native_mmv_mw_q3k_w8_res",
+            &["-DFMT_Q3K", "-DWARPS=8", "-DUSE_RES"],
         ),
         // IQ4_XS: codebook-gather-then-dp4a (the 4-bit code indexes KV_IQ4NL -> int8 before the dot).
         ("native_mmv", "native_mmv_iq4xs", &["-DFMT_IQ4XS"]),
@@ -1974,7 +2018,40 @@ fn main() {
             &["-DQBITS=8", "-DUSE_RES"],
         ),
     ];
-    for (src_stem, dst_stem, defines) in builds {
+    // Subgroup-16 twins for the bandwidth-critical decode GEMV/reduction family (Intel R2, see
+    // caps.sg_pref): every build of these SOURCES also gets a `<stem>_sg16` variant compiled with
+    // -DSG=16 (subgroup width parameterized in the shader — shared-array sizing and lane strides
+    // derive from SG; subgroup ops are width-agnostic). The base (SG=32) builds are byte-identical
+    // to the pre-SG SPIR-V — the define only folds to the constants they already contained.
+    // Selected at kernel-cache time by `caps.sg_pref == 16` (Intel); never created elsewhere.
+    const SG16_SOURCES: &[&str] = &[
+        "native_gemv_sg",
+        "native_gemv_id_multi_sg",
+        "native_mmv_mw",
+        "quant_q8_row",
+        "mul_mat_vec_q",
+    ];
+    let builds: Vec<(String, String, Vec<String>)> = builds
+        .iter()
+        .flat_map(|(src_stem, dst_stem, defines)| {
+            let base = (
+                src_stem.to_string(),
+                dst_stem.to_string(),
+                defines.iter().map(|d| d.to_string()).collect::<Vec<_>>(),
+            );
+            if SG16_SOURCES.contains(src_stem) {
+                let mut sg_defines = base.2.clone();
+                sg_defines.push("-DSG=16".to_string());
+                vec![
+                    base.clone(),
+                    (src_stem.to_string(), format!("{dst_stem}_sg16"), sg_defines),
+                ]
+            } else {
+                vec![base]
+            }
+        })
+        .collect();
+    for (src_stem, dst_stem, defines) in &builds {
         let src = format!("shaders/{src_stem}.comp");
         let dst = format!("{out}/{dst_stem}.spv");
         println!("cargo:rerun-if-changed={src}");
@@ -1984,8 +2061,8 @@ fn main() {
             "-O".into(),
             format!("-I{out}"),
         ];
-        for d in *defines {
-            args.push((*d).to_string());
+        for d in defines {
+            args.push(d.clone());
         }
         args.push(src.clone());
         args.push("-o".into());
@@ -2001,7 +2078,7 @@ fn main() {
     // or glslc/define change flips it, and the persisted cache file is discarded wholesale —
     // stale pipeline entries never accumulate across shader-set changes.
     let mut h: u64 = 0xcbf29ce484222325;
-    for (_, dst_stem, _) in builds {
+    for (_, dst_stem, _) in &builds {
         let bytes = std::fs::read(format!("{out}/{dst_stem}.spv")).expect("read spv for hash");
         for b in bytes {
             h ^= b as u64;

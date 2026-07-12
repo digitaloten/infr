@@ -76,6 +76,20 @@ pub struct Capabilities {
     /// subgroup-size-control unsupported (can't pin at all — use the driver's default subgroup).
     pub subgroup_min: u32,
     pub subgroup_max: u32,
+    /// PREFERRED pinned subgroup size for the bandwidth-critical decode GEMV/reduction kernel
+    /// family (the `_sg16` SPIR-V twins: `native_gemv_sg` / `native_gemv_id_multi_sg` /
+    /// `native_mmv_mw` / `mul_mat_vec_q` / `quant_q8_row`). 16 on Intel (`vendor_intel` and the
+    /// device can pin 16): compiling those kernels SIMD32 on SIMD8-EU hardware strangles per-lane
+    /// registers — llama.cpp pins 16 for mul_mat_vec there (ggml-vulkan.cpp:4839). 32 everywhere
+    /// else (RADV wave32 — 16 is not even pinnable there, `subgroup_min == 32`). Every OTHER
+    /// pinned-32 kernel (rmsnorm/softmax/coopmat GEMM/attention…) is unaffected by this field.
+    /// `INFR_SG=16|32` overrides for A/B; a request the device can't pin falls back to 32.
+    /// 0 on backends without subgroup pinning (CPU/Metal — the field gates Vulkan shader picks).
+    pub sg_pref: u32,
+    /// `vendorID == 0x8086` (Intel). Drives Intel-measured kernel-policy defaults (decode mmv
+    /// dp4a tier default-on, `sg_pref = 16`) — NOT detected from subgroup sizes (some Xe2 SKUs
+    /// report `subgroup_min` 8, others 16, so size-sniffing would misclassify).
+    pub vendor_intel: bool,
     pub max_buffer_bytes: u64,
     /// `maxComputeSharedMemorySize` — the per-workgroup shared-memory budget. Vulkan only guarantees
     /// 16 KB; RADV gives 64 KB, NVIDIA 48 KB, MoltenVK/mobile often 32 KB. The flash-attention tile

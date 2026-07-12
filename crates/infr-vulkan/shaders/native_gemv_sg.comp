@@ -14,8 +14,18 @@
 // the float accumulation vs the 64-thread shared tree-reduce (a valid different summation order,
 // ULP-level per element). Gated to the projection band ONLY — the big GEMVs (lm_head/gate+up) stay on
 // the tree kernel where subgroupAdd was measured to REGRESS occupancy ~20%. -DFMT_* selects the
-// format, -DNR=N the rows/workgroup, -DUSE_RES fuses a residual. Requires requiredSubgroupSize=32.
-layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+// format, -DNR=N the rows/workgroup, -DUSE_RES fuses a residual. Requires requiredSubgroupSize=SG.
+//
+// -DSG=16|32 (default 32) sets the pinned subgroup width: the workgroup is always exactly ONE
+// subgroup (local_size_x = SG), lanes stride SG sub-blocks, and subgroupAdd spans SG lanes — the
+// same full reduction at either width, only the summation order differs (already blessed as
+// reassociation-tolerant). SG=16 is the Intel build (SIMD8/16 EUs; a pinned-32 compile starves
+// per-lane registers there — see caps.sg_pref); SG=32 SPIR-V is bit-identical to the pre-SG code.
+
+#ifndef SG
+#define SG 32
+#endif
+layout(local_size_x = SG, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC { uint rows; uint in_f; uint out_f; uint w_base; } pc;
 layout(binding = 0) readonly buffer WB { uint nw[]; };
@@ -43,7 +53,7 @@ float dqsub(uint gstart, uint xoff) {
 }
 
 void main() {
-    uint lane = gl_SubgroupInvocationID; // 0..31
+    uint lane = gl_SubgroupInvocationID; // 0..SG-1
     // Flat-index recovery for a possibly-2-D dispatch grid — see native_gemv_rm.comp's main() for
     // why no extra bounds check is needed here (the existing `o < pc.out_f` guards already cover
     // a padding workgroup's out-of-range o0).
@@ -51,7 +61,7 @@ void main() {
     uint nsub = pc.in_f / 32u;
     float acc[NR];
     [[unroll]] for (uint rr = 0u; rr < uint(NR); rr++) { acc[rr] = 0.0; }
-    for (uint s = lane; s < nsub; s += 32u) {
+    for (uint s = lane; s < nsub; s += uint(SG)) {
         uint xoff = s * 32u;
         [[unroll]] for (uint rr = 0u; rr < uint(NR); rr++) {
             uint o = o0 + rr;

@@ -7,9 +7,16 @@
 // 16, so the 1-warp SG kernel starved at ~50% occupancy; WARPS≥4 fixes that) while the barrier-free
 // warp-per-row reduction avoids the cross-warp sync the wave64 tree kernel pays on wave32 hardware.
 // Activation pre-quantized to symmetric int8 per 32-block (quant_q8: qa/dact/sact); weight stays raw.
-// REORDERED accumulation vs the tree kernel (subgroupAdd order) → reassociation-tolerant, gated to
-// subgroup_max==32 in the recorder. -DFMT_Q4K/-DFMT_Q6K select the format; -DWARPS=N rows/block;
-// -DUSE_RES fuses a residual add. Requires requiredSubgroupSize=32.
+// REORDERED accumulation vs the tree kernel (subgroupAdd order) → reassociation-tolerant, gated by
+// `mmv_mw_choice` in the adapter. -DFMT_Q4K/-DFMT_Q6K/-DFMT_Q2K/-DFMT_Q3K select the format;
+// -DWARPS=N rows/block; -DUSE_RES fuses a residual add. Requires requiredSubgroupSize=SG.
+//
+// -DSG=16|32 (default 32): pinned subgroup ("warp") width — the block is WARPS subgroups of SG
+// lanes, each subgroup still owns ONE output row (gl_SubgroupID is unchanged by the width), lanes
+// stride SG sub-blocks, subgroupAdd spans SG lanes. Same full reduction at either width, only the
+// float summation order differs (this kernel is already blessed reassociation-tolerant). SG=16 is
+// the Intel build (SIMD8/16 EUs — a pinned-32 compile starves per-lane registers; llama.cpp pins
+// 16 for mul_mat_vec there); the SG=32 SPIR-V is bit-identical to the pre-SG code.
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_integer_dot_product : require
@@ -20,7 +27,10 @@
 #ifndef WARPS
 #define WARPS 8
 #endif
-layout(local_size_x = WARPS * 32, local_size_y = 1, local_size_z = 1) in;
+#ifndef SG
+#define SG 32
+#endif
+layout(local_size_x = WARPS * SG, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC { uint rows; uint in_f; uint out_f; uint w_base; } pc;
 layout(binding = 0) readonly buffer WB { uint nw[]; };          // raw GGUF weight bytes (padded u32)
@@ -36,6 +46,17 @@ layout(binding = 4) buffer YB { float y_buf[]; };
 
 uint rb(uint byte) { return (nw[byte >> 2] >> ((byte & 3u) * 8u)) & 0xFFu; }
 uint ru16(uint byte) { return rb(byte) | (rb(byte + 1u) << 8u); }
+#ifdef FMT_Q3K
+// Unaligned u32 via two word loads + funnel shift (same as native_decode.glsl's ru32u — Q3_K's
+// 110-byte blocks are only 2-aligned). #ifdef-guarded so the pre-existing Q4K/Q6K SPIR-V stays
+// byte-identical.
+uint ru32u(uint byte) {
+    uint w0 = nw[byte >> 2u];
+    uint sh = (byte & 3u) << 3u;
+    if (sh == 0u) { return w0; }
+    return (w0 >> sh) | (nw[(byte >> 2u) + 1u] << (32u - sh));
+}
+#endif
 float f16tof32(uint bits) { return unpackHalf2x16(bits & 0xffffu).x; }
 
 #ifdef FMT_Q4K
@@ -102,17 +123,98 @@ float dpsub(uint gelem, uint qaw[8], float da, float sa) {
 }
 #endif
 
+#ifdef FMT_Q2K
+// Q2_K: [u8 scales[16]][u8 qs[64]][f16 d][f16 dmin] = 84 bytes, 256 elements. Each 16-elem group
+// has its own 4-bit scale|min nibble pair, so the 32-block splits into two dp4a groups (like
+// Q6_K) — PLUS a min term. The min term needs PER-16 activation sums (ml0·Σa[0..16) +
+// ml1·Σa[16..32)), which the per-32-block `sact` can't split — so the two Σqa sub-sums are
+// computed with dp4a against packed ones (0x01010101: signed bytes = 1), keeping the math exactly
+// the scalar dqblk's dequant values, reassociated. Element addressing mirrors native_decode.glsl's
+// FMT_Q2K dqblk: a 32-aligned run has constant half `n` and plane `shift`, its 2-bit codes are 8
+// consecutive ALIGNED words at bd+16+32n (84-byte blocks are word-aligned).
+float dpsub(uint gelem, uint qaw[8], float da, float sa) {
+    uint bd = (gelem / 256u) * 84u;
+    uint p0 = gelem % 256u;
+    float d = f16tof32(ru16(bd + 80u));
+    float dmin = f16tof32(ru16(bd + 82u));
+    uint sb0 = rb(bd + p0 / 16u);        // scale|min nibbles for elems 0..15
+    uint sb1 = rb(bd + p0 / 16u + 1u);   // … and 16..31
+    float dl0 = d * float(sb0 & 0xFu);  float ml0 = dmin * float(sb0 >> 4u);
+    float dl1 = d * float(sb1 & 0xFu);  float ml1 = dmin * float(sb1 >> 4u);
+    uint shift = 2u * ((p0 % 128u) / 32u);
+    uint qw = (bd + 16u + 32u * (p0 / 128u)) >> 2u; // aligned word base of this run's 2-bit codes
+    int dp0 = 0; int dp1 = 0;   // Σ q·qa per 16-elem scale group
+    int s0 = 0;  int s1 = 0;    // Σ qa per 16-elem scale group (dp4a vs packed ones)
+    for (uint j = 0u; j < 8u; j++) {
+        uint qp = (nw[qw + j] >> shift) & 0x03030303u; // four 2-bit codes, one per byte (0..3)
+        if (j < 4u) {
+            dp0 = dotPacked4x8AccSatEXT(int(qp), int(qaw[j]), dp0);
+            s0 = dotPacked4x8AccSatEXT(0x01010101, int(qaw[j]), s0);
+        } else {
+            dp1 = dotPacked4x8AccSatEXT(int(qp), int(qaw[j]), dp1);
+            s1 = dotPacked4x8AccSatEXT(0x01010101, int(qaw[j]), s1);
+        }
+    }
+    return da * (dl0 * float(dp0) + dl1 * float(dp1))
+         - da * (ml0 * float(s0) + ml1 * float(s1));
+}
+#endif
+
+#ifdef FMT_Q3K
+// Q3_K: [u8 hmask[32]][u8 qs[64]][u8 scales_raw[12]][f16 d] = 110 bytes, 256 elements. The 6-bit
+// scale covers 16 elements → two dp4a groups per 32-block; q = (low2 | hbit<<2) − 4 is SYMMETRIC
+// (∈ −4..3, fits a signed byte) so there is no min/Σa term. Bit math mirrors native_decode.glsl's
+// FMT_Q3K dqblk exactly (aux[] scale unpack, plane shift, hmask bit jg); blocks are only
+// 2-aligned → ru32u funnel loads.
+int sgn8(uint b) { return int(b) - ((b > 127u) ? 256 : 0); }
+float dpsub(uint gelem, uint qaw[8], float da, float sa) {
+    uint bd = (gelem / 256u) * 110u;
+    uint p0 = gelem % 256u;
+    float d_all = f16tof32(ru16(bd + 108u));
+    uint a0 = ru32u(bd + 96u); uint a1 = ru32u(bd + 100u); uint a2 = ru32u(bd + 104u);
+    uint k1 = 0x03030303u; uint k2 = 0x0f0f0f0fu; uint tmp = a2;
+    uint aux[4];
+    aux[2] = ((a0 >> 4u) & k2) | (((tmp >> 4u) & k1) << 4u);
+    aux[3] = ((a1 >> 4u) & k2) | (((tmp >> 6u) & k1) << 4u);
+    aux[0] = (a0 & k2) | ((tmp & k1) << 4u);
+    aux[1] = (a1 & k2) | (((tmp >> 2u) & k1) << 4u);
+    uint is0 = p0 / 16u;
+    uint sb0 = (aux[is0 >> 2u] >> ((is0 & 3u) * 8u)) & 0xFFu;
+    uint sb1 = (aux[(is0 + 1u) >> 2u] >> (((is0 + 1u) & 3u) * 8u)) & 0xFFu;
+    float sc0 = float(sgn8(sb0) - 32);
+    float sc1 = float(sgn8(sb1) - 32);
+    uint n = p0 / 128u;
+    uint jj = (p0 % 128u) / 32u;
+    uint shift = 2u * jj;
+    uint jg = 4u * n + jj;          // hmask bit index for this run
+    uint qb = bd + 32u + 32u * n;   // low-2-bit byte base for this run
+    int dp0 = 0; int dp1 = 0;
+    for (uint j = 0u; j < 8u; j++) {
+        uint q4 = ((ru32u(qb + j * 4u) >> shift) & 0x03030303u)
+            | (((ru32u(bd + j * 4u) >> jg) & 0x01010101u) << 2u);
+        uint qp = 0u;
+        for (uint b = 0u; b < 4u; b++) {
+            uint q = (q4 >> (8u * b)) & 7u;
+            qp |= ((q - 4u) & 0xFFu) << (8u * b); // two's-complement signed byte, q−4 ∈ −4..3
+        }
+        if (j < 4u) { dp0 = dotPacked4x8AccSatEXT(int(qp), int(qaw[j]), dp0); }
+        else        { dp1 = dotPacked4x8AccSatEXT(int(qp), int(qaw[j]), dp1); }
+    }
+    return d_all * da * (sc0 * float(dp0) + sc1 * float(dp1));
+}
+#endif
+
 void main() {
     uint sg = gl_SubgroupID;              // 0..WARPS-1 (one output row per subgroup)
-    uint lane = gl_SubgroupInvocationID;  // 0..31
+    uint lane = gl_SubgroupInvocationID;  // 0..SG-1
     // Flat index recovery for the 2-D grid split (dispatch_wide). o is subgroup-uniform, so the
-    // early return below is safe before subgroupAdd (all 32 lanes of a subgroup share it).
+    // early return below is safe before subgroupAdd (all SG lanes of a subgroup share it).
     uint o = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * uint(WARPS) + sg;
     if (o >= pc.out_f) { return; }
     uint nsub = pc.in_f / 32u;
     uint wb = pc.w_base + o * pc.in_f;
     float acc = 0.0;
-    for (uint s = lane; s < nsub; s += 32u) {
+    for (uint s = lane; s < nsub; s += uint(SG)) {
         uint qaw[8];
         [[unroll]] for (uint j = 0u; j < 8u; j++) { qaw[j] = qa[s * 8u + j]; }
         acc += dpsub(wb + s * 32u, qaw, float(dact[s]), float(sact[s]));

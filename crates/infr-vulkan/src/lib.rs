@@ -803,6 +803,46 @@ impl VulkanBackend {
             )));
         }
 
+        // ── sg_pref: pinned subgroup size for the decode GEMV/reduction family ────────────────
+        // Vendor by vendorID, NOT by subgroup range (Xe2 SKUs report minSubgroupSize 8 or 16
+        // depending on the part — size-sniffing would misclassify Battlemage).
+        let vendor_intel = props.vendor_id == 0x8086;
+        // Intel EUs are SIMD8/SIMD16: pinning the decode GEMV family at 32 makes ANV compile
+        // SIMD32 shaders whose per-lane register budget starves those kernels (llama.cpp pins 16
+        // for mul_mat_vec on Intel for exactly this). `max(16, subgroup_min)` keeps this
+        // Battlemage-proof (min=8 SKUs still get 16, never 8 — the kernels' lane math is only
+        // built for 16/32). Everything else (RADV 32-64, NVIDIA 32) keeps 32, so the default
+        // kernel/pipeline set there is byte-identical to before this field existed.
+        let sg_default = if vendor_intel && subgroup_min <= 16 {
+            16u32.max(subgroup_min)
+        } else {
+            32
+        };
+        // INFR_SG=16|32: A/B override (Intel testers; inert on devices that can't pin the value).
+        let sg_pref = match std::env::var("INFR_SG").ok().as_deref() {
+            Some("16") => 16,
+            Some("32") => 32,
+            Some(other) => {
+                return Err(be(format!(
+                    "INFR_SG must be 16 or 32 (got {other:?}) — the decode GEMV family only has \
+                     subgroup-16 and subgroup-32 builds"
+                )))
+            }
+            None => sg_default,
+        };
+        // A 16 request/default is only usable where 16 is pinnable; otherwise CLEANLY fall back
+        // to 32 (e.g. INFR_SG=16 on RADV wave32: subgroup_min == 32 → stays 32, path set
+        // unchanged). 32 is always pinnable here (hard-required above).
+        let sg_pref = if sg_pref == 16 && !(subgroup_min <= 16 && 16 <= subgroup_max) {
+            eprintln!(
+                "[infr] INFR_SG=16 requested but this device's subgroup range \
+                 [{subgroup_min}, {subgroup_max}] cannot pin 16 — keeping 32"
+            );
+            32
+        } else {
+            sg_pref
+        };
+
         let caps = Capabilities {
             name: device_name,
             f16: has_f16,
@@ -816,6 +856,8 @@ impl VulkanBackend {
             bf16_coopmat: has_bf16_coopmat,
             subgroup_min,
             subgroup_max,
+            sg_pref,
+            vendor_intel,
             max_buffer_bytes: props.limits.max_storage_buffer_range as u64,
             max_shared_memory_bytes: props.limits.max_compute_shared_memory_size,
             unified_memory: false, // discrete GPU
@@ -848,7 +890,7 @@ impl VulkanBackend {
         let yn = |b: bool| if b { "y" } else { "n" };
         eprintln!(
             "[infr] GPU: {} | f16:{} f16cm:{} bf16:{} bf16cm:{} f8:{} f8cm:{} i8:{} i8dot:{} i8cm:{} \
-             subgroup:{}-{} shared:{}KB",
+             subgroup:{}-{} sgp:{} shared:{}KB",
             caps.name,
             yn(caps.f16),
             yn(caps.f16_coopmat),
@@ -861,6 +903,7 @@ impl VulkanBackend {
             yn(caps.i8_coopmat),
             caps.subgroup_min,
             caps.subgroup_max,
+            caps.sg_pref,
             caps.max_shared_memory_bytes / 1024,
         );
 

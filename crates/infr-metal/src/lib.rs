@@ -216,6 +216,8 @@ impl Backend for MetalBackend {
             bf16_coopmat: false,
             subgroup_min: 0,
             subgroup_max: 0,
+            sg_pref: 0, // Vulkan-only shader-pick field; Metal exec arms pick their own kernels
+            vendor_intel: false,
             max_buffer_bytes: self.device.max_buffer_length(),
             // Metal's per-threadgroup memory limit (MTLDevice.maxThreadgroupMemoryLength) — the
             // analogue of Vulkan's maxComputeSharedMemorySize (typically 32 KB, 64 KB on Apple GPUs).
