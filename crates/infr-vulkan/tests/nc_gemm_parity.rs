@@ -4,7 +4,7 @@
 //!
 //!  • the 12 NEWLY WIRED dense (non-expert-grid) dp4a mmq GEMM builds (`matmul_mmq` over every
 //!    `MOE_MMQ_DTYPES` member — Q4_K/Q6_K's dense builds pre-existed but ride the same dispatch
-//!    here, so all 14 run);
+//!    here, so all 16 run — incl. the IQ2_S/IQ3_S grid pair);
 //!  • the 3 fma-warp float GEMMs (`matmul_fma`: f16/bf16/f32 weights, native_gemm_fma.comp).
 //!
 //! Each config dispatches the SAME GEMM three times in one submission — bitwise-identical
@@ -49,6 +49,8 @@ fn block_geom(dt: DType) -> (usize, usize) {
         DType::Q6K => (256, 210),
         DType::Iq4Nl => (32, 18),
         DType::Iq4Xs => (256, 136),
+        DType::Iq2S => (256, 82),
+        DType::Iq3S => (256, 110),
         DType::Mxfp4 => (32, 17),
         DType::Nvfp4 => (64, 36),
         other => panic!("no geometry for {other:?}"),
@@ -86,6 +88,8 @@ fn synth_bank(dt: DType, n_elems: usize, seed: u64) -> Vec<u8> {
             }
             DType::Q6K => b[208..210].copy_from_slice(&d16(&mut rng)),
             DType::Iq4Xs => b[0..2].copy_from_slice(&d16(&mut rng)),
+            // grid i-quants: leading f16 d; grid-index/sign bits cover their full table ranges
+            DType::Iq2S | DType::Iq3S => b[0..2].copy_from_slice(&d16(&mut rng)),
             // e8m0 scale byte: 122..=125 → 2^-6..2^-3
             DType::Mxfp4 => b[0] = 122 + (rng.byte() & 3),
             // ue4m3 scale bytes: [0x18, 0x37] → small positive, never 0/0x7F

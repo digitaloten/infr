@@ -3370,8 +3370,11 @@ pub(crate) fn generate_dense_backend(
     // `ffn_gate_up_exps`) — Q5_0 is what the shipped diffusiongemma-26B-A4B-it-GGUF's down banks
     // use; Q5_1 is what the shipped gemma-4-26B-A4B-it-GGUF's down banks use (29/30 layers);
     // unsloth-dynamic Qwen3.6-MoE (UD) quants mix Q5_K/Q6_K/IQ4_XS into gate/up/down banks across
-    // layers; Q2_K/Q3_K is Llama-4-Scout's shipped gate/up (Q2_K) and down (Q3_K). Other codebook
-    // quants (IQ1/IQ2/IQ3/TQ*/fp4) still have no dp4a-mmq kernel and keep the per-token loop.
+    // layers; Q2_K/Q3_K is Llama-4-Scout's shipped gate/up (Q2_K) and down (Q3_K); IQ2_S/IQ3_S is
+    // the UD-IQ3_S file's expert pair (grid-codebook mmq via shared-LUT staging). The remaining
+    // codebook quants (IQ1_*/IQ2_XXS/IQ2_XS/IQ3_XXS/TQ*) have no dp4a-mmq kernel (no shipped MoE
+    // GGUF uses them for expert banks — see MOE_MMQ_DTYPES's EXCLUSIONS) and keep the per-token
+    // loop.
     // `MOE_MMQ_DTYPES` is the SINGLE SOURCE OF TRUTH this closure and the Vulkan adapter's batched
     // `Op::MoeFfn` gate (its `mmq_ok`) both derive from — a mismatch either silently falls back to
     // per-token prefill or compiles a graph the adapter rejects; `moe_mmq_drift_test` (in

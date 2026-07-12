@@ -284,7 +284,7 @@ prefill at 4096 KV depth (the multi-turn serve shape).
 | Qwen3-30B-A3B (MoE)   | Q4_K_M      | 0.96×     | 0.95×     | 0.93×      | **1.14×** |
 | Gemma-4-31B           | UD-Q5_K_XL³ | **0.97×** | 0.88×     | 0.90×      | 0.81×     |
 | Ornith-1.0-35B        | Q4_K_M¹     | 0.89×     | **1.01×** | **1.03×**  | **1.48×** |
-| Qwen3.6-35B-A3B (MoE) | UD-IQ3_S⁴   | 0.03×     | 0.50×     | 0.52×      | 0.35×     |
+| Qwen3.6-35B-A3B (MoE) | UD-IQ3_S⁴   | 0.91×     | 0.89×     | 0.90×      | **1.20×** |
 | Qwen3.6-35B-A3B (MoE) | UD-Q4_K_M   | **1.03×** | 0.98×     | 0.99×      | **1.53×** |
 
 ¹ Rows re-measured 2026-07-12 after the quant-extreme perf slice
@@ -319,14 +319,17 @@ reuses empty KV slots instead of forking a duplicate (`f74556c` — was silently
 wasting a full KV per session, 6.25 GiB on a 14B), and lifted the gemma-family
 multi-turn rows (12B `pp4@d4096` 1.40× → 1.66×: less dead KV to re-scan).
 
-⁴ Grid i-quant (IQ1–IQ3) expert banks are **correct but on the slow floor** (row
-measured post-`618cd3b`, which fixed a device-lost TDR: dynamically indexed GLSL
-`const` codebook tables were lowered to ~1 MB of per-invocation scratch by
-RADV/ACO — they now stage through `shared` memory, ~400× faster). Remaining gaps
-are structural and queued: grid formats have no batched dp4a mmq GEMM, so MoE
-**prefill** rides the per-token id-GEMV floor (0.03×), and the grid decode still
-pays a per-element `dq()` (a grid-aware `dqblk` is the decode lever, ~0.50×
-today).
+⁴ Grid i-quant (IQ1–IQ3) row re-measured 2026-07-12 (llama-bench b9957) after
+the grid-perf slice closed both structural gaps `618cd3b` left behind (that
+commit fixed the device-lost TDR — dynamically indexed GLSL `const` codebook
+tables lowered to ~1 MB of per-invocation scratch by RADV/ACO — by staging the
+grids through `shared` memory): a grid-aware `dqblk` amortizes the per-32-group
+scale/sign/qh decode and grid gathers that the per-element `dq()` re-derived
+(decode 0.50× → 0.89×, tg128 75 → 134 t/s), and IQ2_S/IQ3_S — this file's expert
+pair — got batched dp4a mmq expert GEMMs (shared-LUT grid staging feeds the int8
+dot; prefill 0.03× → 0.91×, pp512 75 → 2575 t/s). The other five grid formats
+keep the id-GEMV prefill fallback (no shipped MoE GGUF uses them for expert
+banks — see `MOE_MMQ_DTYPES`'s exclusions doc).
 
 The MoE expert kernel floor (the id-indexed GEMV family every MoE model needs
 for decode) now covers **every weight dtype the dense Vulkan path supports** —

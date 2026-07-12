@@ -740,6 +740,8 @@ pub(crate) fn native_gemm_mmq_dense_spv(
         Q4_1 => spv!("native_gemm_mmq_q4_1"),
         Iq4Nl => spv!("native_gemm_mmq_iq4_nl"),
         Iq4Xs => spv!("native_gemm_mmq_iq4_xs"),
+        Iq2S => spv!("native_gemm_mmq_iq2_s"),
+        Iq3S => spv!("native_gemm_mmq_iq3_s"),
         Mxfp4 => spv!("native_gemm_mmq_mxfp4"),
         Nvfp4 => spv!("native_gemm_mmq_nvfp4"),
         _ => return None,
@@ -1990,6 +1992,63 @@ pub(crate) fn native_gemm_mmq_q4_0_xpg_spv() -> &'static [u32] {
 pub(crate) fn native_gemm_mmq_q4_0_xpg32_spv() -> &'static [u32] {
     const BYTES: &[u8] =
         include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4_0_xpg32.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+
+/// SPIR-V for the tiled IQ2_S / IQ3_S dp4a (mmq) GEMMs, expert-grid variants (the grid-codebook
+/// pair Qwen3.6-35B-A3B-UD-IQ3_S ships for its expert banks: IQ2_S gate/up, IQ3_S down). Both
+/// symmetric (sign-flipped grid codes are the signed dp4a operand directly) — no `sact`. The
+/// grid LUT is staged into shared memory per workgroup (see the shaders' doc comments).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_iq2_s_xp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq2_s_xp.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_iq2_s_xp32_spv() -> &'static [u32] {
+    const BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq2_s_xp32.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_iq2_s_xpg_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq2_s_xpg.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_iq2_s_xpg32_spv() -> &'static [u32] {
+    const BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq2_s_xpg32.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_iq3_s_xp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq3_s_xp.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_iq3_s_xp32_spv() -> &'static [u32] {
+    const BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq3_s_xp32.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_iq3_s_xpg_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq3_s_xpg.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_iq3_s_xpg32_spv() -> &'static [u32] {
+    const BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq3_s_xpg32.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }

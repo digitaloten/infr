@@ -1156,6 +1156,12 @@ fn main() {
         ("native_gemm_mmq_iq4_xs", "native_gemm_mmq_iq4_xs", &[]),
         ("native_gemm_mmq_mxfp4", "native_gemm_mmq_mxfp4", &[]),
         ("native_gemm_mmq_nvfp4", "native_gemm_mmq_nvfp4", &[]),
+        // IQ2_S / IQ3_S grid-codebook mmq (Qwen3.6-35B-A3B-UD-IQ3_S's expert pair: IQ2_S gate/up,
+        // IQ3_S down). The grid LUT is staged into shared memory via native_grids.glsl's
+        // grid_init() — the shared-staging fix that invalidated the original grid-mmq exclusion
+        // (see the shaders' doc comments + MOE_MMQ_DTYPES's EXCLUSIONS doc).
+        ("native_gemm_mmq_iq2_s", "native_gemm_mmq_iq2_s", &[]),
+        ("native_gemm_mmq_iq3_s", "native_gemm_mmq_iq3_s", &[]),
         // Non-coopmat float-weight prefill GEMM ("fma-warp" tier, see native_gemm_fma.comp): the
         // shared-memory fma warptile for f16/bf16/f32 weights on devices without a usable f16
         // coopmat (adapter.rs `nc_fma`). No subgroup ops, no f16 extensions — dispatchable on
@@ -1285,6 +1291,47 @@ fn main() {
             "native_gemm_mmq_iq4_xs",
             "native_gemm_mmq_iq4_xs_xp",
             &["-DEXPERT_GRID"],
+        ),
+        // IQ2_S (gate/up) / IQ3_S (down) — the Qwen3.6-35B-A3B-UD-IQ3_S expert pair.
+        (
+            "native_gemm_mmq_iq2_s",
+            "native_gemm_mmq_iq2_s_xp",
+            &["-DEXPERT_GRID"],
+        ),
+        (
+            "native_gemm_mmq_iq3_s",
+            "native_gemm_mmq_iq3_s_xp",
+            &["-DEXPERT_GRID"],
+        ),
+        (
+            "native_gemm_mmq_iq2_s",
+            "native_gemm_mmq_iq2_s_xp32",
+            &["-DEXPERT_GRID", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_iq3_s",
+            "native_gemm_mmq_iq3_s_xp32",
+            &["-DEXPERT_GRID", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_iq2_s",
+            "native_gemm_mmq_iq2_s_xpg",
+            &["-DEXPERT_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemm_mmq_iq3_s",
+            "native_gemm_mmq_iq3_s_xpg",
+            &["-DEXPERT_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemm_mmq_iq2_s",
+            "native_gemm_mmq_iq2_s_xpg32",
+            &["-DEXPERT_GRID", "-DPAGED", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_iq3_s",
+            "native_gemm_mmq_iq3_s_xpg32",
+            &["-DEXPERT_GRID", "-DPAGED", "-DBM_TILE=32u"],
         ),
         // BM=32 row-tile variants of the expert-grid GEMM (see matmul_mmq_experts' `n_used` doc):
         // at small rows-per-expert (Qwen3.6-MoE's 256-expert pool averages ~16/expert at pp512)

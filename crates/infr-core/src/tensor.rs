@@ -112,12 +112,17 @@ impl DType {
 ///     staging loop would degenerate into the same scalar decode the idm fallback already does;
 ///     TQ2_0 would map, but no shipped MoE GGUF quantizes expert banks ternary, so neither earns
 ///     a kernel until one does.
-///   * `Iq1S`/`Iq1M`/`Iq2Xxs`/`Iq2Xs`/`Iq2S`/`Iq3Xxs`/`Iq3S` (grid i-quants): decode is a
-///     per-8-element codebook-grid gather + 7-bit sign-mask expansion (large LUTs, several
-///     dependent loads per byte staged) — the dp4a int path's win (cheap int8 staging feeding
-///     the dot) inverts when staging itself is the bottleneck (the same ALU-not-bandwidth
-///     lesson `native_dense_supported`'s grid note records for dense GEMV). They keep the idm
-///     fallback.
+///   * `Iq1S`/`Iq1M`/`Iq2Xxs`/`Iq2Xs`/`Iq3Xxs` (remaining grid i-quants): NOT ALU-impossible —
+///     the original "grid gather + sign staging is ALU-bound" rationale was DISPROVEN by the
+///     shared-memory grid-LUT staging fix (grid_init(); see build.rs::gen_grids) and the shipped
+///     `Iq2S`/`Iq3S` mmq kernels (one shared gather serves four staged int8 bytes, reused BM
+///     times by the dp4a loop — same ~20% staging overhead Q3_K carries, near-Q3_K throughput
+///     measured). These five stay out only because no audited MoE GGUF quantizes expert banks
+///     with them (unsloth UD mixes use IQ2_S/IQ3_S/IQ4_XS + K-quants); each maps to the same
+///     recipe (IQ2_XS/IQ2_XXS ≙ IQ2_S with KSIGNS-packed signs at BLK=16; IQ3_XXS ≙ IQ3_S with
+///     KSIGNS at BLK=32; IQ1_S/IQ1_M add the ±0.125 delta as a per-sub-block `sact`-style
+///     correction since Σ±delta·x needs the activation sum). They keep the idm fallback until a
+///     real model ships them.
 ///   * `Bf16`/`F16`/`F32` (float weights): not dp4a material at all — no integer codes to feed
 ///     the packed int8 dot; they ride the float GEMM/GEMV routes.
 pub const MOE_MMQ_DTYPES: &[DType] = &[
@@ -133,6 +138,8 @@ pub const MOE_MMQ_DTYPES: &[DType] = &[
     DType::Q6K,
     DType::Iq4Nl,
     DType::Iq4Xs,
+    DType::Iq2S,
+    DType::Iq3S,
     DType::Mxfp4,
     DType::Nvfp4,
 ];
@@ -148,8 +155,8 @@ pub fn moe_mmq_ok(dt: DType) -> bool {
 /// convention). Q2_K is ALSO min-carrying but is deliberately excluded — its 16-elem sub-block is
 /// HALF the activation's 32-elem `sact` granularity, so it self-computes its own narrower Σx
 /// in-shader instead (see `native_gemm_mmq_q2_k.comp`'s doc); Q3_K/Q6_K/Q8_0/Q5_0/Q4_0/IQ4_NL/
-/// IQ4_XS/MXFP4/NVFP4 are symmetric (no min term at all — the two fp4 formats share IQ4_NL's
-/// signed-codebook treatment).
+/// IQ4_XS/IQ2_S/IQ3_S/MXFP4/NVFP4 are symmetric (no min term at all — the fp4 formats share
+/// IQ4_NL's signed-codebook treatment, the grid formats' sign-flipped codes are already signed).
 pub const MOE_MMQ_SACT_DTYPES: &[DType] = &[DType::Q4K, DType::Q5K, DType::Q5_1, DType::Q4_1];
 
 /// True for [`MOE_MMQ_DTYPES`] members whose mmq kernel reads the activation's `sact` buffer.
@@ -178,6 +185,8 @@ pub const MOE_MMQ_PAGED_DTYPES: &[DType] = &[
     DType::Q6K,
     DType::Iq4Nl,
     DType::Iq4Xs,
+    DType::Iq2S,
+    DType::Iq3S,
     DType::Mxfp4,
     DType::Nvfp4,
 ];
