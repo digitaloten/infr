@@ -204,16 +204,16 @@ impl Backend for MetalBackend {
             name: self.device.name().to_string(),
             // Metal simdgroup_matrix / dp4a tiers aren't wired through these Vulkan-oriented flags
             // yet; the Metal exec arms select their own kernels. f16/i8 math is available; the
-            // matrix/dot-primitive flags are N-A → off.
+            // matrix/dot-primitive shapes are N-A → None/off.
             f16: true,
-            f16_coopmat: false,
+            coopmat_f16: None,
             f8: false,
-            f8_coopmat: false,
+            coopmat_f8: None,
             i8: true,
             i8_dot: false,
-            i8_coopmat: false,
+            coopmat_i8: None,
             bf16: false,
-            bf16_coopmat: false,
+            coopmat_bf16: None,
             subgroup_min: 0,
             subgroup_max: 0,
             sg_pref: 0, // Vulkan-only shader-pick field; Metal exec arms pick their own kernels

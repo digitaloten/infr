@@ -17,6 +17,15 @@ use crate::graph::Graph;
 use crate::tensor::TensorId;
 use std::collections::HashMap;
 
+/// The 16x16x16 (M,N,K) cooperative-matrix tile every production coopmat shader is built for
+/// (RADV/RDNA3+, NVIDIA — every `coopmat<...,16,16,...>` declaration across
+/// gemm_warp/native_gemm*/attn_*/deltanet_prep).
+pub const COOPMAT_TILE_16: (u32, u32, u32) = (16, 16, 16);
+/// The 8x8x16 (M,N,K) tile Intel Arc (Mesa ANV, XMX) enumerates for f16 — the ONLY non-16x16x16
+/// shape any kernel here is built for, and only `native_gemm_warp`'s `_cm8` variants at that
+/// (opt-in via `INFR_CM_8X8=1`; see the Vulkan backend's shape selection).
+pub const COOPMAT_TILE_8: (u32, u32, u32) = (8, 8, 16);
+
 /// Device capabilities the graph compiler queries to pick fast vs fallback kernels.
 #[derive(Clone, Debug, Default)]
 pub struct Capabilities {
@@ -38,38 +47,48 @@ pub struct Capabilities {
     // unconditional `linear_f32` GEMV. And no target GPU enumerates an f32-operand coopmat config.)
     /// f16 (== fp16) scalar/vector ALU (`shaderFloat16`) — the non-coopmat f16 warp/GEMV fallback.
     pub f16: bool,
-    /// The cooperative-matrix unit accepts f16 components (f16×f16→f16/f32) — the current production
-    /// GEMM primitive. Was `cooperative_matrix`. Independent of the `f16` ALU flag above.
-    pub f16_coopmat: bool,
+    /// The (M,N,K) tile the cooperative-matrix unit accepts for f16 components (f16×f16→f16/f32),
+    /// picked from the device's enumerated config list by preference order: [`COOPMAT_TILE_16`]
+    /// first (the production shape every coopmat shader is built for), then [`COOPMAT_TILE_8`]
+    /// (Intel Arc XMX — only honored when the `INFR_CM_8X8=1` opt-in is set, since only the
+    /// `native_gemm_warp` `_cm8` builds exist at that shape). `None` = no usable f16 coopmat
+    /// (route to the non-coopmat tiers). Call sites that mean "the full 16x16x16 kernel set is
+    /// live" use the [`f16_coopmat`](Self::f16_coopmat) accessor, which is EXACTLY the pre-shape-
+    /// table boolean.
+    pub coopmat_f16: Option<(u32, u32, u32)>,
     /// f8 (== fp8, E4M3/E5M2) storage/convert support (`VK_EXT_shader_float8`-class). infr has no
     /// scalar f8 math path today; this exists for symmetry / future use. False on RDNA3.
     pub f8: bool,
-    /// The cooperative-matrix unit accepts f8 (E4M3/E5M2) components (f8×f8→f16 accumulate) — the
-    /// fp8 coopmat GEMM tier. Detected by enumerating the device's coopmat configs; NOT a subset of
-    /// `f16_coopmat` (a unit can do f16 components but not f8). False on all pre-RDNA4/pre-Ada HW.
-    pub f8_coopmat: bool,
+    /// The (M,N,K) tile the cooperative-matrix unit accepts for f8 (E4M3/E5M2) A/B components —
+    /// the fp8 coopmat GEMM tier. Detected by enumerating the device's coopmat configs; NOT a
+    /// subset of `coopmat_f16` (a unit can do f16 components but not f8). Only
+    /// [`COOPMAT_TILE_16`] is ever selected (no f8 8x8x16 kernels exist). `None` on all
+    /// pre-RDNA4/pre-Ada HW.
+    pub coopmat_f8: Option<(u32, u32, u32)>,
     /// i8 (== int8) storage & math in shaders (`shaderInt8`) — the scalar integer path.
     pub i8: bool,
     /// The device advertises packed i8 dot-product (`VK_KHR_shader_integer_dot_product` /
     /// `dotPacked4x8AccSat`, core in Vulkan 1.3) — the decode i8 `mmv` path's dp4a accumulate. A
-    /// SEPARATE primitive from coopmat (hence not `i8_coopmat`). False = route to the scalar dequant
-    /// GEMV (needs no extension). Independent of `f16`/`f16_coopmat`.
+    /// SEPARATE primitive from coopmat (hence not `coopmat_i8`). False = route to the scalar
+    /// dequant GEMV (needs no extension). Independent of `f16`/`coopmat_f16`.
     pub i8_dot: bool,
-    /// The cooperative-matrix unit accepts SINT8×SINT8→SINT32 components at the exact 16x16x16 tile
-    /// every int8 coopmat shader here is hardcoded to (enumerated from the device's coopmat config
-    /// list, same discipline as `f16_coopmat`). DETECTION ONLY — true on this RX 7900 XTX (Mesa
-    /// 26.1.4), but int8 coopmat previously HUNG the GPU on an older Mesa (commit ad82a77; the
-    /// standalone `coopmat_int8_test` harness confirmed the fix). The kernel is therefore an
-    /// ADDITIONAL opt-in gate on top of this flag: the adapter only dispatches it when
-    /// `INFR_I8_COOPMAT=1` is also set (default off) — see adapter.rs's `Op::Linear` GEMM branch.
-    pub i8_coopmat: bool,
+    /// The (M,N,K) tile the cooperative-matrix unit accepts for SINT8×SINT8→SINT32 components
+    /// (enumerated from the device's coopmat config list, same discipline as `coopmat_f16`; only
+    /// [`COOPMAT_TILE_16`] is ever selected — the shape every int8 coopmat shader is hardcoded
+    /// to). DETECTION ONLY — Some on this RX 7900 XTX (Mesa 26.1.4), but int8 coopmat previously
+    /// HUNG the GPU on an older Mesa (commit ad82a77; the standalone `coopmat_int8_test` harness
+    /// confirmed the fix). The kernel is therefore an ADDITIONAL opt-in gate on top of this:
+    /// the adapter only dispatches it when `INFR_I8_COOPMAT=1` is also set (default off) — see
+    /// adapter.rs's `Op::Linear` GEMM branch.
+    pub coopmat_i8: Option<(u32, u32, u32)>,
     /// bf16 (bfloat16) scalar storage/convert support (`VK_KHR_shader_bfloat16`-class). Distinct
     /// from `f16` (IEEE half): same 16 bits but 8 exponent / 7 mantissa. False on RDNA3.
     pub bf16: bool,
-    /// The cooperative-matrix unit accepts bf16 components (bf16×bf16→bf16/f32) at 16x16x16.
-    /// Enumerated from the device's coopmat config list (raw `VK_COMPONENT_TYPE_BFLOAT16_KHR`,
-    /// confirmed on RDNA4/Navi44). NOT a subset of `f16_coopmat`. False on all pre-RDNA4 HW.
-    pub bf16_coopmat: bool,
+    /// The (M,N,K) tile the cooperative-matrix unit accepts for bf16 components
+    /// (bf16×bf16→bf16/f32). Enumerated from the device's coopmat config list (raw
+    /// `VK_COMPONENT_TYPE_BFLOAT16_KHR`, confirmed on RDNA4/Navi44). NOT a subset of
+    /// `coopmat_f16`. Only [`COOPMAT_TILE_16`] is ever selected. `None` on all pre-RDNA4 HW.
+    pub coopmat_bf16: Option<(u32, u32, u32)>,
     /// Supported subgroup-size range (`VkPhysicalDeviceSubgroupSizeControlProperties`). The coopmat
     /// GEMM pins `requiredSubgroupSize = 32` (RDNA3 wave32); a device whose range excludes 32 can't
     /// run the pinned kernel and must fall back to a non-pinned variant. `(0, 0)` =
@@ -140,6 +159,34 @@ pub struct Capabilities {
     /// full context (see the seam's SWA ring sizing). Backends whose kernels index rows directly
     /// by position (Metal) leave this false and get full-context allocations for every layer.
     pub kv_swa_ring: bool,
+}
+
+impl Capabilities {
+    /// The full 16x16x16 f16 coopmat kernel set is live (`coopmat_f16 == COOPMAT_TILE_16`) —
+    /// byte-for-byte the boolean every pre-shape-table gate keyed on. All existing coopmat
+    /// shaders (GEMM warptiles, flash attention, deltanet_prep) are built ONLY at this shape,
+    /// so they must stay dark when the device's tile is 8x8x16.
+    pub fn f16_coopmat(&self) -> bool {
+        self.coopmat_f16 == Some(COOPMAT_TILE_16)
+    }
+    /// The 8x8x16 f16 tile was selected (Intel Arc XMX under `INFR_CM_8X8=1`) — gates ONLY the
+    /// `native_gemm_warp` `_cm8` builds; every other coopmat family has no kernel at this shape.
+    pub fn f16_coopmat_8x8(&self) -> bool {
+        self.coopmat_f16 == Some(COOPMAT_TILE_8)
+    }
+    /// 16x16x16 f8 coopmat GEMM tier available (see `coopmat_f8`).
+    pub fn f8_coopmat(&self) -> bool {
+        self.coopmat_f8 == Some(COOPMAT_TILE_16)
+    }
+    /// 16x16x16 i8 coopmat available — DETECTION ONLY, the adapter additionally requires
+    /// `INFR_I8_COOPMAT=1` (see `coopmat_i8`).
+    pub fn i8_coopmat(&self) -> bool {
+        self.coopmat_i8 == Some(COOPMAT_TILE_16)
+    }
+    /// 16x16x16 bf16 coopmat GEMM tier available (see `coopmat_bf16`).
+    pub fn bf16_coopmat(&self) -> bool {
+        self.coopmat_bf16 == Some(COOPMAT_TILE_16)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

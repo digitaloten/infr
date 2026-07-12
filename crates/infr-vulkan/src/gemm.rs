@@ -1182,6 +1182,37 @@ pub(crate) fn native_gemm_warp_n128_build_spv(dtype: infr_core::DType) -> Option
     })
 }
 
+/// 8x8x16-fragment `_cm8` warptile variants (Intel Arc/ANV XMX; `-DCM_M=8 -DCM_N=8` on the
+/// NARROW_N+BM32 tile, 128 threads / pinned subgroup 16) — dispatched ONLY when the device's
+/// selected f16 coopmat shape is 8x8x16 (`caps.f16_coopmat_8x8()`, which itself requires the
+/// `INFR_CM_8X8=1` opt-in; see lib.rs `select_coopmat_shape`). Name+SPIR-V so `kernel_sg` caches
+/// distinct pipelines. Hot k-quants + Q8_0 only; `None` routes the shape to the nc_mmq/nc_fma
+/// non-coopmat tier (the Arc default).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_warp_cm8_build_spv(
+    dtype: infr_core::DType,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            (
+                $name,
+                S.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice(),
+            )
+        }};
+    }
+    Some(match dtype {
+        Q4K => v!("native_gemm_warp_q4k_cm8"),
+        Q6K => v!("native_gemm_warp_q6k_cm8"),
+        Q8_0 => v!("native_gemm_warp_q8_0_cm8"),
+        _ => return None,
+    })
+}
+
 /// A_GLOBAL warptile variants: A pre-converted to f16 by the caller and coopMatLoad'd straight
 /// from global memory — no As staging, no As LDS. Shrinking LDS to Bs-only lifts occupancy from
 /// 2 to 3 workgroups/WGP, which is worth ~1.5x on the 8B prefill shapes (29→44 TF on the o

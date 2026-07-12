@@ -641,22 +641,28 @@ impl VulkanBackend {
                  {raws:?}"
             );
         }
-        // f16 coopmat: a config with f16 A AND B operands (accumulator/result f16 or f32) AND the
-        // EXACT tile dims our coopmat shaders are hardcoded to: M=16, N=16, K=16 (every
-        // `coopmat<...,16,16,...>` declaration across gemm_coopmat*/gemm_warp/native_gemm*/attn_*
-        // /deltanet_prep). Component types alone are NOT sufficient — an Intel A770 (Mesa ANV)
-        // advertises f16×f16→f32 only at M=8,N=8,K=16; creating our 16x16x16 pipeline on such a
-        // device silently fails vkCreateComputePipelines (the segfault bug — the result wasn't
-        // checked, see `create_compute_pipeline` below). Requiring the dimension match here makes
-        // an unsupported device fall back to the scalar/f16 non-coopmat ladder instead of crashing.
-        // Derived from the enumeration, not assumed from the ext bit. `has_coop_matrix` keeps its
-        // downstream name (ext-enable, feature chain, caps.f16_coopmat).
+        // f16 coopmat: configs with f16 A AND B operands (accumulator/result f16 or f32), reduced
+        // to ONE chosen (M,N,K) tile by `select_coopmat_shape`'s preference order: 16x16x16 first
+        // (the shape every production coopmat shader is built for — every `coopmat<...,16,16,...>`
+        // declaration across gemm_coopmat*/gemm_warp/native_gemm*/attn_*/deltanet_prep), then
+        // 8x8x16 (Intel Arc/ANV XMX — ONLY under the `INFR_CM_8X8=1` opt-in, and only the
+        // `native_gemm_warp` `_cm8` builds exist at that shape). Component types alone are NOT
+        // sufficient — an Intel A770 (Mesa ANV) advertises f16×f16→f32 only at M=8,N=8,K=16;
+        // creating our 16x16x16 pipeline on such a device silently fails
+        // vkCreateComputePipelines (the segfault bug — the result wasn't checked, see
+        // `create_compute_pipeline` below). Requiring the shape match here makes an unsupported
+        // device fall back to the non-coopmat ladder instead of crashing. Derived from the
+        // enumeration, not assumed from the ext bit. `has_coop_matrix` (any usable f16 shape)
+        // keeps its downstream role (ext-enable, feature chain).
         let f16c = vk::ComponentTypeKHR::FLOAT16;
-        const CMS_TILE: (u32, u32, u32) = (16, 16, 16); // M, N, K — matches every coopmat shader
-        let has_coop_matrix = has_coop_ext_feat
-            && coopmat_configs
+        let cm8_env = std::env::var("INFR_CM_8X8").is_ok();
+        let coopmat_f16 = select_coopmat_shape(
+            coopmat_configs
                 .iter()
-                .any(|&(m, n, k, a, b, _, _)| (m, n, k) == CMS_TILE && a == f16c && b == f16c);
+                .filter(|&&(_, _, _, a, b, _, _)| a == f16c && b == f16c)
+                .map(|&(m, n, k, ..)| (m, n, k)),
+            cm8_env,
+        );
         // Extension-added ComponentTypeKHR raw values (ash 0.38 predates these variants, so match by
         // raw i32). CONFIRMED on RDNA4/Navi44 via INFR_DEBUG_COOPMAT — all CORE types are 0..=10
         // (FLOAT16=0/FLOAT32=1/SINT8=3/UINT8=7/…), these are the KHR-standard ext values:
@@ -664,37 +670,47 @@ impl VulkanBackend {
         const CT_E5M2: i32 = 1_000_491_003; // VK_COMPONENT_TYPE_FLOAT_E5M2_KHR
         const CT_BF16: i32 = 1_000_141_000; // VK_COMPONENT_TYPE_BFLOAT16_KHR
         let is_f8 = |t: i32| t == CT_E4M3 || t == CT_E5M2;
-        // f8 coopmat: a config with fp8 (E4M3/E5M2) A AND B operands at the exact 16x16x16 tile our
-        // shaders use. Uses the KHR-standard fp8 raw values (confirmed on RDNA4) rather than the
-        // older `>= 1e9` heuristic, which also matched bf16 (`CT_BF16` is ext-range too) and would
-        // false-positive f8 on a bf16-only unit. Also requires the float8 storage ext. NEVER true on
-        // RDNA3 (enumerates no fp8 config).
-        let has_f8_coopmat = has_coop_ext_feat
-            && has_f8_ext
-            && coopmat_configs.iter().any(|&(m, n, k, a, b, _, _)| {
-                (m, n, k) == CMS_TILE && is_f8(a.as_raw()) && is_f8(b.as_raw())
-            });
-        // bf16 coopmat: BFLOAT16 A AND B operands at the 16x16x16 tile. Confirmed on RDNA4/Navi44
+        // f8 coopmat: configs with fp8 (E4M3/E5M2) A AND B operands, 16x16x16 ONLY (no f8 shader
+        // exists at any other shape → `allow_8x8x16 = false`). Uses the KHR-standard fp8 raw
+        // values (confirmed on RDNA4) rather than the older `>= 1e9` heuristic, which also
+        // matched bf16 (`CT_BF16` is ext-range too) and would false-positive f8 on a bf16-only
+        // unit. Also requires the float8 storage ext. NEVER Some on RDNA3 (enumerates no fp8
+        // config).
+        let coopmat_f8 = select_coopmat_shape(
+            coopmat_configs
+                .iter()
+                .filter(|&&(_, _, _, a, b, _, _)| is_f8(a.as_raw()) && is_f8(b.as_raw()))
+                .map(|&(m, n, k, ..)| (m, n, k)),
+            false,
+        )
+        .filter(|_| has_f8_ext);
+        // bf16 coopmat: BFLOAT16 A AND B operands, 16x16x16 only. Confirmed on RDNA4/Navi44
         // (bf16×bf16→bf16 and →f32); RDNA3 enumerates none. Same discipline as f8/f16 above.
-        let has_bf16_coopmat = has_coop_ext_feat
-            && coopmat_configs.iter().any(|&(m, n, k, a, b, _, _)| {
-                (m, n, k) == CMS_TILE && a.as_raw() == CT_BF16 && b.as_raw() == CT_BF16
-            });
-        // i8 coopmat: a config with SINT8 A AND B operands and a SINT32 result, at the exact
-        // 16x16x16 tile every int8 coopmat shader here uses — same discipline as `f16_coopmat`'s
-        // dimension check above. DETECTION ONLY (see the `i8_coopmat` doc comment on
-        // `Capabilities`): the standalone `coopmat_int8_test` harness confirmed this exact config
+        let coopmat_bf16 = select_coopmat_shape(
+            coopmat_configs
+                .iter()
+                .filter(|&&(_, _, _, a, b, _, _)| a.as_raw() == CT_BF16 && b.as_raw() == CT_BF16)
+                .map(|&(m, n, k, ..)| (m, n, k)),
+            false,
+        );
+        // i8 coopmat: configs with SINT8 A AND B operands and a SINT32 result, 16x16x16 only (the
+        // shape every int8 coopmat shader here uses) — same discipline as `coopmat_f16`'s shape
+        // selection above. DETECTION ONLY (see the `coopmat_i8` doc comment on `Capabilities`):
+        // the standalone `coopmat_int8_test` harness confirmed this exact config
         // (SINT8xSINT8->SINT32, subgroup-pinned 32, A RowMajor/B ColumnMajor) dispatches correctly
         // on this driver, but int8 coopmat hung an OLDER Mesa (commit ad82a77) despite enumerating
         // fine there too — so detection alone does NOT make this capability a safe default; the
-        // adapter requires `INFR_I8_COOPMAT=1` in addition to `caps.i8_coopmat` before ever
+        // adapter requires `INFR_I8_COOPMAT=1` in addition to `caps.i8_coopmat()` before ever
         // dispatching the kernel.
         let i8c = vk::ComponentTypeKHR::SINT8;
         let i32c = vk::ComponentTypeKHR::SINT32;
-        let has_i8_coopmat = has_coop_ext_feat
-            && coopmat_configs.iter().any(|&(m, n, k, a, b, _, r)| {
-                (m, n, k) == CMS_TILE && a == i8c && b == i8c && r == i32c
-            });
+        let coopmat_i8 = select_coopmat_shape(
+            coopmat_configs
+                .iter()
+                .filter(|&&(_, _, _, a, b, _, r)| a == i8c && b == i8c && r == i32c)
+                .map(|&(m, n, k, ..)| (m, n, k)),
+            false,
+        );
 
         // ── force-disable capabilities for fallback-path testing on capable HW ──
         // These env knobs drop a DETECTED capability so the next kernel tier down is exercised on a
@@ -703,18 +719,66 @@ impl VulkanBackend {
         // forced-off feature is genuinely NOT enabled on the device (a faithful simulation, not just
         // a caps flag flip). f16 is a coopmat prerequisite, so INFR_NO_F16 ⇒ NO coopmat too.
         let has_f16 = has_f16 && std::env::var("INFR_NO_F16").is_err();
-        let has_coop_matrix =
-            has_coop_matrix && has_f16 && std::env::var("INFR_NO_COOPMAT").is_err();
+        let coopmat_f16 = coopmat_f16
+            .filter(|_| has_f16 && std::env::var("INFR_NO_COOPMAT").is_err())
+            .filter(|&s| {
+                // 8x8x16 additionally needs a pinnable subgroup size 16: the `_cm8` builds run
+                // 128 threads = 8 warps × 16 lanes (XMX/DPAS is SIMD16-native) and reuse the
+                // kernel's 8-warp index math, so a device that can't pin 16 can't run them.
+                // (Checked here so the coopmat ext is never enabled for a shape we then refuse.
+                // The physical-device subgroup range is queried again for `caps` below; this
+                // early copy exists because that query currently runs after device creation.)
+                if s != infr_core::COOPMAT_TILE_8 {
+                    return true;
+                }
+                let mut sgp = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
+                let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sgp);
+                unsafe { instance.get_physical_device_properties2(physical_device, &mut p2) };
+                has_sgsize && sgp.min_subgroup_size <= 16 && 16 <= sgp.max_subgroup_size
+            });
+        // `has_coop_matrix` = ANY usable f16 coopmat shape — drives the ext enable + feature
+        // chain below. On a 16x16x16 device this is exactly the old boolean; on an 8x8x16-only
+        // device it is false unless INFR_CM_8X8=1 selected the 8x8x16 shape above (default OFF:
+        // the ext is then NOT enabled, byte-identical to the pre-shape-table behavior there).
+        let has_coop_matrix = coopmat_f16.is_some();
         // f8 coopmat is a coopmat sub-tier, so dropping coopmat drops it too.
-        let has_f8_coopmat = has_f8_coopmat && has_coop_matrix;
+        let coopmat_f8 = coopmat_f8.filter(|_| has_coop_matrix);
         // bf16 coopmat: same coopmat sub-tier dependency (rides the coopmat device-feature enable).
-        let has_bf16_coopmat = has_bf16_coopmat && has_coop_matrix;
+        let coopmat_bf16 = coopmat_bf16.filter(|_| has_coop_matrix);
         // i8 coopmat rides the SAME device feature enable (coopmat_ci is only chained into
         // device_ci below when `has_coop_matrix`) — without it the extension isn't enabled on the
         // logical device even if int8 configs were enumerated, so this is a real dependency, not
-        // just symmetry with f8_coopmat above. INFR_NO_COOPMAT/INFR_NO_F16 drop it too.
-        let has_i8_coopmat = has_i8_coopmat && has_coop_matrix;
+        // just symmetry with coopmat_f8 above. INFR_NO_COOPMAT/INFR_NO_F16 drop it too.
+        let coopmat_i8 = coopmat_i8.filter(|_| has_coop_matrix);
         let has_i8_dot = has_i8_dot && std::env::var("INFR_NO_I8DOT").is_err();
+        // INFR_CM_8X8=1 outcome notice (once, at device init): the tester A/B knob must be loud
+        // about whether it actually engaged — on RADV (16x16x16 enumerated) or any device without
+        // an 8x8x16 f16 config it changes NOTHING, and the kernel set stays identical.
+        if cm8_env {
+            match coopmat_f16 {
+                Some(infr_core::COOPMAT_TILE_8) => eprintln!(
+                    "[infr] INFR_CM_8X8=1: 8x8x16 f16 coopmat selected — native_gemm_warp _cm8 \
+                     prefill tier live (other coopmat families stay on their non-coopmat \
+                     fallbacks)"
+                ),
+                Some(_) => eprintln!(
+                    "[infr] INFR_CM_8X8=1 has no effect: device provides the default 16x16x16 \
+                     f16 coopmat tile — kernel set unchanged"
+                ),
+                None => eprintln!(
+                    "[infr] INFR_CM_8X8=1 has no effect: device enumerates no usable 8x8x16 f16 \
+                     coopmat config (or coopmat is disabled) — kernel set unchanged"
+                ),
+            }
+        }
+        // Extend the INFR_DEBUG_COOPMAT dump with the CHOSEN shape per component type (the raw
+        // enumeration is printed above, before selection).
+        if std::env::var("INFR_DEBUG_COOPMAT").is_ok() {
+            eprintln!(
+                "[infr] coopmat chosen shapes (M,N,K): f16={coopmat_f16:?} bf16={coopmat_bf16:?} \
+                 f8={coopmat_f8:?} i8={coopmat_i8:?}"
+            );
+        }
 
         // ── build extension name list (only available ones) ────────────────────
         let mut ext_ptrs: Vec<*const i8> = Vec::new();
@@ -898,14 +962,14 @@ impl VulkanBackend {
         let caps = Capabilities {
             name: device_name,
             f16: has_f16,
-            f16_coopmat: has_coop_matrix,
+            coopmat_f16,
             f8: has_f8_ext,
-            f8_coopmat: has_f8_coopmat,
+            coopmat_f8,
             i8: has_int8,
             i8_dot: has_i8_dot,
-            i8_coopmat: has_i8_coopmat,
+            coopmat_i8,
             bf16: has_bf16_ext,
-            bf16_coopmat: has_bf16_coopmat,
+            coopmat_bf16,
             subgroup_min,
             subgroup_max,
             sg_pref,
@@ -945,14 +1009,14 @@ impl VulkanBackend {
              subgroup:{}-{} sgp:{} shared:{}KB",
             caps.name,
             yn(caps.f16),
-            yn(caps.f16_coopmat),
+            yn(caps.f16_coopmat()),
             yn(caps.bf16),
-            yn(caps.bf16_coopmat),
+            yn(caps.bf16_coopmat()),
             yn(caps.f8),
-            yn(caps.f8_coopmat),
+            yn(caps.f8_coopmat()),
             yn(caps.i8),
             yn(caps.i8_dot),
-            yn(caps.i8_coopmat),
+            yn(caps.i8_coopmat()),
             caps.subgroup_min,
             caps.subgroup_max,
             caps.sg_pref,
@@ -1731,12 +1795,67 @@ impl Backend for VulkanBackend {
     }
 }
 
+/// Pick ONE cooperative-matrix (M,N,K) tile for a component type from the device's enumerated
+/// shape list, by preference order:
+///
+/// 1. [`infr_core::COOPMAT_TILE_16`] (16x16x16) — the shape EVERY production coopmat shader is
+///    built for; a device that enumerates it (RADV/RDNA3+, NVIDIA, and reportedly some
+///    Battlemage drivers) always gets it, regardless of `allow_8x8x16` — the env knob must never
+///    move a device off the proven kernel set.
+/// 2. [`infr_core::COOPMAT_TILE_8`] (8x8x16, Intel Arc/ANV XMX) — only when `allow_8x8x16`
+///    (the `INFR_CM_8X8=1` opt-in; only `native_gemm_warp`'s `_cm8` builds exist at this shape,
+///    and Alchemist coopmat is a llama.cpp-documented regression, so it stays default-OFF).
+/// 3. `None` — no shape any kernel here is built for; the non-coopmat tiers take over.
+///
+/// Pure function of the enumerated list + the opt-in flag (no env reads) so the selection is
+/// unit-testable with synthetic property lists.
+fn select_coopmat_shape(
+    shapes: impl IntoIterator<Item = (u32, u32, u32)>,
+    allow_8x8x16: bool,
+) -> Option<(u32, u32, u32)> {
+    let mut has_8x8x16 = false;
+    for s in shapes {
+        if s == infr_core::COOPMAT_TILE_16 {
+            return Some(infr_core::COOPMAT_TILE_16);
+        }
+        has_8x8x16 |= s == infr_core::COOPMAT_TILE_8;
+    }
+    (allow_8x8x16 && has_8x8x16).then_some(infr_core::COOPMAT_TILE_8)
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use infr_core::Backend;
+
+    /// Shape selection over synthetic property lists (no GPU needed) — the caps-table core of the
+    /// shape-aware coopmat gate. RADV-like (16x16x16 present, plus the other shapes RADV
+    /// enumerates) must pick 16x16x16 regardless of the 8x8 opt-in; ANV-like (8x8x16 only) must
+    /// stay dark by default and pick 8x8x16 only under the opt-in; empty (no coopmat) is None.
+    #[test]
+    fn coopmat_shape_selection() {
+        let t16 = infr_core::COOPMAT_TILE_16;
+        let t8 = infr_core::COOPMAT_TILE_8;
+        // RADV-like: 16x16x16 f16 (RDNA3 WMMA). Opt-in must NOT move it off 16x16x16.
+        let radv = [t16];
+        assert_eq!(select_coopmat_shape(radv, false), Some(t16));
+        assert_eq!(select_coopmat_shape(radv, true), Some(t16));
+        // Device enumerating BOTH shapes: 16x16x16 preferred, opt-in irrelevant.
+        let both = [t8, t16];
+        assert_eq!(select_coopmat_shape(both, false), Some(t16));
+        assert_eq!(select_coopmat_shape(both, true), Some(t16));
+        // ANV-like (Intel Arc A770): 8x8x16 only — default OFF, opt-in selects it.
+        let anv = [t8];
+        assert_eq!(select_coopmat_shape(anv, false), None);
+        assert_eq!(select_coopmat_shape(anv, true), Some(t8));
+        // No configs (ext absent / feature off): None either way.
+        assert_eq!(select_coopmat_shape([], false), None);
+        assert_eq!(select_coopmat_shape([], true), None);
+        // A shape no kernel is built for (e.g. a hypothetical 32x32x16): None even with opt-in.
+        assert_eq!(select_coopmat_shape([(32, 32, 16)], true), None);
+    }
 
     /// Weight arena: reserve a small arena, allocate several `Weights` buffers from it (forcing both
     /// the reserved block and at least one overflow block), and verify each round-trips bytes through

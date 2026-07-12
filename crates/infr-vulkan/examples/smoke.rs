@@ -33,7 +33,7 @@ fn main() -> infr_core::Result<()> {
     println!(
         "    f16={} coop_matrix={} max_buf={}MiB",
         caps.f16,
-        caps.f16_coopmat,
+        caps.f16_coopmat(),
         caps.max_buffer_bytes / (1024 * 1024)
     );
     println!();

@@ -298,16 +298,16 @@ impl Backend for CpuBackend {
             name: "cpu-reference".into(),
             // The scalar interpreter has no GPU-kernel tier choice; these per-type feature flags
             // don't gate any CPU op handler (they select Vulkan/Metal shaders). f16/i8 math is
-            // available in the interpreter; the matrix/dot-primitive flags are N-A → off.
+            // available in the interpreter; the matrix/dot-primitive shapes are N-A → None/off.
             f16: true,
-            f16_coopmat: false,
+            coopmat_f16: None,
             f8: false,
-            f8_coopmat: false,
+            coopmat_f8: None,
             i8: true,
             i8_dot: false,
-            i8_coopmat: false,
+            coopmat_i8: None,
             bf16: false,
-            bf16_coopmat: false,
+            coopmat_bf16: None,
             subgroup_min: 0,
             subgroup_max: 0,
             sg_pref: 0, // no subgroup pinning on the scalar interpreter

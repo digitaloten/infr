@@ -405,7 +405,9 @@ dequant).
 > Numbers are a snapshot and move with each perf slice; regenerate on your own
 > hardware with `infr compare --sweep <model...>`. Results on other GPUs
 > (NVIDIA, Intel Arc) and Apple Metal are wanted — please open an issue with
-> your `infr bench` / `infr compare` output.
+> your `infr bench` / `infr compare` output. Intel Arc testers: include one run
+> with `INFR_DEBUG_COOPMAT=1` (the enumerated/chosen coopmat shapes), then A/B
+> `INFR_CM_8X8=1` (opt-in 8x8x16 XMX prefill GEMM) against the default.
 
 ## Scope
 

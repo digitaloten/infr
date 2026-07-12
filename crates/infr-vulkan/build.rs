@@ -2045,6 +2045,53 @@ fn main() {
             "native_gemm_warp_q8_0_n128_ag_bm16",
             &["-DFMT_Q8_0", "-DNARROW_N", "-DA_GLOBAL", "-DBM16"],
         ),
+        // 8x8x16-fragment `_cm8` builds — Intel Arc/ANV XMX, which enumerates f16 coopmat ONLY at
+        // M=8,N=8,K=16 (no 16x16x16 config; all default coopmat kernels stay dark there). Runtime
+        // selection requires the device to enumerate the 8x8x16 f16 shape AND `INFR_CM_8X8=1`
+        // (default OFF: Alchemist coopmat is a llama.cpp-documented regression; the nc_mmq/nc_fma
+        // tiers stay the Arc default) — see lib.rs `select_coopmat_shape` and the adapter's
+        // `cm8_ok`. Tile: NARROW_N+BM32 (BM=32, BN=128, BK=64) — the 8x8 fragments double
+        // CMS_M/CMS_N (2x4 = 8 frags/warp), so the wide 64x256 tile's 4x8 = 32 acc frags would
+        // blow the per-lane register budget; the small tile keeps 8 frags = the default build's
+        // register footprint. -DWG_THREADS=128: pinned subgroup 16 (XMX/DPAS is SIMD16-native)
+        // x the warp math's required 8 subgroups. Hot k-quants + Q8_0 only (the field testers'
+        // model set); other formats keep the nc tier — extend after first A/B reports.
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q4k_cm8",
+            &[
+                "-DFMT_Q4K",
+                "-DNARROW_N",
+                "-DBM32",
+                "-DCM_M=8",
+                "-DCM_N=8",
+                "-DWG_THREADS=128",
+            ],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q6k_cm8",
+            &[
+                "-DFMT_Q6K",
+                "-DNARROW_N",
+                "-DBM32",
+                "-DCM_M=8",
+                "-DCM_N=8",
+                "-DWG_THREADS=128",
+            ],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q8_0_cm8",
+            &[
+                "-DFMT_Q8_0",
+                "-DNARROW_N",
+                "-DBM32",
+                "-DCM_M=8",
+                "-DCM_N=8",
+                "-DWG_THREADS=128",
+            ],
+        ),
         ("splitk_reduce", "splitk_reduce", &[]),
         ("native_gemm", "native_gemm_q8_0", &["-DFMT_Q8_0"]),
         ("native_gemm", "native_gemm_bf16", &["-DFMT_BF16"]),

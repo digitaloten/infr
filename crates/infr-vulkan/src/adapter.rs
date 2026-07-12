@@ -972,14 +972,29 @@ fn lower_op(
             // `rows=m`; they dispatch `rows*out_f` (or row-tiled) workgroups with no upper bound
             // on `rows`, so they are a drop-in, just without any weight-reuse-across-rows win).
             // Bit-identical to before when caps are all true.
-            let is_gemm = gemm_ok
-                && be_.caps().f16_coopmat
-                && (native_dense_supported(dt) || matches!(dt, infr_core::DType::F16));
+            // ── 8x8x16 coopmat prefill GEMM tier (Intel Arc/ANV XMX; `caps.f16_coopmat_8x8()` is
+            // Some only when the device enumerates the 8x8x16 f16 shape AND `INFR_CM_8X8=1` —
+            // NEVER on RADV, which enumerates 16x16x16 and keeps the full tier below untouched).
+            // Only `native_gemm_warp`'s `_cm8` builds exist at this shape: one fixed
+            // NARROW_N+BM32 tile (BN=128, BK=64 → n%128, k%64) over the hot k-quants + Q8_0.
+            // Anything it can't cover (dtype without a `_cm8` build, non-dividing shape) keeps
+            // falling to the nc_mmq/nc_fma tier — the Arc default this knob A/Bs against.
+            let cm8_ok = gemm_ok
+                && be_.caps().f16_coopmat_8x8()
+                && out_f % 128 == 0
+                && in_f % 64 == 0
+                && crate::gemm::native_gemm_warp_cm8_build_spv(dt).is_some();
+            let is_gemm = cm8_ok
+                || (gemm_ok
+                    && be_.caps().f16_coopmat()
+                    && (native_dense_supported(dt) || matches!(dt, infr_core::DType::F16)));
             // ── NON-COOPMAT prefill GEMM tier (never taken when `caps.f16_coopmat` — zero effect
             // on coopmat-capable defaults). The Intel Arc A770 (Mesa ANV) enumerates f16 coopmat
-            // only at M=8,N=8,K=16 — `caps.f16_coopmat` is false there (see lib.rs) — but HAS
+            // only at M=8,N=8,K=16 — `caps.f16_coopmat()` is false there (see lib.rs) — but HAS
             // packed int8 dot, and prefill GEMMs previously fell all the way to the per-row
             // scalar GEMVs (the field-measured 10-30x prefill gap; decode was already at parity).
+            // This tier remains the Arc DEFAULT; the opt-in `cm8_ok` XMX tier above takes only
+            // the Linears it covers, and only under INFR_CM_8X8=1.
             // Two arms, same padded-dst convention as `is_gemm`:
             //  • `nc_mmq`: weight dtype in `infr_core::tensor::MOE_MMQ_DTYPES` + `caps.i8_dot` →
             //    the DENSE dp4a mmq GEMM family (`matmul_mmq` — the same shader code the batched
@@ -992,7 +1007,7 @@ fn lower_op(
             // knob — drops the device feature itself, a faithful simulation). INFR_NO_MMQ_FALLBACK=1
             // disables the WHOLE tier (both arms) for A/B against the scalar floor.
             let nc_tier = gemm_ok
-                && !be_.caps().f16_coopmat
+                && !be_.caps().f16_coopmat()
                 && std::env::var("INFR_NO_MMQ_FALLBACK").is_err();
             let nc_mmq = nc_tier && be_.caps().i8_dot && infr_core::tensor::moe_mmq_ok(dt);
             let nc_fma = nc_tier && !nc_mmq && crate::gemm::native_gemm_fma_build_spv(dt).is_some();
@@ -1052,11 +1067,11 @@ fn lower_op(
                 let f8_wide = out_f % 256 == 0 && in_f % 32 == 0;
                 let f8_narrow = !f8_wide && out_f % 128 == 0 && in_f % 64 == 0;
                 let f8cm_ok = matches!(dt, infr_core::DType::Q8_0)
-                    && be_.caps().f8_coopmat
+                    && be_.caps().f8_coopmat()
                     && (f8_wide || f8_narrow)
                     && std::env::var("INFR_F8_COOPMAT").is_ok();
                 let i8cm_ok = matches!(dt, infr_core::DType::Q8_0)
-                    && be_.caps().i8_coopmat
+                    && be_.caps().i8_coopmat()
                     && std::env::var("INFR_I8_COOPMAT").is_ok();
                 // NATIVE bf16 cooperative-matrix (WMMA) prefill GEMM — the `-DBF16CM` build of the
                 // SAME production kernel (crates/infr-vulkan/shaders/native_gemm_warp.comp) that
@@ -1075,10 +1090,16 @@ fn lower_op(
                 let bf16cm_wide = out_f % 256 == 0 && in_f % 32 == 0;
                 let bf16cm_narrow = !bf16cm_wide && out_f % 128 == 0 && in_f % 64 == 0;
                 let bf16cm_ok = matches!(dt, infr_core::DType::Bf16)
-                    && be_.caps().bf16_coopmat
+                    && be_.caps().bf16_coopmat()
                     && (bf16cm_wide || bf16cm_narrow)
                     && std::env::var("INFR_BF16_COOPMAT").is_ok();
-                if f8cm_ok {
+                if cm8_ok {
+                    // 8x8x16 `_cm8` warptile (see the `cm8_ok` doc above). First in the chain:
+                    // when it's true, `caps.f16_coopmat()` is false (the shapes are mutually
+                    // exclusive), so every 16x16x16 branch below would mis-dispatch — none of
+                    // their SPIR-V exists at the device's fragment shape.
+                    rec.matmul_native_cm8(dt, xb, w, w_off, out, m, in_f, out_f);
+                } else if f8cm_ok {
                     // E4M3's range is tiny (max normal 448) — unscaled f32 activations overflow to
                     // inf/NaN on cast, which is what produced garbage output on the first RDNA4
                     // run. `quant_f8_row` pre-scales activations into E4M3's range (one amax/scale
@@ -2133,7 +2154,7 @@ fn lower_op(
                     && matches!(mask, AttnMask::Causal)
                     && (*scale - 1.0 / (hd as f32).sqrt()).abs() < 1e-6
                     && !(k_q8_eff || v_q8_eff)
-                    && be_.caps().f16_coopmat
+                    && be_.caps().f16_coopmat()
                     && matches!(graph.tensors[q.0 as usize].kind, TensorKind::Internal)
                     && matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal);
                 // Prefill at hd≠128 (qwen35/gemma hd=256): the non-FA coopmat pipeline
@@ -2162,7 +2183,7 @@ fn lower_op(
                     && hd % 64 == 0
                     && hd <= 512
                     && !(k_q8_eff || v_q8_eff)
-                    && be_.caps().f16_coopmat
+                    && be_.caps().f16_coopmat()
                     && matches!(graph.tensors[q.0 as usize].kind, TensorKind::Internal)
                     && matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal);
                 // NON-COOPMAT flash tier (`attn_nc_fa.comp`, the attention companion of the
@@ -2180,7 +2201,7 @@ fn lower_op(
                 // against the scalar/split floor).
                 let nc_fa_ok = !flash_ok
                     && !nonfa_ok
-                    && !be_.caps().f16_coopmat
+                    && !be_.caps().f16_coopmat()
                     && (rows >= 64 || (rows >= flash_min_rows && kv_len >= 8192))
                     && canvas_lo.is_none()
                     && hd % 4 == 0
@@ -2594,7 +2615,7 @@ fn lower_op(
             // (still fast, just not split-prep) `deltanet_chunked` kernel below instead of the
             // sequential one — chunked math doesn't require coopmat, only this particular prep
             // kernel's implementation does.
-            if chunked && be_.caps().f16_coopmat && std::env::var("INFR_NO_DN_SPLIT").is_err() {
+            if chunked && be_.caps().f16_coopmat() && std::env::var("INFR_NO_DN_SPLIT").is_err() {
                 let nchunk = rows_.div_ceil(32);
                 // alloc_uninit: every slot the scan reads is written by prep/gates first.
                 let kn =

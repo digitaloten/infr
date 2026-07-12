@@ -28,9 +28,30 @@
 #define CMTYPE float16_t
 #endif
 
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+// Cooperative-matrix FRAGMENT shape (the coopmat<> template dims), default 16x16x16 — the shape
+// every desktop RADV/NVIDIA device enumerates. -DCM_M=8 -DCM_N=8 (the `_cm8` builds, selected at
+// runtime only when the device enumerates 8x8x16 f16 AND INFR_CM_8X8=1 — Intel Arc/ANV XMX, which
+// enumerates NO 16x16x16 f16 config) shrinks the A/B/acc fragments to 8x8x16; K stays 16 on both.
+// Everything downstream is derived: CMS_M/CMS_N (fragments per warp) = WM/CM_M and WN/CM_N, the
+// frag-granular LDS offsets/loop strides use CM_M/CM_N/CM_K, and the warptile constants
+// (BM/BN/BK/WM/WN) are untouched — so the default build's preprocessed source is byte-identical
+// to the pre-parameterization kernel. -DWG_THREADS=128 accompanies the _cm8 builds: they pin
+// subgroup size 16 (XMX/DPAS is SIMD16-native; the default builds pin 32), and the warp index
+// math requires exactly WARPS_M*WARPS_N == 8 subgroups, so threads = 8*16 = 128.
+#ifndef CM_M
+#define CM_M 16
+#endif
+#ifndef CM_N
+#define CM_N 16
+#endif
+#define CM_K 16
+#ifndef WG_THREADS
+#define WG_THREADS 256
+#endif
 
-const uint THREADS = 256u;
+layout(local_size_x = WG_THREADS, local_size_y = 1, local_size_z = 1) in;
+
+const uint THREADS = WG_THREADS;
 // -DNARROW_N halves the column tile (BN 256→128) and doubles the k-stage (BK 32→64): the SAME
 // 256 dequant calls per stage (128 cols × 2 k-blocks), the same ~25 KB LDS, but 2× the
 // workgroups — narrow-n GEMMs (n=1024/2048: the qkv/o/down shapes of small-ne models) underfill
@@ -87,10 +108,10 @@ const uint WN = 32u;
 const uint WN = 64u;
 #endif
 #endif
-const uint WARPS_M = BM / WM; // 2 (1 for BM16)
-const uint WARPS_N = BN / WN; // 4 → 8 warps / 256 threads (8 for BM16, same product)
-const uint CMS_M = WM / 16u;  // 2 (1 for BM16/BM32)
-const uint CMS_N = WN / 16u;  // 4 (1 narrow / 2 wide for BM16)
+const uint WARPS_M = BM / WM;   // 2 (1 for BM16)
+const uint WARPS_N = BN / WN;   // 4 → 8 warps / 256 threads (8 for BM16, same product)
+const uint CMS_M = WM / CM_M;   // 2 (1 for BM16/BM32; doubled under -DCM_M=8)
+const uint CMS_N = WN / CM_N;   // 4 (1 narrow / 2 wide for BM16; doubled under -DCM_N=8)
 const uint SAK = BK + 8u;
 const uint SBK = BK + 8u;     // Bs is [BN][BK]
 
@@ -142,10 +163,10 @@ void main() {
     uint warp_c = warp / WARPS_M;
     uint li = gl_LocalInvocationIndex;
 
-    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[CMS_M][CMS_N];
+    coopmat<float, gl_ScopeSubgroup, CM_M, CM_N, gl_MatrixUseAccumulator> acc[CMS_M][CMS_N];
     [[unroll]] for (uint i = 0u; i < CMS_M; i++) {
         [[unroll]] for (uint j = 0u; j < CMS_N; j++) {
-            acc[i][j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+            acc[i][j] = coopmat<float, gl_ScopeSubgroup, CM_M, CM_N, gl_MatrixUseAccumulator>(0.0);
         }
     }
 
@@ -174,20 +195,20 @@ void main() {
             }
         }
         barrier();
-        [[unroll]] for (uint kf = 0u; kf < BK; kf += 16u) {
-            coopmat<CMTYPE, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> af[CMS_M];
+        [[unroll]] for (uint kf = 0u; kf < BK; kf += CM_K) {
+            coopmat<CMTYPE, gl_ScopeSubgroup, CM_M, CM_K, gl_MatrixUseA> af[CMS_M];
             [[unroll]] for (uint i = 0u; i < CMS_M; i++) {
 #ifdef A_GLOBAL
-                coopMatLoad(af[i], a, (wgRow + warp_r * WM + i * 16u) * pc.k + k0 + kf, pc.k,
+                coopMatLoad(af[i], a, (wgRow + warp_r * WM + i * CM_M) * pc.k + k0 + kf, pc.k,
                             gl_CooperativeMatrixLayoutRowMajor);
 #else
-                coopMatLoad(af[i], As, (warp_r * WM + i * 16u) * SAK + kf, SAK,
+                coopMatLoad(af[i], As, (warp_r * WM + i * CM_M) * SAK + kf, SAK,
                             gl_CooperativeMatrixLayoutRowMajor);
 #endif
             }
             [[unroll]] for (uint j = 0u; j < CMS_N; j++) {
-                coopmat<CMTYPE, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bf;
-                coopMatLoad(bf, Bs, (warp_c * WN + j * 16u) * SBK + kf, SBK,
+                coopmat<CMTYPE, gl_ScopeSubgroup, CM_K, CM_N, gl_MatrixUseB> bf;
+                coopMatLoad(bf, Bs, (warp_c * WN + j * CM_N) * SBK + kf, SBK,
                             gl_CooperativeMatrixLayoutColumnMajor);
                 [[unroll]] for (uint i = 0u; i < CMS_M; i++) {
                     acc[i][j] = coopMatMulAdd(af[i], bf, acc[i][j]);
@@ -199,8 +220,8 @@ void main() {
 
     [[unroll]] for (uint i = 0u; i < CMS_M; i++) {
         [[unroll]] for (uint j = 0u; j < CMS_N; j++) {
-            uint cr = wgRow + warp_r * WM + i * 16u;
-            uint cc = wgCol + warp_c * WN + j * 16u;
+            uint cr = wgRow + warp_r * WM + i * CM_M;
+            uint cc = wgCol + warp_c * WN + j * CM_N;
 #ifdef SPLIT_K
             coopMatStore(acc[i][j], c, split * pc.mpad * pc.n + cr * pc.n + cc, pc.n,
                          gl_CooperativeMatrixLayoutRowMajor);
