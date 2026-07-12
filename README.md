@@ -302,21 +302,44 @@ this small-model row has the widest spread of any in the table. Treat ±5% on
 `pp512` as noise everywhere; this row's spread is larger than that.
 
 ² The MTP repos ship a `mtp-*.gguf` draft head. Their `mtp128`
-speculative-decode ratio is **0.75–0.78× (4B) / 0.60–0.67× (9B)** — infr's one
+speculative-decode ratio is **0.76–0.78× (4B) / 0.61–0.70× (9B)** — infr's one
 consistent loss, see the prose below. Plain (non-MTP) metrics for the same
-weights are the rows shown. These four rows' `tg64@d4096` cells were a GPU
-device-lost in the raw sweep and are re-measured post-`8513358`: 35821b6's
-capacity gate on the `nonfa` coopmat prefill tier (which reads K in whole
-256-row tiles, so it touches `ceil(kv_len/256)*256` rows) had no catcher for a
-**non-SWA** model — `split_ok` only covered the SWA `ring_past` case — so the op
-fell through to the scalar `attention_kv` at 3591 rows × 3591 kv and hung the
-GPU. MTP's un-chunked whole-prompt verify is the only shape that reliably lands
-`kv_len` within one tile-pad of the cache's row capacity.
+weights are the rows shown.
+
+An optimization pass (`a9b5cae`) removed the wasted vocab-wide `lm_head` compute
+on the reprime re-sync pass (it computed up to `MTP_REPRIME_MAX_M`−1 rows and
+discarded all but the last); token-identity is preserved, but the gain does not
+survive independent re-measurement against a fresh llama.cpp baseline, so the
+ratios above are unchanged. **The verify pass (57–60% of MTP wall time) is still
+the whole gap**, and the reason it is stuck is worth recording: the obvious
+lever — an int8-quantized-activation `mrow` GEMV tier for the small-m verify
+batch — was built for **Q5_K** and **broke token-identity**, because infr's
+_plain_ decode still runs Q5_K through an f32-exact dequant GEMV. That asymmetry
+between the spec and non-spec streams flips the occasional greedy token.
+Q4_K/Q6_K don't have the problem: both streams already use int8 there. The fix
+is therefore not an MTP fix at all — it is to make the int8-activation tier
+**symmetric** across plain decode and verify (footnote ³), which is also what
+closes the mid/large decode gap.
+
+These four rows' `tg64@d4096` cells were a GPU device-lost in the raw sweep and
+are re-measured post-`8513358`: 35821b6's capacity gate on the `nonfa` coopmat
+prefill tier (which reads K in whole 256-row tiles, so it touches
+`ceil(kv_len/256)*256` rows) had no catcher for a **non-SWA** model — `split_ok`
+only covered the SWA `ring_past` case — so the op fell through to the scalar
+`attention_kv` at 3591 rows × 3591 kv and hung the GPU. MTP's un-chunked
+whole-prompt verify is the only shape that reliably lands `kv_len` within one
+tile-pad of the cache's row capacity.
 
 ³ The Qwen3-14B **Q2_K** decode gap (0.72–0.74×) is llama.cpp's dp4a **mmvq**
-int8-activation tier — a precision trade infr deliberately doesn't take by
-default (an opt-in tier is possible; `INFR_MMV_MW=1` already buys +20% on this
-row).
+int8-activation tier, which infr does not take by default. Note this is
+llama.cpp's **default** on this hardware, not an exotic mode:
+`ggml_vk_should_use_mmvq` returns true for every quant type on AMD at
+`k >= 2048`, carving out only Q6_K (2-byte alignment makes it a loss off Intel)
+and Q8_0 (GCN only) — so Q2_K/Q3_K/Q4_K/Q5_K all decode with Q8_1-quantized
+activations and an integer dot. `INFR_MMV_MW=1` already buys +20% on this row.
+Matching them is parity, not a regression in output quality, and doing it
+**symmetrically** (plain decode and MTP verify on the same tier) is the single
+lever behind both this row and footnote ²'s MTP gap.
 
 ⁴ Gemma-4-31B (21.9 GiB weights on the 24 GB card) runs **fully resident,
 including at depth**, after two placement slices: try-resident-first dense
