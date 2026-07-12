@@ -323,6 +323,14 @@ pub(crate) fn generate_dense_backend(
             Some("f16") | Some("F16") => DType::F16,
             // unset/unknown → legacy INFR_KV_Q8 alias (both sides q8) or f16.
             _ if std::env::var("INFR_KV_Q8").is_ok() && kv_align_ok && kv_q8_backend => DType::Q8_0,
+            // Placement-pinned auto-q8 (see `crate::seam::PINNED_KV_Q8`): the Vulkan placement
+            // chose a q8 cache to stay resident / keep the default ctx. Vulkan-gated — the pin
+            // is a Vulkan placement decision and must not leak into a CPU/Metal session (e.g.
+            // the CPU oracle of a parity test) running in the same process. The pin is only ever
+            // set when `kv_env_unset()` and `kv_q8_layout_ok` held, so the alignment/backend
+            // gates here re-check what already passed; the env being unset means no earlier arm
+            // can shadow this one.
+            _ if crate::seam::kv_auto_q8() && be.name() == "vulkan" && kv_align_ok => DType::Q8_0,
             _ => DType::F16,
         }
     };

@@ -237,6 +237,49 @@ pub(crate) fn ubatch_rows() -> usize {
 /// (placement runs first in the same call), never changed after.
 static PINNED_UBATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
+/// Placement-pinned auto-q8 KV: set ONCE when the placement ladder chooses a Q8_0 KV cache to
+/// keep a session RESIDENT (dense try-resident tier in [`vulkan_moe_binder`]) or to avoid
+/// shrinking a DEFAULT context (`SeamModel::clamp_default_ctx`) — the "q8 KV" rung between the
+/// SWA ring and ctx-clamp/weight-streaming rungs of the VRAM placement ladder. Read by the
+/// runner's per-side KV-format selection (and by every KV-footprint estimate) ONLY when the
+/// user set none of INFR_KV_TYPE_K / INFR_KV_TYPE_V / INFR_KV_Q8 — an explicit setting always
+/// wins, in both directions (an explicit `f16` forces f16 and the placement falls through to
+/// the next rung). Policy, deliberately conservative:
+///   - BOTH sides go q8_0 (the existing coherence-tested replayable config — coupled Q8 keeps
+///     record-once decode replay; llama.cpp guidance says keep K >= V precision, and q8/q8
+///     satisfies it symmetrically);
+///   - never auto-picks anything BELOW q8_0 (the low-bit/turbo formats trade real quality and
+///     stay explicit opt-ins).
+///
+/// Like [`PINNED_UBATCH`], set before the session's first KV allocation and never changed —
+/// warm calls and rebuilt graphs must agree with the buffers they were sized with.
+static PINNED_KV_Q8: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// Whether the placement ladder pinned auto-q8 KV for this process (see [`PINNED_KV_Q8`]).
+pub(crate) fn kv_auto_q8() -> bool {
+    PINNED_KV_Q8.get().is_some()
+}
+
+/// Pin auto-q8 KV from outside this module (the default-ctx clamp path in `model.rs`); the
+/// binder's own rung sets [`PINNED_KV_Q8`] directly. Idempotent (OnceLock).
+pub(crate) fn pin_kv_auto_q8() {
+    let _ = PINNED_KV_Q8.set(());
+}
+
+/// True when the user expressed NO explicit KV-format choice — the only state auto-q8 may fill.
+pub(crate) fn kv_env_unset() -> bool {
+    std::env::var("INFR_KV_TYPE_K").is_err()
+        && std::env::var("INFR_KV_TYPE_V").is_err()
+        && std::env::var("INFR_KV_Q8").is_err()
+}
+
+/// Layout gate for a Q8_0 KV cache — every layer's KV row must be whole 32-elem blocks (the
+/// same alignment the runner's own `parse_kv_fmt` gate checks; keeping them identical means a
+/// pinned auto-q8 is never silently gated back to f16 with an under-sized placement estimate).
+pub(crate) fn kv_q8_layout_ok(cfg: &Config) -> bool {
+    (0..cfg.n_layer).all(|l| (cfg.layer_n_kv(l) * cfg.layer_head_dim(l)).is_multiple_of(32))
+}
+
 /// [`kv_rows`] at an EXPLICIT chunk height (the try-resident sweep prices candidate heights
 /// before pinning one; everyone else goes through `kv_rows`/`ubatch_rows`).
 pub(crate) fn kv_rows_at(
@@ -655,12 +698,28 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // lets a mostly-SWA model (gemma-4-31B: 50/60 layers SWA) price its KV small enough to
         // take the try-resident tier at real contexts instead of streaming. +64 rows/layer slop.
         let ring = kv_ring_wanted(cfg);
-        let kv_bytes: u64 = (0..cfg.n_layer)
-            .map(|l| {
-                (cfg.layer_n_kv(l) * cfg.layer_head_dim(l) * 2 * 2) as u64
-                    * (kv_rows(cfg, l, want_ctx, ring) as u64 + 64)
-            })
-            .sum::<u64>();
+        // KV bytes at an EXPLICIT chunk height and side format — the ONE pricing helper every
+        // decision below shares (try-resident, the chunk sweeps, the auto-q8 rung, the streaming
+        // budget), so they all price exactly the allocation the runner will make. `q8` prices
+        // BOTH sides Q8_0 (34 bytes / 32 elems, mirroring `kv_fmt_bytes`); false = f16 (2 B/elem).
+        let kv_total_at = |ubatch: usize, q8: bool| -> u64 {
+            (0..cfg.n_layer)
+                .map(|l| {
+                    let elems = (cfg.layer_n_kv(l) * cfg.layer_head_dim(l)) as u64
+                        * (kv_rows_at(cfg, l, want_ctx, ring, ubatch) as u64 + 64);
+                    if q8 {
+                        2 * (elems / 32 * 34).next_multiple_of(4)
+                    } else {
+                        2 * 2 * elems
+                    }
+                })
+                .sum()
+        };
+        // Does weights + KV + the honest activation reserve fit live VRAM at this (chunk, fmt)?
+        let fits = |ubatch: usize, q8: bool| {
+            fp.total() + kv_total_at(ubatch, q8) + dense_act_reserve_at(cfg, want_ctx, ubatch)
+                <= vram.available
+        };
         // Try-resident-first: a dense model goes FULLY RESIDENT (the exact pre-streaming fast
         // path) whenever weights + this session's KV + an HONEST dense activation estimate fit
         // the live free VRAM; only a genuine miss streams. The MoE tier's 2 GiB ACT_HEADROOM is
@@ -669,8 +728,10 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // ~3 t/s streamed at the PCIe ceiling). If residency is chosen but a later activation
         // alloc still misses (fragmentation, another process grabbing VRAM), the alloc-time VRAM
         // guard fails that request cleanly — INFR_CACHE=<size> is the escape hatch that forces
-        // streaming.
-        let act_reserve = dense_act_reserve(cfg, want_ctx);
+        // streaming. `kv_auto_q8()` may already be pinned by the default-ctx clamp path (see
+        // `SeamModel::clamp_default_ctx`) — then every check here prices the q8 cache the runner
+        // will actually allocate.
+        //
         // Residency sweep: when the FULL-chunk reserve is what tips a big model into streaming,
         // try smaller prefill chunks — a smaller chunk shrinks BOTH the activation reserve
         // (whole-chunk logits/gate_up scratch scale with rows) and the SWA ring rows
@@ -678,29 +739,16 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // the PCIe ceiling (gemma-4-31B @ d4096: 27.6 vs 2.9 t/s), so trading prefill chunk
         // height for residency is strictly the right call. Pinned process-wide (PINNED_UBATCH)
         // so the prefill loop and the runner's ring sizing use exactly the priced height; an
-        // explicit INFR_UBATCH disables the sweep (the user's height is authoritative).
-        let mut resident = fp.total() + kv_bytes + act_reserve <= vram.available;
+        // explicit INFR_UBATCH disables the sweep (the user's height is authoritative). Runs
+        // BEFORE the auto-q8 rung below: a shorter prefill chunk costs only some prefill
+        // throughput, while q8 KV costs ~10-16% GQA decode — prefer the cheaper concession.
+        let mut resident = fits(ubatch_rows(), kv_auto_q8());
         if !resident && std::env::var("INFR_UBATCH").is_err() && cache_override.is_none() {
             for cand in [512usize, 256, 128] {
-                let kv_c: u64 = (0..cfg.n_layer)
-                    .map(|l| {
-                        (cfg.layer_n_kv(l) * cfg.layer_head_dim(l) * 2 * 2) as u64
-                            * (kv_rows_at(cfg, l, want_ctx, ring, cand) as u64 + 64)
-                    })
-                    .sum();
-                if fp.total() + kv_c + dense_act_reserve_at(cfg, want_ctx, cand) <= vram.available {
+                if fits(cand, kv_auto_q8()) {
                     let _ = PINNED_UBATCH.set(cand);
                     // Re-read through the pin (a racing earlier set wins — use whatever stuck).
-                    if fp.total()
-                        + (0..cfg.n_layer)
-                            .map(|l| {
-                                (cfg.layer_n_kv(l) * cfg.layer_head_dim(l) * 2 * 2) as u64
-                                    * (kv_rows(cfg, l, want_ctx, ring) as u64 + 64)
-                            })
-                            .sum::<u64>()
-                        + dense_act_reserve(cfg, want_ctx)
-                        <= vram.available
-                    {
+                    if fits(ubatch_rows(), kv_auto_q8()) {
                         eprintln!(
                             "dense placement: resident with a {}-row prefill chunk (the default \
                              1024-row chunk's activation reserve wouldn't fit); set INFR_UBATCH \
@@ -713,13 +761,55 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 }
             }
         }
+        // ── auto-q8 KV rung (the placement-ladder step between the SWA ring and streaming):
+        // f16 KV missed residency at every chunk height, but a Q8_0 cache (roughly HALF the KV
+        // bytes) might fit — placing RESIDENT with q8 KV beats the remaining rungs by an order
+        // of magnitude (streaming decodes at the PCIe ceiling; the explicit-ctx path never
+        // clamps). Gates: the user set NO KV format (see `PINNED_KV_Q8`'s policy doc — explicit
+        // settings always win, both sides go q8_0, never below q8), no INFR_CACHE override
+        // (that's the deterministic force-streaming hook), and the runner's own q8 layout gate
+        // (32-elem block alignment; this binder is the Vulkan path, a native q8-KV backend —
+        // decode reads Q8 natively and coupled K==V==Q8 keeps record-once replay; batched
+        // prefill reads it through the dequant prepass, which the SWA ring kept for q8).
+        // Tries the pinned/current chunk height first, then the same smaller-chunk ladder as
+        // the f16 sweep (floor 128).
+        if !resident
+            && cache_override.is_none()
+            && !kv_auto_q8()
+            && kv_env_unset()
+            && kv_q8_layout_ok(cfg)
+        {
+            let ub_now = ubatch_rows();
+            let mut cands = vec![ub_now];
+            if std::env::var("INFR_UBATCH").is_err() {
+                cands.extend([512usize, 256, 128].into_iter().filter(|&c| c < ub_now));
+            }
+            for cand in cands {
+                if fits(cand, true) {
+                    let _ = PINNED_KV_Q8.set(());
+                    if cand != ubatch_rows() {
+                        let _ = PINNED_UBATCH.set(cand);
+                    }
+                    // Re-read through the pins (racing earlier sets win — use whatever stuck).
+                    if kv_auto_q8() && fits(ubatch_rows(), true) {
+                        eprintln!(
+                            "kv auto-quant: q8_0 (f16 KV wouldn't fit resident at ctx={want_ctx}; \
+                             INFR_KV_TYPE_K/V=f16 to force f16)"
+                        );
+                        resident = true;
+                    }
+                    break;
+                }
+            }
+        }
         let budget = match cache_override {
             Some(spec) => Some(spec.resolve(vram.available)),
             None if resident => None,
-            None => Some(
-                vram.available
-                    .saturating_sub((fp.total() - streamable_resident) + kv_bytes + act_reserve),
-            ),
+            None => Some(vram.available.saturating_sub(
+                (fp.total() - streamable_resident)
+                    + kv_total_at(ubatch_rows(), kv_auto_q8())
+                    + dense_act_reserve_at(cfg, want_ctx, ubatch_rows()),
+            )),
         };
         if let (Some(mut budget), false) = (budget, eligible.is_empty()) {
             // Slot stride: the group's raw bytes padded to a whole number of quant blocks AND

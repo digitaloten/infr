@@ -221,9 +221,11 @@ impl DenseMetalSession {
 /// runner honors (`INFR_KV_TYPE_K/V`, legacy `INFR_KV_Q8`). ESTIMATE ONLY — the runner
 /// additionally gates each format on backend/alignment and falls back to f16, so a gated-out
 /// low-bit request can under-estimate here; the alloc-time VRAM budget guard backstops that.
-/// Unknown/unset → f16 (2 bytes), the GPU default.
+/// Unknown/unset → `auto_q8` picks between f16 (2 bytes, the GPU default) and Q8_0 — pass the
+/// current [`crate::seam::kv_auto_q8`] pin (or `true` to PRICE a candidate auto-q8 placement
+/// before pinning it, as `clamp_default_ctx` does).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-fn kv_bytes_per_elem(var: &str) -> f64 {
+fn kv_bytes_per_elem(var: &str, auto_q8: bool) -> f64 {
     let side = std::env::var(var).ok();
     match side.as_deref() {
         Some("f32") => 4.0,
@@ -237,6 +239,7 @@ fn kv_bytes_per_elem(var: &str) -> f64 {
         Some("turbo3") => 50.0 / 128.0,
         Some("turbo4") => 66.0 / 128.0,
         _ if std::env::var("INFR_KV_Q8").is_ok() => 34.0 / 32.0,
+        _ if auto_q8 => 34.0 / 32.0,
         _ => 2.0,
     }
 }
@@ -323,6 +326,27 @@ impl SeamModel {
             return want; // pure recurrent-state arch: no per-token KV to size.
         };
         if fit < want {
+            // Auto-q8 KV rung, clamp flavor (see `crate::seam::PINNED_KV_Q8` for the policy):
+            // before shrinking the DEFAULT context below the trained window, try a Q8_0 KV
+            // cache — roughly half the bytes per token. Only a FULL rescue pins q8 (fit at q8
+            // reaches `want`); a partial rescue keeps the predictable f16 cache and clamps as
+            // before — auto-q8 exists to avoid losing capability (ctx / residency), not to
+            // trade decode speed for a somewhat-larger-but-still-clamped default window.
+            // Dense non-MoE models only, matching the placement rung this was validated on
+            // (MoE placement budgets pager arenas separately from this fit math).
+            if self.cfg.moe.is_none()
+                && !crate::seam::kv_auto_q8()
+                && crate::seam::kv_env_unset()
+                && crate::seam::kv_q8_layout_ok(&self.cfg)
+                && self.kv_fit_ctx_fmt(vk, true).is_some_and(|f| f >= want)
+            {
+                crate::seam::pin_kv_auto_q8();
+                eprintln!(
+                    "kv auto-quant: q8_0 (f16 KV would clamp the default ctx {want} -> {fit}; \
+                     INFR_KV_TYPE_K/V=f16 to force f16)"
+                );
+                return want;
+            }
             let vram = vk.vram();
             let fp = crate::weights::weight_footprint(&self.gguf);
             eprintln!(
@@ -345,6 +369,16 @@ impl SeamModel {
     /// arch (no per-token KV). Extra KV slots (INFR_KV_SLOTS forks) aren't modeled — the
     /// alloc-time budget guard remains the backstop.
     fn kv_fit_ctx(&self, vk: &infr_vulkan::VulkanBackend) -> Option<usize> {
+        // Price whatever the runner will actually allocate: the auto-q8 pin (if the placement
+        // ladder set it earlier in this process) or the plain env-driven formats.
+        self.kv_fit_ctx_fmt(vk, crate::seam::kv_auto_q8())
+    }
+
+    /// [`kv_fit_ctx`](Self::kv_fit_ctx) at an EXPLICIT assumed-when-env-unset KV format:
+    /// `auto_q8 = true` prices both sides Q8_0 wherever the user set nothing — how the ctx
+    /// clamp's auto-q8 rung asks "would the trained window fit if we quantized the cache?"
+    /// BEFORE pinning that choice process-wide.
+    fn kv_fit_ctx_fmt(&self, vk: &infr_vulkan::VulkanBackend, auto_q8: bool) -> Option<usize> {
         /// Take only this fraction of the KV bytes that nominally fit — absorbs allocation slop
         /// (alignment, dedicated-buffer rounding) and estimate error, same spirit as the alloc
         /// guard's fixed headroom.
@@ -376,8 +410,8 @@ impl SeamModel {
         // env the runner honors; formats it would gate back to f16 are an estimate only — the
         // alloc guard catches a resulting overflow).
         let (kb, vb) = (
-            kv_bytes_per_elem("INFR_KV_TYPE_K"),
-            kv_bytes_per_elem("INFR_KV_TYPE_V"),
+            kv_bytes_per_elem("INFR_KV_TYPE_K", auto_q8),
+            kv_bytes_per_elem("INFR_KV_TYPE_V", auto_q8),
         );
         let kv_per_tok: u64 = (0..self.cfg.n_layer)
             .map(|l| {
