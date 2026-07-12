@@ -5417,9 +5417,21 @@ impl<'a> Recorder<'a> {
                 crate::gemm::native_gemm_mmq_nvfp4_xp32_spv(),
                 6,
             ),
+            // Q2_0: Bonsai ternary, symmetric small-int (codes-1 = {-1,0,+1,+2} feed dp4a
+            // directly) — no `sact`.
+            (infr_core::DType::Q2_0, false) => (
+                "native_gemm_mmq_q2_0_xp",
+                crate::gemm::native_gemm_mmq_q2_0_xp_spv(),
+                6,
+            ),
+            (infr_core::DType::Q2_0, true) => (
+                "native_gemm_mmq_q2_0_xp32",
+                crate::gemm::native_gemm_mmq_q2_0_xp32_spv(),
+                6,
+            ),
             _ => unreachable!(
                 "batched MoE expert GEMM: the MOE_MMQ_DTYPES set only (Q4_0/Q4_1/Q4_K/Q5_K/Q6_K/\
-                 Q8_0/Q5_0/Q5_1/Q2_K/Q3_K/IQ4_NL/IQ4_XS/IQ2_S/IQ3_S/MXFP4/NVFP4)"
+                 Q8_0/Q5_0/Q5_1/Q2_K/Q3_K/Q2_0/IQ4_NL/IQ4_XS/IQ2_S/IQ3_S/MXFP4/NVFP4)"
             ),
         };
         let kern = self.be.kernel(name, spv, nb, 16);
@@ -5648,10 +5660,22 @@ impl<'a> Recorder<'a> {
                 crate::gemm::native_gemm_mmq_nvfp4_xpg32_spv(),
                 7,
             ),
+            // Q2_0: Bonsai ternary, symmetric small-int, no `sact` (7 bindings = resident's 6 +
+            // LUT).
+            (infr_core::DType::Q2_0, false) => (
+                "native_gemm_mmq_q2_0_xpg",
+                crate::gemm::native_gemm_mmq_q2_0_xpg_spv(),
+                7,
+            ),
+            (infr_core::DType::Q2_0, true) => (
+                "native_gemm_mmq_q2_0_xpg32",
+                crate::gemm::native_gemm_mmq_q2_0_xpg32_spv(),
+                7,
+            ),
             _ => unreachable!(
                 "paged batched MoE expert GEMM: the MOE_MMQ_PAGED_DTYPES set only \
-                 (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/IQ4_NL/IQ4_XS/IQ2_S/IQ3_S/\
-                 MXFP4/NVFP4)"
+                 (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K/Q3_K/Q2_0/Q4_K/Q5_K/Q6_K/IQ4_NL/IQ4_XS/IQ2_S/\
+                 IQ3_S/MXFP4/NVFP4)"
             ),
         };
         let kern = self.be.kernel(name, spv, nb, 16);

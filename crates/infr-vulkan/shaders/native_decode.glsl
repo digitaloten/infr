@@ -580,6 +580,33 @@ float dq(uint g) {
 }
 #endif
 
+#if defined(FMT_Q2_0)
+// Q2_0 (Bonsai ternary): [f16 d][u8 qs[16]] = 18 bytes, 64 elements. y = (q - 1) * d,
+// q ∈ {0,1,2,3} → {-d, 0, +d, +2d}. Codes pack SEQUENTIALLY: element j → byte j/4,
+// shift (j%4)*2 — so a 32-elem group is 8 contiguous bytes (2 unaligned u32s via ru32u;
+// 18-byte blocks aren't word-aligned, same funnel-load convention as Q3_K's 110 B).
+float dq(uint g) {
+    uint p = g % 64u; uint bd = (g / 64u) * 18u;
+    float d = f16tof32(ru16(bd));
+    uint q = (rb(bd + 2u + p / 4u) >> ((p % 4u) * 2u)) & 3u;
+    return (float(q) - 1.0) * d;
+}
+#define HAVE_DQBLK
+// 32-aligned run = half a 64-block: scale decoded once, codes pulled as 2 unaligned words with a
+// 2-bit bitfieldExtract per element — identical (q-1)*d product per element, bit-identical to dq().
+void dqblk(uint gstart, out float v[32]) {
+    uint bd = (gstart / 64u) * 18u;
+    float d = f16tof32(ru16(bd));
+    uint qoff = bd + 2u + ((gstart % 64u) >> 2u); // 0 or 8 bytes into qs
+    for (uint w = 0u; w < 2u; w++) {
+        uint bits = ru32u(qoff + w * 4u);
+        for (uint b = 0u; b < 16u; b++) {
+            v[w * 16u + b] = (float((bits >> (b * 2u)) & 3u) - 1.0) * d;
+        }
+    }
+}
+#endif
+
 // ── grid-based i-quants (tables from native_grids.glsl) ──
 // All 7 grid formats get an amortized dqblk: a 32-aligned run is exactly one 32-elem group
 // (ib32 / pair·grp / ib), so the per-group header work — scale decode, sign/aux words, qh bits,

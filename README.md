@@ -64,8 +64,12 @@ Fine-tunes on any of these backbones run unchanged. **Ornith-1.0**
 and the 35B rides `qwen35moe` with no code changes
 (`infr run deepreinforce-ai/Ornith-1.0-9B-GGUF:Q4_K_M "..."`).
 **Ternary-Bonsai** (Prism ML, weights trained to {-1, 0, +1}) validated
-2026-07-12 — the 1.7B/4B ride `qwen3` zero-code in the TQ2_0 repack
-(`superkaiii/Ternary-Bonsai-4B-GGUF`).
+2026-07-12 — the 1.7B/4B ride `qwen3`, both zero-code in the TQ2_0 repack
+(`superkaiii/Ternary-Bonsai-4B-GGUF`) and in llama.cpp's new **Q2_0** weight
+dtype (2.25 bpw, GGML type 42 — native in-shader dequant + dp4a mmq, no fork
+needed; note the pre-merge `prism-ml/*-Q2_0.gguf` uploads use an older
+incompatible 128-elem block layout — requantize from F16 with upstream
+`llama-quantize ... Q2_0`).
 
 ```bash
 # Qwen3 dense
@@ -336,12 +340,12 @@ banks — see `MOE_MMQ_DTYPES`'s exclusions doc).
 
 The MoE expert kernel floor (the id-indexed GEMV family every MoE model needs
 for decode) now covers **every weight dtype the dense Vulkan path supports** —
-all quants (Q\*, K-quants, IQ\*, TQ\*, MXFP4/NVFP4, BF16) plus F16/F32 float
-banks — so no expert-bank quant is rejected at load. On top of that, the
-batched-MoE dp4a mmq prefill family covers Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0 /
-Q2_K / Q3_K / Q4_K / Q5_K / Q6_K / IQ4_NL / IQ4_XS / MXFP4 / NVFP4
-(`infr_core::tensor::MOE_MMQ_DTYPES` is the single source of truth both the
-graph-build and adapter gates derive from; `moe_mmq_drift_test` guards the
+all quants (Q\* incl. ternary Q2_0, K-quants, IQ\*, TQ\*, MXFP4/NVFP4, BF16)
+plus F16/F32 float banks — so no expert-bank quant is rejected at load. On top
+of that, the batched-MoE dp4a mmq prefill family covers Q4_0 / Q4_1 / Q5_0 /
+Q5_1 / Q8_0 / Q2_0 / Q2_K / Q3_K / Q4_K / Q5_K / Q6_K / IQ4_NL / IQ4_XS / MXFP4
+/ NVFP4 (`infr_core::tensor::MOE_MMQ_DTYPES` is the single source of truth both
+the graph-build and adapter gates derive from; `moe_mmq_drift_test` guards the
 kernel tables against drift, and its doc records the deliberate exclusions: grid
 i-quants (IQ1–IQ3), ternary (TQ\*), and float banks prefill via the per-token
 id-GEMV path).

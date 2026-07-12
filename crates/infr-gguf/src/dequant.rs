@@ -457,6 +457,7 @@ pub fn is_codebook_quant(d: infr_core::DType) -> bool {
             | Iq4Xs
             | Tq1_0
             | Tq2_0
+            | Q2_0
             | Mxfp4
             | Nvfp4
     )
@@ -1032,6 +1033,27 @@ pub fn dequant_codebook(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
             }
             out
         }
+        // ── Q2_0: block = [half d][u8 qs[16]], 18 bytes, QK2_0=64 (Bonsai ternary) ──
+        // 2 bits per element, packed sequentially: element j → byte j/4, shift (j%4)*2.
+        //   q = (qs[j/4] >> ((j%4)*2)) & 3  ∈ {0,1,2,3}
+        //   y = (q - 1) * d                 → {-d, 0, +d, +2d}
+        // Ref: llama.cpp dequantize_row_q2_0 (ggml-quants.c l.439)
+        Q2_0 => {
+            let bpb = 18usize; // 2 + 16
+            let nblk = bytes.len() / bpb;
+            let mut out = vec![0.0f32; nblk * 64];
+            for b in 0..nblk {
+                let blk = &bytes[b * bpb..(b + 1) * bpb];
+                let d = rdf16(blk);
+                let qs = &blk[2..18];
+                let base = b * 64;
+                for j in 0..64usize {
+                    let q = ((qs[j / 4] >> ((j % 4) * 2)) & 3) as i32;
+                    out[base + j] = (q - 1) as f32 * d;
+                }
+            }
+            out
+        }
         // ── MXFP4: block = [u8 e][u8 qs[16]], 17 bytes, QK_MXFP4=32 ─────────────
         // E8M0 shared exponent + nibble-packed E2M1 4-bit values.
         //   d = e8m0_to_fp32_half(e) = 2^(e-128)
@@ -1275,6 +1297,36 @@ mod dequant_tests {
             assert!(
                 (y[i] - (-1.0)).abs() < 1e-4,
                 "tq2_0 y[{i}] expected -1.0, got {}",
+                y[i]
+            );
+        }
+    }
+
+    // ── Q2_0 (Bonsai ternary) ───────────────────────────────────────────────────
+    // Block: [half d][u8 qs[16]], 18 bytes, QK2_0=64
+    // qs[0]=0b11100100 encodes q = 0,1,2,3 for elements 0..3 → y = -d, 0, +d, +2d.
+    // Remaining qs zero: q=0 → y=-d for elements 4..63.
+    // Ref: llama.cpp dequantize_row_q2_0 (ggml-quants.c l.439)
+    #[test]
+    fn q2_0_single_block() {
+        let d_bytes = half::f16::from_f32(0.5).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 18];
+        block[0..2].copy_from_slice(&d_bytes);
+        block[2] = 0b1110_0100; // elems 0..3 → codes 0,1,2,3
+        let y = dequant_codebook(infr_core::DType::Q2_0, &block);
+        assert_eq!(y.len(), 64);
+        let want = [-0.5f32, 0.0, 0.5, 1.0];
+        for (i, w) in want.iter().enumerate() {
+            assert!(
+                (y[i] - w).abs() < 1e-4,
+                "q2_0 y[{i}] expected {w}, got {}",
+                y[i]
+            );
+        }
+        for i in 4..64 {
+            assert!(
+                (y[i] - (-0.5)).abs() < 1e-4,
+                "q2_0 y[{i}] expected -0.5, got {}",
                 y[i]
             );
         }

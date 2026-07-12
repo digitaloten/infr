@@ -52,6 +52,7 @@ pub fn native_id_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
         Nvfp4 => "native_id_nvfp4",
         Tq1_0 => "native_id_tq1_0",
         Tq2_0 => "native_id_tq2_0",
+        Q2_0 => "native_id_q2_0",
         Iq2Xxs => "native_id_iq2xxs",
         Iq2Xs => "native_id_iq2xs",
         Iq2S => "native_id_iq2s",
@@ -87,6 +88,7 @@ pub fn native_idm_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
         Nvfp4 => "native_idm_nvfp4",
         Tq1_0 => "native_idm_tq1_0",
         Tq2_0 => "native_idm_tq2_0",
+        Q2_0 => "native_idm_q2_0",
         Iq2Xxs => "native_idm_iq2xxs",
         Iq2Xs => "native_idm_iq2xs",
         Iq2S => "native_idm_iq2s",
@@ -136,6 +138,7 @@ pub fn native_id_paged_kernel_name(dtype: infr_core::DType) -> Option<&'static s
         Nvfp4 => "native_id_nvfp4_paged",
         Tq1_0 => "native_id_tq1_0_paged",
         Tq2_0 => "native_id_tq2_0_paged",
+        Q2_0 => "native_id_q2_0_paged",
         Iq2Xxs => "native_id_iq2xxs_paged",
         Iq2Xs => "native_id_iq2xs_paged",
         Iq2S => "native_id_iq2s_paged",
@@ -172,6 +175,7 @@ pub fn native_idm_paged_kernel_name(dtype: infr_core::DType) -> Option<&'static 
         Nvfp4 => "native_idm_nvfp4_paged",
         Tq1_0 => "native_idm_tq1_0_paged",
         Tq2_0 => "native_idm_tq2_0_paged",
+        Q2_0 => "native_idm_q2_0_paged",
         Iq2Xxs => "native_idm_iq2xxs_paged",
         Iq2Xs => "native_idm_iq2xs_paged",
         Iq2S => "native_idm_iq2s_paged",
@@ -224,6 +228,8 @@ pub fn native_kernel_name(dtype: infr_core::DType, residual: bool) -> &'static s
         (Tq1_0, true) => "native_tq1_0_res",
         (Tq2_0, false) => "native_tq2_0",
         (Tq2_0, true) => "native_tq2_0_res",
+        (Q2_0, false) => "native_q2_0",
+        (Q2_0, true) => "native_q2_0_res",
         (Iq2Xxs, false) => "native_iq2xxs",
         (Iq2Xxs, true) => "native_iq2xxs_res",
         (Iq2Xs, false) => "native_iq2xs",
@@ -264,6 +270,7 @@ pub fn native_gemm_kernel_name(dtype: infr_core::DType) -> &'static str {
         Nvfp4 => "native_gemm_nvfp4",
         Tq1_0 => "native_gemm_tq1_0",
         Tq2_0 => "native_gemm_tq2_0",
+        Q2_0 => "native_gemm_q2_0",
         Iq2Xxs => "native_gemm_iq2xxs",
         Iq2Xs => "native_gemm_iq2xs",
         Iq2S => "native_gemm_iq2s",
@@ -312,6 +319,7 @@ pub fn native_dense_supported(dtype: infr_core::DType) -> bool {
             | Nvfp4
             | Tq1_0
             | Tq2_0
+            | Q2_0
             | Iq2Xxs
             | Iq2Xs
             | Iq2S
@@ -655,7 +663,7 @@ mod tests {
         use infr_core::DType::{self, *};
         let all: &[DType] = &[
             Bf16, F16, F32, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2K, Q3K, Q4K, Q5K, Q6K, Iq4Nl, Iq4Xs,
-            Mxfp4, Nvfp4, Tq1_0, Tq2_0, Iq2Xxs, Iq2Xs, Iq2S, Iq3Xxs, Iq3S, Iq1S, Iq1M,
+            Mxfp4, Nvfp4, Tq1_0, Tq2_0, Q2_0, Iq2Xxs, Iq2Xs, Iq2S, Iq3Xxs, Iq3S, Iq1S, Iq1M,
         ];
         for &d in all {
             assert!(

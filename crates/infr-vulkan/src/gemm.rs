@@ -47,6 +47,7 @@ pub(crate) fn native_mrow_build_spv(dtype: infr_core::DType) -> Option<&'static 
         Q6K => v!("native_mrow_q6k"),
         Iq4Nl => v!("native_mrow_iq4nl"),
         Iq4Xs => v!("native_mrow_iq4xs"),
+        Q2_0 => v!("native_mrow_q2_0"),
         _ => return None,
     })
 }
@@ -69,6 +70,7 @@ pub(crate) fn native_mrow_kernel_name(dtype: infr_core::DType) -> &'static str {
         Q6K => "native_mrow_q6k",
         Iq4Nl => "native_mrow_iq4nl",
         Iq4Xs => "native_mrow_iq4xs",
+        Q2_0 => "native_mrow_q2_0",
         _ => "native_mrow_unsupported",
     }
 }
@@ -123,6 +125,8 @@ pub(crate) fn native_build_spv(dtype: infr_core::DType, res: bool) -> Option<&'s
         (Tq1_0, true) => v!("native_tq1_0_res"),
         (Tq2_0, false) => v!("native_tq2_0"),
         (Tq2_0, true) => v!("native_tq2_0_res"),
+        (Q2_0, false) => v!("native_q2_0"),
+        (Q2_0, true) => v!("native_q2_0_res"),
         (Iq2Xxs, false) => v!("native_iq2xxs"),
         (Iq2Xxs, true) => v!("native_iq2xxs_res"),
         (Iq2Xs, false) => v!("native_iq2xs"),
@@ -285,6 +289,7 @@ pub(crate) fn native_id_build_spv(dtype: infr_core::DType) -> Option<&'static [u
         Nvfp4 => v!("native_id_nvfp4"),
         Tq1_0 => v!("native_id_tq1_0"),
         Tq2_0 => v!("native_id_tq2_0"),
+        Q2_0 => v!("native_id_q2_0"),
         Iq2Xxs => v!("native_id_iq2xxs"),
         Iq2Xs => v!("native_id_iq2xs"),
         Iq2S => v!("native_id_iq2s"),
@@ -328,6 +333,7 @@ pub(crate) fn native_idm_build_spv(dtype: infr_core::DType) -> Option<&'static [
         Nvfp4 => v!("native_idm_nvfp4"),
         Tq1_0 => v!("native_idm_tq1_0"),
         Tq2_0 => v!("native_idm_tq2_0"),
+        Q2_0 => v!("native_idm_q2_0"),
         Iq2Xxs => v!("native_idm_iq2xxs"),
         Iq2Xs => v!("native_idm_iq2xs"),
         Iq2S => v!("native_idm_iq2s"),
@@ -371,6 +377,7 @@ pub(crate) fn native_id_paged_build_spv(dtype: infr_core::DType) -> Option<&'sta
         Nvfp4 => v!("native_id_nvfp4_paged"),
         Tq1_0 => v!("native_id_tq1_0_paged"),
         Tq2_0 => v!("native_id_tq2_0_paged"),
+        Q2_0 => v!("native_id_q2_0_paged"),
         Iq2Xxs => v!("native_id_iq2xxs_paged"),
         Iq2Xs => v!("native_id_iq2xs_paged"),
         Iq2S => v!("native_id_iq2s_paged"),
@@ -414,6 +421,7 @@ pub(crate) fn native_idm_paged_build_spv(dtype: infr_core::DType) -> Option<&'st
         Nvfp4 => v!("native_idm_nvfp4_paged"),
         Tq1_0 => v!("native_idm_tq1_0_paged"),
         Tq2_0 => v!("native_idm_tq2_0_paged"),
+        Q2_0 => v!("native_idm_q2_0_paged"),
         Iq2Xxs => v!("native_idm_iq2xxs_paged"),
         Iq2Xs => v!("native_idm_iq2xs_paged"),
         Iq2S => v!("native_idm_iq2s_paged"),
@@ -744,6 +752,7 @@ pub(crate) fn native_gemm_mmq_dense_spv(
         Iq3S => spv!("native_gemm_mmq_iq3_s"),
         Mxfp4 => spv!("native_gemm_mmq_mxfp4"),
         Nvfp4 => spv!("native_gemm_mmq_nvfp4"),
+        Q2_0 => spv!("native_gemm_mmq_q2_0"),
         _ => return None,
     })
 }
@@ -960,6 +969,7 @@ pub(crate) fn embed_gather_build_spv(dtype: infr_core::DType) -> Option<&'static
         Q6K => v!("embed_gather_q6k"),
         Iq4Nl => v!("embed_gather_iq4nl"),
         Iq4Xs => v!("embed_gather_iq4xs"),
+        Q2_0 => v!("embed_gather_q2_0"),
         _ => return None,
     })
 }
@@ -982,6 +992,7 @@ pub(crate) fn embed_gather_kernel_name(dtype: infr_core::DType) -> &'static str 
         Q6K => "embed_gather_q6k",
         Iq4Nl => "embed_gather_iq4nl",
         Iq4Xs => "embed_gather_iq4xs",
+        Q2_0 => "embed_gather_q2_0",
         _ => unreachable!("embed_gather_kernel_name: gated by embed_gather_build_spv"),
     }
 }
@@ -1468,6 +1479,7 @@ pub(crate) fn native_gemm_build_spv(dtype: infr_core::DType) -> Option<&'static 
         Nvfp4 => v!("native_gemm_nvfp4"),
         Tq1_0 => v!("native_gemm_tq1_0"),
         Tq2_0 => v!("native_gemm_tq2_0"),
+        Q2_0 => v!("native_gemm_q2_0"),
         Iq2Xxs => v!("native_gemm_iq2xxs"),
         Iq2Xs => v!("native_gemm_iq2xs"),
         Iq2S => v!("native_gemm_iq2s"),
@@ -1992,6 +2004,35 @@ pub(crate) fn native_gemm_mmq_q4_0_xpg_spv() -> &'static [u32] {
 pub(crate) fn native_gemm_mmq_q4_0_xpg32_spv() -> &'static [u32] {
     const BYTES: &[u8] =
         include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4_0_xpg32.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+
+/// SPIR-V for the tiled Q2_0 dp4a (mmq) GEMM, expert-grid variants (Bonsai ternary — symmetric
+/// trivial family member like Q4_0; no shipped MoE GGUF uses it for expert banks, synthetic
+/// parity only).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q2_0_xp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q2_0_xp.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q2_0_xp32_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q2_0_xp32.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q2_0_xpg_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q2_0_xpg.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q2_0_xpg32_spv() -> &'static [u32] {
+    const BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q2_0_xpg32.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }

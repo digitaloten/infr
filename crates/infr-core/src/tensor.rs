@@ -35,6 +35,9 @@ pub enum DType {
     // ternary quants
     Tq1_0,
     Tq2_0,
+    /// Bonsai ternary (llama.cpp GGML_TYPE_Q2_0 = 42): 64-elem blocks, 18 B = f16 d + 16 B of
+    /// 2-bit codes (2.25 bpw); w = (q - 1) · d, q ∈ {0,1,2,3} → {-d, 0, +d, +2d}.
+    Q2_0,
     // fp4 quants
     Mxfp4,
     Nvfp4,
@@ -73,6 +76,7 @@ impl DType {
                 | DType::Iq4Xs
                 | DType::Tq1_0
                 | DType::Tq2_0
+                | DType::Q2_0
                 | DType::Mxfp4
                 | DType::Nvfp4
         )
@@ -142,6 +146,11 @@ pub const MOE_MMQ_DTYPES: &[DType] = &[
     DType::Iq3S,
     DType::Mxfp4,
     DType::Nvfp4,
+    // Q2_0 (Bonsai ternary): symmetric small-int — codes-1 = {-1,0,+1,+2} feed dp4a directly
+    // (IQ4_NL's treatment minus the codebook); one f16 d per 64-elem block spanning two 32-elem
+    // activation quant blocks. No shipped MoE GGUF uses it for expert banks yet, but the dense
+    // nc_mmq tier derives from this list too, so the dense build earns the full family.
+    DType::Q2_0,
 ];
 
 /// True for dtypes the batched-MoE dp4a mmq expert-GEMM family covers (gate/up/down each
@@ -189,6 +198,7 @@ pub const MOE_MMQ_PAGED_DTYPES: &[DType] = &[
     DType::Iq3S,
     DType::Mxfp4,
     DType::Nvfp4,
+    DType::Q2_0,
 ];
 
 /// True for [`MOE_MMQ_DTYPES`] members with a paged (Scout-style GpuPager) batched expert-GEMM

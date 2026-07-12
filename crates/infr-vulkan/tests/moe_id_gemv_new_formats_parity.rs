@@ -42,6 +42,7 @@ fn block_geom(dt: DType) -> (usize, usize) {
         DType::Nvfp4 => (64, 36),
         DType::Tq1_0 => (256, 54),
         DType::Tq2_0 => (256, 66),
+        DType::Q2_0 => (64, 18),
         DType::Iq2Xxs => (256, 66),
         DType::Iq2Xs => (256, 74),
         DType::Iq2S => (256, 82),
@@ -72,6 +73,8 @@ fn synth_block(dt: DType, rng: &mut Rng) -> Vec<u8> {
         // trailing f16 d
         DType::Tq1_0 => b[52..54].copy_from_slice(&d16),
         DType::Tq2_0 => b[64..66].copy_from_slice(&d16),
+        // leading f16 d (Bonsai ternary; 2-bit codes cover their full {0,1,2,3} range)
+        DType::Q2_0 => b[0..2].copy_from_slice(&d16),
         // leading f16 d
         DType::Iq2Xxs | DType::Iq2Xs | DType::Iq2S | DType::Iq3Xxs | DType::Iq3S | DType::Iq1S => {
             b[0..2].copy_from_slice(&d16)
@@ -146,6 +149,7 @@ const NEW_DTYPES: &[DType] = &[
     DType::Nvfp4,
     DType::Tq1_0,
     DType::Tq2_0,
+    DType::Q2_0,
     DType::Iq2Xxs,
     DType::Iq2Xs,
     DType::Iq2S,

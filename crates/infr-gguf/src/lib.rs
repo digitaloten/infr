@@ -229,6 +229,7 @@ fn ggml_type_to_dtype(t: u32) -> Result<DType> {
         35 => Ok(DType::Tq2_0),  // GGML_TYPE_TQ2_0: 256 elems, 66 bytes/block
         39 => Ok(DType::Mxfp4),  // GGML_TYPE_MXFP4: 32 elems, 17 bytes/block
         40 => Ok(DType::Nvfp4),  // GGML_TYPE_NVFP4: 64 elems, 36 bytes/block
+        42 => Ok(DType::Q2_0),   // GGML_TYPE_Q2_0: 64 elems, 18 bytes/block (Bonsai ternary)
         _ => Err(Error::Unsupported(format!("ggml type {t}"))),
     }
 }
@@ -292,6 +293,8 @@ pub fn block_layout(dtype: DType) -> (usize, usize) {
         DType::Tq1_0 => (256, 54),
         // block_tq2_0: half + QK_K/4 = 2+64 = 66 bytes
         DType::Tq2_0 => (256, 66),
+        // block_q2_0: half d + QK2_0/4 = 2+16 = 18 bytes; QK2_0=64 (Bonsai ternary, 2.25 bpw)
+        DType::Q2_0 => (64, 18),
         // FP4 quants
         // block_mxfp4: uint8 e + QK_MXFP4/2 = 1+16 = 17 bytes; QK_MXFP4=32
         DType::Mxfp4 => (32, 17),

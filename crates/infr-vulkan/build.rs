@@ -371,6 +371,12 @@ fn main() {
             "native_tq2_0_res",
             &["-DFMT_TQ2_0", "-DUSE_RES"],
         ),
+        ("native_gemv", "native_q2_0", &["-DFMT_Q2_0"]),
+        (
+            "native_gemv",
+            "native_q2_0_res",
+            &["-DFMT_Q2_0", "-DUSE_RES"],
+        ),
         ("native_gemv", "native_q4_0", &["-DFMT_Q4_0"]),
         (
             "native_gemv",
@@ -526,6 +532,7 @@ fn main() {
         ("native_gemv_mrow", "native_mrow_q6k", &["-DFMT_Q6K"]),
         ("native_gemv_mrow", "native_mrow_iq4nl", &["-DFMT_IQ4NL"]),
         ("native_gemv_mrow", "native_mrow_iq4xs", &["-DFMT_IQ4XS"]),
+        ("native_gemv_mrow", "native_mrow_q2_0", &["-DFMT_Q2_0"]),
         (
             "native_gemv",
             "native_q8_0_res",
@@ -560,6 +567,7 @@ fn main() {
         ("native_gemv_id", "native_id_nvfp4", &["-DFMT_NVFP4"]),
         ("native_gemv_id", "native_id_tq1_0", &["-DFMT_TQ1_0"]),
         ("native_gemv_id", "native_id_tq2_0", &["-DFMT_TQ2_0"]),
+        ("native_gemv_id", "native_id_q2_0", &["-DFMT_Q2_0"]),
         (
             "native_gemv_id",
             "native_id_iq2xxs",
@@ -683,6 +691,11 @@ fn main() {
         ),
         (
             "native_gemv_id",
+            "native_id_q2_0_paged",
+            &["-DFMT_Q2_0", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id",
             "native_id_iq2xxs_paged",
             &["-DFMT_IQ2XXS", "-DUSE_GRID", "-DPAGED"],
         ),
@@ -749,6 +762,7 @@ fn main() {
         ("native_gemv_id_multi", "native_idm_nvfp4", &["-DFMT_NVFP4"]),
         ("native_gemv_id_multi", "native_idm_tq1_0", &["-DFMT_TQ1_0"]),
         ("native_gemv_id_multi", "native_idm_tq2_0", &["-DFMT_TQ2_0"]),
+        ("native_gemv_id_multi", "native_idm_q2_0", &["-DFMT_Q2_0"]),
         (
             "native_gemv_id_multi",
             "native_idm_iq2xxs",
@@ -867,6 +881,11 @@ fn main() {
             "native_gemv_id_multi",
             "native_idm_tq2_0_paged",
             &["-DFMT_TQ2_0", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_q2_0_paged",
+            &["-DFMT_Q2_0", "-DPAGED"],
         ),
         (
             "native_gemv_id_multi",
@@ -1162,6 +1181,9 @@ fn main() {
         // (see the shaders' doc comments + MOE_MMQ_DTYPES's EXCLUSIONS doc).
         ("native_gemm_mmq_iq2_s", "native_gemm_mmq_iq2_s", &[]),
         ("native_gemm_mmq_iq3_s", "native_gemm_mmq_iq3_s", &[]),
+        // Q2_0 (Bonsai ternary): symmetric small-int — codes-1 = {-1,0,+1,+2} feed dp4a directly
+        // (IQ4_NL's treatment minus the codebook; see the shader's doc comment).
+        ("native_gemm_mmq_q2_0", "native_gemm_mmq_q2_0", &[]),
         // Non-coopmat float-weight prefill GEMM ("fma-warp" tier, see native_gemm_fma.comp): the
         // shared-memory fma warptile for f16/bf16/f32 weights on devices without a usable f16
         // coopmat (adapter.rs `nc_fma`). No subgroup ops, no f16 extensions — dispatchable on
@@ -1292,6 +1314,13 @@ fn main() {
             "native_gemm_mmq_iq4_xs_xp",
             &["-DEXPERT_GRID"],
         ),
+        // Q2_0 (Bonsai ternary): symmetric trivial member like Q4_0 — no shipped MoE GGUF uses it
+        // for expert banks (Bonsai models are dense), synthetic parity only.
+        (
+            "native_gemm_mmq_q2_0",
+            "native_gemm_mmq_q2_0_xp",
+            &["-DEXPERT_GRID"],
+        ),
         // IQ2_S (gate/up) / IQ3_S (down) — the Qwen3.6-35B-A3B-UD-IQ3_S expert pair.
         (
             "native_gemm_mmq_iq2_s",
@@ -1417,6 +1446,11 @@ fn main() {
             "native_gemm_mmq_iq4_xs_xp32",
             &["-DEXPERT_GRID", "-DBM_TILE=32u"],
         ),
+        (
+            "native_gemm_mmq_q2_0",
+            "native_gemm_mmq_q2_0_xp32",
+            &["-DEXPERT_GRID", "-DBM_TILE=32u"],
+        ),
         // PAGED expert-grid variants (Scout's batched prefill through the GpuPager arena+LUT —
         // see the shaders' PAGED doc): every dtype the batched-MoE gate (`mmq_ok`) covers, now
         // that `paged_mmq_ok` mirrors it in full (see adapter.rs's drift-guard doc).
@@ -1448,6 +1482,16 @@ fn main() {
         (
             "native_gemm_mmq_q4_0",
             "native_gemm_mmq_q4_0_xpg32",
+            &["-DEXPERT_GRID", "-DPAGED", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_q2_0",
+            "native_gemm_mmq_q2_0_xpg",
+            &["-DEXPERT_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemm_mmq_q2_0",
+            "native_gemm_mmq_q2_0_xpg32",
             &["-DEXPERT_GRID", "-DPAGED", "-DBM_TILE=32u"],
         ),
         (
@@ -1603,6 +1647,9 @@ fn main() {
         ("embed_gather", "embed_gather_q6k", &["-DFMT_Q6K"]),
         ("embed_gather", "embed_gather_iq4nl", &["-DFMT_IQ4NL"]),
         ("embed_gather", "embed_gather_iq4xs", &["-DFMT_IQ4XS"]),
+        // Q2_0 (Bonsai ternary): the shipped Bonsai GGUFs quantize token_embd.weight itself as
+        // Q2_0, so the gather kernel needs the format or prefill falls back to host embedding.
+        ("embed_gather", "embed_gather_q2_0", &["-DFMT_Q2_0"]),
         // Chained-decode id ring log (ring[pos & 63] = sampled id) — see id_log.comp.
         ("id_log", "id_log", &[]),
         // Device-side decode-replay params advance ([pos, kv_len] += 1) — see params_advance.comp.
@@ -2016,6 +2063,7 @@ fn main() {
         ("native_gemm", "native_gemm_nvfp4", &["-DFMT_NVFP4"]),
         ("native_gemm", "native_gemm_tq1_0", &["-DFMT_TQ1_0"]),
         ("native_gemm", "native_gemm_tq2_0", &["-DFMT_TQ2_0"]),
+        ("native_gemm", "native_gemm_q2_0", &["-DFMT_Q2_0"]),
         (
             "native_gemm",
             "native_gemm_iq2xxs",

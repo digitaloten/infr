@@ -53,6 +53,7 @@ fn block_geom(dt: DType) -> (usize, usize) {
         DType::Iq3S => (256, 110),
         DType::Mxfp4 => (32, 17),
         DType::Nvfp4 => (64, 36),
+        DType::Q2_0 => (64, 18),
         other => panic!("no geometry for {other:?}"),
     }
 }
@@ -70,7 +71,7 @@ fn synth_bank(dt: DType, n_elems: usize, seed: u64) -> Vec<u8> {
         let d16 = |r: &mut Rng| half::f16::from_f32(0.004 + (r.byte() as f32) * 1e-5).to_le_bytes();
         let m16 = |r: &mut Rng| half::f16::from_f32(0.002 + (r.byte() as f32) * 1e-5).to_le_bytes();
         match dt {
-            DType::Q4_0 | DType::Q5_0 | DType::Q8_0 | DType::Iq4Nl => {
+            DType::Q4_0 | DType::Q5_0 | DType::Q8_0 | DType::Iq4Nl | DType::Q2_0 => {
                 b[0..2].copy_from_slice(&d16(&mut rng))
             }
             DType::Q4_1 | DType::Q5_1 => {
