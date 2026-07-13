@@ -680,20 +680,58 @@ impl VulkanBackend {
         }
         .map_err(|e| be(format!("create_instance: {e}")))?;
 
-        // ── physical device: prefer discrete ──────────────────────────────────
+        // ── physical device: `INFR_DEV` if set, else prefer discrete ──────────
+        // `INFR_DEV=VulkanN` (set by the CLI's `--dev`) pins the Nth device in ENUMERATION order,
+        // matching llama.cpp's `--dev VulkanN` naming so the two tools address the same GPU on a
+        // multi-GPU box. Unset => the historical rule: first DISCRETE_GPU, else device 0.
+        //
+        // An out-of-range / unparseable INFR_DEV is a hard error, NOT a fallback: silently running
+        // on a different GPU than the one asked for produces numbers that look plausible and are
+        // wrong, which is far worse than refusing to start.
         let pdevices = unsafe { instance.enumerate_physical_devices() }
             .map_err(|e| be(format!("enumerate_physical_devices: {e}")))?;
         if pdevices.is_empty() {
             return Err(be("no Vulkan physical devices"));
         }
-        let physical_device = pdevices
-            .iter()
-            .copied()
-            .find(|&pd| {
-                let p = unsafe { instance.get_physical_device_properties(pd) };
-                p.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
-            })
-            .unwrap_or(pdevices[0]);
+        let physical_device = match std::env::var("INFR_DEV") {
+            Ok(spec) => {
+                let s = spec.trim();
+                let idx_str = s
+                    .strip_prefix("Vulkan")
+                    .or_else(|| s.strip_prefix("vulkan"));
+                let idx: usize = idx_str.unwrap_or(s).parse().map_err(|_| {
+                    be(format!(
+                        "INFR_DEV/--dev: expected `VulkanN` (e.g. Vulkan0, Vulkan1), got `{spec}`"
+                    ))
+                })?;
+                *pdevices.get(idx).ok_or_else(|| {
+                    let names: Vec<String> = pdevices
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &pd)| {
+                            let p = unsafe { instance.get_physical_device_properties(pd) };
+                            let n = unsafe { CStr::from_ptr(p.device_name.as_ptr()) }
+                                .to_string_lossy()
+                                .into_owned();
+                            format!("Vulkan{i}={n}")
+                        })
+                        .collect();
+                    be(format!(
+                        "INFR_DEV/--dev `{spec}`: no such Vulkan device (this system has {}: {})",
+                        pdevices.len(),
+                        names.join(", ")
+                    ))
+                })?
+            }
+            Err(_) => pdevices
+                .iter()
+                .copied()
+                .find(|&pd| {
+                    let p = unsafe { instance.get_physical_device_properties(pd) };
+                    p.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
+                })
+                .unwrap_or(pdevices[0]),
+        };
 
         // ── compute queue family ───────────────────────────────────────────────
         let qf_props =
