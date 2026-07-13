@@ -2937,6 +2937,34 @@ fn sample_f32_matches_cpu() {
     }
 }
 
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn sample_f32_vocab_split_matches_cpu() {
+    let n = 151_936usize;
+    let xs: Vec<f32> = rand_f32(n, 121).iter().map(|v| v * 8.0).collect();
+    for (top_k, temp, top_p, uu) in [
+        (20u32, 0.7f32, 0.95f32, 0.03f32),
+        (20, 0.7, 0.95, 0.51),
+        (20, 0.7, 0.95, 0.97),
+        (64, 1.0, 1.0, 0.74),
+    ] {
+        let mut g = Graph::new();
+        let x = g.input(TensorDesc::new(vec![n], DType::F32));
+        let u = g.input(TensorDesc::new(vec![1], DType::F32));
+        let dst = g.output(TensorDesc::new(vec![1], DType::F32));
+        g.push(Op::Sample {
+            x,
+            u,
+            dst,
+            n: n as u32,
+            top_k,
+            temp,
+            top_p,
+        });
+        assert_id_parity(&g, &[(x, f32_bytes(&xs)), (u, f32_bytes(&[uu]))], dst, 1);
+    }
+}
+
 // embed_gather_*: dst[r, :] = dequant(table[ids[r], :]) * scale, gathering the
 // resident quantized token_embd row on-device (the SAME DEC16_* decode the
 // linear kernels use) instead of a host dequant + upload. Covers both kernel

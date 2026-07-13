@@ -158,11 +158,34 @@ mod tests {
     }
 
     #[test]
+    fn sample_msl_has_vocab_split_entrypoints() {
+        let src = include_str!("../shaders/elementwise_norms.metal");
+        assert!(src.contains("kernel void sample_f32_stage1"));
+        assert!(src.contains("kernel void sample_f32_stage2"));
+        assert!(src.contains("kernel void sample_f32_stage2_dyn"));
+    }
+
+    #[test]
     fn argmax_split_policy_only_targets_vocab_scale_inputs() {
         assert_eq!(argmax_split_groups(151_936), Some(38));
         assert_eq!(argmax_split_groups(32_768), Some(8));
         assert_eq!(argmax_split_groups(8_192), None);
         assert_eq!(argmax_split_groups(4_099), None);
+    }
+
+    #[test]
+    fn sample_split_policy_only_targets_vocab_scale_inputs() {
+        assert_eq!(sample_split_groups(151_936), Some(38));
+        assert_eq!(sample_split_groups(32_768), Some(8));
+        assert_eq!(sample_split_groups(8_192), None);
+        assert_eq!(sample_split_groups(4_099), None);
+    }
+
+    #[test]
+    fn sample_split_sizes_merge_candidates_from_top_k() {
+        assert_eq!(sample_split_shape(151_936, 20), Some((38, 760)));
+        assert_eq!(sample_split_shape(151_936, 64), Some((38, 2_432)));
+        assert_eq!(sample_split_shape(8_192, 20), None);
     }
 
     #[test]
@@ -592,9 +615,18 @@ fn metal_embed_gather_kern(dt: DType) -> Option<&'static str> {
 }
 
 const ARGMAX_SPLIT_CHUNK: usize = 4096;
+const SAMPLE_SPLIT_CHUNK: usize = 4096;
 
 fn argmax_split_groups(n: usize) -> Option<usize> {
     (n > 8192).then(|| n.div_ceil(ARGMAX_SPLIT_CHUNK))
+}
+
+fn sample_split_groups(n: usize) -> Option<usize> {
+    (n > 8192).then(|| n.div_ceil(SAMPLE_SPLIT_CHUNK))
+}
+
+fn sample_split_shape(n: usize, top_k: usize) -> Option<(usize, usize)> {
+    sample_split_groups(n).map(|groups| (groups, groups * top_k.min(64)))
 }
 
 /// Classify the GPU-resident decode tail ops that may appear on an otherwise replayable graph.
@@ -2644,32 +2676,84 @@ impl MetalBackend {
                 let bx = self.ensure_device(r, x);
                 let bu = self.ensure_device(r, u);
                 let bd = self.dev_dst(r, dst, 1);
-                let mut p = n.to_ne_bytes().to_vec();
-                p.extend_from_slice(&top_k.to_ne_bytes());
-                p.extend_from_slice(&temp.to_ne_bytes());
-                p.extend_from_slice(&top_p.to_ne_bytes());
-                if let Some(posbuf) = r.posbuf.clone() {
-                    let pso = self.pipelines.get("sample_f32_dyn")?;
+                if let Some((groups, candidates)) = sample_split_shape(n as usize, top_k as usize) {
+                    let values = self.scratch_buf(candidates, 11);
+                    let indices = self.scratch_buf(candidates, 12);
+                    let mut p1 = n.to_ne_bytes().to_vec();
+                    p1.extend_from_slice(&top_k.to_ne_bytes());
+                    p1.extend_from_slice(&(SAMPLE_SPLIT_CHUNK as u32).to_ne_bytes());
+                    let stage1 = self.pipelines.get("sample_f32_stage1")?;
                     self.encode_tg_w(
                         r,
-                        &pso,
-                        &[bx.as_ref(), bu.as_ref(), &posbuf, bd.as_ref()],
-                        1 << 3,
-                        &p,
-                        256,
+                        &stage1,
+                        &[bx.as_ref(), values.as_ref(), indices.as_ref()],
+                        (1 << 1) | (1 << 2),
+                        &p1,
+                        groups * 256,
                         256,
                     );
+
+                    let mut p2 = (candidates as u32).to_ne_bytes().to_vec();
+                    p2.extend_from_slice(&top_k.to_ne_bytes());
+                    p2.extend_from_slice(&temp.to_ne_bytes());
+                    p2.extend_from_slice(&top_p.to_ne_bytes());
+                    if let Some(posbuf) = r.posbuf.clone() {
+                        let stage2 = self.pipelines.get("sample_f32_stage2_dyn")?;
+                        self.encode_tg_w(
+                            r,
+                            &stage2,
+                            &[
+                                values.as_ref(),
+                                indices.as_ref(),
+                                bu.as_ref(),
+                                &posbuf,
+                                bd.as_ref(),
+                            ],
+                            1 << 4,
+                            &p2,
+                            256,
+                            256,
+                        );
+                    } else {
+                        let stage2 = self.pipelines.get("sample_f32_stage2")?;
+                        self.encode_tg_w(
+                            r,
+                            &stage2,
+                            &[values.as_ref(), indices.as_ref(), bu.as_ref(), bd.as_ref()],
+                            1 << 3,
+                            &p2,
+                            256,
+                            256,
+                        );
+                    }
                 } else {
-                    let pso = self.pipelines.get("sample_f32")?;
-                    self.encode_tg_w(
-                        r,
-                        &pso,
-                        &[bx.as_ref(), bu.as_ref(), bd.as_ref()],
-                        1 << 2,
-                        &p,
-                        256,
-                        256,
-                    );
+                    let mut p = n.to_ne_bytes().to_vec();
+                    p.extend_from_slice(&top_k.to_ne_bytes());
+                    p.extend_from_slice(&temp.to_ne_bytes());
+                    p.extend_from_slice(&top_p.to_ne_bytes());
+                    if let Some(posbuf) = r.posbuf.clone() {
+                        let pso = self.pipelines.get("sample_f32_dyn")?;
+                        self.encode_tg_w(
+                            r,
+                            &pso,
+                            &[bx.as_ref(), bu.as_ref(), &posbuf, bd.as_ref()],
+                            1 << 3,
+                            &p,
+                            256,
+                            256,
+                        );
+                    } else {
+                        let pso = self.pipelines.get("sample_f32")?;
+                        self.encode_tg_w(
+                            r,
+                            &pso,
+                            &[bx.as_ref(), bu.as_ref(), bd.as_ref()],
+                            1 << 2,
+                            &p,
+                            256,
+                            256,
+                        );
+                    }
                 }
                 r.loc[dst.0 as usize] = Loc::Device;
             }
