@@ -371,11 +371,26 @@ void dqblk(uint gstart, out float v[32]) {  // decode d/dmin/6-bit scale once fo
     uint hw = (bd + 16u) >> 2u;
     uint nsh = ((sub & 1u) == 0u) ? 0u : 4u;      // low/high nibble of qs
     uint hsh = 2u * j + (((sub & 1u) == 0u) ? 0u : 1u); // qh bit index for this sub-block
+    // SWAR the 5-bit rebuild across all four byte-lanes at once. The per-element form
+    //   val = ((q >> 8b) & 0xF) | (((h >> 8b) & 1) << 4)
+    // costs 6 integer ops PER ELEMENT (shift/and/shift/and/shl/or). Masking the whole word
+    // instead — `q & 0x0F0F0F0F` leaves each byte's nibble in place, `(h & 0x01010101) << 4`
+    // leaves each byte's 5th bit at bit 4 of its lane — rebuilds all four 5-bit codes in 4 ops
+    // TOTAL, leaving one bitfieldExtract per element. 6 ops/elem -> ~2. Same integers, so this
+    // is bit-identical to the byte-serial form.
+    //
+    // Why it matters: Q5_K's dequant ALU is CO-CRITICAL with DRAM at decode, not free. On a
+    // 7900 XTX the gemma-4-31B Q5_K weights (14.90 GB/token) have a 15.5 us/GB DRAM floor of
+    // 15.5 ms, while the old ~9 ops/elem cost ~12.7 ms of ALU — so the two could not overlap and
+    // the GEMV landed at 737 GB/s (77% of peak). Q8_0, whose decode is ~4 ops/elem (ALU
+    // effectively free), hits 863 GB/s (90%) through this SAME kernel — that gap was the ALU,
+    // and this cuts it to ~5 ops/elem.
     for (uint w8 = 0u; w8 < 8u; w8++) {
         uint q = NW(qw + w8) >> nsh;
         uint h = NW(hw + w8) >> hsh;
+        uint packed = (q & 0x0F0F0F0Fu) | ((h & 0x01010101u) << 4u);
         for (uint b = 0u; b < 4u; b++) {
-            uint val = ((q >> (8u * b)) & 0xFu) | (((h >> (8u * b)) & 1u) << 4u);
+            uint val = bitfieldExtract(packed, int(8u * b), 5);
             v[w8 * 4u + b] = dl * float(val) - mm;
         }
     }
