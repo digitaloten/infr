@@ -1,4 +1,8 @@
 // ---- elementwise ----
+kernel void advance_position_i32(device int* position [[buffer(0)]]) {
+    position[0] += 1;
+}
+
 kernel void add_f32(device const float* a   [[buffer(0)]],
                     device const float* b   [[buffer(1)]],
                     device float*       dst [[buffer(2)]],
@@ -169,7 +173,7 @@ kernel void argmax_f32(device const float* logits [[buffer(0)]],
                        uint t [[thread_position_in_threadgroup]]) {
     threadgroup float sval[256];
     threadgroup uint  sidx[256];
-    float best = -1e30f;
+    float best = -INFINITY;
     uint bi = 0u;
     for (uint i = t; i < p.n; i += 256u) {
         if (logits[i] > best) { best = logits[i]; bi = i; }
@@ -181,6 +185,71 @@ kernel void argmax_f32(device const float* logits [[buffer(0)]],
         if (t < s && sval[t + s] > sval[t]) {
             sval[t] = sval[t + s];
             sidx[t] = sidx[t + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (t == 0u) { out_id[0] = sidx[0]; }
+}
+
+struct ArgmaxSplitParams { uint n; uint chunk; };
+kernel void argmax_f32_stage1(device const float* logits [[buffer(0)]],
+                              device float*       out_val [[buffer(1)]],
+                              device uint*        out_idx [[buffer(2)]],
+                              constant ArgmaxSplitParams& p [[buffer(3)]],
+                              uint t [[thread_position_in_threadgroup]],
+                              uint group [[threadgroup_position_in_grid]]) {
+    threadgroup float sval[256];
+    threadgroup uint  sidx[256];
+    uint base = group * p.chunk;
+    uint end = min(base + p.chunk, p.n);
+    float best = -INFINITY;
+    uint bi = base;
+    for (uint i = base + t; i < end; i += 256u) {
+        float v = logits[i];
+        if (v > best || (v == best && i < bi)) { best = v; bi = i; }
+    }
+    sval[t] = best;
+    sidx[t] = bi;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128u; s > 0u; s /= 2u) {
+        if (t < s) {
+            float v = sval[t + s];
+            uint i = sidx[t + s];
+            if (v > sval[t] || (v == sval[t] && i < sidx[t])) {
+                sval[t] = v;
+                sidx[t] = i;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (t == 0u) { out_val[group] = sval[0]; out_idx[group] = sidx[0]; }
+}
+
+kernel void argmax_f32_stage2(device const float* values [[buffer(0)]],
+                              device const uint*  indices [[buffer(1)]],
+                              device uint*        out_id  [[buffer(2)]],
+                              constant ArgmaxParams& p    [[buffer(3)]],
+                              uint t [[thread_position_in_threadgroup]]) {
+    threadgroup float sval[256];
+    threadgroup uint  sidx[256];
+    float best = -INFINITY;
+    uint bi = 0u;
+    for (uint i = t; i < p.n; i += 256u) {
+        float v = values[i];
+        uint idx = indices[i];
+        if (v > best || (v == best && idx < bi)) { best = v; bi = idx; }
+    }
+    sval[t] = best;
+    sidx[t] = bi;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128u; s > 0u; s /= 2u) {
+        if (t < s) {
+            float v = sval[t + s];
+            uint i = sidx[t + s];
+            if (v > sval[t] || (v == sval[t] && i < sidx[t])) {
+                sval[t] = v;
+                sidx[t] = i;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -201,15 +270,47 @@ kernel void argmax_f32(device const float* logits [[buffer(0)]],
 // the host: softmax(temp) over the selected set, nucleus (top-p) cutoff, inverse-CDF walk with `u`.
 #define SAMPLE_KMAX 64u
 struct SampleParams { uint n; uint top_k; float temp; float top_p; };
-kernel void sample_f32(device const float* logits [[buffer(0)]],
-                       device const float* u_buf  [[buffer(1)]],
-                       device uint*        out_id [[buffer(2)]],
-                       constant SampleParams& p    [[buffer(3)]],
-                       uint t [[thread_position_in_threadgroup]]) {
-    threadgroup float sval[256];
-    threadgroup uint  sidx[256];
-    threadgroup float gval[SAMPLE_KMAX];
-    threadgroup uint  gidx[SAMPLE_KMAX];
+inline void sample_f32_finish(float uniform,
+                              device uint* out_id,
+                              constant SampleParams& p,
+                              uint k,
+                              threadgroup float* gval,
+                              threadgroup uint* gidx) {
+    float maxl = gval[0];
+    float sum = 0.0f;
+    for (uint j = 0u; j < k; j++) {
+        float pr = exp((gval[j] - maxl) / p.temp);
+        gval[j] = pr;
+        sum += pr;
+    }
+    for (uint j = 0u; j < k; j++) { gval[j] /= sum; }
+    float cum = 0.0f;
+    uint cutoff = k;
+    for (uint j = 0u; j < k; j++) {
+        cum += gval[j];
+        if (cum >= p.top_p) { cutoff = j + 1u; break; }
+    }
+    float total = 0.0f;
+    for (uint j = 0u; j < cutoff; j++) { total += gval[j]; }
+    float r = uniform * total;
+    uint tok = gidx[cutoff - 1u];
+    float acc = 0.0f;
+    for (uint j = 0u; j < cutoff; j++) {
+        acc += gval[j];
+        if (r <= acc) { tok = gidx[j]; break; }
+    }
+    out_id[0] = tok;
+}
+
+inline void sample_f32_impl(device const float* logits,
+                            float uniform,
+                            device uint* out_id,
+                            constant SampleParams& p,
+                            uint t,
+                            threadgroup float* sval,
+                            threadgroup uint* sidx,
+                            threadgroup float* gval,
+                            threadgroup uint* gidx) {
     // Clamp like the host (`k = top_k.min(logits.len())`) — defensive against a vocab smaller
     // than top_k; never triggers in practice (vocab >> 64).
     uint k = min(p.top_k, p.n);
@@ -240,32 +341,184 @@ kernel void sample_f32(device const float* logits [[buffer(0)]],
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    // Phase 2 (single lane): softmax(temp), nucleus cutoff, inverse-CDF sample — same two-pass
-    // structure (cutoff scan, then an independent re-summed `total`) as the host reference.
+    // Phase 2 (single lane): softmax(temp), nucleus cutoff, inverse-CDF sample.
     if (t == 0u) {
-        float maxl = gval[0];
-        float sum = 0.0f;
-        for (uint j = 0u; j < k; j++) {
-            float pr = exp((gval[j] - maxl) / p.temp);
-            gval[j] = pr; // reuse gval to hold probabilities
-            sum += pr;
-        }
-        for (uint j = 0u; j < k; j++) { gval[j] /= sum; }
-        float cum = 0.0f;
-        uint cutoff = k;
-        for (uint j = 0u; j < k; j++) {
-            cum += gval[j];
-            if (cum >= p.top_p) { cutoff = j + 1u; break; }
-        }
-        float total = 0.0f;
-        for (uint j = 0u; j < cutoff; j++) { total += gval[j]; }
-        float r = u_buf[0] * total;
-        uint tok = gidx[cutoff - 1u];
-        float acc = 0.0f;
-        for (uint j = 0u; j < cutoff; j++) {
-            acc += gval[j];
-            if (r <= acc) { tok = gidx[j]; break; }
-        }
-        out_id[0] = tok;
+        sample_f32_finish(uniform, out_id, p, k, gval, gidx);
     }
+}
+
+kernel void sample_f32(device const float* logits [[buffer(0)]],
+                       device const float* u_buf  [[buffer(1)]],
+                       device uint*        out_id [[buffer(2)]],
+                       constant SampleParams& p    [[buffer(3)]],
+                       uint t [[thread_position_in_threadgroup]]) {
+    threadgroup float sval[256];
+    threadgroup uint  sidx[256];
+    threadgroup float gval[SAMPLE_KMAX];
+    threadgroup uint  gidx[SAMPLE_KMAX];
+    sample_f32_impl(logits, u_buf[0], out_id, p, t, sval, sidx, gval, gidx);
+}
+
+// Record-once decode variant: params are fixed in the tape, while the bound position and the
+// runner's 64-slot uniform ring change per token.
+kernel void sample_f32_dyn(device const float* logits    [[buffer(0)]],
+                           device const float* u_buf     [[buffer(1)]],
+                           device const int*   positions [[buffer(2)]],
+                           device uint*        out_id    [[buffer(3)]],
+                           constant SampleParams& p       [[buffer(4)]],
+                           uint t [[thread_position_in_threadgroup]]) {
+    threadgroup float sval[256];
+    threadgroup uint  sidx[256];
+    threadgroup float gval[SAMPLE_KMAX];
+    threadgroup uint  gidx[SAMPLE_KMAX];
+    sample_f32_impl(
+        logits, u_buf[(uint)positions[0] & 63u], out_id, p, t, sval, sidx, gval, gidx
+    );
+}
+
+struct SampleSplitParams { uint n; uint top_k; uint chunk; };
+kernel void sample_f32_stage1(device const float* logits [[buffer(0)]],
+                              device float*       out_val [[buffer(1)]],
+                              device uint*        out_idx [[buffer(2)]],
+                              constant SampleSplitParams& p [[buffer(3)]],
+                              uint t [[thread_position_in_threadgroup]],
+                              uint group [[threadgroup_position_in_grid]]) {
+    threadgroup float sval[256];
+    threadgroup uint  sidx[256];
+    uint base = group * p.chunk;
+    uint end = min(base + p.chunk, p.n);
+    uint k = min(p.top_k, SAMPLE_KMAX);
+    // A 4K chunk gives each lane at most 16 strided logits. Once a lane wins a reduction,
+    // remember that local slot directly instead of comparing every logit with all prior winners.
+    uint used_mask = 0u;
+    for (uint iter = 0u; iter < k; iter++) {
+        float best = -INFINITY;
+        uint bi = base;
+        uint slot = 0u;
+        for (uint i = base + t; i < end; i += 256u, slot++) {
+            float v = logits[i];
+            if ((used_mask & (1u << slot)) == 0u &&
+                (v > best || (v == best && i < bi))) {
+                best = v;
+                bi = i;
+            }
+        }
+        sval[t] = best;
+        sidx[t] = bi;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = 128u; s > 0u; s /= 2u) {
+            if (t < s) {
+                float v = sval[t + s];
+                uint i = sidx[t + s];
+                if (v > sval[t] || (v == sval[t] && i < sidx[t])) {
+                    sval[t] = v;
+                    sidx[t] = i;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        uint winner = sidx[0];
+        uint lane_base = base + t;
+        if (winner >= lane_base && winner < end) {
+            uint delta = winner - lane_base;
+            if (delta % 256u == 0u) {
+                uint slot = delta / 256u;
+                used_mask |= 1u << slot;
+            }
+        }
+        if (t == 0u) {
+            uint out = group * k + iter;
+            out_val[out] = sval[0];
+            out_idx[out] = sidx[0];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+inline void sample_f32_stage2_impl(device const float* values,
+                                   device const uint* indices,
+                                   float uniform,
+                                   device uint* out_id,
+                                   constant SampleParams& p,
+                                   uint t,
+                                   threadgroup float* sval,
+                                   threadgroup uint* sidx,
+                                   threadgroup float* gval,
+                                   threadgroup uint* gidx,
+                                   threadgroup uint* gslot) {
+    uint k = min(min(p.top_k, p.n), SAMPLE_KMAX);
+    for (uint iter = 0u; iter < k; iter++) {
+        float best = -INFINITY;
+        uint bi = 0u;
+        for (uint i = t; i < p.n; i += 256u) {
+            bool used = false;
+            for (uint j = 0u; j < iter; j++) {
+                if (gslot[j] == i) { used = true; break; }
+            }
+            float v = values[i];
+            uint idx = indices[i];
+            if (!used && (v > best || (v == best && idx < indices[bi]))) {
+                best = v;
+                bi = i;
+            }
+        }
+        sval[t] = best;
+        sidx[t] = bi;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = 128u; s > 0u; s /= 2u) {
+            if (t < s) {
+                float v = sval[t + s];
+                uint slot = sidx[t + s];
+                if (v > sval[t] || (v == sval[t] && indices[slot] < indices[sidx[t]])) {
+                    sval[t] = v;
+                    sidx[t] = slot;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (t == 0u) {
+            uint slot = sidx[0];
+            gval[iter] = sval[0];
+            gidx[iter] = indices[slot];
+            gslot[iter] = slot;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (t == 0u) {
+        sample_f32_finish(uniform, out_id, p, k, gval, gidx);
+    }
+}
+
+kernel void sample_f32_stage2(device const float* values [[buffer(0)]],
+                              device const uint*  indices [[buffer(1)]],
+                              device const float* u_buf   [[buffer(2)]],
+                              device uint*        out_id  [[buffer(3)]],
+                              constant SampleParams& p    [[buffer(4)]],
+                              uint t [[thread_position_in_threadgroup]]) {
+    threadgroup float sval[256];
+    threadgroup uint  sidx[256];
+    threadgroup float gval[SAMPLE_KMAX];
+    threadgroup uint  gidx[SAMPLE_KMAX];
+    threadgroup uint  gslot[SAMPLE_KMAX];
+    sample_f32_stage2_impl(
+        values, indices, u_buf[0], out_id, p, t, sval, sidx, gval, gidx, gslot
+    );
+}
+
+kernel void sample_f32_stage2_dyn(device const float* values    [[buffer(0)]],
+                                  device const uint*  indices   [[buffer(1)]],
+                                  device const float* u_buf     [[buffer(2)]],
+                                  device const int*   positions [[buffer(3)]],
+                                  device uint*        out_id    [[buffer(4)]],
+                                  constant SampleParams& p      [[buffer(5)]],
+                                  uint t [[thread_position_in_threadgroup]]) {
+    threadgroup float sval[256];
+    threadgroup uint  sidx[256];
+    threadgroup float gval[SAMPLE_KMAX];
+    threadgroup uint  gidx[SAMPLE_KMAX];
+    threadgroup uint  gslot[SAMPLE_KMAX];
+    sample_f32_stage2_impl(
+        values, indices, u_buf[(uint)positions[0] & 63u], out_id, p,
+        t, sval, sidx, gval, gidx, gslot
+    );
 }

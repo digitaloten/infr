@@ -69,7 +69,8 @@ kernel void qknormrope_f32(device const float* x   [[buffer(0)]],
         uint i0 = pp, i1 = pp + hf;
         float ang = p0 * pow(p.theta, -2.0f * (float)pp / (float)p.rope_dim);
         if (p.has_ff != 0) ang /= ff[pp];
-        float c = cos(ang), sn = sin(ang);
+        float c;
+        float sn = sincos(ang, c);
         float a = x[xbase + i0] * s * w[i0];
         float b = x[xbase + i1] * s * w[i1];
         dst[dbase + i0] = a * c - b * sn;
@@ -114,7 +115,8 @@ kernel void qknormrope_wide_f32(device const float* x   [[buffer(0)]],
         uint i0 = pp, i1 = pp + hf;
         float ang = p0 * pow(p.theta, -2.0f * (float)pp / (float)p.rope_dim);
         if (p.has_ff != 0) ang /= ff[pp];
-        float c = cos(ang), sn = sin(ang);
+        float c;
+        float sn = sincos(ang, c);
         float a = x[xbase + i0] * s * w[i0];
         float b = x[xbase + i1] * s * w[i1];
         dst[dbase + i0] = a * c - b * sn;

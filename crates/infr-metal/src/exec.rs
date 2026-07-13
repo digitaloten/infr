@@ -32,6 +32,451 @@ pub(crate) struct QuiWeight {
     dshift: u32,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use infr_core::backend::{Backend, Buffer, BufferUsage};
+    use infr_core::graph::{AttnMask, Graph};
+    use infr_core::tensor::TensorDesc;
+
+    #[test]
+    fn replay_gpu_decode_op_eligibility() {
+        let mut g = infr_core::graph::Graph::new();
+        let logits = g.input(TensorDesc::new(vec![128], DType::F32));
+        let uniform = g.input(TensorDesc::new(vec![64], DType::F32));
+        let ids = g.input(TensorDesc::new(vec![2], DType::I32));
+        let q4k = g.weight(TensorDesc::new(vec![8, 256], DType::Q4K));
+        let q5k = g.weight(TensorDesc::new(vec![8, 256], DType::Q5K));
+        let token = g.output(TensorDesc::new(vec![1], DType::F32));
+        let gathered = g.output(TensorDesc::new(vec![2, 256], DType::F32));
+
+        assert_eq!(
+            replay_gpu_decode_op_supported(
+                &Op::Argmax {
+                    x: logits,
+                    dst: token,
+                    n: 128,
+                    rows: 1,
+                },
+                &g,
+            ),
+            Some(true),
+        );
+        assert_eq!(
+            replay_gpu_decode_op_supported(
+                &Op::Argmax {
+                    x: logits,
+                    dst: token,
+                    n: 128,
+                    rows: 2,
+                },
+                &g,
+            ),
+            Some(false),
+        );
+        assert_eq!(
+            replay_gpu_decode_op_supported(
+                &Op::Sample {
+                    x: logits,
+                    u: uniform,
+                    dst: token,
+                    n: 128,
+                    top_k: 40,
+                    temp: 0.8,
+                    top_p: 0.95,
+                },
+                &g,
+            ),
+            Some(true),
+        );
+        assert_eq!(
+            replay_gpu_decode_op_supported(
+                &Op::EmbedGather {
+                    ids,
+                    table: q4k,
+                    dst: gathered,
+                    rows: 1,
+                    ne: 256,
+                    scale: 1.0,
+                },
+                &g,
+            ),
+            Some(true),
+        );
+        assert_eq!(
+            replay_gpu_decode_op_supported(
+                &Op::EmbedGather {
+                    ids,
+                    table: q4k,
+                    dst: gathered,
+                    rows: 2,
+                    ne: 256,
+                    scale: 1.0,
+                },
+                &g,
+            ),
+            Some(false),
+        );
+        assert_eq!(
+            replay_gpu_decode_op_supported(
+                &Op::EmbedGather {
+                    ids,
+                    table: q5k,
+                    dst: gathered,
+                    rows: 1,
+                    ne: 256,
+                    scale: 1.0,
+                },
+                &g,
+            ),
+            Some(false),
+        );
+    }
+
+    #[test]
+    fn embed_gather_msl_reads_raw_i32_ids() {
+        let src = include_str!("../shaders/embed_gather.metal");
+        assert_eq!(
+            src.matches("device const int*").count(),
+            3,
+            "quant, f16, and bf16 gather entry points must share the raw-i32 ID ABI",
+        );
+        assert!(
+            !src.contains("device const float*  ids"),
+            "numeric-f32 IDs require a host mirror and cannot be replayed",
+        );
+    }
+
+    #[test]
+    fn sample_msl_has_position_dynamic_entrypoint() {
+        let src = include_str!("../shaders/elementwise_norms.metal");
+        assert!(src.contains("kernel void sample_f32_dyn"));
+        assert!(
+            src.contains("positions[0]") && src.contains("& 63u"),
+            "dynamic sampling must select the runner's position-indexed uniform slot",
+        );
+    }
+
+    #[test]
+    fn sample_msl_has_vocab_split_entrypoints() {
+        let src = include_str!("../shaders/elementwise_norms.metal");
+        assert!(src.contains("kernel void sample_f32_stage1"));
+        assert!(src.contains("kernel void sample_f32_stage2"));
+        assert!(src.contains("kernel void sample_f32_stage2_dyn"));
+    }
+
+    #[test]
+    fn sample_stage1_tracks_selected_logits_per_lane() {
+        let src = include_str!("../shaders/elementwise_norms.metal");
+        assert!(src.contains("uint used_mask = 0u"));
+        assert!(src.contains("used_mask |= 1u << slot"));
+    }
+
+    #[test]
+    fn qknormrope_uses_combined_sincos() {
+        let src = include_str!("../shaders/rope_ffn.metal");
+        assert_eq!(src.matches("sincos(ang, c)").count(), 2);
+    }
+
+    #[test]
+    fn argmax_split_policy_only_targets_vocab_scale_inputs() {
+        assert_eq!(argmax_split_groups(151_936), Some(38));
+        assert_eq!(argmax_split_groups(32_768), Some(8));
+        assert_eq!(argmax_split_groups(8_192), None);
+        assert_eq!(argmax_split_groups(4_099), None);
+    }
+
+    #[test]
+    fn sample_split_policy_only_targets_vocab_scale_inputs() {
+        assert_eq!(sample_split_groups(151_936), Some(38));
+        assert_eq!(sample_split_groups(32_768), Some(8));
+        assert_eq!(sample_split_groups(8_192), None);
+        assert_eq!(sample_split_groups(4_099), None);
+    }
+
+    #[test]
+    fn sample_split_sizes_merge_candidates_from_top_k() {
+        assert_eq!(sample_split_shape(151_936, 20), Some((38, 760)));
+        assert_eq!(sample_split_shape(151_936, 64), Some((38, 2_432)));
+        assert_eq!(sample_split_shape(8_192, 20), None);
+    }
+
+    #[test]
+    #[ignore = "requires a Metal GPU"]
+    fn replay_gpu_decode_ops_observe_dynamic_inputs() {
+        let be = MetalBackend::new().expect("Metal backend");
+        let mut g = Graph::new();
+
+        let rope_x = g.input(TensorDesc::new(vec![1, 1, 64], DType::F32));
+        let positions = g.input(TensorDesc::new(vec![1], DType::I32));
+        let rope_dst = g.internal(TensorDesc::new(vec![1, 1, 64], DType::F32));
+        g.push(Op::Rope {
+            x: rope_x,
+            positions,
+            dst: rope_dst,
+            rows: 1,
+            n_head: 1,
+            head_dim: 64,
+            rope_dim: 64,
+            theta: 10_000.0,
+            freq_factors: None,
+            x_stride: 0,
+        });
+
+        let q = g.input(TensorDesc::new(vec![1, 1, 64], DType::F32));
+        let k_cache = g.input(TensorDesc::new(vec![8, 1, 64], DType::F16));
+        let v_cache = g.input(TensorDesc::new(vec![8, 1, 64], DType::F16));
+        let attn_dst = g.internal(TensorDesc::new(vec![1, 1, 64], DType::F32));
+        g.push(Op::Attention {
+            q,
+            k_cache,
+            v_cache,
+            dst: attn_dst,
+            rows: 1,
+            kv_len: 1,
+            n_head: 1,
+            n_kv: 1,
+            head_dim: 64,
+            scale: 0.125,
+            mask: AttnMask::Causal,
+            pos: 0,
+        });
+
+        let ids = g.input(TensorDesc::new(vec![1], DType::I32));
+        let table = g.weight(TensorDesc::new(vec![8, 64], DType::F16));
+        let gathered = g.output(TensorDesc::new(vec![1, 64], DType::F32));
+        g.push(Op::EmbedGather {
+            ids,
+            table,
+            dst: gathered,
+            rows: 1,
+            ne: 64,
+            scale: 1.0,
+        });
+
+        let logits = g.input(TensorDesc::new(vec![128], DType::F32));
+        let uniform = g.input(TensorDesc::new(vec![64], DType::F32));
+        let sampled = g.output(TensorDesc::new(vec![1], DType::F32));
+        let greedy = g.output(TensorDesc::new(vec![1], DType::F32));
+        g.push(Op::Sample {
+            x: logits,
+            u: uniform,
+            dst: sampled,
+            n: 128,
+            top_k: 4,
+            temp: 1.0,
+            top_p: 1.0,
+        });
+        g.push(Op::Argmax {
+            x: logits,
+            dst: greedy,
+            n: 128,
+            rows: 1,
+        });
+
+        let alloc = |bytes: &[u8]| -> Box<dyn Buffer> {
+            let buf = be
+                .alloc(bytes.len().max(4), BufferUsage::Activations)
+                .unwrap();
+            be.upload(buf.as_ref(), bytes).unwrap();
+            buf
+        };
+        let zeros_f32 = vec![0u8; 64 * 4];
+        let zeros_f16_cache = vec![0u8; 8 * 64 * 2];
+        let table_values: Vec<u16> = (0..8)
+            .flat_map(|row| std::iter::repeat_n(half::f16::from_f32(row as f32).to_bits(), 64))
+            .collect();
+        let logits_values: Vec<f32> = (0..128).map(|i| -(i as f32) * 0.1).collect();
+        let mut uniform_values = [0.0f32; 64];
+        uniform_values[0] = 0.01;
+
+        let rope_x_buf = alloc(&zeros_f32);
+        let positions_buf = alloc(bytemuck::cast_slice(&[0i32]));
+        let q_buf = alloc(&zeros_f32);
+        let k_buf = alloc(&zeros_f16_cache);
+        let v_buf = alloc(&zeros_f16_cache);
+        let ids_buf = alloc(bytemuck::cast_slice(&[1i32]));
+        let table_buf = alloc(bytemuck::cast_slice(&table_values));
+        let gathered_buf = alloc(&vec![0u8; 64 * 4]);
+        let logits_buf = alloc(bytemuck::cast_slice(&logits_values));
+        let uniform_buf = alloc(bytemuck::cast_slice(&uniform_values));
+        let sampled_buf = alloc(&[0u8; 4]);
+        let greedy_buf = alloc(&[0u8; 4]);
+
+        let mut bindings = Bindings::new();
+        bindings.bind(rope_x, rope_x_buf.as_ref());
+        bindings.bind(positions, positions_buf.as_ref());
+        bindings.bind(q, q_buf.as_ref());
+        bindings.bind(k_cache, k_buf.as_ref());
+        bindings.bind(v_cache, v_buf.as_ref());
+        bindings.bind(ids, ids_buf.as_ref());
+        bindings.bind(table, table_buf.as_ref());
+        bindings.bind(gathered, gathered_buf.as_ref());
+        bindings.bind(logits, logits_buf.as_ref());
+        bindings.bind(uniform, uniform_buf.as_ref());
+        bindings.bind(sampled, sampled_buf.as_ref());
+        bindings.bind(greedy, greedy_buf.as_ref());
+
+        let plan = be.compile(&g).unwrap();
+        let replay_capable = be.replay_capable(&g, &bindings);
+        be.execute(plan.as_ref(), &bindings).unwrap();
+        if !replay_capable {
+            assert!(
+                be.replay.lock().unwrap().is_none(),
+                "a capability-capped device must stay on static execution"
+            );
+            return;
+        }
+        let first_tape = {
+            let replay = be.replay.lock().unwrap();
+            let tape = replay.as_ref().expect("first execute must record a tape");
+            (tape.fp, tape.entries.len())
+        };
+
+        let mut gathered_bytes = vec![0u8; 64 * 4];
+        be.download(gathered_buf.as_ref(), &mut gathered_bytes)
+            .unwrap();
+        assert_eq!(bytemuck::cast_slice::<u8, f32>(&gathered_bytes)[0], 1.0);
+        let mut token_bytes = [0u8; 4];
+        be.download(sampled_buf.as_ref(), &mut token_bytes).unwrap();
+        assert_eq!(u32::from_le_bytes(token_bytes), 0);
+
+        be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&[6i32]))
+            .unwrap();
+        be.upload(positions_buf.as_ref(), bytemuck::cast_slice(&[7i32]))
+            .unwrap();
+        uniform_values[7] = 0.99;
+        be.upload(uniform_buf.as_ref(), bytemuck::cast_slice(&uniform_values))
+            .unwrap();
+        be.execute(plan.as_ref(), &bindings).unwrap();
+
+        let second_tape = {
+            let replay = be.replay.lock().unwrap();
+            let tape = replay
+                .as_ref()
+                .expect("second execute must retain the tape");
+            (tape.fp, tape.entries.len())
+        };
+        assert_eq!(
+            second_tape, first_tape,
+            "second execute rebuilt the replay tape"
+        );
+        be.download(gathered_buf.as_ref(), &mut gathered_bytes)
+            .unwrap();
+        assert_eq!(bytemuck::cast_slice::<u8, f32>(&gathered_bytes)[0], 6.0);
+        be.download(sampled_buf.as_ref(), &mut token_bytes).unwrap();
+        assert_eq!(u32::from_le_bytes(token_bytes), 3);
+        be.download(greedy_buf.as_ref(), &mut token_bytes).unwrap();
+        assert_eq!(u32::from_le_bytes(token_bytes), 0);
+
+        let mut chain_bindings = Bindings::new();
+        chain_bindings.bind(rope_x, rope_x_buf.as_ref());
+        chain_bindings.bind(positions, positions_buf.as_ref());
+        chain_bindings.bind(q, q_buf.as_ref());
+        chain_bindings.bind(k_cache, k_buf.as_ref());
+        chain_bindings.bind(v_cache, v_buf.as_ref());
+        chain_bindings.bind(ids, ids_buf.as_ref());
+        chain_bindings.bind(table, table_buf.as_ref());
+        chain_bindings.bind(gathered, gathered_buf.as_ref());
+        chain_bindings.bind(logits, logits_buf.as_ref());
+        chain_bindings.bind(uniform, uniform_buf.as_ref());
+        chain_bindings.bind(sampled, ids_buf.as_ref());
+        chain_bindings.bind(greedy, greedy_buf.as_ref());
+
+        uniform_values[0] = 0.01;
+        uniform_values[1] = 0.99;
+        uniform_values[2] = 0.01;
+        be.upload(uniform_buf.as_ref(), bytemuck::cast_slice(&uniform_values))
+            .unwrap();
+        be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&[6i32]))
+            .unwrap();
+        be.upload(positions_buf.as_ref(), bytemuck::cast_slice(&[0i32]))
+            .unwrap();
+
+        let chain_plan = be.compile(&g).unwrap();
+        let ids = be
+            .execute_chain(chain_plan.as_ref(), &chain_bindings, 3)
+            .unwrap()
+            .expect("Metal replay must support device-side token chains");
+        assert_eq!(ids, vec![0, 3, 0]);
+
+        be.download(gathered_buf.as_ref(), &mut gathered_bytes)
+            .unwrap();
+        assert_eq!(
+            bytemuck::cast_slice::<u8, f32>(&gathered_bytes)[0],
+            3.0,
+            "the third replay must gather the second replay's sampled ID",
+        );
+        be.download(positions_buf.as_ref(), &mut token_bytes)
+            .unwrap();
+        assert_eq!(i32::from_le_bytes(token_bytes), 2);
+
+        let mut unsupported = Graph::new();
+        let bad_rope_x = unsupported.input(TensorDesc::new(vec![1, 1, 64], DType::F32));
+        let bad_positions = unsupported.input(TensorDesc::new(vec![1], DType::I32));
+        let bad_rope_dst = unsupported.internal(TensorDesc::new(vec![1, 1, 64], DType::F32));
+        unsupported.push(Op::Rope {
+            x: bad_rope_x,
+            positions: bad_positions,
+            dst: bad_rope_dst,
+            rows: 1,
+            n_head: 1,
+            head_dim: 64,
+            rope_dim: 64,
+            theta: 10_000.0,
+            freq_factors: None,
+            x_stride: 0,
+        });
+        let bad_ids = unsupported.input(TensorDesc::new(vec![1], DType::I32));
+        let bad_table = unsupported.weight(TensorDesc::new(vec![8, 64], DType::F16));
+        let bad_gathered = unsupported.output(TensorDesc::new(vec![1, 64], DType::F32));
+        unsupported.push(Op::EmbedGather {
+            ids: bad_ids,
+            table: bad_table,
+            dst: bad_gathered,
+            rows: 1,
+            ne: 64,
+            scale: 1.0,
+        });
+        let bad_logits = unsupported.input(TensorDesc::new(vec![128], DType::F32));
+        let bad_uniform = unsupported.input(TensorDesc::new(vec![64], DType::F32));
+        let bad_sampled = unsupported.output(TensorDesc::new(vec![1], DType::F32));
+        unsupported.push(Op::Sample {
+            x: bad_logits,
+            u: bad_uniform,
+            dst: bad_sampled,
+            n: 128,
+            top_k: 4,
+            temp: 1.0,
+            top_p: 1.0,
+        });
+        be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&[6i32]))
+            .unwrap();
+        let mut bad_bindings = Bindings::new();
+        bad_bindings.bind(bad_rope_x, rope_x_buf.as_ref());
+        bad_bindings.bind(bad_positions, positions_buf.as_ref());
+        bad_bindings.bind(bad_ids, ids_buf.as_ref());
+        bad_bindings.bind(bad_table, table_buf.as_ref());
+        bad_bindings.bind(bad_gathered, gathered_buf.as_ref());
+        bad_bindings.bind(bad_logits, logits_buf.as_ref());
+        bad_bindings.bind(bad_uniform, uniform_buf.as_ref());
+        bad_bindings.bind(bad_sampled, ids_buf.as_ref());
+        let bad_plan = be.compile(&unsupported).unwrap();
+        assert!(
+            be.execute_chain(bad_plan.as_ref(), &bad_bindings, 3)
+                .unwrap()
+                .is_none(),
+            "a graph without a replayable decode shape cannot chain",
+        );
+        be.download(ids_buf.as_ref(), &mut token_bytes).unwrap();
+        assert_eq!(
+            i32::from_le_bytes(token_bytes),
+            6,
+            "declining a chain must not execute any graph side effects",
+        );
+    }
+}
+
 /// Where a tensor's current value lives. GPU ops keep their results on the device and only pay a
 /// CPU↔GPU round-trip when a host-side op (or the final write-back) actually needs the bytes.
 #[derive(Clone, Copy, PartialEq)]
@@ -175,6 +620,49 @@ fn replay_fp(g: &infr_core::graph::Graph, bindings: &Bindings) -> u64 {
     h
 }
 
+fn metal_embed_gather_kern(dt: DType) -> Option<&'static str> {
+    match dt {
+        DType::F16 => Some("embed_gather_f16"),
+        DType::Bf16 => Some("embed_gather_bf16"),
+        DType::Q8_0 => Some("embed_gather_q8_0"),
+        DType::Q4_0 => Some("embed_gather_q4_0"),
+        DType::Q5_0 => Some("embed_gather_q5_0"),
+        DType::Q4K => Some("embed_gather_q4k"),
+        DType::Q6K => Some("embed_gather_q6k"),
+        DType::Iq4Nl => Some("embed_gather_iq4nl"),
+        DType::Iq4Xs => Some("embed_gather_iq4xs"),
+        _ => None,
+    }
+}
+
+const ARGMAX_SPLIT_CHUNK: usize = 4096;
+const SAMPLE_SPLIT_CHUNK: usize = 4096;
+
+fn argmax_split_groups(n: usize) -> Option<usize> {
+    (n > 8192).then(|| n.div_ceil(ARGMAX_SPLIT_CHUNK))
+}
+
+fn sample_split_groups(n: usize) -> Option<usize> {
+    (n > 8192).then(|| n.div_ceil(SAMPLE_SPLIT_CHUNK))
+}
+
+fn sample_split_shape(n: usize, top_k: usize) -> Option<(usize, usize)> {
+    sample_split_groups(n).map(|groups| (groups, groups * top_k.min(64)))
+}
+
+/// Classify the GPU-resident decode tail ops that may appear on an otherwise replayable graph.
+/// `None` leaves the op to the main replay-shape match; `Some(false)` is an explicit rejection.
+fn replay_gpu_decode_op_supported(op: &Op, g: &infr_core::graph::Graph) -> Option<bool> {
+    match op {
+        Op::Argmax { rows, .. } => Some(*rows == 1),
+        Op::Sample { .. } => Some(true),
+        Op::EmbedGather { table, rows, .. } => {
+            Some(*rows == 1 && metal_embed_gather_kern(g.desc(*table).dtype).is_some())
+        }
+        _ => None,
+    }
+}
+
 /// Is this graph the decode shape the replay tape supports? Every op must be one the recorder
 /// handles fully on-device, attention must be the rows=1 f16 shape with a dynamic-pos kernel
 /// instantiation (hd 64/128), and a QkNormRope must exist to name the positions buffer.
@@ -183,6 +671,12 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
     let mut has_rope = false;
     let mut has_attn = false;
     for op in &g.ops {
+        if let Some(supported) = replay_gpu_decode_op_supported(op, g) {
+            if !supported {
+                return false;
+            }
+            continue;
+        }
         match op {
             Op::RmsNorm { .. }
             | Op::RmsNormAdd { .. }
@@ -622,71 +1116,65 @@ impl MetalBackend {
         }
     }
 
+    fn encode_tape(&self, cb: &metal::CommandBufferRef, tape: &Tape) {
+        // CONCURRENT dispatch: with the serial type every dispatch implicitly orders after the
+        // previous one. Explicit barriers below preserve only the actual RAW/WAW/WAR hazards.
+        let enc = cb.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent);
+        let mut written: Vec<*const c_void> = Vec::with_capacity(8);
+        let mut read: Vec<*const c_void> = Vec::with_capacity(24);
+        let mut touched: Vec<&MtlBuffer> = Vec::with_capacity(32);
+        for e in &tape.entries {
+            let is_w = |i: usize| e.wmask & (1u32 << i.min(31)) != 0;
+            let hazard = e.bufs.iter().enumerate().any(|(i, b)| {
+                let p = b.as_ptr() as *const c_void;
+                written.contains(&p) || (is_w(i) && read.contains(&p))
+            });
+            if hazard {
+                let refs: Vec<&metal::ResourceRef> = touched
+                    .iter()
+                    .map(|b| b.as_ref() as &metal::ResourceRef)
+                    .collect();
+                enc.memory_barrier_with_resources(&refs);
+                written.clear();
+                read.clear();
+                touched.clear();
+            }
+            for (i, b) in e.bufs.iter().enumerate() {
+                let p = b.as_ptr() as *const c_void;
+                if is_w(i) {
+                    written.push(p);
+                } else {
+                    read.push(p);
+                }
+                if !touched.iter().any(|t| t.as_ptr() as *const c_void == p) {
+                    touched.push(b);
+                }
+            }
+            enc.set_compute_pipeline_state(&e.pso);
+            for (i, b) in e.bufs.iter().enumerate() {
+                enc.set_buffer(i as u64, Some(b), e.offs[i]);
+            }
+            if !e.params.is_empty() {
+                enc.set_bytes(
+                    e.bufs.len() as u64,
+                    e.params.len() as u64,
+                    e.params.as_ptr() as *const c_void,
+                );
+            }
+            let cap = e.pso.max_total_threads_per_threadgroup() as usize;
+            let tg = if e.tg == 0 { cap } else { e.tg.min(cap) }.min(e.threads.max(1)) as u64;
+            enc.dispatch_threads(MTLSize::new(e.threads as u64, 1, 1), MTLSize::new(tg, 1, 1));
+        }
+        enc.end_encoding();
+    }
+
     /// Re-encode a recorded tape: one command buffer, the flat dispatch list, commit + wait.
     /// This IS the per-token decode cost on the replay path — no graph walk, no host mirror,
     /// no allocation.
     fn replay_tape(&self, tape: &Tape) {
         objc::rc::autoreleasepool(|| {
             let cb = self.queue.new_command_buffer();
-            // CONCURRENT dispatch: with the serial type every dispatch implicitly orders after
-            // the previous one, which costs ~1 µs of pipeline drain per dispatch on runs of
-            // INDEPENDENT work (decode's q/k/v GEMVs, the two KV writes). Ordering here comes
-            // from explicit barriers, placed exactly where the recorded write masks show a
-            // hazard: this dispatch reads or writes a buffer someone wrote since the last
-            // barrier (RAW/WAW), or writes one someone read (WAR). Un-annotated entries
-            // (wmask = MAX) count every buffer as written — serialized, never under-fenced.
-            let enc =
-                cb.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent);
-            let mut written: Vec<*const c_void> = Vec::with_capacity(8);
-            let mut read: Vec<*const c_void> = Vec::with_capacity(24);
-            // Every buffer touched since the last barrier (owned refs into the tape entries) —
-            // the resource list the barrier fences.
-            let mut touched: Vec<&MtlBuffer> = Vec::with_capacity(32);
-            for e in &tape.entries {
-                let is_w = |i: usize| e.wmask & (1u32 << i.min(31)) != 0;
-                let hazard = e.bufs.iter().enumerate().any(|(i, b)| {
-                    let p = b.as_ptr() as *const c_void;
-                    written.contains(&p) || (is_w(i) && read.contains(&p))
-                });
-                if hazard {
-                    // Barrier over every buffer touched since the last one: prior dispatches'
-                    // accesses to those resources complete before anything encoded after.
-                    let refs: Vec<&metal::ResourceRef> = touched
-                        .iter()
-                        .map(|b| b.as_ref() as &metal::ResourceRef)
-                        .collect();
-                    enc.memory_barrier_with_resources(&refs);
-                    written.clear();
-                    read.clear();
-                    touched.clear();
-                }
-                for (i, b) in e.bufs.iter().enumerate() {
-                    let p = b.as_ptr() as *const c_void;
-                    if is_w(i) {
-                        written.push(p);
-                    } else {
-                        read.push(p);
-                    }
-                    if !touched.iter().any(|t| t.as_ptr() as *const c_void == p) {
-                        touched.push(b);
-                    }
-                }
-                enc.set_compute_pipeline_state(&e.pso);
-                for (i, b) in e.bufs.iter().enumerate() {
-                    enc.set_buffer(i as u64, Some(b), e.offs[i]);
-                }
-                if !e.params.is_empty() {
-                    enc.set_bytes(
-                        e.bufs.len() as u64,
-                        e.params.len() as u64,
-                        e.params.as_ptr() as *const c_void,
-                    );
-                }
-                let cap = e.pso.max_total_threads_per_threadgroup() as usize;
-                let tg = if e.tg == 0 { cap } else { e.tg.min(cap) }.min(e.threads.max(1)) as u64;
-                enc.dispatch_threads(MTLSize::new(e.threads as u64, 1, 1), MTLSize::new(tg, 1, 1));
-            }
-            enc.end_encoding();
+            self.encode_tape(cb, tape);
             let t0 = self.profiling.then(std::time::Instant::now);
             cb.commit();
             cb.wait_until_completed();
@@ -785,6 +1273,29 @@ impl MetalBackend {
         }
     }
 
+    fn replay_capable(&self, g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
+        if self.counter_set.is_some() || !replay_shape(g, bindings) {
+            return false;
+        }
+        let Some((kern, need)) = g.ops.iter().find_map(|op| match op {
+            Op::Attention {
+                head_dim: hd @ (64 | 128 | 256),
+                k_cache,
+                ..
+            } => Some((
+                dyn_attnvec_kern(g.desc(*k_cache).dtype, *hd as usize),
+                if *hd == 256 { 512 } else { 1024 },
+            )),
+            _ => None,
+        }) else {
+            return false;
+        };
+        self.pipelines
+            .get(kern)
+            .map(|pl| pl.max_total_threads_per_threadgroup() >= need)
+            .unwrap_or(false)
+    }
+
     pub(crate) fn execute_graph(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()> {
         let g = &plan
             .as_any()
@@ -798,30 +1309,10 @@ impl MetalBackend {
         // subsequent token takes this path. The dynamic-pos vector kernel REQUIRES its full
         // 1024-thread threadgroup (same silent-clamp hazard as the split kernels), so recording is
         // gated on its pipeline cap — a capped device (CI paravirtual) keeps the per-token path.
-        let dyn_cap_ok = || -> bool {
-            let kern = g.ops.iter().find_map(|op| match op {
-                Op::Attention {
-                    head_dim: hd @ (64 | 128 | 256),
-                    k_cache,
-                    ..
-                } => Some((
-                    dyn_attnvec_kern(g.desc(*k_cache).dtype, *hd as usize),
-                    // hd=256 instantiates at NSG=16 (threadgroup budget) — 512 threads.
-                    if *hd == 256 { 512 } else { 1024 },
-                )),
-                _ => None,
-            });
-            kern.is_some_and(|(kn, need)| {
-                self.pipelines
-                    .get(kn)
-                    .map(|pl| pl.max_total_threads_per_threadgroup() >= need)
-                    .unwrap_or(false)
-            })
-        };
         // Counter profiling is per-op analysis: the tape would replay decode tokens without
         // walking ops (only the RECORDED token would ever be attributed — every per-token op
         // reading would silently be a sample of one), so it is disabled under PROFILE=3.
-        if self.counter_set.is_none() && replay_shape(g, bindings) && dyn_cap_ok() {
+        if self.replay_capable(g, bindings) {
             let fp = replay_fp(g, bindings);
             if let Some(tape) = self.replay.lock().unwrap().as_ref() {
                 if tape.fp == fp {
@@ -839,6 +1330,128 @@ impl MetalBackend {
         // Wrap the whole forward in one autorelease pool: the batched command buffers/encoders are
         // retained owned handles, so we drain the pool once per forward instead of once per op.
         objc::rc::autoreleasepool(|| self.run_graph(g, bindings, false).map(|_| ()))
+    }
+
+    pub(crate) fn execute_graph_chain(
+        &self,
+        plan: &dyn Plan,
+        bindings: &Bindings,
+        n: usize,
+    ) -> Result<Option<Vec<u32>>> {
+        if n == 0 || n > 64 || self.counter_set.is_some() {
+            return Ok(None);
+        }
+        let Some(g) = plan
+            .as_any()
+            .downcast_ref::<infr_core::backend::GraphPlan>()
+            .map(|p| &p.graph)
+        else {
+            return Ok(None);
+        };
+        if !self.replay_capable(g, bindings) {
+            return Ok(None);
+        }
+        let positions = g.ops.iter().find_map(|op| match op {
+            Op::QkNormRope { positions, .. } | Op::Rope { positions, .. } => Some(*positions),
+            _ => None,
+        });
+        let feed = g.ops.iter().find_map(|op| match op {
+            Op::EmbedGather { ids, .. } => Some(*ids),
+            _ => None,
+        });
+        let sampled = g
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                Op::Sample { dst, .. } => Some(*dst),
+                _ => None,
+            })
+            .or_else(|| {
+                g.ops.iter().find_map(|op| match op {
+                    Op::Argmax { dst, .. } => Some(*dst),
+                    _ => None,
+                })
+            });
+        let (Some(positions), Some(feed), Some(sampled)) = (positions, feed, sampled) else {
+            return Ok(None);
+        };
+        let (Some(pos_buf), Some(feed_buf), Some(sampled_buf)) = (
+            bindings.get(positions),
+            bindings.get(feed),
+            bindings.get(sampled),
+        ) else {
+            return Ok(None);
+        };
+        let pos_buf = metal_buf(pos_buf);
+        let feed_buf = metal_buf(feed_buf);
+        let sampled_buf = metal_buf(sampled_buf);
+        if feed_buf.raw.as_ptr() != sampled_buf.raw.as_ptr() {
+            return Ok(None);
+        }
+
+        let fp = replay_fp(g, bindings);
+        let mut ids = Vec::with_capacity(n);
+        let tape_ready = self
+            .replay
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|t| t.fp == fp);
+        if !tape_ready {
+            self.execute_graph(plan, bindings)?;
+            let recorded = self
+                .replay
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|t| t.fp == fp);
+            if !recorded {
+                return Ok(None);
+            }
+            let id = unsafe { *(sampled_buf.raw.contents() as *const u32) };
+            ids.push(id);
+        }
+
+        let remaining = n - ids.len();
+        if remaining == 0 {
+            return Ok(Some(ids));
+        }
+        let result = self.device.new_buffer(
+            (remaining * std::mem::size_of::<u32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let advance = self.pipelines.get("advance_position_i32")?;
+        let guard = self.replay.lock().unwrap();
+        let tape = guard.as_ref().expect("chain checked recorded tape");
+        objc::rc::autoreleasepool(|| {
+            let cb = self.queue.new_command_buffer();
+            for i in 0..remaining {
+                if !ids.is_empty() || i > 0 {
+                    let enc = cb.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(&advance);
+                    enc.set_buffer(0, Some(&pos_buf.raw), 0);
+                    enc.dispatch_threads(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+                    enc.end_encoding();
+                }
+                self.encode_tape(cb, tape);
+                let blit = cb.new_blit_command_encoder();
+                blit.copy_from_buffer(&sampled_buf.raw, 0, &result, (i * 4) as u64, 4);
+                blit.end_encoding();
+            }
+            let t0 = self.profiling.then(std::time::Instant::now);
+            cb.commit();
+            cb.wait_until_completed();
+            if let Some(t0) = t0 {
+                let mut pr = self.prof.lock().unwrap();
+                pr.add_dispatch(t0.elapsed());
+                pr.add_forward();
+            }
+        });
+        let chained = unsafe {
+            std::slice::from_raw_parts(result.contents() as *const u32, remaining).to_vec()
+        };
+        ids.extend(chained);
+        Ok(Some(ids))
     }
 
     fn run_graph(
@@ -984,7 +1597,12 @@ impl MetalBackend {
                     None
                 };
                 let mut pr = self.prof.lock().unwrap();
-                pr.add_op(op_name(op), enc);
+                let name = if self.counter_set.is_some() {
+                    r.cur_op
+                } else {
+                    op_name(op)
+                };
+                pr.add_op(name, enc);
                 if let Some(gpu) = gpu {
                     pr.add_op_gpu(op_name(op), gpu);
                 }
@@ -1743,7 +2361,7 @@ impl MetalBackend {
                             // already saturate and keep NSG=1.
                             let rpg = match qw.kern {
                                 "linear_q4k" | "linear_q6k" => 2usize,
-                                "linear_q8_0" | "linear_q5_0" | "linear_q4_0" => 4,
+                                "linear_q8_0" | "linear_q5_0" | "linear_q4_0" | "linear_iq4nl" => 4,
                                 _ => 1,
                             };
                             let groups = out_f.div_ceil(rpg);
@@ -1780,6 +2398,7 @@ impl MetalBackend {
                                 "linear_q8_0" => "linear_q8_0_add",
                                 "linear_q5_0" => "linear_q5_0_add",
                                 "linear_q4_0" => "linear_q4_0_add",
+                                "linear_iq4nl" => "linear_iq4nl_add",
                                 "linear_q4k_ks" => "linear_q4k_ks_add",
                                 "linear_q6k_ks" => "linear_q6k_ks_add",
                                 "linear_q8_0_ks" => "linear_q8_0_ks_add",
@@ -1790,6 +2409,9 @@ impl MetalBackend {
                             let bres = self.ensure_device(r, res);
                             let bfd = self.dev_dst(r, fdst, out_f);
                             let pso = self.pipelines.get(fk)?;
+                            if self.counter_set.is_some() && m == 1 {
+                                r.cur_op = fk;
+                            }
                             self.encode_tg_off(
                                 r,
                                 &pso,
@@ -1810,6 +2432,9 @@ impl MetalBackend {
                             return Ok(());
                         }
                         let pso = self.pipelines.get(kern)?;
+                        if self.counter_set.is_some() && m == 1 {
+                            r.cur_op = kern;
+                        }
                         self.encode_tg_off(
                             r,
                             &pso,
@@ -1830,6 +2455,9 @@ impl MetalBackend {
                     // f16/f32/bf16 weight: dequant-to-f32 device buffer, cached.
                     let bw = self.weight_buf(weight, g, bindings)?;
                     let pso = self.pipelines.get("linear_f32")?;
+                    if self.counter_set.is_some() && m == 1 {
+                        r.cur_op = "linear_f32";
+                    }
                     self.encode_tg_off(
                         r,
                         &pso,
@@ -2070,19 +2698,85 @@ impl MetalBackend {
                 let bx = self.ensure_device(r, x);
                 let bu = self.ensure_device(r, u);
                 let bd = self.dev_dst(r, dst, 1);
-                let pso = self.pipelines.get("sample_f32")?;
-                let mut p = n.to_ne_bytes().to_vec();
-                p.extend_from_slice(&top_k.to_ne_bytes());
-                p.extend_from_slice(&temp.to_ne_bytes());
-                p.extend_from_slice(&top_p.to_ne_bytes());
-                self.encode_tg(
-                    r,
-                    &pso,
-                    &[bx.as_ref(), bu.as_ref(), bd.as_ref()],
-                    &p,
-                    256,
-                    256,
-                );
+                if let Some((groups, candidates)) = sample_split_shape(n as usize, top_k as usize) {
+                    let values = self.scratch_buf(candidates, 11);
+                    let indices = self.scratch_buf(candidates, 12);
+                    let mut p1 = n.to_ne_bytes().to_vec();
+                    p1.extend_from_slice(&top_k.to_ne_bytes());
+                    p1.extend_from_slice(&(SAMPLE_SPLIT_CHUNK as u32).to_ne_bytes());
+                    let stage1 = self.pipelines.get("sample_f32_stage1")?;
+                    self.encode_tg_w(
+                        r,
+                        &stage1,
+                        &[bx.as_ref(), values.as_ref(), indices.as_ref()],
+                        (1 << 1) | (1 << 2),
+                        &p1,
+                        groups * 256,
+                        256,
+                    );
+
+                    let mut p2 = (candidates as u32).to_ne_bytes().to_vec();
+                    p2.extend_from_slice(&top_k.to_ne_bytes());
+                    p2.extend_from_slice(&temp.to_ne_bytes());
+                    p2.extend_from_slice(&top_p.to_ne_bytes());
+                    if let Some(posbuf) = r.posbuf.clone() {
+                        let stage2 = self.pipelines.get("sample_f32_stage2_dyn")?;
+                        self.encode_tg_w(
+                            r,
+                            &stage2,
+                            &[
+                                values.as_ref(),
+                                indices.as_ref(),
+                                bu.as_ref(),
+                                &posbuf,
+                                bd.as_ref(),
+                            ],
+                            1 << 4,
+                            &p2,
+                            256,
+                            256,
+                        );
+                    } else {
+                        let stage2 = self.pipelines.get("sample_f32_stage2")?;
+                        self.encode_tg_w(
+                            r,
+                            &stage2,
+                            &[values.as_ref(), indices.as_ref(), bu.as_ref(), bd.as_ref()],
+                            1 << 3,
+                            &p2,
+                            256,
+                            256,
+                        );
+                    }
+                } else {
+                    let mut p = n.to_ne_bytes().to_vec();
+                    p.extend_from_slice(&top_k.to_ne_bytes());
+                    p.extend_from_slice(&temp.to_ne_bytes());
+                    p.extend_from_slice(&top_p.to_ne_bytes());
+                    if let Some(posbuf) = r.posbuf.clone() {
+                        let pso = self.pipelines.get("sample_f32_dyn")?;
+                        self.encode_tg_w(
+                            r,
+                            &pso,
+                            &[bx.as_ref(), bu.as_ref(), &posbuf, bd.as_ref()],
+                            1 << 3,
+                            &p,
+                            256,
+                            256,
+                        );
+                    } else {
+                        let pso = self.pipelines.get("sample_f32")?;
+                        self.encode_tg_w(
+                            r,
+                            &pso,
+                            &[bx.as_ref(), bu.as_ref(), bd.as_ref()],
+                            1 << 2,
+                            &p,
+                            256,
+                            256,
+                        );
+                    }
+                }
                 r.loc[dst.0 as usize] = Loc::Device;
             }
             // GPU embed gather: `dst[r, :] = dequant(table[ids[r], :]) * scale` — the table's
@@ -2095,10 +2789,9 @@ impl MetalBackend {
             // wider (Q4_1/Q5_1/Q2_K/Q3_K/Q5_K have factored-only Metal decode): those return
             // Unsupported here and fail loudly rather than silently gathering garbage.
             //
-            // `ids` reaches the device as f32 NUMERIC token ids: the graph declares it I32, the
-            // host mirror widens it via bytes_to_f32, and `ensure_device` uploads that f32
-            // vector (an EmbedGather graph never records a tape — replay_shape rejects the op —
-            // so the mirror is always the source; the kernels read `device const float*`).
+            // `ids` stays in its bound raw-I32 buffer. That buffer is stable across per-token
+            // replay, and its bytes also match the uint token ID written by Argmax/Sample when
+            // the runner aliases sampler output to the next gather input.
             Op::EmbedGather {
                 ids,
                 table,
@@ -2108,25 +2801,14 @@ impl MetalBackend {
                 scale,
             } => {
                 let dt = g.desc(table).dtype;
-                let kern = match dt {
-                    DType::F16 => "embed_gather_f16",
-                    DType::Bf16 => "embed_gather_bf16",
-                    DType::Q8_0 => "embed_gather_q8_0",
-                    DType::Q4_0 => "embed_gather_q4_0",
-                    DType::Q5_0 => "embed_gather_q5_0",
-                    DType::Q4K => "embed_gather_q4k",
-                    DType::Q6K => "embed_gather_q6k",
-                    DType::Iq4Nl => "embed_gather_iq4nl",
-                    DType::Iq4Xs => "embed_gather_iq4xs",
-                    other => {
-                        return Err(Error::Unsupported(format!(
-                            "Metal Op::EmbedGather: no native gather kernel for {other:?}"
-                        )));
-                    }
-                };
+                let kern = metal_embed_gather_kern(dt).ok_or_else(|| {
+                    Error::Unsupported(format!(
+                        "Metal Op::EmbedGather: no native gather kernel for {dt:?}"
+                    ))
+                })?;
                 let (rows_u, ne_u) = (rows as usize, ne as usize);
                 let bt = metal_buf(bindings.get(table).expect("metal backend: unbound Weight"));
-                let bi = self.ensure_device(r, ids);
+                let bi = metal_buf(bindings.get(ids).expect("metal backend: unbound token IDs"));
                 let bd = self.dev_dst(r, dst, rows_u * ne_u);
                 let pso = self.pipelines.get(kern)?;
                 let mut p = rows.to_ne_bytes().to_vec();
@@ -2135,7 +2817,7 @@ impl MetalBackend {
                 self.encode_tg_w(
                     r,
                     &pso,
-                    &[&bt.raw, bi.as_ref(), bd.as_ref()],
+                    &[&bt.raw, &bi.raw, bd.as_ref()],
                     1 << 2,
                     &p,
                     rows_u * 32,
@@ -2157,9 +2839,36 @@ impl MetalBackend {
                 }
                 let bx = self.ensure_device(r, x);
                 let bd = self.dev_dst(r, dst, 1);
-                let pso = self.pipelines.get("argmax_f32")?;
-                let p = n.to_ne_bytes().to_vec();
-                self.encode_tg(r, &pso, &[bx.as_ref(), bd.as_ref()], &p, 256, 256);
+                if let Some(groups) = argmax_split_groups(n as usize) {
+                    let values = self.scratch_buf(groups, 9);
+                    let indices = self.scratch_buf(groups, 10);
+                    let mut p = n.to_ne_bytes().to_vec();
+                    p.extend_from_slice(&(ARGMAX_SPLIT_CHUNK as u32).to_ne_bytes());
+                    let stage1 = self.pipelines.get("argmax_f32_stage1")?;
+                    self.encode_tg_w(
+                        r,
+                        &stage1,
+                        &[bx.as_ref(), values.as_ref(), indices.as_ref()],
+                        (1 << 1) | (1 << 2),
+                        &p,
+                        groups * 256,
+                        256,
+                    );
+                    let stage2 = self.pipelines.get("argmax_f32_stage2")?;
+                    self.encode_tg_w(
+                        r,
+                        &stage2,
+                        &[values.as_ref(), indices.as_ref(), bd.as_ref()],
+                        1 << 2,
+                        &(groups as u32).to_ne_bytes(),
+                        256,
+                        256,
+                    );
+                } else {
+                    let pso = self.pipelines.get("argmax_f32")?;
+                    let p = n.to_ne_bytes().to_vec();
+                    self.encode_tg_w(r, &pso, &[bx.as_ref(), bd.as_ref()], 1 << 1, &p, 256, 256);
+                }
                 r.loc[dst.0 as usize] = Loc::Device;
             }
             Op::ArgmaxProb { .. } => {

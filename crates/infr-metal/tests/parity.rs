@@ -893,6 +893,32 @@ fn synth_iq4xs(n_elem: usize, seed: u32) -> Vec<u8> {
     out
 }
 
+fn synth_iq4nl(n_elem: usize, seed: u32) -> Vec<u8> {
+    assert_eq!(n_elem % 32, 0);
+    let mut out = Vec::new();
+    for blk_i in 0..(n_elem / 32) {
+        let mut blk = vec![0u8; 18];
+        blk[0..2].copy_from_slice(&half::f16::from_f32(0.004).to_le_bytes());
+        blk[2..18].copy_from_slice(&lcg_bytes(seed ^ blk_i as u32, 16));
+        out.extend_from_slice(&blk);
+    }
+    out
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_iq4nl_gemv_matches_dequant_reference() {
+    let (m, in_f, out_f) = (1usize, 256usize, 94usize);
+    check_quant_linear_parity(DType::Iq4Nl, synth_iq4nl(out_f * in_f, 121), m, in_f, out_f);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_add_fusion_iq4nl_parity() {
+    let (in_f, out_f) = (512usize, 384usize);
+    check_linear_add_fusion(DType::Iq4Nl, synth_iq4nl(out_f * in_f, 120), in_f, out_f);
+}
+
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn linear_iq4xs_matches_dequant_reference() {
@@ -2862,6 +2888,43 @@ fn argmax_f32_matches_cpu() {
         );
         assert_eq!(got[0].to_bits() as usize, peak, "argmax n={n}");
     }
+
+    let n = 151_936usize;
+    let mut g = Graph::new();
+    let x = g.input(TensorDesc::new(vec![n], DType::F32));
+    let dst = g.output(TensorDesc::new(vec![1], DType::F32));
+    g.push(Op::Argmax {
+        x,
+        dst,
+        n: n as u32,
+        rows: 1,
+    });
+    let mut xs = vec![-1.0f32; n];
+    xs[17] = 10.0;
+    xs[90_210] = 10.0;
+    let got = run(
+        &MetalBackend::new().unwrap(),
+        &g,
+        &[(x, f32_bytes(&xs))],
+        dst,
+        1,
+    );
+    assert_eq!(got[0].to_bits(), 17, "argmax must keep the lowest tie");
+
+    xs.fill(f32::NEG_INFINITY);
+    xs[90_210] = -1e35;
+    let got = run(
+        &MetalBackend::new().unwrap(),
+        &g,
+        &[(x, f32_bytes(&xs))],
+        dst,
+        1,
+    );
+    assert_eq!(
+        got[0].to_bits() as usize,
+        90_210,
+        "argmax must cover the full finite f32 range",
+    );
 }
 
 // sample_f32: temperature + top-k + top-p stochastic pick, with the uniform
@@ -2897,6 +2960,34 @@ fn sample_f32_matches_cpu() {
             });
             assert_id_parity(&g, &[(x, f32_bytes(&xs)), (u, f32_bytes(&[uu]))], dst, 1);
         }
+    }
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn sample_f32_vocab_split_matches_cpu() {
+    let n = 151_936usize;
+    let xs: Vec<f32> = rand_f32(n, 121).iter().map(|v| v * 8.0).collect();
+    for (top_k, temp, top_p, uu) in [
+        (20u32, 0.7f32, 0.95f32, 0.03f32),
+        (20, 0.7, 0.95, 0.51),
+        (20, 0.7, 0.95, 0.97),
+        (64, 1.0, 1.0, 0.74),
+    ] {
+        let mut g = Graph::new();
+        let x = g.input(TensorDesc::new(vec![n], DType::F32));
+        let u = g.input(TensorDesc::new(vec![1], DType::F32));
+        let dst = g.output(TensorDesc::new(vec![1], DType::F32));
+        g.push(Op::Sample {
+            x,
+            u,
+            dst,
+            n: n as u32,
+            top_k,
+            temp,
+            top_p,
+        });
+        assert_id_parity(&g, &[(x, f32_bytes(&xs)), (u, f32_bytes(&[uu]))], dst, 1);
     }
 }
 
