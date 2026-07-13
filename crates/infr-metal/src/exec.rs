@@ -166,6 +166,13 @@ mod tests {
     }
 
     #[test]
+    fn sample_stage1_tracks_selected_logits_per_lane() {
+        let src = include_str!("../shaders/elementwise_norms.metal");
+        assert!(src.contains("uint used_mask = 0u"));
+        assert!(src.contains("used_mask |= 1u << slot"));
+    }
+
+    #[test]
     fn argmax_split_policy_only_targets_vocab_scale_inputs() {
         assert_eq!(argmax_split_groups(151_936), Some(38));
         assert_eq!(argmax_split_groups(32_768), Some(8));

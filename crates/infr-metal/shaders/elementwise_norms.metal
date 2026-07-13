@@ -385,20 +385,23 @@ kernel void sample_f32_stage1(device const float* logits [[buffer(0)]],
                               uint group [[threadgroup_position_in_grid]]) {
     threadgroup float sval[256];
     threadgroup uint  sidx[256];
-    threadgroup uint  gidx[SAMPLE_KMAX];
     uint base = group * p.chunk;
     uint end = min(base + p.chunk, p.n);
     uint k = min(p.top_k, SAMPLE_KMAX);
+    // A 4K chunk gives each lane at most 16 strided logits. Once a lane wins a reduction,
+    // remember that local slot directly instead of comparing every logit with all prior winners.
+    uint used_mask = 0u;
     for (uint iter = 0u; iter < k; iter++) {
         float best = -INFINITY;
         uint bi = base;
-        for (uint i = base + t; i < end; i += 256u) {
-            bool used = false;
-            for (uint j = 0u; j < iter; j++) {
-                if (gidx[j] == i) { used = true; break; }
-            }
+        uint slot = 0u;
+        for (uint i = base + t; i < end; i += 256u, slot++) {
             float v = logits[i];
-            if (!used && (v > best || (v == best && i < bi))) { best = v; bi = i; }
+            if ((used_mask & (1u << slot)) == 0u &&
+                (v > best || (v == best && i < bi))) {
+                best = v;
+                bi = i;
+            }
         }
         sval[t] = best;
         sidx[t] = bi;
@@ -414,11 +417,19 @@ kernel void sample_f32_stage1(device const float* logits [[buffer(0)]],
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
+        uint winner = sidx[0];
+        uint lane_base = base + t;
+        if (winner >= lane_base && winner < end) {
+            uint delta = winner - lane_base;
+            if (delta % 256u == 0u) {
+                uint slot = delta / 256u;
+                used_mask |= 1u << slot;
+            }
+        }
         if (t == 0u) {
             uint out = group * k + iter;
             out_val[out] = sval[0];
             out_idx[out] = sidx[0];
-            gidx[iter] = sidx[0];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
