@@ -201,15 +201,15 @@ kernel void argmax_f32(device const float* logits [[buffer(0)]],
 // the host: softmax(temp) over the selected set, nucleus (top-p) cutoff, inverse-CDF walk with `u`.
 #define SAMPLE_KMAX 64u
 struct SampleParams { uint n; uint top_k; float temp; float top_p; };
-kernel void sample_f32(device const float* logits [[buffer(0)]],
-                       device const float* u_buf  [[buffer(1)]],
-                       device uint*        out_id [[buffer(2)]],
-                       constant SampleParams& p    [[buffer(3)]],
-                       uint t [[thread_position_in_threadgroup]]) {
-    threadgroup float sval[256];
-    threadgroup uint  sidx[256];
-    threadgroup float gval[SAMPLE_KMAX];
-    threadgroup uint  gidx[SAMPLE_KMAX];
+inline void sample_f32_impl(device const float* logits,
+                            float uniform,
+                            device uint* out_id,
+                            constant SampleParams& p,
+                            uint t,
+                            threadgroup float* sval,
+                            threadgroup uint* sidx,
+                            threadgroup float* gval,
+                            threadgroup uint* gidx) {
     // Clamp like the host (`k = top_k.min(logits.len())`) — defensive against a vocab smaller
     // than top_k; never triggers in practice (vocab >> 64).
     uint k = min(p.top_k, p.n);
@@ -259,7 +259,7 @@ kernel void sample_f32(device const float* logits [[buffer(0)]],
         }
         float total = 0.0f;
         for (uint j = 0u; j < cutoff; j++) { total += gval[j]; }
-        float r = u_buf[0] * total;
+        float r = uniform * total;
         uint tok = gidx[cutoff - 1u];
         float acc = 0.0f;
         for (uint j = 0u; j < cutoff; j++) {
@@ -268,4 +268,33 @@ kernel void sample_f32(device const float* logits [[buffer(0)]],
         }
         out_id[0] = tok;
     }
+}
+
+kernel void sample_f32(device const float* logits [[buffer(0)]],
+                       device const float* u_buf  [[buffer(1)]],
+                       device uint*        out_id [[buffer(2)]],
+                       constant SampleParams& p    [[buffer(3)]],
+                       uint t [[thread_position_in_threadgroup]]) {
+    threadgroup float sval[256];
+    threadgroup uint  sidx[256];
+    threadgroup float gval[SAMPLE_KMAX];
+    threadgroup uint  gidx[SAMPLE_KMAX];
+    sample_f32_impl(logits, u_buf[0], out_id, p, t, sval, sidx, gval, gidx);
+}
+
+// Record-once decode variant: params are fixed in the tape, while the bound position and the
+// runner's 64-slot uniform ring change per token.
+kernel void sample_f32_dyn(device const float* logits    [[buffer(0)]],
+                           device const float* u_buf     [[buffer(1)]],
+                           device const int*   positions [[buffer(2)]],
+                           device uint*        out_id    [[buffer(3)]],
+                           constant SampleParams& p       [[buffer(4)]],
+                           uint t [[thread_position_in_threadgroup]]) {
+    threadgroup float sval[256];
+    threadgroup uint  sidx[256];
+    threadgroup float gval[SAMPLE_KMAX];
+    threadgroup uint  gidx[SAMPLE_KMAX];
+    sample_f32_impl(
+        logits, u_buf[(uint)positions[0] & 63u], out_id, p, t, sval, sidx, gval, gidx
+    );
 }

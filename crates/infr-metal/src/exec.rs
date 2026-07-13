@@ -35,6 +35,8 @@ pub(crate) struct QuiWeight {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use infr_core::backend::{Backend, Buffer, BufferUsage};
+    use infr_core::graph::{AttnMask, Graph};
     use infr_core::tensor::TensorDesc;
 
     #[test]
@@ -143,6 +145,177 @@ mod tests {
             !src.contains("device const float*  ids"),
             "numeric-f32 IDs require a host mirror and cannot be replayed",
         );
+    }
+
+    #[test]
+    fn sample_msl_has_position_dynamic_entrypoint() {
+        let src = include_str!("../shaders/elementwise_norms.metal");
+        assert!(src.contains("kernel void sample_f32_dyn"));
+        assert!(
+            src.contains("positions[0]") && src.contains("& 63u"),
+            "dynamic sampling must select the runner's position-indexed uniform slot",
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a Metal GPU"]
+    fn replay_gpu_decode_ops_observe_dynamic_inputs() {
+        let be = MetalBackend::new().expect("Metal backend");
+        let mut g = Graph::new();
+
+        let rope_x = g.input(TensorDesc::new(vec![1, 1, 64], DType::F32));
+        let positions = g.input(TensorDesc::new(vec![1], DType::I32));
+        let rope_dst = g.internal(TensorDesc::new(vec![1, 1, 64], DType::F32));
+        g.push(Op::Rope {
+            x: rope_x,
+            positions,
+            dst: rope_dst,
+            rows: 1,
+            n_head: 1,
+            head_dim: 64,
+            rope_dim: 64,
+            theta: 10_000.0,
+            freq_factors: None,
+            x_stride: 0,
+        });
+
+        let q = g.input(TensorDesc::new(vec![1, 1, 64], DType::F32));
+        let k_cache = g.input(TensorDesc::new(vec![8, 1, 64], DType::F16));
+        let v_cache = g.input(TensorDesc::new(vec![8, 1, 64], DType::F16));
+        let attn_dst = g.internal(TensorDesc::new(vec![1, 1, 64], DType::F32));
+        g.push(Op::Attention {
+            q,
+            k_cache,
+            v_cache,
+            dst: attn_dst,
+            rows: 1,
+            kv_len: 1,
+            n_head: 1,
+            n_kv: 1,
+            head_dim: 64,
+            scale: 0.125,
+            mask: AttnMask::Causal,
+            pos: 0,
+        });
+
+        let ids = g.input(TensorDesc::new(vec![1], DType::I32));
+        let table = g.weight(TensorDesc::new(vec![8, 64], DType::F16));
+        let gathered = g.output(TensorDesc::new(vec![1, 64], DType::F32));
+        g.push(Op::EmbedGather {
+            ids,
+            table,
+            dst: gathered,
+            rows: 1,
+            ne: 64,
+            scale: 1.0,
+        });
+
+        let logits = g.input(TensorDesc::new(vec![128], DType::F32));
+        let uniform = g.input(TensorDesc::new(vec![64], DType::F32));
+        let sampled = g.output(TensorDesc::new(vec![1], DType::F32));
+        let greedy = g.output(TensorDesc::new(vec![1], DType::F32));
+        g.push(Op::Sample {
+            x: logits,
+            u: uniform,
+            dst: sampled,
+            n: 128,
+            top_k: 4,
+            temp: 1.0,
+            top_p: 1.0,
+        });
+        g.push(Op::Argmax {
+            x: logits,
+            dst: greedy,
+            n: 128,
+            rows: 1,
+        });
+
+        let alloc = |bytes: &[u8]| -> Box<dyn Buffer> {
+            let buf = be
+                .alloc(bytes.len().max(4), BufferUsage::Activations)
+                .unwrap();
+            be.upload(buf.as_ref(), bytes).unwrap();
+            buf
+        };
+        let zeros_f32 = vec![0u8; 64 * 4];
+        let zeros_f16_cache = vec![0u8; 8 * 64 * 2];
+        let table_values: Vec<u16> = (0..8)
+            .flat_map(|row| std::iter::repeat_n(half::f16::from_f32(row as f32).to_bits(), 64))
+            .collect();
+        let logits_values: Vec<f32> = (0..128).map(|i| -(i as f32) * 0.1).collect();
+        let mut uniform_values = [0.0f32; 64];
+        uniform_values[0] = 0.01;
+
+        let rope_x_buf = alloc(&zeros_f32);
+        let positions_buf = alloc(bytemuck::cast_slice(&[0i32]));
+        let q_buf = alloc(&zeros_f32);
+        let k_buf = alloc(&zeros_f16_cache);
+        let v_buf = alloc(&zeros_f16_cache);
+        let ids_buf = alloc(bytemuck::cast_slice(&[1i32]));
+        let table_buf = alloc(bytemuck::cast_slice(&table_values));
+        let gathered_buf = alloc(&vec![0u8; 64 * 4]);
+        let logits_buf = alloc(bytemuck::cast_slice(&logits_values));
+        let uniform_buf = alloc(bytemuck::cast_slice(&uniform_values));
+        let sampled_buf = alloc(&[0u8; 4]);
+        let greedy_buf = alloc(&[0u8; 4]);
+
+        let mut bindings = Bindings::new();
+        bindings.bind(rope_x, rope_x_buf.as_ref());
+        bindings.bind(positions, positions_buf.as_ref());
+        bindings.bind(q, q_buf.as_ref());
+        bindings.bind(k_cache, k_buf.as_ref());
+        bindings.bind(v_cache, v_buf.as_ref());
+        bindings.bind(ids, ids_buf.as_ref());
+        bindings.bind(table, table_buf.as_ref());
+        bindings.bind(gathered, gathered_buf.as_ref());
+        bindings.bind(logits, logits_buf.as_ref());
+        bindings.bind(uniform, uniform_buf.as_ref());
+        bindings.bind(sampled, sampled_buf.as_ref());
+        bindings.bind(greedy, greedy_buf.as_ref());
+
+        let plan = be.compile(&g).unwrap();
+        be.execute(plan.as_ref(), &bindings).unwrap();
+        let first_tape = {
+            let replay = be.replay.lock().unwrap();
+            let tape = replay.as_ref().expect("first execute must record a tape");
+            (tape.fp, tape.entries.len())
+        };
+
+        let mut gathered_bytes = vec![0u8; 64 * 4];
+        be.download(gathered_buf.as_ref(), &mut gathered_bytes)
+            .unwrap();
+        assert_eq!(bytemuck::cast_slice::<u8, f32>(&gathered_bytes)[0], 1.0);
+        let mut token_bytes = [0u8; 4];
+        be.download(sampled_buf.as_ref(), &mut token_bytes).unwrap();
+        assert_eq!(u32::from_le_bytes(token_bytes), 0);
+
+        be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&[6i32]))
+            .unwrap();
+        be.upload(positions_buf.as_ref(), bytemuck::cast_slice(&[7i32]))
+            .unwrap();
+        uniform_values[7] = 0.99;
+        be.upload(uniform_buf.as_ref(), bytemuck::cast_slice(&uniform_values))
+            .unwrap();
+        be.execute(plan.as_ref(), &bindings).unwrap();
+
+        let second_tape = {
+            let replay = be.replay.lock().unwrap();
+            let tape = replay
+                .as_ref()
+                .expect("second execute must retain the tape");
+            (tape.fp, tape.entries.len())
+        };
+        assert_eq!(
+            second_tape, first_tape,
+            "second execute rebuilt the replay tape"
+        );
+        be.download(gathered_buf.as_ref(), &mut gathered_bytes)
+            .unwrap();
+        assert_eq!(bytemuck::cast_slice::<u8, f32>(&gathered_bytes)[0], 6.0);
+        be.download(sampled_buf.as_ref(), &mut token_bytes).unwrap();
+        assert_eq!(u32::from_le_bytes(token_bytes), 3);
+        be.download(greedy_buf.as_ref(), &mut token_bytes).unwrap();
+        assert_eq!(u32::from_le_bytes(token_bytes), 0);
     }
 }
 
@@ -2218,19 +2391,33 @@ impl MetalBackend {
                 let bx = self.ensure_device(r, x);
                 let bu = self.ensure_device(r, u);
                 let bd = self.dev_dst(r, dst, 1);
-                let pso = self.pipelines.get("sample_f32")?;
                 let mut p = n.to_ne_bytes().to_vec();
                 p.extend_from_slice(&top_k.to_ne_bytes());
                 p.extend_from_slice(&temp.to_ne_bytes());
                 p.extend_from_slice(&top_p.to_ne_bytes());
-                self.encode_tg(
-                    r,
-                    &pso,
-                    &[bx.as_ref(), bu.as_ref(), bd.as_ref()],
-                    &p,
-                    256,
-                    256,
-                );
+                if let Some(posbuf) = r.posbuf.clone() {
+                    let pso = self.pipelines.get("sample_f32_dyn")?;
+                    self.encode_tg_w(
+                        r,
+                        &pso,
+                        &[bx.as_ref(), bu.as_ref(), &posbuf, bd.as_ref()],
+                        1 << 3,
+                        &p,
+                        256,
+                        256,
+                    );
+                } else {
+                    let pso = self.pipelines.get("sample_f32")?;
+                    self.encode_tg_w(
+                        r,
+                        &pso,
+                        &[bx.as_ref(), bu.as_ref(), bd.as_ref()],
+                        1 << 2,
+                        &p,
+                        256,
+                        256,
+                    );
+                }
                 r.loc[dst.0 as usize] = Loc::Device;
             }
             // GPU embed gather: `dst[r, :] = dequant(table[ids[r], :]) * scale` — the table's
@@ -2295,7 +2482,7 @@ impl MetalBackend {
                 let bd = self.dev_dst(r, dst, 1);
                 let pso = self.pipelines.get("argmax_f32")?;
                 let p = n.to_ne_bytes().to_vec();
-                self.encode_tg(r, &pso, &[bx.as_ref(), bd.as_ref()], &p, 256, 256);
+                self.encode_tg_w(r, &pso, &[bx.as_ref(), bd.as_ref()], 1 << 1, &p, 256, 256);
                 r.loc[dst.0 as usize] = Loc::Device;
             }
             Op::ArgmaxProb { .. } => {
