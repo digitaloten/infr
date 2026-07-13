@@ -173,6 +173,12 @@ mod tests {
     }
 
     #[test]
+    fn qknormrope_uses_combined_sincos() {
+        let src = include_str!("../shaders/rope_ffn.metal");
+        assert_eq!(src.matches("sincos(ang, c)").count(), 2);
+    }
+
+    #[test]
     fn argmax_split_policy_only_targets_vocab_scale_inputs() {
         assert_eq!(argmax_split_groups(151_936), Some(38));
         assert_eq!(argmax_split_groups(32_768), Some(8));
