@@ -287,7 +287,7 @@ multi-turn serve shape).
 | Gemma-4-12B           | Q4_K_M      | **1.27×**  | 1.00×     | 0.99×      | **1.73×** |
 | Qwen3-14B             | Q2_K³       | **1.22×**  | 0.81×     | 0.78×      | **1.17×** |
 | Qwen3-14B             | Q4_K_M      | **1.12×**  | 0.92×     | 0.87×      | **1.30×** |
-| Qwen3-14B             | Q8_0        | **1.14×**  | **1.02×** | 0.97×      | 0.93×     |
+| Qwen3-14B             | Q8_0        | **1.15×**  | **1.02×** | 0.97×      | **1.13×⁷** |
 | Gemma-4-26B-A4B (MoE) | UD-Q4_K_M   | **1.06×**  | **1.03×** | **1.04×**  | **1.52×** |
 | Qwen3.6-27B           | Q4_K_M      | **1.09×**  | 0.94×     | 0.93×      | **1.21×** |
 | Qwen3-30B-A3B (MoE)   | Q4_K_M      | 0.95×      | 0.94×     | 0.91×      | **1.17×** |
@@ -447,6 +447,31 @@ and IQ2_S/IQ3_S — this file's expert pair — got batched dp4a mmq expert GEMM
 shipped MoE GGUF uses them for expert banks — see `MOE_MMQ_DTYPES`'s exclusions
 doc).
 
+⁷ **The legacy 32-block quants now have an int8 dp4a GEMV**, not just a dp4a
+GEMM. The dp4a *GEMM* (`native_gemm_mmq_*`) has covered ~17 dtypes for a while,
+but the dp4a *GEMV* (`native_mmv_mrow.comp`) covered only the six k-quants +
+IQ4_XS — so every non-k-quant integer file fell to the f32 dequant path at
+decode AND at small-m prefill, which is exactly why this Q8_0 row was one of the
+table's three `pp4@d4096` LOSSES. Q8_0/Q4_0/Q5_0/Q4_1/Q5_1/IQ4_NL now have
+`wdec` arms (the mmq unpack, word-parallelized: aligned/funnel-shifted u32 loads
+— every `_0`-family stride is 2 mod 4 — nibble masks, SWAR zero-point rebias, a
+4-bit→4-byte-lane `qh` spread, and Q4_1/Q5_1's additive min folded through the
+ones-dot against `sact`). Measured on Qwen3-14B (7900 XTX), int8 vs the f32
+GEMV that shipped before, **ordinary prefill** (`pp4@d4096`): Q4_0 **+66.9%**,
+Q5_0 **+64.0%**, Q5_1 **+42.2%**, Q4_1 **+32.9%**, Q8_0 **+28.8%** (128 → 158
+t/s — this row: 0.92× → **1.13×**), IQ4_NL **+20.7%**. **Decode** (`tg64`) is a
+separate policy and splits: Q5_0 **+16.8%**, Q4_0 **+10.5%**, IQ4_NL **+6.3%**,
+Q5_1 **+6.1%** are default-ON; **Q8_0 −4.2%, and Q4_1 a wash, are default-OFF**
+(prefill-only). Q8_0's decode loss is structural, not a wart to fix — at 8 bits
+the stored byte already IS the dp4a operand, so there is no unpack ALU to save,
+and decode is weight-bandwidth bound while the int8 route still pays the
+`quant_q8` bubble (llama.cpp excludes Q8_0 from mmvq off old GCN for the same
+reason). Hence this row's `tg64@d4096` stays 0.97×: the fix is a prefill fix.
+Guards: `mmv_mrow_legacy_formats` (each `wdec` vs a from-scratch host reference,
+f64-accumulated), `mmv_row1_bit_identical` (m=1 decode ≡ row 0 of the m≥3
+dispatch, exact `to_bits()`), and all 13 `gpu_seam_matches_cpu_*` (two of which
+load an IQ4_NL and a Q8_0 model, so the decode flips face the CPU oracle).
+
 The MoE expert kernel floor (the id-indexed GEMV family every MoE model needs
 for decode) now covers **every weight dtype the dense Vulkan path supports** —
 all quants (Q\* incl. ternary Q2_0, K-quants, IQ\*, TQ\*, MXFP4/NVFP4, BF16)
@@ -461,7 +486,7 @@ id-GEMV path).
 
 **Where infr wins.** Prefill on **every dense family** at the mainstream quants
 (1.04–1.44× at Q4_K_M/Q8_0), and it now leads the gemma-4 MoE too (1.06×).
-Multi-turn ingest (`pp4@d4096`) wins on **32 of 35 rows** (1.01–2.17×) — this is
+Multi-turn ingest (`pp4@d4096`) wins on **33 of 35 rows** (1.01–2.17×) — this is
 the shape a coding agent actually runs, and it is where infr is furthest ahead.
 Decode is at-or-above parity up to ~1.7B, on the gemma-4 MoE (1.03×), and on the
 35B-class DeltaNet models (Ornith-35B 1.02×).

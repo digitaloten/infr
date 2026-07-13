@@ -460,10 +460,13 @@ fn mmv_decode_enabled() -> bool {
 /// used to defer to, and it is now in place. MTP verify still runs Q5_K f32-exact (matching
 /// decode), so token-identity holds; only ordinary prefill takes the win.
 fn mmv_int8_decode_dtypes(caps: &infr_core::backend::Capabilities) -> &'static [infr_core::DType] {
-    use infr_core::DType::{Q2K, Q3K, Q4K, Q5K, Q6K};
+    use infr_core::DType::{Iq4Nl, Q2K, Q3K, Q4K, Q4_0, Q4_1, Q5K, Q5_0, Q5_1, Q6K, Q8_0};
     match std::env::var("INFR_MMV_MW").ok().as_deref() {
-        Some("0") => &[],                      // force-off everywhere
-        Some(_) => &[Q4K, Q6K, Q2K, Q3K, Q5K], // explicit opt-in: full set, any vendor (A/B)
+        Some("0") => &[], // force-off everywhere
+        // Explicit opt-in: every dtype with an int8 decode arm, any vendor (the A/B measurement
+        // escape). The legacy 32-block set is included so its decode tier is measurable without a
+        // rebuild — none of them are on any vendor's DEFAULT set (see the `None` arms).
+        Some(_) => &[Q4K, Q6K, Q2K, Q3K, Q5K, Q8_0, Q4_0, Q5_0, Q4_1, Q5_1, Iq4Nl],
         // Intel: the four measured-on-Intel wins. Q5_K is NOT included — its FMT_Q5K mmv_mw build
         // exists (Intel's decode kernel) but has never been measured on Intel hardware; adding it
         // here on the strength of an AMD number would be exactly the assume-don't-measure this
@@ -523,7 +526,38 @@ fn mmv_int8_decode_dtypes(caps: &infr_core::backend::Capabilities) -> &'static [
         //
         // Q5_K stays OFF on a plain throughput tradeoff (decode -1.4%, prefill +45%) — see the doc
         // above; its accuracy was never the blocker.
-        None => &[Q2K, Q4K, Q6K],
+        //
+        // **LEGACY 32-BLOCK SET** (Q8_0/Q4_0/Q5_0/Q4_1/Q5_1/IQ4_NL — the dtypes whose int8 GEMV
+        // arms are new; the dp4a GEMM has had them for a while). Every one MEASURED on
+        // Qwen3-14B, this box, `-p0 -n64 -r5` x2 alternating, int8 vs the shipping f32 GEMV:
+        //   Q4_0    81.1 → 89.6  (**+10.5%**)  ON
+        //   Q5_0    65.9 → 76.9  (**+16.8%**)  ON
+        //   Q5_1    69.4 → 73.6  (**+6.1%**)   ON
+        //   IQ4_NL  59.0 → 62.7  (**+6.3%**)   ON
+        //   Q4_1    81.4 → 81.3  (±0% — WASH, inside run-to-run noise)              OFF
+        //   Q8_0    55.3 → 53.0  (**−4.2%**, reproducible across 2 alternating pairs) OFF
+        // (int8 column = this shipping default; f32 column = the same binary with `INFR_MMV_MW=0`.
+        // The A/B is per-dtype-clean on the pure files; unsloth's IQ4_NL GGUF is MIXED — 40 Q5_K
+        // attn_v tensors — so its opt-in-set probe read a diluted +4.9%, and the +6.3% above is the
+        // final default-set number, with those Q5_K tensors correctly left f32.)
+        // Q8_0's loss is structural, not a kernel wart to fix: at 8 bits the stored byte already IS
+        // the dp4a operand, so there is NO unpack ALU to save — the int8 route buys nothing on the
+        // weight side and still pays the per-dispatch `quant_q8` bubble, while decode at this size
+        // is weight-bandwidth bound (the f32 dequant hides fully behind the stream). llama.cpp
+        // excludes Q8_0 from mmvq off old GCN for the same reason. Q4_1 is the same story one bit
+        // down: its unpack is a nibble mask and a `sact` fold, the cheapest of the 4-bit family, so
+        // there is too little ALU to amortize. BOTH still bank a large ORDINARY-PREFILL win
+        // (Q8_0 +28.8%, Q4_1 +32.9%) via [`mrow_int8_prefill_dtypes`] — prefill-only, exactly the
+        // Q5_K/Q6_K split, and a fully successful outcome for them.
+        //
+        // Accuracy gate for the four decode flips: all 13 `gpu_seam_matches_cpu_*` pass (the gate
+        // that caught Q3_K's coherence cliff). It is not a formality here — `gpu_seam_matches_cpu_
+        // gemma3_q2k_iq4nl` runs an IQ4_NL model and `gpu_seam_matches_cpu_qwen3_q8_0_i8coopmat` a
+        // Q8_0 one, so the flip is exercised against the CPU oracle on real mixed GGUFs, not merely
+        // on dtypes the suite never loads. `mmv_row1_bit_identical` covers all six (decode and the
+        // m>=3 tier dispatch the same kernel, so they are bit-identical by construction), and
+        // `mmv_mrow_legacy_formats` proves each `wdec` against a from-scratch host reference.
+        None => &[Q2K, Q4K, Q6K, Q4_0, Q5_0, Q5_1, Iq4Nl],
     }
 }
 
@@ -543,6 +577,18 @@ fn mmv_int8_decode_dtypes(caps: &infr_core::backend::Capabilities) -> &'static [
 /// (previously tied to the decode set, which is what kept Q3_K/Q5_K's prefill win unreachable by
 /// default).
 ///
+/// The LEGACY 32-BLOCK set (Q8_0, Q4_0, Q5_0, Q4_1, Q5_1, IQ4_NL) joined this list wholesale — six
+/// dtypes that had a dp4a *GEMM* (`native_gemm_mmq_*`) but no dp4a *GEMV*, so every non-k-quant
+/// integer file fell to the f32 dequant path at decode AND at small-m. All six MEASURED a large
+/// ordinary-prefill win on Qwen3-14B (AMD RDNA3/RADV, `pp4@d4096`, r=3, int8 vs the shipping f32
+/// dequant mrow — `INFR_NO_MMV=1`, which for these dtypes is exactly the pre-change behavior):
+/// **Q4_0 +66.9%** (139.1 → 232.1), **Q5_0 +64.0%** (130.7 → 214.4), **Q5_1 +42.2%** (145.3 →
+/// 206.6), **Q4_1 +32.9%** (152.2 → 202.3), **Q8_0 +28.8%** (127.5 → 164.2), **IQ4_NL +20.7%**
+/// (132.2 → 159.5). Four of them ALSO win at decode and are on the decode default; Q8_0 and Q4_1
+/// are prefill-ONLY (they lose / wash at m=1 — see [`mmv_int8_decode_dtypes`]'s legacy note for
+/// why, it is structural at 8 bits, not a fixable kernel wart). This split is the whole point of
+/// having two policies: a dtype that loses decode still banks its prefill win here.
+///
 /// Q3_K's accuracy was ISOLATED before this default shipped, not assumed: an earlier attempt to
 /// flip Q3_K default-on tied decode AND mrow together (the pre-split policy) and broke
 /// `gpu_seam_matches_cpu_qwen3_q2k` into a divergent/degenerate generation (unsloth's Q2_K GGUF is
@@ -558,8 +604,11 @@ fn mmv_int8_decode_dtypes(caps: &infr_core::backend::Capabilities) -> &'static [
 /// therefore safe to ship unconditionally; Q3_K's DECODE default stays off (its own accuracy
 /// question is still open — this only clears prefill).
 fn mrow_int8_prefill_dtypes(dt: infr_core::DType) -> bool {
-    use infr_core::DType::{Iq4Xs, Q2K, Q3K, Q4K, Q5K, Q6K};
-    matches!(dt, Q2K | Q3K | Q4K | Q5K | Q6K | Iq4Xs)
+    use infr_core::DType::{Iq4Nl, Iq4Xs, Q2K, Q3K, Q4K, Q4_0, Q4_1, Q5K, Q5_0, Q5_1, Q6K, Q8_0};
+    matches!(
+        dt,
+        Q2K | Q3K | Q4K | Q5K | Q6K | Iq4Xs | Q8_0 | Q4_0 | Q5_0 | Q4_1 | Q5_1 | Iq4Nl
+    )
 }
 
 /// Does `dt` take the int8 dp4a `mrow` kernel for the m>=3 batched forward? `verify` selects which
@@ -640,13 +689,27 @@ fn mmv_mw_choice(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(default_warps);
-    // sg16=false probe: the SG=16 twin set is identical per (dtype, res, warps), so base existence
-    // is the correct gate on every device. {1,2,16} are Q4_K-only dispatch-shape sweep builds (see
-    // README footnote 3 / native_mmv_mw_build_spv) — not part of the shipped {4,8} policy set for
-    // Q6_K/Q2_K/Q3_K, only reachable via the INFR_MMV_MW_WARPS A/B escape for those dtypes.
-    (matches!(warps, 1 | 2 | 4 | 8 | 16)
-        && crate::gemm::native_mmv_mw_build_spv(dt, false, warps, false).is_some())
-    .then_some(warps)
+    // SPIR-V existence gate — per ROUTE, not one-size-fits-all: AMD dispatches
+    // `linear_mmv_mrow(rows=1)` (see [`unified_mmv_row1`]) and never touches `native_mmv_mw.comp`,
+    // so gating AMD on the mmv_mw build set would make an mrow-only dtype permanently
+    // decode-INELIGIBLE for want of an Intel kernel it would never dispatch. That is exactly the
+    // legacy 32-block set (Q8_0/Q4_0/Q5_0/Q4_1/Q5_1/IQ4_NL): `native_mmv_mrow` builds, no mmv_mw
+    // ones (Intel's decode kernel was never extended to them — no Intel GPU here to measure on).
+    //
+    // Intel keeps the mmv_mw gate. sg16=false probe: the SG=16 twin set is identical per (dtype,
+    // res, warps), so base existence is the correct gate on every device. {1,2,16} are Q4_K-only
+    // dispatch-shape sweep builds (see README footnote 3 / native_mmv_mw_build_spv) — not part of
+    // the shipped {4,8} policy set for Q6_K/Q2_K/Q3_K, only reachable via INFR_MMV_MW_WARPS.
+    let have_spv = if unified_mmv_row1(caps) {
+        // Same (o4, m4=true, res=false) probe the rows=1 dispatch resolves — see
+        // `Recorder::linear_mmv_mrow`'s variant selection (decode is always m4, and every dtype
+        // with a plain build has the o4/res twins too).
+        crate::gemm::native_mmv_mrow_variant_spv(dt, in_f < 2048, true, false).is_some()
+    } else {
+        matches!(warps, 1 | 2 | 4 | 8 | 16)
+            && crate::gemm::native_mmv_mw_build_spv(dt, false, warps, false).is_some()
+    };
+    have_spv.then_some(warps)
 }
 
 /// Get-or-alloc the pool buffer for (tag, bytes); returns the map key so callers can hold several
@@ -4860,6 +4923,24 @@ mod tests {
     /// `verify` no longer has an unconditional arm for Q4_K/Q6_K/IQ4_XS. ORDINARY prefill (verify:
     /// false) is intentionally NOT covered by this loop: it has no bit-identity partner, so it is
     /// checked separately below against `mrow_int8_prefill_dtypes` instead.
+    ///
+    /// EVERY dtype with an int8 mrow build must be listed in `POLICY_DTYPES` — the k-quants, IQ4_XS,
+    /// and the legacy 32-block family.
+    const POLICY_DTYPES: [DType; 12] = [
+        DType::Q2K,
+        DType::Q3K,
+        DType::Q4K,
+        DType::Q5K,
+        DType::Q6K,
+        DType::Iq4Xs,
+        DType::Q8_0,
+        DType::Q4_0,
+        DType::Q5_0,
+        DType::Q4_1,
+        DType::Q5_1,
+        DType::Iq4Nl,
+    ];
+
     #[test]
     fn int8_decode_and_mrow_tiers_agree_on_policy_dtypes() {
         let amd = infr_core::backend::Capabilities {
@@ -4880,14 +4961,7 @@ mod tests {
                     Some(v) => std::env::set_var("INFR_MMV_MW", v),
                     None => std::env::remove_var("INFR_MMV_MW"),
                 }
-                for dt in [
-                    DType::Q2K,
-                    DType::Q3K,
-                    DType::Q4K,
-                    DType::Q5K,
-                    DType::Q6K,
-                    DType::Iq4Xs,
-                ] {
+                for dt in POLICY_DTYPES {
                     let decode_int8 = mmv_int8_decode_dtypes(caps).contains(&dt);
                     let verify_int8 = mrow_int8_dtype_ok(caps, dt, true);
                     assert_eq!(
@@ -4935,22 +5009,29 @@ mod tests {
         assert!(!mrow_int8_dtype_ok(&amd, DType::Q5K, true));
         assert!(!mmv_int8_decode_dtypes(&intel).contains(&DType::Q5K));
         assert!(!mrow_int8_dtype_ok(&intel, DType::Q5K, true));
-        // Q6_K/IQ4_XS: CLOSES the pre-split wart. IQ4_XS has no int8 decode arm on ANY vendor, and
-        // Q6_K's decode is off on the AMD default — so before this split, both took the mrow
-        // kernel unconditionally at MTP-verify, silently able to flip a greedy token vs plain
-        // decode (README's former "Known wart"). Now verify correctly lands on f32-exact for both.
-        assert!(!mrow_int8_dtype_ok(&amd, DType::Q6K, true));
+        // Q6_K: decode-ON on the AMD default since the word-parallel `wdec` rewrite (see
+        // `mmv_int8_decode_dtypes`). IQ4_XS still has no int8 decode arm on ANY vendor, so its
+        // MTP-verify batch correctly lands on the f32-exact path (matching its decode) — the
+        // pre-split wart (README's former "Known wart") stays closed.
+        assert!(mmv_int8_decode_dtypes(&amd).contains(&DType::Q6K));
         assert!(!mrow_int8_dtype_ok(&amd, DType::Iq4Xs, true));
+        // The legacy 32-block set's decode default is a MEASURED split (see
+        // `mmv_int8_decode_dtypes`): Q4_0/Q5_0/Q5_1/IQ4_NL win at m=1 and are ON; Q8_0 LOSES
+        // (−4.2%) and Q4_1 washes, so both are decode-OFF and prefill-ONLY. Spelled out so a
+        // "finish the set" edit has to face the numbers.
+        for dt in [DType::Q4_0, DType::Q5_0, DType::Q5_1, DType::Iq4Nl] {
+            assert!(mmv_int8_decode_dtypes(&amd).contains(&dt), "{dt:?} decode");
+        }
+        for dt in [DType::Q8_0, DType::Q4_1] {
+            assert!(
+                !mmv_int8_decode_dtypes(&amd).contains(&dt),
+                "{dt:?}: decode measured a loss/wash — prefill-only, do not flip without a number"
+            );
+            assert!(mrow_int8_prefill_dtypes(dt), "{dt:?} prefill win must stay");
+        }
         // Every dtype's ORDINARY PREFILL is unconditionally on regardless of the decode/verify
         // policy above — this is the actual point of the split: prefill has no partner to protect.
-        for dt in [
-            DType::Q2K,
-            DType::Q3K,
-            DType::Q4K,
-            DType::Q5K,
-            DType::Q6K,
-            DType::Iq4Xs,
-        ] {
+        for dt in POLICY_DTYPES {
             assert!(
                 mrow_int8_dtype_ok(&amd, dt, false),
                 "{dt:?} ordinary-prefill mrow must stay on"

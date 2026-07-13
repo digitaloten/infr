@@ -1344,6 +1344,200 @@ fn main() {
             "native_mmv_mrow_q5k_m16",
             &["-DFMT_Q5K", "-DMRV=16"],
         ),
+        // LEGACY 32-BLOCK int8 mrow tier — Q8_0/Q4_0/Q5_0/Q4_1/Q5_1/IQ4_NL. The dp4a *GEMM*
+        // (native_gemm_mmq_*) has covered these for a while; the dp4a *GEMV* did not, so decode and
+        // small-m prefill fell to the f32 dequant path for every non-k-quant integer file. Their
+        // int8 packing is a port of the already-shipped mmq unpack (same nibble/qh/codebook/min
+        // conventions), word-parallelized — see native_mmv_mrow.comp's legacy-format section. Full
+        // {plain,o4} x {MR=8,MR=4} + the rows=1 -DUSE_RES decode twins + the rows 9..=16 MR=16 tier,
+        // i.e. the same 7-build matrix Q4_K/Q5_K carry (IQ4_XS's missing _res builds are a historical
+        // gap, not a pattern to copy: these dtypes need the res twin to be decode-A/B-able at all).
+        ("native_mmv_mrow", "native_mmv_mrow_q8_0", &["-DFMT_Q8_0"]),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q8_0_m4",
+            &["-DFMT_Q8_0", "-DMRV=4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q8_0_o4",
+            &["-DFMT_Q8_0", "-DOUTS4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q8_0_o4_m4",
+            &["-DFMT_Q8_0", "-DOUTS4", "-DMRV=4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q8_0_m4_res",
+            &["-DFMT_Q8_0", "-DMRV=4", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q8_0_o4_m4_res",
+            &["-DFMT_Q8_0", "-DOUTS4", "-DMRV=4", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q8_0_m16",
+            &["-DFMT_Q8_0", "-DMRV=16"],
+        ),
+        ("native_mmv_mrow", "native_mmv_mrow_q4_0", &["-DFMT_Q4_0"]),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q4_0_m4",
+            &["-DFMT_Q4_0", "-DMRV=4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q4_0_o4",
+            &["-DFMT_Q4_0", "-DOUTS4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q4_0_o4_m4",
+            &["-DFMT_Q4_0", "-DOUTS4", "-DMRV=4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q4_0_m4_res",
+            &["-DFMT_Q4_0", "-DMRV=4", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q4_0_o4_m4_res",
+            &["-DFMT_Q4_0", "-DOUTS4", "-DMRV=4", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q4_0_m16",
+            &["-DFMT_Q4_0", "-DMRV=16"],
+        ),
+        ("native_mmv_mrow", "native_mmv_mrow_q5_0", &["-DFMT_Q5_0"]),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q5_0_m4",
+            &["-DFMT_Q5_0", "-DMRV=4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q5_0_o4",
+            &["-DFMT_Q5_0", "-DOUTS4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q5_0_o4_m4",
+            &["-DFMT_Q5_0", "-DOUTS4", "-DMRV=4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q5_0_m4_res",
+            &["-DFMT_Q5_0", "-DMRV=4", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q5_0_o4_m4_res",
+            &["-DFMT_Q5_0", "-DOUTS4", "-DMRV=4", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q5_0_m16",
+            &["-DFMT_Q5_0", "-DMRV=16"],
+        ),
+        ("native_mmv_mrow", "native_mmv_mrow_q4_1", &["-DFMT_Q4_1"]),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q4_1_m4",
+            &["-DFMT_Q4_1", "-DMRV=4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q4_1_o4",
+            &["-DFMT_Q4_1", "-DOUTS4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q4_1_o4_m4",
+            &["-DFMT_Q4_1", "-DOUTS4", "-DMRV=4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q4_1_m4_res",
+            &["-DFMT_Q4_1", "-DMRV=4", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q4_1_o4_m4_res",
+            &["-DFMT_Q4_1", "-DOUTS4", "-DMRV=4", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q4_1_m16",
+            &["-DFMT_Q4_1", "-DMRV=16"],
+        ),
+        ("native_mmv_mrow", "native_mmv_mrow_q5_1", &["-DFMT_Q5_1"]),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q5_1_m4",
+            &["-DFMT_Q5_1", "-DMRV=4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q5_1_o4",
+            &["-DFMT_Q5_1", "-DOUTS4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q5_1_o4_m4",
+            &["-DFMT_Q5_1", "-DOUTS4", "-DMRV=4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q5_1_m4_res",
+            &["-DFMT_Q5_1", "-DMRV=4", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q5_1_o4_m4_res",
+            &["-DFMT_Q5_1", "-DOUTS4", "-DMRV=4", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q5_1_m16",
+            &["-DFMT_Q5_1", "-DMRV=16"],
+        ),
+        ("native_mmv_mrow", "native_mmv_mrow_iq4nl", &["-DFMT_IQ4NL"]),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_iq4nl_m4",
+            &["-DFMT_IQ4NL", "-DMRV=4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_iq4nl_o4",
+            &["-DFMT_IQ4NL", "-DOUTS4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_iq4nl_o4_m4",
+            &["-DFMT_IQ4NL", "-DOUTS4", "-DMRV=4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_iq4nl_m4_res",
+            &["-DFMT_IQ4NL", "-DMRV=4", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_iq4nl_o4_m4_res",
+            &["-DFMT_IQ4NL", "-DOUTS4", "-DMRV=4", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_iq4nl_m16",
+            &["-DFMT_IQ4NL", "-DMRV=16"],
+        ),
         ("native_gemm_mmq_q4k", "native_gemm_mmq_q4k", &[]),
         ("native_gemm_mmq_q6k", "native_gemm_mmq_q6k", &[]),
         // DENSE (non-expert-grid) builds of the remaining mmq dtypes — the non-coopmat prefill

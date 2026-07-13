@@ -7,8 +7,12 @@
 //! `rows=1` (decode) or `rows=2..16` (verify) — see `native_mmv_mrow.comp`'s header. A row's
 //! result depends only on its own `qa`/`dact`/`sact` slice, never on `rows`, so this test proves
 //! decode-shape (rows=1) and verify-shape (rows=3) agree bit-for-bit, for every dtype on the
-//! int8-decode/mrow tier (Q4_K, Q6_K, Q2_K, Q3_K, Q5_K) — the set `native_mmv_mrow_variant_spv`
-//! builds a `-DUSE_RES` rows=1 twin for.
+//! int8-decode/mrow tier — the set `native_mmv_mrow_variant_spv` builds a `-DUSE_RES` rows=1 twin
+//! for: the k-quants (Q4_K, Q6_K, Q2_K, Q3_K, Q5_K) AND the legacy 32-block family (Q8_0, Q4_0,
+//! Q5_0, Q4_1, Q5_1, IQ4_NL). The legacy formats belong here for exactly the same reason Q5_K does
+//! — several of them ship PREFILL-only (`mrow_int8_prefill_dtypes`) with their decode tier off on a
+//! throughput tradeoff, but the kernels are dispatched at rows=1 the moment anyone flips one on, so
+//! the bit-identity guard has to be standing BEFORE that edit, not after it.
 //!
 //! Q5_K is the dtype this whole invariant is NAMED after: the historical Q5_K int8 attempt wired
 //! only the verify batch, left plain decode f32-exact, and flipped greedy tokens. It now has an
@@ -32,13 +36,21 @@ use infr_core::backend::{Backend, BufferUsage};
 use infr_core::DType;
 use infr_vulkan::VulkanBackend;
 
-fn blk_bytes(dt: DType) -> usize {
+/// (bytes per block, elements per block) — the k-quants are 256-element super-blocks, the legacy
+/// "_0"/"_1" family and IQ4_NL are flat 32-element blocks.
+fn blk_shape(dt: DType) -> (usize, usize) {
     match dt {
-        DType::Q4K => 144,
-        DType::Q6K => 210,
-        DType::Q2K => 84,
-        DType::Q3K => 110,
-        DType::Q5K => 176,
+        DType::Q4K => (144, 256),
+        DType::Q6K => (210, 256),
+        DType::Q2K => (84, 256),
+        DType::Q3K => (110, 256),
+        DType::Q5K => (176, 256),
+        DType::Q8_0 => (34, 32),
+        DType::Q4_0 => (18, 32),
+        DType::Q5_0 => (22, 32),
+        DType::Q4_1 => (20, 32),
+        DType::Q5_1 => (24, 32),
+        DType::Iq4Nl => (18, 32),
         _ => unreachable!(),
     }
 }
@@ -66,6 +78,15 @@ fn patch_scales(dt: DType, bi: usize, blk: &mut [u8]) {
             blk[0..2].copy_from_slice(&f16b(d));
             blk[2..4].copy_from_slice(&f16b(0.05 + (bi % 5) as f32 * 0.015));
         }
+        // Legacy 32-block family: `d` always leads; the `_1` twins carry an additive (signed) min
+        // right after it. Q8_0/Q4_0/Q5_0/IQ4_NL are single-scale.
+        DType::Q8_0 | DType::Q4_0 | DType::Q5_0 | DType::Iq4Nl => {
+            blk[0..2].copy_from_slice(&f16b(d));
+        }
+        DType::Q4_1 | DType::Q5_1 => {
+            blk[0..2].copy_from_slice(&f16b(d));
+            blk[2..4].copy_from_slice(&f16b(((bi % 7) as f32 - 3.0) * 0.04));
+        }
         _ => unreachable!(),
     }
 }
@@ -81,10 +102,22 @@ fn mmv_row1_matches_mrow_row0_exact() {
     // (in_f, out_f) pairs exercise both layout gates: in_f < 2048 takes -DOUTS4, in_f >= 2048
     // takes the 2-output layout; odd out_f exercises the has1/tail guard.
     let shapes = [(1536usize, 66usize), (2048, 66), (2048, 2049), (6144, 2048)];
-    for dt in [DType::Q4K, DType::Q6K, DType::Q2K, DType::Q3K, DType::Q5K] {
+    for dt in [
+        DType::Q4K,
+        DType::Q6K,
+        DType::Q2K,
+        DType::Q3K,
+        DType::Q5K,
+        DType::Q8_0,
+        DType::Q4_0,
+        DType::Q5_0,
+        DType::Q4_1,
+        DType::Q5_1,
+        DType::Iq4Nl,
+    ] {
         for &(in_f, out_f) in &shapes {
-            let blk = blk_bytes(dt);
-            let wbytes = in_f * out_f / 256 * blk;
+            let (blk, belems) = blk_shape(dt);
+            let wbytes = in_f * out_f / belems * blk;
             let mut wsrc: Vec<u8> = (0..wbytes)
                 .map(|i| ((i as u32).wrapping_mul(2654435761) >> 24) as u8)
                 .collect();
