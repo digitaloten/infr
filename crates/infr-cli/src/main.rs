@@ -55,6 +55,22 @@ impl CompletionShell {
     }
 }
 
+/// Publish `--dev` to the backend as `INFR_DEV`, the process-global GPU pick that
+/// `VulkanBackend::new()` reads (the backend is constructed deep inside the session seam, far from
+/// argv — the same channel `--dev Metal`/`INFR_METAL` already uses).
+///
+/// Only `VulkanN` specs are forwarded: `--dev Metal` selects the Metal session via its own branch
+/// in `cmd_bench`/`cmd_run` and must not be handed to the Vulkan device picker. `None` (flag not
+/// passed) leaves `INFR_DEV` unset, preserving the default "first discrete GPU, else device 0" —
+/// so this flag can only ever *narrow* behavior, never silently change an existing invocation.
+fn apply_dev(dev: Option<&str>) {
+    if let Some(d) = dev {
+        if d.to_ascii_lowercase().starts_with("vulkan") {
+            std::env::set_var("INFR_DEV", d);
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Download + cache a model (`org/repo[:quant]` from HuggingFace, or a path to a `.gguf`).
@@ -64,12 +80,20 @@ enum Cmd {
         model: String,
         /// Optional one-shot message (otherwise drop into a REPL).
         message: Option<String>,
+        /// GPU device for the Vulkan forward (matches llama.cpp's --dev, e.g. Vulkan0/Vulkan1).
+        /// Defaults to the first discrete GPU, else device 0.
+        #[arg(long)]
+        dev: Option<String>,
     },
     /// Start the OpenAI-compatible HTTP API (auto-pulls if missing).
     Serve {
         model: String,
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: String,
+        /// GPU device for the Vulkan forward (matches llama.cpp's --dev, e.g. Vulkan0/Vulkan1).
+        /// Defaults to the first discrete GPU, else device 0.
+        #[arg(long)]
+        dev: Option<String>,
         /// Concurrent generation slots (llama-server's `-np`). N requests generate at once, each
         /// with its own KV cache, taking turns on the GPU at token granularity; the (N+1)'th queues.
         ///
@@ -131,8 +155,9 @@ enum Cmd {
         #[arg(short = 't', long, default_value_t = 0)]
         threads: usize,
         /// GPU device for the Vulkan forward (matches llama-bench --dev, e.g. Vulkan0/Vulkan1).
-        #[arg(long, default_value = "Vulkan0")]
-        dev: String,
+        /// Unset = the first discrete GPU, else device 0.
+        #[arg(long)]
+        dev: Option<String>,
         /// Emit `[{"avg_ts": X}]` (same shape as `llama-bench -o json`) for scripted comparison.
         #[arg(long)]
         json: bool,
@@ -212,13 +237,24 @@ fn main() -> anyhow::Result<()> {
     };
     match cmd {
         Cmd::Pull { model } => cmd_pull(&model),
-        Cmd::Run { model, message } => cmd_run(&model, message.as_deref()),
+        Cmd::Run {
+            model,
+            message,
+            dev,
+        } => {
+            apply_dev(dev.as_deref());
+            cmd_run(&model, message.as_deref())
+        }
         Cmd::Serve {
             model,
             addr,
             parallel,
             ctx,
-        } => cmd_serve(&model, &addr, parallel, ctx.as_deref()),
+            dev,
+        } => {
+            apply_dev(dev.as_deref());
+            cmd_serve(&model, &addr, parallel, ctx.as_deref())
+        }
         Cmd::Bench {
             model,
             n_prompt,
@@ -232,9 +268,22 @@ fn main() -> anyhow::Result<()> {
             threads,
             dev,
             json,
-        } => cmd_bench(
-            &model, n_prompt, n_gen, depth, pg, ubatch, reps, ngl, threads, &dev, json,
-        ),
+        } => {
+            apply_dev(dev.as_deref());
+            cmd_bench(
+                &model,
+                n_prompt,
+                n_gen,
+                depth,
+                pg,
+                ubatch,
+                reps,
+                ngl,
+                threads,
+                dev.as_deref().unwrap_or_default(),
+                json,
+            )
+        }
         Cmd::Compare {
             models,
             sweep,
@@ -1266,8 +1315,11 @@ fn cmd_bench(
             json,
         );
     }
-    let _ = dev; // GPU device selection: VulkanBackend uses the default adapter (--dev reserved for parity).
-                 // ubatch>0 pins the seam's prefill chunk (= llama-bench -ub); 0 = the default (1024).
+    // `--dev VulkanN` was already published to the backend as INFR_DEV by `apply_dev` in main();
+    // `VulkanBackend::new()` reads it when picking the physical device. Nothing to do here — the
+    // remaining uses of `dev` above are the Metal-session branch.
+    let _ = dev;
+    // ubatch>0 pins the seam's prefill chunk (= llama-bench -ub); 0 = the default (1024).
     if ubatch > 0 {
         std::env::set_var("INFR_UBATCH", ubatch.to_string());
     }
