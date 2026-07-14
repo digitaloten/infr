@@ -659,6 +659,14 @@ fn linear_bf16_cmm_preserves_wide_finite_weights() {
 fn linear_woff_f16_rt() {
     let (in_f, slices) = (256usize, [128usize, 64, 64]);
     let wf = rand_f32(256 * in_f, 352);
+    check_linear_woff(DType::F16, f16_bytes(&wf), 4, in_f, &slices, false, 1e-3);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_woff_f16_cmm_small() {
+    let (in_f, slices) = (256usize, [128usize, 64, 64]);
+    let wf = rand_f32(256 * in_f, 362);
     check_linear_woff(DType::F16, f16_bytes(&wf), 8, in_f, &slices, false, 1e-3);
 }
 

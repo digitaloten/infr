@@ -2521,7 +2521,7 @@ impl MetalBackend {
                     let bf16_native =
                         wdt == DType::Bf16 && std::env::var("INFR_METAL_NO_BF16_NATIVE").is_err();
                     let f16_cmm = f16_native
-                        && m >= 16
+                        && m >= 8
                         && out_f % 64 == 0
                         && std::env::var("INFR_METAL_NO_F16_CMM").is_err()
                         && self
