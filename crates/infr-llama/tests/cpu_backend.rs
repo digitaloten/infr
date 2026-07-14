@@ -35,13 +35,22 @@ macro_rules! need_model {
     };
 }
 
-/// Self-skip the test when there's no Vulkan device (the GPU goldens run only with a GPU present).
+/// HARD-FAIL when there's no Vulkan device. Every caller is `#[ignore]`d ("requires a Vulkan
+/// GPU"), so a GPU test only runs when someone asked for it with `--include-ignored` — and at that
+/// point a missing GPU is a broken environment, not a reason to pass.
+///
+/// This used to `return` instead, and that was a VACUOUS GREEN: on a GPU-less box (CI, or this box
+/// while its iGPU was wedged out of enumeration) all 31 GPU tests printed "skip" and reported
+/// **passed**. A suite that reports success without executing is worse than no suite — it is the
+/// one test that would catch real corruption, quietly switched off.
 macro_rules! need_gpu {
     () => {
-        if !infr_llama::gpu_available() {
-            eprintln!("skip: no Vulkan GPU");
-            return;
-        }
+        assert!(
+            infr_llama::gpu_available(),
+            "no Vulkan GPU: this test is #[ignore]d and is only run on a GPU box \
+             (`cargo test -p infr-llama --test cpu_backend gpu_seam -- --include-ignored`). \
+             Refusing to pass without executing."
+        );
     };
 }
 
@@ -162,6 +171,7 @@ fn qwen2_05b() -> Option<PathBuf> {
 /// Qwen2.5 through the Vulkan seam must match the CPU oracle token-for-token — validates the QKV
 /// bias (`AddBias`) end to end on prefill + decode + record-once replay, plus tied embeddings.
 #[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_qwen2() {
     let path = need_model!(qwen2_05b(), "Qwen2.5-0.5B-Instruct");
     need_gpu!();
@@ -363,6 +373,7 @@ const QWEN3_SEAM_GOLDEN: &[(&str, usize, u64)] = &[
 /// the identical `Graph` the CPU reference builds; this proves the dense forward maps faithfully to
 /// the GPU and reproduces the production GPU path (`gpu_golden_qwen3`).
 #[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_golden_qwen3() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
     need_gpu!();
@@ -386,6 +397,7 @@ fn gpu_seam_golden_qwen3() {
 /// projections are all small, so it exercises the `dqblk` path; the assertion guards that the decode
 /// stays bit-faithful (token-for-token with the f32 CPU reference).
 #[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_qwen3_iq4xs() {
     let path = need_model!(qwen3_quant("IQ4_XS"), "Qwen3-0.6B-IQ4_XS");
     need_gpu!();
@@ -402,6 +414,7 @@ fn gpu_seam_matches_cpu_qwen3_iq4xs() {
 /// path (same dqblk, same MMA order), so this guards that the added pipelines stay token-faithful
 /// to the f32 CPU reference.
 #[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_qwen3_q2k() {
     let path = need_model!(qwen3_quant("Q2_K"), "Qwen3-0.6B-Q2_K");
     need_gpu!();
@@ -418,6 +431,7 @@ fn gpu_seam_matches_cpu_qwen3_q2k() {
 /// `Capabilities::i8_coopmat`'s doc — so this test would otherwise silently run the default f16
 /// path and prove nothing).
 #[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_qwen3_q8_0_i8coopmat() {
     let path = need_model!(qwen3_quant("Q8_0"), "Qwen3-0.6B-Q8_0");
     need_gpu!();
@@ -432,6 +446,7 @@ fn gpu_seam_matches_cpu_qwen3_q8_0_i8coopmat() {
 /// must generate the SAME greedy continuation as the CPU reference oracle (which uses the naive
 /// per-token attention). Guards the m>1 prefill kernels the short-prompt goldens never exercise.
 #[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_flash_matches_cpu() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
     need_gpu!();
@@ -497,6 +512,7 @@ fn seam_vulkan_matches_cpu(path: &std::path::Path, prompt: &str, n: usize) {
 /// prefill only the un-cached suffix (stats.n_prompt ≪ the full prompt length). The seam twin of
 /// the bespoke ChatSession's incremental prefill.
 #[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_kv_reuse_matches_fresh() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
     need_gpu!();
@@ -543,6 +559,7 @@ fn gpu_seam_kv_reuse_matches_fresh() {
 /// f16 golden), but the near-lossless quant must stay sensible; a broken quantize/dequant, a
 /// mis-gated kernel, or a wrong planar scales base (`cap`) would collapse or garble the output.
 #[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_kv_q8_coherent() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
     need_gpu!();
@@ -599,6 +616,7 @@ fn gpu_seam_kv_q8_coherent() {
 /// the standard f16 flash/split/scalar attention. K=f16 with each quantized V must stay coherent
 /// (K needs higher precision). A broken GPU quantize or dequant would garble even a V-only cache.
 #[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_kv_mainline_quants_coherent() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
     need_gpu!();
@@ -640,6 +658,7 @@ fn gpu_seam_kv_mainline_quants_coherent() {
 /// (b) prefill only past the shared prefix (its slot was SEEDED by a device-side KV copy from
 /// A's slot), and (c) not evict A — A's next turn still extends its own slot cheaply.
 #[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_multi_slot_prefix_sharing() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
     need_gpu!();
@@ -878,6 +897,7 @@ fn metal_seam_multi_slot_prefix_sharing() {
 
 /// gemma3 (SWA + dual-rope + GeGLU + sandwich norms, hd=256) through the Vulkan seam.
 #[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_gemma3() {
     let path = need_model!(gemma3_1b(), "gemma-3-1b");
     need_gpu!();
@@ -897,6 +917,7 @@ fn gpu_seam_matches_cpu_gemma3() {
 /// or GEMM bug corrupts the context and diverges immediately; assert a substantial common prefix
 /// instead (the `flash_prefill_seam_matches_cpu` precedent).
 #[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_gemma3_q2k_iq4nl() {
     let path = need_model!(gemma3_1b_q2k(), "gemma-3-1b Q2_K");
     need_gpu!();
@@ -929,6 +950,7 @@ fn gpu_seam_matches_cpu_gemma3_q2k_iq4nl() {
 /// llama (no qk-norm: standalone INTERLEAVED RoPE — llama.cpp's ROPE_TYPE_NORM — through the
 /// f16-out Rope shape, fused KV write, and the rope_f16_dyn record-once replay).
 #[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_llama() {
     let path = need_model!(llama32_1b(), "Llama-3.2-1B");
     need_gpu!();
@@ -938,6 +960,7 @@ fn gpu_seam_matches_cpu_llama() {
 
 /// gemma4 (heterogeneous head dims 256/512, V-norm, freq_factors, softcap) through the Vulkan seam.
 #[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_gemma4() {
     let path = need_model!(gemma4_12b(), "gemma-4-12b");
     need_gpu!();
@@ -967,6 +990,7 @@ const GEMMA4_E2B_GOLDEN: &[(&str, usize, u64)] = &[
 
 /// E2B is excluded from the batched-prefill fast path).
 #[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_gemma4_e2b() {
     let path = need_model!(gemma4_e2b(), "gemma-4-E2B");
     need_gpu!();
@@ -980,6 +1004,7 @@ fn gpu_seam_matches_cpu_gemma4_e2b() {
 /// pick, so per the repo convention this locks its OWN golden (deterministic + read for
 /// coherence; refresh with INFR_BLESS=1) instead of comparing token-for-token.
 #[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_golden_qwen3moe() {
     let path = need_model!(qwen3moe_30b(), "Qwen3-30B-A3B");
     need_gpu!();
@@ -1012,6 +1037,7 @@ fn gpu_seam_golden_qwen3moe() {
 /// rmsnorm/qk_norm kernels read f32). Must match the CPU reference oracle token-for-token — proving
 /// the float-weight GPU path is correct, not just fast.
 #[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_bf16_matches_cpu() {
     let snap = match qwen3_06b() {
         Some(p) => p.parent().unwrap().to_path_buf(),
@@ -1171,6 +1197,7 @@ fn cpu_golden_qwen35() {
 /// `gpu_seam_matches_cpu_*` test, now exercising `MixerW::DeltaNet` (Conv1dSilu/DeltaNet ops) AND
 /// the qwen35 attention layers' interleaved q+gate split + sigmoid output gate through Vulkan.
 #[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn unified_qwen35_gpu_seam_matches_cpu() {
     let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
     need_gpu!();
@@ -1188,6 +1215,7 @@ fn unified_qwen35_gpu_seam_matches_cpu() {
 ///       `n_prompt` equal to what a brand-new session prefills for the same prompt (proving the
 ///       state was zero-reset, not silently reused from a wrong point).
 #[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn unified_qwen35_session_no_rewind() {
     let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
     need_gpu!();
@@ -1512,6 +1540,7 @@ fn mtp_head_forward_finite() {
 /// produce the IDENTICAL token sequence (dense head, no MoE/routing noise to legitimately diverge
 /// on — unlike the CPU/GPU generation goldens elsewhere in this file, which tolerate divergence).
 #[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn mtp_head_cpu_vulkan_parity() {
     need_gpu!();
     let path = need_model!(qwen35_4b_mtp(), "Qwen3.5-4B-MTP");
@@ -1581,6 +1610,7 @@ fn mtp_head_cpu_vulkan_parity() {
 /// same KV row / RoPE angle / kv_len and corrupting every step past the first. Fuzzes several
 /// realistic primed states (each prompt row's trunk-`h` as `pending_h`, varied `id_last`).
 #[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn mtp_draft_chain_matches_per_step() {
     need_gpu!();
     let path = need_model!(qwen35_4b_mtp(), "Qwen3.5-4B-MTP");
@@ -1803,6 +1833,7 @@ fn mtp_spec_matches_target_only_greedy() {
 /// head's own per-step rate against the oracle's implied ~0.5) — this just surfaces the aggregate
 /// alpha the full loop achieves so it's visible in normal test output.
 #[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn mtp_spec_acceptance_stats() {
     need_gpu!();
     let path = need_model!(qwen35_4b_mtp(), "Qwen3.5-4B-MTP");
@@ -1890,6 +1921,7 @@ fn cpu_golden_qwen3moe() {
 /// f32 CPU oracle on a near-tie greedy pick, which would make any divergence here ambiguous
 /// (quantization noise vs a real bug).
 #[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_paged_moe_matches_resident_and_cpu() {
     let path = need_model!(qwen3moe_30b(), "Qwen3-30B-A3B");
     need_gpu!();
@@ -1947,6 +1979,7 @@ fn gpu_seam_paged_moe_matches_resident_and_cpu() {
 /// across layers, so `fuse_qkv_decision` is false) plus a fused gate_up block and mixed
 /// Q4_K/Q6_K pools; the 14B test below covers the fused-qkv form.
 #[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_dense_stream_matches_resident_and_cpu() {
     let path = need_model!(qwen3_17b(), "Qwen3-1.7B");
     need_gpu!();
@@ -2004,6 +2037,7 @@ fn qwen3_14b_q8() -> Option<PathBuf> {
 /// fully resident. Same token-identity bar as the 1.7B test; CPU included (Q8_0 int dots on both
 /// sides — the 14B CPU run is ~15 s of the suite, the price of a real >budget model check).
 #[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_dense_stream_matches_resident_qwen3_14b() {
     let path = need_model!(qwen3_14b_q8(), "Qwen3-14B-Q8_0");
     need_gpu!();
@@ -2122,6 +2156,7 @@ fn cpu_qwen35moe_prefill_finite() {
 /// cosine floor on the whole-vocab last-row logits, NOT bit-identical (CPU f32 vs Vulkan f16-native
 /// routing legitimately flips near-tie expert selection).
 #[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_qwen35moe() {
     let path = need_model!(qwen35moe_35b_a3b(), "Qwen3.6-35B-A3B");
     need_gpu!();
@@ -2289,6 +2324,7 @@ fn cpu_llama4_scout_greedy() {
 /// `gpu_seam_paged_moe_matches_resident_and_cpu` documents, whose mixed down role spans two arena
 /// pools), so this is the classic one-pool-per-role split-bank shape.
 #[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_paged_moe_matches_scout_oracle() {
     let path = need_model!(llama4_scout(), "Llama-4-Scout");
     need_gpu!();
@@ -2393,6 +2429,7 @@ fn cpu_diffusion_gemma_prefill_finite() {
 /// of divergence the golden-hash tests sidestep by locking per-backend hashes instead of a direct
 /// float compare; here we compare directly since Phase 1 has no generation golden yet).
 #[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_diffusion_gemma() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
     need_gpu!();
@@ -2563,6 +2600,7 @@ fn cpu_diffusion_gemma_denoise_step() {
 /// token — assert per-row cosine + top-5 overlap on a handful of rows rather than a tight
 /// tolerance across all 256.
 #[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_diffusion_gemma_denoise() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
     need_gpu!();
@@ -2673,6 +2711,7 @@ fn gpu_seam_matches_cpu_diffusion_gemma_denoise() {
 /// every DG graph `no_decode_replay` so both modes run the SAME static kernels; two separate
 /// same-kernel sessions are bit-deterministic (also verified), hence the exact assert.
 #[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_diffusion_gemma_denoise_replay_matches_static() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
     need_gpu!();
@@ -2756,6 +2795,7 @@ fn gpu_diffusion_gemma_denoise_replay_matches_static() {
 /// the capital of France?", `n_predict=64`, greedy (`INFR_SEED` default 42). Prints the decoded
 /// text, step count and block count; asserts the post-thought answer contains "Paris".
 #[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn diffusion_gemma_decode_matches_oracle() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
     need_gpu!();
