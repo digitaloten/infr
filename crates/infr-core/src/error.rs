@@ -12,6 +12,12 @@ pub enum Error {
     Model(String),
     #[error("unsupported: {0}")]
     Unsupported(String),
+    /// The process-wide shutdown latch (`crate::shutdown`) was set — a `SIGINT`/`SIGTERM` arrived
+    /// and the backend stopped issuing NEW GPU work at the next submit boundary. Work already
+    /// submitted was drained before this was returned; the caller should unwind (NOT
+    /// `process::exit`) so the device is destroyed properly.
+    #[error("aborted: shutdown requested")]
+    Aborted,
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("{0}")]

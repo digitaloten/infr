@@ -48,6 +48,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 memmap2 = "0.9"
 rayon = "1"
+# SIGINT/SIGTERM via `sigaction` in the CLI (see `infr_core::shutdown`). Already in the lockfile
+# under tokio and indicatif/console — a direct dep here costs nothing new.
+libc = "0.2"
 tokio = { version = "1", features = ["full"] }
 axum = "0.7"
 tower-http = { version = "0.6", features = ["trace"] }

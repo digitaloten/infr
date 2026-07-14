@@ -11,6 +11,7 @@ pub mod iquant_grids;
 pub mod loader;
 pub mod pager;
 pub mod progress;
+pub mod shutdown;
 pub mod tensor;
 
 pub use backend::{

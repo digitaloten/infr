@@ -1,0 +1,91 @@
+//! The process-wide graceful-shutdown latch (SIGINT / SIGTERM).
+//!
+//! **Why this exists.** A GPU submit is not cancellable. Once a command buffer is on the queue the
+//! only legal thing a host can do is WAIT for its fence — and if the process dies first, the kernel
+//! is left holding a fence nobody will ever reap. On amdgpu that is not theoretical: a `SIGTERM`
+//! delivered while an `infr` prefill submit was in flight on an integrated part left the task
+//! unkillable in `D` state inside `drm_suballoc_insert` (the queued `SIGKILL` is never delivered
+//! because the thread is blocked in the kernel on a GPU fence), and its buffer objects were never
+//! released — the whole 2 GiB carveout plus 7.2 GiB of GTT stayed pinned by a dead process, so
+//! every subsequent client got `ENOMEM` opening the render node and the GPU vanished from Vulkan
+//! enumeration until a reboot. Two `amdgpu_gpu_recover` cycles did not free it.
+//!
+//! There are driver bugs under that, but the loaded gun is ours: `infr` installed no signal
+//! handlers at all, so the default disposition (terminate immediately) fired mid-ioctl. The fix is
+//! this latch:
+//!
+//! * The CLI's signal handler does exactly ONE thing — [`request_shutdown`], a lock-free atomic
+//!   store. Nothing else in the handler is async-signal-safe, so nothing else is in it.
+//! * Everything that can issue GPU work polls [`shutdown_requested`] at the boundary where it is
+//!   about to submit MORE work, and stops there. Work already submitted is always drained
+//!   (`vkQueueWaitIdle` / fence wait) — never abandoned.
+//! * Nobody calls `std::process::exit` on that path. The stack unwinds, the backend's `Drop` runs,
+//!   `vkDestroyDevice` happens, and the kernel gets its buffer objects back.
+//!
+//! The latch is process-wide and monotonic (it never un-sets): the only thing it means is "this
+//! process is on its way out, stop starting things". It is deliberately NOT the per-request abort
+//! (`infr_llama::sampling::RequestCtx::abort`, which one `serve` request latches when its stop
+//! sequence hits) — but that request-level poll ORs this one in, so every existing poll site
+//! inherits process shutdown for free.
+//!
+//! `Relaxed` ordering throughout: there is no other data to publish (the flag IS the message), and
+//! a poll loop that observes it one iteration late is fine — the guarantee is "stops promptly", not
+//! "stops instantly".
+
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+/// The signal number that latched it (0 = none), so the CLI can exit 128+signo.
+static SIGNO: AtomicI32 = AtomicI32::new(0);
+
+/// Latch the shutdown request. Returns `true` if THIS call was the one that latched it, `false` if
+/// it was already set (i.e. this is a second signal — the caller may then decide the user has given
+/// up waiting and force-exit).
+///
+/// **Async-signal-safe**: a `compare_exchange` and a `store` on lock-free atomics, nothing else. No
+/// allocation, no locking, no I/O. It is called directly from the CLI's `SIGINT`/`SIGTERM` handler.
+pub fn request_shutdown(signo: i32) -> bool {
+    let first = SHUTDOWN
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok();
+    if first {
+        SIGNO.store(signo, Ordering::Relaxed);
+    }
+    first
+}
+
+/// Has a shutdown been requested? One relaxed atomic load — cheap enough for a per-op poll inside
+/// the Vulkan recording loop (it is dwarfed by the descriptor writes of a single dispatch).
+#[inline]
+pub fn shutdown_requested() -> bool {
+    SHUTDOWN.load(Ordering::Relaxed)
+}
+
+/// The signal that latched the shutdown, or `None` if none has. The CLI turns this into the
+/// conventional exit status (130 for `SIGINT`, 143 for `SIGTERM`) once the stack has unwound and
+/// the GPU device has been destroyed.
+pub fn shutdown_signal() -> Option<i32> {
+    match SIGNO.load(Ordering::Relaxed) {
+        0 => None,
+        s => Some(s),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The latch is monotonic and reports the FIRST signal only — the second one is the caller's
+    /// cue to force-exit, and must not overwrite the exit status the first one chose.
+    #[test]
+    fn latch_is_monotonic_and_reports_first_signal() {
+        assert!(!shutdown_requested());
+        assert_eq!(shutdown_signal(), None);
+        assert!(request_shutdown(15), "first signal latches");
+        assert!(shutdown_requested());
+        assert_eq!(shutdown_signal(), Some(15));
+        assert!(!request_shutdown(2), "second signal does NOT latch again");
+        assert_eq!(shutdown_signal(), Some(15), "exit status stays the first's");
+        assert!(shutdown_requested(), "the latch never un-sets");
+    }
+}

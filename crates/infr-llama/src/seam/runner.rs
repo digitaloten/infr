@@ -3475,6 +3475,15 @@ pub(crate) fn generate_dense_backend(
         let pf_end = prompt.len() - 1;
         let mut cstart = start;
         while cstart < pf_end {
+            // Shutdown (SIGINT/SIGTERM) or a per-request abort: do not START another chunk. The
+            // chunk that was already in flight is not cut off — the backend drains it and returns
+            // `Error::Aborted` from `be.execute` below, which lands here as the same bail. Nothing
+            // useful was produced (a half-filled KV cache is not a generation), so this is an error
+            // and not a partial success; the CLI turns the latched signal into the conventional
+            // 130/143 exit status regardless of what this call returns.
+            if crate::sampling::abort_requested(req) {
+                anyhow::bail!("aborted: shutdown requested");
+            }
             // One chunk = one turn on the GPU. Dropped at the end of the iteration, handing the
             // baton to whichever sequence has been waiting longest.
             let _gp = req.and_then(|r| r.gate_pass());
@@ -3733,6 +3742,15 @@ pub(crate) fn generate_dense_backend(
         // has been processed (the frontier token stays un-fed at max_new == 0, matching the
         // batched-prefill path's plen-1 contract).
         if out.len() >= max_new && pos + 1 >= prompt.len() {
+            break;
+        }
+        // Shutdown (SIGINT/SIGTERM), polled at the TOP of the loop as well as at the existing
+        // bottom-of-loop stop checks. The bottom checks only run on a step that SAMPLED, so the
+        // per-token PROMPT-feed steps this loop also does (MoE / gemma-E2B / short suffixes, which
+        // have no batched-prefill path) had no stop check at all — a Ctrl-C during one of those
+        // prefills would have fed the whole prompt, one submit at a time, before anything noticed.
+        // Whatever partial output was already streamed stands; the caller reports it.
+        if crate::sampling::abort_requested(req) {
             break;
         }
         // ONE turn on the GPU per loop iteration — a single decode step, or one chained chunk of

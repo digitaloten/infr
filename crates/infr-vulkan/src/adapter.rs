@@ -7,8 +7,9 @@ use crate::linear::native_dense_supported;
 use crate::recorder::Recorder;
 use crate::{be, VulkanBackend};
 use infr_core::backend::{Bindings, Buffer, BufferUsage, Plan};
-use infr_core::error::Result;
+use infr_core::error::{Error, Result};
 use infr_core::graph::{Activation, AttnMask, Graph, Op, TensorKind};
+use infr_core::shutdown::shutdown_requested;
 use infr_core::{Backend, TensorId};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -4176,6 +4177,33 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     for (op_idx, op) in graph.ops.iter().enumerate() {
         if skip_op.contains(&op_idx) {
             continue;
+        }
+        // ── shutdown (SIGINT/SIGTERM) ─────────────────────────────────────────────────────────
+        // Polled HERE — at the op/submit boundary INSIDE the forward — and not merely between
+        // tokens, because on the devices that split (§ the splitter above) a single forward is
+        // tens of seconds of GPU: a token-boundary-only check would make Ctrl-C during an iGPU
+        // prefill sit for a whole forward before it took effect, which is exactly the window in
+        // which a impatient second signal (or a `timeout` SIGKILL) kills the process mid-submit
+        // and wedges the device. Stopping at an op boundary bounds the wait by ONE segment.
+        //
+        // A submitted command buffer CANNOT be cancelled, so this is a "stop recording", never a
+        // "stop waiting". Two halves:
+        //   * the segment being RECORDED right now is not submitted at all — `discard` frees it
+        //     (its dispatches are waste: this forward is being abandoned, and handing the driver
+        //     more work is the last thing we want while trying to stop);
+        //   * everything ALREADY submitted is drained to its fence, exactly as the success path
+        //     does. That is the irreducible part of the wait, and it is why the in-flight window
+        //     (`MAX_INFLIGHT`) is the real latency bound.
+        if shutdown_requested() {
+            let partial = rec.take().expect("segment always Some between ops");
+            partial.discard().map_err(|e| be(e.to_string()))?;
+            for seg in segments {
+                seg.wait().map_err(|e| be(e.to_string()))?;
+            }
+            pstream.drain()?;
+            // `transient`, `pool`, `dyn_args` and the scratch arena drop AFTER these waits (they
+            // are locals of this fn), so nothing the GPU was reading is freed under it.
+            return Err(Error::Aborted);
         }
         // Split BETWEEN ops, never inside one: a single op can lower to several dispatches that
         // share transient scratch, and the hazard tracking that orders them is per-recorder.

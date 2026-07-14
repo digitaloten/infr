@@ -207,12 +207,89 @@ enum Cmd {
     },
 }
 
+// ---------------------------------------------------------------------------
+// Signals — the graceful GPU shutdown path (see `infr_core::shutdown`)
+// ---------------------------------------------------------------------------
+
+/// `SIGINT`/`SIGTERM` handler. **Async-signal-safe by construction**: the first signal does nothing
+/// but a lock-free atomic store ([`infr_core::shutdown::request_shutdown`]) — no allocation, no
+/// locking, no Rust `println!` (which takes the stdout lock and would deadlock against an
+/// interrupted `print!`). The engine's poll sites see the latch at their next submit boundary,
+/// drain the GPU work already in flight, unwind, and let the backend's `Drop` destroy the device.
+///
+/// The SECOND signal is the user saying they have given up waiting, and is honoured immediately:
+/// `write(2)` and `_exit(2)` are both on POSIX's async-signal-safe list (unlike `exit`, which runs
+/// atexit handlers and flushes streams from a signal context). It is a real risk, so it says so.
+#[cfg(unix)]
+extern "C" fn on_signal(signo: libc::c_int) {
+    if infr_core::shutdown::request_shutdown(signo) {
+        return; // first signal: latch and let the engine wind down at its next submit boundary
+    }
+    const MSG: &[u8] = b"\ninfr: second signal - exiting NOW without draining the GPU. \
+        If a submit was in flight, the device may stay wedged until reboot.\n";
+    // SAFETY: `write` and `_exit` are async-signal-safe; MSG is a 'static byte string.
+    unsafe {
+        libc::write(2, MSG.as_ptr().cast(), MSG.len());
+        libc::_exit(128 + signo);
+    }
+}
+
+/// Install [`on_signal`] for `SIGINT` and `SIGTERM`, once, before anything touches the GPU.
+///
+/// Chosen over `tokio::signal` (which is in the tree via tokio's `full` feature) because three of
+/// the four subcommands — `run`, `bench`, `compare` — are plain synchronous code with no runtime to
+/// hang a signal future off, and `serve` builds its runtime only after the model is loaded (uploads
+/// = submits: a signal during LOAD must already be safe). `libc` is a direct dep now but adds
+/// nothing to the lockfile — it was already there under tokio and indicatif/console.
+///
+/// No `SA_RESTART`: an interrupted blocking `read(2)` at the chat prompt then returns `EINTR`,
+/// which is what lets [`read_line_interruptible`] notice a Ctrl-C at an idle REPL instead of
+/// sitting on the read until the user presses Enter. Everything else in the process that can see
+/// an interrupted syscall already retries it (Rust's `io` retries `ErrorKind::Interrupted`, libdrm's
+/// ioctl wrapper loops on `EINTR`).
+#[cfg(unix)]
+fn install_signal_handlers() {
+    // SAFETY: a zeroed `sigaction` with a valid handler pointer and an empty mask is exactly what
+    // POSIX asks for; the handler itself is async-signal-safe (see `on_signal`).
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_signal as *const () as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = 0;
+        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+    }
+}
+
+#[cfg(not(unix))]
+fn install_signal_handlers() {}
+
+/// The conventional exit status for a signal-terminated process, `128 + signo` (130 for `SIGINT`,
+/// 143 for `SIGTERM`) — what a shell reports for a process killed by that signal, so scripts and
+/// `timeout` see what they expect.
+///
+/// Called from `main` AFTER the subcommand has returned, i.e. after the engine has unwound and the
+/// backend's `Drop` has destroyed the Vulkan device. `process::exit` here cannot strand a submit —
+/// that is the whole point of doing it here and nowhere else.
+fn exit_if_signalled() {
+    use std::io::Write;
+    let Some(signo) = infr_core::shutdown::shutdown_signal() else {
+        return;
+    };
+    // Partial output the user already saw is theirs to keep — flush it.
+    std::io::stdout().flush().ok();
+    eprintln!("\ninfr: interrupted — GPU work drained, device released.");
+    std::io::stderr().flush().ok();
+    std::process::exit(128 + signo);
+}
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    install_signal_handlers();
 
     let cli = Cli::parse();
 
@@ -235,6 +312,17 @@ fn main() -> anyhow::Result<()> {
         Cli::command().print_help()?;
         return Ok(());
     };
+    // The subcommand runs to completion (or to its abort) and EVERYTHING it owns — model, backend,
+    // Vulkan device — is dropped as it returns. Only then does `exit_if_signalled` turn a latched
+    // SIGINT/SIGTERM into 130/143, and it does so in preference to the abort error the unwinding
+    // produced (an aborted forward reports `aborted: shutdown requested`, which is noise once we
+    // are already saying "interrupted" with the right status).
+    let res = dispatch(cmd);
+    exit_if_signalled();
+    res
+}
+
+fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
     match cmd {
         Cmd::Pull { model } => cmd_pull(&model),
         Cmd::Run {
@@ -588,7 +676,6 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         run_chat_turn(&mut chat, m, max_new, visual.as_mut())?;
         return Ok(());
     }
-    let stdin = std::io::stdin();
     loop {
         match chat.repl_status() {
             Some(s) => print!("\n[{s}] > "),
@@ -596,8 +683,8 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         }
         std::io::stdout().flush().ok();
         let mut line = String::new();
-        if stdin.read_line(&mut line)? == 0 {
-            break;
+        if read_line_interruptible(&mut line)? == 0 {
+            break; // EOF, or a signal arrived while we sat at the prompt
         }
         let line = line.trim();
         if line.is_empty() {
@@ -607,10 +694,68 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
             break;
         }
         if let Err(e) = run_chat_turn(&mut chat, line, max_new, visual.as_mut()) {
-            eprintln!("error: {e}");
+            // A shutdown-aborted turn reports the abort as an error; don't print it as a failure,
+            // just leave the REPL (main then exits 130/143).
+            if !infr_core::shutdown::shutdown_requested() {
+                eprintln!("error: {e}");
+            }
+        }
+        if infr_core::shutdown::shutdown_requested() {
+            break;
         }
     }
     Ok(())
+}
+
+/// `read_line` that gives up when a signal has latched the shutdown.
+///
+/// `Stdin::read_line` cannot: `BufRead::read_until` swallows `EINTR` and re-issues the `read`, so a
+/// Ctrl-C at an IDLE chat prompt would leave the latch set but the process parked on the terminal
+/// until the user pressed Enter. Reading fd 0 directly lets the `EINTR` (the handler installs
+/// without `SA_RESTART`) come back to us, where we check the latch and return EOF.
+///
+/// Byte-at-a-time so no input past the newline is ever consumed (nothing else in the process reads
+/// stdin, but over-reading a pipe would silently eat the next prompt). One syscall per typed
+/// character is free at human speed.
+///
+/// Returns bytes read (0 = EOF or shutdown), like `read_line`.
+fn read_line_interruptible(line: &mut String) -> anyhow::Result<usize> {
+    #[cfg(not(unix))]
+    {
+        return Ok(std::io::stdin().read_line(line)?);
+    }
+    #[cfg(unix)]
+    {
+        // Bytes, not chars: a multi-byte UTF-8 codepoint (any non-ASCII prompt) arrives one byte
+        // per read and is only a `char` once it is whole.
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            if infr_core::shutdown::shutdown_requested() {
+                return Ok(0);
+            }
+            let mut b = 0u8;
+            // SAFETY: a 1-byte read into a live stack byte.
+            let r = unsafe { libc::read(0, std::ptr::addr_of_mut!(b).cast(), 1) };
+            match r {
+                0 => break, // EOF
+                1 => {
+                    buf.push(b);
+                    if b == b'\n' {
+                        break;
+                    }
+                }
+                _ => {
+                    let e = std::io::Error::last_os_error();
+                    if e.kind() == std::io::ErrorKind::Interrupted {
+                        continue; // signal: the latch check at the top of the loop decides
+                    }
+                    return Err(e.into());
+                }
+            }
+        }
+        line.push_str(&String::from_utf8_lossy(&buf));
+        Ok(buf.len())
+    }
 }
 
 /// Run one chat turn through the shared [`Chat`]: stream pieces via the `<think>` renderer, then

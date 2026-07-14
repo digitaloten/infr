@@ -1151,6 +1151,7 @@ dependencies = [
  "infr-llama",
  "infr-server",
  "infr-vulkan",
+ "libc",
  "serde_json",
  "tokio",
  "tracing",

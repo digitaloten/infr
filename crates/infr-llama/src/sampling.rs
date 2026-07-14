@@ -200,10 +200,21 @@ impl RequestCtx {
     }
 }
 
-/// The decode loop's abort poll, hoisted so `req: None` (every non-serve path) is a single
-/// `Option::is_some_and` and not an atomic load.
+/// The decode loop's abort poll: "should this generation stop issuing new work at the next
+/// boundary?" TWO sources, ORed —
+///
+/// 1. the PROCESS-wide shutdown latch ([`infr_core::shutdown`]): a `SIGINT`/`SIGTERM` arrived, so
+///    every generation on every backend must wind down and let the GPU device be destroyed
+///    properly. ORing it in HERE is what makes every pre-existing poll site (the chained-decode
+///    loop, the per-token loop, the grammar-constrained loop, the prefill chunk loop) honour
+///    Ctrl-C for free, on Vulkan, Metal and CPU alike, with no new plumbing;
+/// 2. this ONE sequence's abort latch ([`RequestCtx::abort`]) — the `serve` stop-sequence hit,
+///    which must stop request A without touching request B.
+///
+/// Cost is one relaxed atomic load (plus, for `serve`, a second) per token — nothing against a
+/// multi-millisecond forward.
 pub(crate) fn abort_requested(req: Option<&RequestCtx>) -> bool {
-    req.is_some_and(RequestCtx::aborted)
+    infr_core::shutdown::shutdown_requested() || req.is_some_and(RequestCtx::aborted)
 }
 
 // ---------------------------------------------------------------------------

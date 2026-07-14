@@ -6558,6 +6558,38 @@ impl<'a> Recorder<'a> {
         Ok(())
     }
 
+    /// Abandon a partially recorded command buffer WITHOUT submitting it, releasing exactly what
+    /// [`Self::finish`] releases (command buffer, descriptor pools, query pool) — the shutdown path
+    /// (`adapter::execute_static`'s abort on the `infr_core::shutdown` latch).
+    ///
+    /// The point is that the work recorded so far is WASTE: the forward it belongs to is being
+    /// abandoned, so nothing will ever read what those dispatches would write. Submitting it anyway
+    /// (the obvious `finish()`) would add a whole segment of GPU time to how long Ctrl-C takes —
+    /// and would hand the driver more work at the exact moment we are trying to stop giving it any.
+    /// Dropping the recorder instead is not an option: it has no `Drop`, so its descriptor pools
+    /// would outlive it and `vkDestroyDevice` would (rightly) be reported as destroying a device
+    /// with live pools.
+    ///
+    /// Only the NOT-yet-submitted buffer is abandoned. Anything already on the queue is still
+    /// drained by the caller — a submitted command buffer cannot be cancelled, only waited on.
+    pub fn discard(self) -> Result<()> {
+        let device = &self.be.shared.device;
+        unsafe {
+            device
+                .end_command_buffer(self.cmd)
+                .map_err(|e| be(format!("end cmd: {e}")))?;
+            if self.prof2 {
+                device.destroy_query_pool(self.query_pool, None);
+            }
+            let cmd_pool = *self.be.shared.cmd_pool.lock().unwrap();
+            device.free_command_buffers(cmd_pool, &[self.cmd]);
+            for p in self.pools.borrow().iter() {
+                device.destroy_descriptor_pool(*p, None);
+            }
+        }
+        Ok(())
+    }
+
     /// [`Self::finish`]'s pipelined twin: end recording and submit WITHOUT waiting, returning a
     /// [`PendingSegment`] whose [`PendingSegment::wait`] blocks on a fence and releases the
     /// command buffer / descriptor pools. The paged-MoE executor uses this to keep staging the

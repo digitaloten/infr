@@ -564,8 +564,29 @@ pub async fn serve(
     let router = build_router(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, %n_parallel, "infr-server listening");
-    axum::serve(listener, router).await?;
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_latched())
+        .await?;
     Ok(())
+}
+
+/// Resolves once the process-wide shutdown latch is set (SIGINT/SIGTERM — see
+/// [`infr_core::shutdown`]), which is `axum`'s cue to stop accepting connections and let the
+/// in-flight ones finish. The requests themselves see the SAME latch through the decode loop's
+/// abort poll, so each one stops issuing new GPU work at its next token/chunk boundary, drains what
+/// it already submitted, and returns what it had — then `serve` returns, the runtime drops, the
+/// engine drops, and the Vulkan device is destroyed properly. No `process::exit` anywhere on this
+/// path: exiting under a live submit is the bug this whole mechanism exists to prevent.
+///
+/// A POLL (50 ms) rather than `tokio::signal::ctrl_c`, on purpose: the CLI already owns SIGINT and
+/// SIGTERM via `sigaction`, and `tokio::signal` would install its OWN handler over the top of it —
+/// last writer wins, and the loser's semantics (in this case, "drain the GPU") silently vanish. One
+/// handler, one latch, everything downstream reads the latch.
+async fn shutdown_latched() {
+    while !infr_core::shutdown::shutdown_requested() {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    tracing::info!("shutdown requested — draining in-flight requests");
 }
 
 // ---------------------------------------------------------------------------
