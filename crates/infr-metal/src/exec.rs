@@ -204,6 +204,15 @@ mod tests {
     }
 
     #[test]
+    fn deltanet_msl_has_hoisted_gate_scan() {
+        let src = include_str!("../shaders/deltanet.metal");
+        assert!(src.contains("kernel void deltanet_gates_f32"));
+        assert!(src.contains("host_name(\"deltanet_gates_k4\")"));
+        assert!(!prefer_deltanet_gate_prep(4));
+        assert!(prefer_deltanet_gate_prep(8));
+    }
+
+    #[test]
     fn argmax_split_policy_only_targets_vocab_scale_inputs() {
         assert_eq!(argmax_split_groups(151_936), Some(38));
         assert_eq!(argmax_split_groups(32_768), Some(8));
@@ -717,6 +726,10 @@ fn prefer_iq4nl_rt(kern: &str, m: usize) -> bool {
 
 fn prefer_rmsnorm_vec4(rows: usize, dim: usize) -> bool {
     rows <= 4 && dim >= 2048 && dim.is_multiple_of(4)
+}
+
+fn prefer_deltanet_gate_prep(rows: usize) -> bool {
+    rows >= 8
 }
 
 fn counter_linear_label(enabled: bool, kern: &'static str) -> Option<&'static str> {
@@ -4426,11 +4439,17 @@ impl MetalBackend {
                     if let Some(sb) = bindings.get(state) {
                         // KPL = kd/32 is a compile-time template parameter (register
                         // promotion needs the fixed bound) — pick the instantiation.
-                        let dn_kern: &'static str = match kd / 32 {
-                            1 => "deltanet_f32_k1",
-                            2 => "deltanet_f32_k2",
-                            4 => "deltanet_f32_k4",
-                            _ => "deltanet_f32_k8",
+                        let gate_prep = prefer_deltanet_gate_prep(rr)
+                            && std::env::var("INFR_METAL_NO_DN_GATE_PREP").is_err();
+                        let dn_kern: &'static str = match (gate_prep, kd / 32) {
+                            (false, 1) => "deltanet_f32_k1",
+                            (false, 2) => "deltanet_f32_k2",
+                            (false, 4) => "deltanet_f32_k4",
+                            (false, _) => "deltanet_f32_k8",
+                            (true, 1) => "deltanet_gates_k1",
+                            (true, 2) => "deltanet_gates_k2",
+                            (true, 4) => "deltanet_gates_k4",
+                            (true, _) => "deltanet_gates_k8",
                         };
                         let fits = self
                             .pipelines
@@ -4445,6 +4464,11 @@ impl MetalBackend {
                             let ba = self.ensure_device(r, a);
                             let bac = self.weight_buf(a_coef, g, bindings)?;
                             let bdt = self.weight_buf(dt_bias, g, bindings)?;
+                            let gates = if gate_prep {
+                                self.scratch_buf(rr * nv * 2, 15)
+                            } else {
+                                bb.clone()
+                            };
                             let bd = self.dev_dst(r, dst, rr * nv * vd);
                             let sbuf = metal_buf(sb);
                             let i = state.0 as usize;
@@ -4457,6 +4481,25 @@ impl MetalBackend {
                             p.extend_from_slice(&(kd as u32).to_ne_bytes());
                             p.extend_from_slice(&(vd as u32).to_ne_bytes());
                             p.extend_from_slice(&eps.to_ne_bytes());
+                            if gate_prep {
+                                let gpso = self.pipelines.get("deltanet_gates_f32")?;
+                                let mut gp = (rr as u32).to_ne_bytes().to_vec();
+                                gp.extend_from_slice(&(nv as u32).to_ne_bytes());
+                                self.encode_w(
+                                    r,
+                                    &gpso,
+                                    &[
+                                        bb.as_ref(),
+                                        ba.as_ref(),
+                                        bac.as_ref(),
+                                        bdt.as_ref(),
+                                        gates.as_ref(),
+                                    ],
+                                    1 << 4,
+                                    &gp,
+                                    rr * nv,
+                                );
+                            }
                             self.encode_tg_w(
                                 r,
                                 &pso,
@@ -4468,10 +4511,11 @@ impl MetalBackend {
                                     ba.as_ref(),
                                     bac.as_ref(),
                                     bdt.as_ref(),
+                                    gates.as_ref(),
                                     &sbuf.raw,
                                     bd.as_ref(),
                                 ],
-                                (1 << 7) | (1 << 8),
+                                (1 << 8) | (1 << 9),
                                 &p,
                                 nv * (vd / 4) * 128,
                                 128,

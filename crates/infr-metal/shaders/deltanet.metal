@@ -38,6 +38,25 @@ kernel void conv1d_silu_f32(device const float* x     [[buffer(0)]],
 // one-threadgroup-per-head grid, which left the GPU idle at qwen35's 32 heads). State
 // reads/writes touch device memory once per chunk instead of 2*rows times.
 struct DeltaNetParams { uint rows; uint nv; uint nk; uint kd; uint vd; float eps; };
+struct DeltaNetGateParams { uint rows; uint nv; };
+
+// Multi-row gate prep: compute the token/head scalars once instead of repeating four
+// transcendentals in every state-column simdgroup and every lane of that simdgroup.
+kernel void deltanet_gates_f32(device const float* b       [[buffer(0)]],
+                               device const float* a       [[buffer(1)]],
+                               device const float* a_coef  [[buffer(2)]],
+                               device const float* dt_bias [[buffer(3)]],
+                               device float2*      gates   [[buffer(4)]],
+                               constant DeltaNetGateParams& p [[buffer(5)]],
+                               uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.rows * p.nv) return;
+    uint h = gid % p.nv;
+    float beta = 1.0f / (1.0f + exp(-b[gid]));
+    float z = a[gid] + dt_bias[h];
+    float sp = max(z, 0.0f) + log(1.0f + exp(-fabs(z)));
+    gates[gid] = float2(beta, exp(a_coef[h] * sp));
+}
+
 #define DN_VPT 4u
 // KPL (k entries per lane, = kd/32) is a COMPILE-TIME template parameter: with a runtime
 // bound the ls[]/qv[]/kv[] arrays are runtime-indexed, the compiler cannot promote them to
@@ -45,7 +64,7 @@ struct DeltaNetParams { uint rows; uint nv; uint nk; uint kd; uint vd; float eps
 // measured 1.7x SLOWER than the old threadgroup-staged shape (507 ms vs 302 per qwen35
 // prefill). Unrolled at fixed KPL the arrays genuinely live in registers: 185 ms, 1.6x
 // faster than the old shape.
-template<uint KPL>
+template<uint KPL, bool PREPARED_GATES>
 kernel void deltanet_f32_t(device const float* q       [[buffer(0)]],
                          device const float* k       [[buffer(1)]],
                          device const float* v       [[buffer(2)]],
@@ -53,9 +72,10 @@ kernel void deltanet_f32_t(device const float* q       [[buffer(0)]],
                          device const float* a       [[buffer(4)]],
                          device const float* a_coef  [[buffer(5)]],
                          device const float* dt_bias [[buffer(6)]],
-                         device float*       state   [[buffer(7)]],
-                         device float*       dst     [[buffer(8)]],
-                         constant DeltaNetParams& p  [[buffer(9)]],
+                         device const float2* gates  [[buffer(7)]],
+                         device float*       state   [[buffer(8)]],
+                         device float*       dst     [[buffer(9)]],
+                         constant DeltaNetParams& p  [[buffer(10)]],
                          uint   tgpig [[threadgroup_position_in_grid]],
                          uint   lane  [[thread_index_in_simdgroup]],
                          uint   sgid  [[simdgroup_index_in_threadgroup]]) {
@@ -92,13 +112,19 @@ kernel void deltanet_f32_t(device const float* q       [[buffer(0)]],
             qv[j] = qv[j] / qn * qscale;
             kv[j] = kv[j] / kn;
         }
-        // beta = sigmoid(b); decay = exp(a_coef * softplus(a + dt_bias)) — computed on every
-        // lane (identical inputs, cheaper than a broadcast).
-        float bv = b[t * p.nv + h];
-        float beta = 1.0f / (1.0f + exp(-bv));
-        float z = a[t * p.nv + h] + dt_bias[h];
-        float sp = max(z, 0.0f) + log(1.0f + exp(-fabs(z)));
-        float decay = exp(a_coef[h] * sp);
+        float beta, decay;
+        if (PREPARED_GATES) {
+            float2 gd = gates[t * p.nv + h];
+            beta = gd.x;
+            decay = gd.y;
+        } else {
+            // Decode keeps one dispatch: these inputs are uniform across the simdgroup.
+            float bv = b[t * p.nv + h];
+            beta = 1.0f / (1.0f + exp(-bv));
+            float z = a[t * p.nv + h] + dt_bias[h];
+            float sp = max(z, 0.0f) + log(1.0f + exp(-fabs(z)));
+            decay = exp(a_coef[h] * sp);
+        }
 
         // Delta rule on the decayed state, fused with the output accumulation.
         float s_k = 0.0f;
@@ -125,8 +151,12 @@ kernel void deltanet_f32_t(device const float* q       [[buffer(0)]],
     for (uint j = 0; j < KPL; j++) S[(ulong)(lane * KPL + j) * p.vd + d] = ls[j];
 }
 
-typedef decltype(deltanet_f32_t<4>) deltanet_f32_k;
-template [[host_name("deltanet_f32_k1")]] kernel deltanet_f32_k deltanet_f32_t<1>;
-template [[host_name("deltanet_f32_k2")]] kernel deltanet_f32_k deltanet_f32_t<2>;
-template [[host_name("deltanet_f32_k4")]] kernel deltanet_f32_k deltanet_f32_t<4>;
-template [[host_name("deltanet_f32_k8")]] kernel deltanet_f32_k deltanet_f32_t<8>;
+typedef decltype(deltanet_f32_t<4, false>) deltanet_f32_k;
+template [[host_name("deltanet_f32_k1")]] kernel deltanet_f32_k deltanet_f32_t<1, false>;
+template [[host_name("deltanet_f32_k2")]] kernel deltanet_f32_k deltanet_f32_t<2, false>;
+template [[host_name("deltanet_f32_k4")]] kernel deltanet_f32_k deltanet_f32_t<4, false>;
+template [[host_name("deltanet_f32_k8")]] kernel deltanet_f32_k deltanet_f32_t<8, false>;
+template [[host_name("deltanet_gates_k1")]] kernel deltanet_f32_k deltanet_f32_t<1, true>;
+template [[host_name("deltanet_gates_k2")]] kernel deltanet_f32_k deltanet_f32_t<2, true>;
+template [[host_name("deltanet_gates_k4")]] kernel deltanet_f32_k deltanet_f32_t<4, true>;
+template [[host_name("deltanet_gates_k8")]] kernel deltanet_f32_k deltanet_f32_t<8, true>;
