@@ -66,7 +66,7 @@ fn asserts_token_seq(src: &str, needle: &str) {
     );
 }
 
-// The three tripwires below guard OPTIMIZATIONS, not correctness. The parity tests pass whether
+// The four tripwires below guard OPTIMIZATIONS, not correctness. The parity tests pass whether
 // or not these are present (a reverted optimization is still numerically right, just slower), so
 // nothing else in the suite would notice if one silently vanished — the exact failure mode this
 // file's header describes. That is why they assert on shader source at all.
@@ -97,6 +97,24 @@ fn q5k_reconstructs_four_codes_per_word() {
     asserts_token_seq(src, "uint packed = (q & 0x0F0F0F0Fu)");
     asserts_token_seq(src, "(h & 0x01010101u) << 4u");
     asserts_token_seq(src, "packed >> 24u");
+}
+
+#[test]
+fn regular_cmm_unrolls_its_fixed_tile_loops() {
+    let src = include_str!("../shaders/moe.metal");
+    asserts_token_seq(
+        src,
+        "#define CMM_UNROLL(x) _Pragma(\"clang loop unroll(full)\") for (x)",
+    );
+    let compact = despace(src);
+    let cmm = compact
+        .split_once(&despace("#define CMM_KERNEL(NAME, DEC)"))
+        .unwrap()
+        .1
+        .split_once(&despace("#define CMMKS_KERNEL(NAME, DEC)"))
+        .unwrap()
+        .0;
+    assert!(cmm.matches("CMM_UNROLL").count() >= 8);
 }
 
 // The two below test the TRIPWIRE ITSELF. A guard nobody has watched fail is not a guard: it can

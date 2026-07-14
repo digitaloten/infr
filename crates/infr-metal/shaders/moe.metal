@@ -291,6 +291,7 @@ RT_KERNEL(linear_iq2xs_rt, DEC16_IQ2XS)
 // accumulators; a partial token tile stages through threadgroup memory and row-guards the copy,
 // so every tile takes the MMA path. Requires out_f % 64 == 0 and in_f % 32 == 0; other shapes
 // fall back to the per-simdgroup HGEMM.
+#define CMM_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
 #define CMM_KERNEL(NAME, DEC)                                                                     \
 kernel void NAME(device const float*  x     [[buffer(0)]],                                       \
                  device const uchar*  codes [[buffer(1)]],                                       \
@@ -325,7 +326,7 @@ kernel void NAME(device const float*  x     [[buffer(0)]],                      
     simdgroup_half8x8 ma[4];                                                                      \
     simdgroup_half8x8 mb[2];                                                                      \
     simdgroup_float8x8 mc[8];                                                                     \
-    for (uint i = 0; i < 8u; i++) mc[i] = simdgroup_float8x8(0.0f);                               \
+    CMM_UNROLL(uint i = 0; i < 8u; i++) mc[i] = simdgroup_float8x8(0.0f);                         \
                                                                                                   \
     uint nb = p.in_f >> 4;                                                                        \
     for (uint k0 = 0; k0 < p.in_f; k0 += 32u) {                                                   \
@@ -343,7 +344,7 @@ kernel void NAME(device const float*  x     [[buffer(0)]],                      
         {   /* stage A: one 16-block per thread, into pre-transposed 8x8 tiles */                 \
             uint sy = lr0 >> 3;                                                                   \
             uint lx = lr0 & 7u;                                                                   \
-            for (uint i = 0; i < 16u; i++) {                                                      \
+            CMM_UNROLL(uint i = 0; i < 16u; i++) {                                                \
                 uint sx = 2u * il0 + (i >> 3);                                                    \
                 sa[64u * (8u * sx + sy) + 8u * (i & 7u) + lx] = (half)wk[i];                      \
             }                                                                                     \
@@ -358,13 +359,13 @@ kernel void NAME(device const float*  x     [[buffer(0)]],                      
         threadgroup_barrier(mem_flags::mem_threadgroup);                                          \
         threadgroup const half* lsma = sa + 4u * 64u * (sgid & 1u);                               \
         threadgroup const half* lsmb = sb + 2u * 64u * (sgid >> 1);                               \
-        for (uint ik = 0; ik < 4u; ik++) {                                                        \
+        CMM_UNROLL(uint ik = 0; ik < 4u; ik++) {                                                  \
             simdgroup_barrier(mem_flags::mem_none);                                               \
-            for (uint i = 0; i < 4u; i++) simdgroup_load(ma[i], lsma + 64u * i, 8);               \
+            CMM_UNROLL(uint i = 0; i < 4u; i++) simdgroup_load(ma[i], lsma + 64u * i, 8);         \
             simdgroup_barrier(mem_flags::mem_none);                                               \
-            for (uint i = 0; i < 2u; i++) simdgroup_load(mb[i], lsmb + 64u * i, 8);               \
+            CMM_UNROLL(uint i = 0; i < 2u; i++) simdgroup_load(mb[i], lsmb + 64u * i, 8);         \
             simdgroup_barrier(mem_flags::mem_none);                                               \
-            for (uint i = 0; i < 8u; i++)                                                         \
+            CMM_UNROLL(uint i = 0; i < 8u; i++)                                                   \
                 simdgroup_multiply_accumulate(mc[i], mb[i >> 2], ma[i & 3u], mc[i]);              \
             lsma += 8u * 64u;                                                                     \
             lsmb += 4u * 64u;                                                                     \
@@ -375,12 +376,12 @@ kernel void NAME(device const float*  x     [[buffer(0)]],                      
     if (rt + 32u <= p.m) {                                                                        \
         device float* C = dst + (ro + 32u * (sgid & 1u)) +                                        \
                           (ulong)(rt + 16u * (sgid >> 1)) * p.out_f;                              \
-        for (uint i = 0; i < 8u; i++)                                                             \
+        CMM_UNROLL(uint i = 0; i < 8u; i++)                                                       \
             simdgroup_store(mc[i], C + 8u * (i & 3u) + 8u * p.out_f * (i >> 2), p.out_f);         \
     } else {                                                                                      \
         /* partial token tile: stage through threadgroup memory, row-guard the copy-out */        \
         threadgroup float* tc = shraw + 32u * (sgid & 1u) + (16u * (sgid >> 1)) * 64u;            \
-        for (uint i = 0; i < 8u; i++)                                                             \
+        CMM_UNROLL(uint i = 0; i < 8u; i++)                                                       \
             simdgroup_store(mc[i], tc + 8u * (i & 3u) + 8u * 64u * (i >> 2), 64u);                \
         threadgroup_barrier(mem_flags::mem_threadgroup);                                          \
         if (sgid == 0u) {                                                                         \
