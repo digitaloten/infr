@@ -560,6 +560,14 @@ fn linear_woff_f16_gemv() {
 
 #[test]
 #[ignore = "requires a Metal GPU"]
+fn linear_woff_f32_gemv() {
+    let (in_f, slices) = (256usize, [128usize, 64, 64]);
+    let wf = rand_f32(256 * in_f, 353);
+    check_linear_woff(DType::F32, f32_bytes(&wf), 1, in_f, &slices, false, 1e-3);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
 fn linear_woff_f16_rt() {
     let (in_f, slices) = (256usize, [128usize, 64, 64]);
     let wf = rand_f32(256 * in_f, 352);

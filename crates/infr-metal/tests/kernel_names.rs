@@ -146,6 +146,16 @@ fn f16_small_multirow_linear_uses_the_exact_row_tile() {
     asserts_token_seq(exec, "self.pipelines.get(\"linear_f16_rt\")");
 }
 
+#[test]
+fn f32_linear_reads_the_bound_weight_directly() {
+    let exec = include_str!("../src/exec.rs");
+    asserts_token_seq(
+        exec,
+        "let f32_native = wdt == DType::F32 && std::env::var(\"INFR_METAL_NO_F32_NATIVE\").is_err()",
+    );
+    asserts_token_seq(exec, "DType::F32 if f32_native => (\"linear_f32\", 4u64)");
+}
+
 // The two below test the TRIPWIRE ITSELF. A guard nobody has watched fail is not a guard: it can
 // rot into a tautology (matching something that is always present) and nothing would say so.
 

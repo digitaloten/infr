@@ -2516,6 +2516,8 @@ impl MetalBackend {
                 } else {
                     let f16_native =
                         wdt == DType::F16 && std::env::var("INFR_METAL_NO_F16_NATIVE").is_err();
+                    let f32_native =
+                        wdt == DType::F32 && std::env::var("INFR_METAL_NO_F32_NATIVE").is_err();
                     let f16_cmm = f16_native
                         && m >= 16
                         && out_f % 64 == 0
@@ -2530,6 +2532,7 @@ impl MetalBackend {
                         && std::env::var("INFR_METAL_NO_F16_RT").is_err();
                     let (kern, elem_bytes) = match wdt {
                         DType::F16 if f16_native => ("linear_f16", 2u64),
+                        DType::F32 if f32_native => ("linear_f32", 4u64),
                         _ => ("linear_f32", 4u64),
                     };
                     if f16_cmm {
@@ -2586,9 +2589,9 @@ impl MetalBackend {
                             m.div_ceil(8) * out_f * 32,
                             32,
                         );
-                    } else if f16_native {
-                        // Read the uploaded GGUF half buffer directly. Besides halving the weight
-                        // stream, this avoids a same-size host read plus a 2x f32 cache allocation.
+                    } else if f16_native || f32_native {
+                        // Read uploaded float weights directly. F16 also halves the stream; both
+                        // avoid a host read and redundant f32 device-cache allocation.
                         let bw =
                             metal_buf(bindings.get(weight).expect("metal backend: unbound Weight"));
                         let pso = self.pipelines.get(kern)?;
@@ -2610,7 +2613,7 @@ impl MetalBackend {
                             32,
                         );
                     } else {
-                        // f32/bf16 weight: dequant-to-f32 device buffer, cached.
+                        // bf16 or a forced-control float weight: dequant-to-f32 device cache.
                         let bw = self.weight_buf(weight, g, bindings)?;
                         let pso = self.pipelines.get(kern)?;
                         if let Some(label) = counter_linear_label(self.counter_set.is_some(), kern)

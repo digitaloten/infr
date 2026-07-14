@@ -156,6 +156,57 @@ fn f16_native_probe() {
     bench_chained(DType::F16, &w16, in_f, out_f, 16.0, "f16 native");
 }
 
+fn bench_f32_cold(wbytes: &[u8], in_f: usize, out_f: usize, force_cache: bool, label: &str) {
+    if force_cache {
+        std::env::set_var("INFR_METAL_NO_F32_NATIVE", "1");
+    } else {
+        std::env::remove_var("INFR_METAL_NO_F32_NATIVE");
+    }
+    let be = MetalBackend::new().unwrap();
+    let xs = vec![0.01f32; in_f];
+    let mut g = Graph::new();
+    let x = g.input(TensorDesc::new(vec![1, in_f], DType::F32));
+    let w = g.weight(TensorDesc::new(vec![out_f, in_f], DType::F32));
+    let dst = g.output(TensorDesc::new(vec![1, out_f], DType::F32));
+    g.push(Op::Linear {
+        x,
+        weight: w,
+        dst,
+        m: 1,
+        in_f: in_f as u32,
+        out_f: out_f as u32,
+        w_off: 0,
+    });
+    let xb = be.alloc(in_f * 4, BufferUsage::Activations).unwrap();
+    let wb = be.alloc(wbytes.len(), BufferUsage::Weights).unwrap();
+    let ob = be.alloc(out_f * 4, BufferUsage::Activations).unwrap();
+    be.upload(xb.as_ref(), bytemuck::cast_slice(&xs)).unwrap();
+    be.upload(wb.as_ref(), wbytes).unwrap();
+    let mut bindings = Bindings::new();
+    bindings.bind(x, xb.as_ref());
+    bindings.bind(w, wb.as_ref());
+    bindings.bind(dst, ob.as_ref());
+    let plan = be.compile(&g).unwrap();
+
+    let t0 = std::time::Instant::now();
+    be.execute(plan.as_ref(), &bindings).unwrap();
+    println!(
+        "{label}: {:.3} ms cold execute",
+        t0.elapsed().as_secs_f64() * 1e3
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU; evidence probe, not a correctness test"]
+fn f32_native_cold_probe() {
+    let (in_f, out_f) = (1024usize, 16384usize);
+    let wf: Vec<f32> = (0..out_f * in_f).map(|i| (i % 13) as f32 * 0.01).collect();
+    let wbytes = bytemuck::cast_slice(&wf);
+    bench_f32_cold(wbytes, in_f, out_f, true, "f32 cached copy");
+    bench_f32_cold(wbytes, in_f, out_f, false, "f32 direct");
+    std::env::remove_var("INFR_METAL_NO_F32_NATIVE");
+}
+
 #[test]
 #[ignore = "requires a Metal GPU; evidence probe, not a correctness test"]
 fn f16_cmm_probe() {
