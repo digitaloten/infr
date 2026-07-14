@@ -2561,10 +2561,15 @@ impl MetalBackend {
                         && std::env::var("INFR_METAL_NO_F16_RT").is_err();
                     let bf16_rt =
                         bf16_native && m >= 2 && std::env::var("INFR_METAL_NO_BF16_RT").is_err();
+                    let f32_rt = f32_native
+                        && (2..16).contains(&m)
+                        && std::env::var("INFR_METAL_NO_F32_RT").is_err();
                     let native_rt = if f16_rt {
                         Some("linear_f16_rt")
                     } else if bf16_rt {
                         Some("linear_bf16_rt")
+                    } else if f32_rt {
+                        Some("linear_f32_rt")
                     } else {
                         None
                     };
