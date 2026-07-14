@@ -320,16 +320,21 @@ fn f32_cmm_probe() {
         .flat_map(|i| ((i % 13) as f32 * 0.01).to_le_bytes())
         .collect();
 
-    for m in [16usize, 32] {
+    for m in [8usize, 12, 16, 32] {
         std::env::set_var("INFR_METAL_NO_F32_CMM", "1");
+        let (fallback_bpw, fallback_label) = if m < 16 {
+            (32.0, "f32 rt")
+        } else {
+            (32.0 * m as f64, "f32 native-gemv")
+        };
         bench_chained_m(
             DType::F32,
             &w32,
             m,
             in_f,
             out_f,
-            32.0 * m as f64,
-            "f32 native-gemv",
+            fallback_bpw,
+            fallback_label,
         );
         std::env::remove_var("INFR_METAL_NO_F32_CMM");
         bench_chained_m(DType::F32, &w32, m, in_f, out_f, 32.0, "f32 cmm");

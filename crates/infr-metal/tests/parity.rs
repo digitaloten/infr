@@ -579,6 +579,14 @@ fn linear_woff_f32_cmm() {
 fn linear_woff_f32_rt() {
     let (in_f, slices) = (256usize, [128usize, 64, 64]);
     let wf = rand_f32(256 * in_f, 359);
+    check_linear_woff(DType::F32, f32_bytes(&wf), 4, in_f, &slices, false, 1e-3);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_woff_f32_cmm_small() {
+    let (in_f, slices) = (256usize, [128usize, 64, 64]);
+    let wf = rand_f32(256 * in_f, 360);
     check_linear_woff(DType::F32, f32_bytes(&wf), 8, in_f, &slices, false, 1e-3);
 }
 

@@ -159,12 +159,12 @@ fn f32_linear_reads_the_bound_weight_directly() {
 }
 
 #[test]
-fn f32_large_multirow_linear_uses_the_cooperative_tile() {
+fn f32_aligned_multirow_linear_uses_the_cooperative_tile() {
     let shader = include_str!("../shaders/moe.metal");
     asserts_token_seq(shader, "CMM_F32_KERNEL(linear_f32_cmm, DEC16_F32)");
 
     let exec = include_str!("../src/exec.rs");
-    asserts_token_seq(exec, "let f32_cmm = f32_native && m >= 16");
+    asserts_token_seq(exec, "let f32_cmm = f32_native && m >= 8");
     asserts_token_seq(exec, "Some(\"linear_f32_cmm\")");
 }
 
