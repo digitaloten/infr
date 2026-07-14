@@ -552,6 +552,134 @@ fn linear_woff_q8_0_gemv() {
 
 #[test]
 #[ignore = "requires a Metal GPU"]
+fn linear_woff_f16_gemv() {
+    let (in_f, slices) = (256usize, [128usize, 64, 64]);
+    let wf = rand_f32(256 * in_f, 350);
+    check_linear_woff(DType::F16, f16_bytes(&wf), 1, in_f, &slices, false, 1e-3);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_woff_f32_gemv() {
+    let (in_f, slices) = (256usize, [128usize, 64, 64]);
+    let wf = rand_f32(256 * in_f, 353);
+    check_linear_woff(DType::F32, f32_bytes(&wf), 1, in_f, &slices, false, 1e-3);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_woff_f32_cmm() {
+    let (in_f, slices) = (256usize, [128usize, 64, 64]);
+    let wf = rand_f32(256 * in_f, 358);
+    check_linear_woff(DType::F32, f32_bytes(&wf), 40, in_f, &slices, false, 1e-3);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_woff_f32_rt() {
+    let (in_f, slices) = (256usize, [128usize, 64, 64]);
+    let wf = rand_f32(256 * in_f, 359);
+    check_linear_woff(DType::F32, f32_bytes(&wf), 4, in_f, &slices, false, 1e-3);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_woff_f32_cmm_small() {
+    let (in_f, slices) = (256usize, [128usize, 64, 64]);
+    let wf = rand_f32(256 * in_f, 360);
+    check_linear_woff(DType::F32, f32_bytes(&wf), 8, in_f, &slices, false, 1e-3);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_woff_bf16_gemv() {
+    let (in_f, slices) = (256usize, [128usize, 64, 64]);
+    let wf = rand_f32(256 * in_f, 354);
+    check_linear_woff(DType::Bf16, bf16_bytes(&wf), 1, in_f, &slices, false, 1e-3);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_woff_bf16_rt() {
+    let (in_f, slices) = (256usize, [128usize, 64, 64]);
+    let wf = rand_f32(256 * in_f, 355);
+    check_linear_woff(DType::Bf16, bf16_bytes(&wf), 4, in_f, &slices, false, 1e-3);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_woff_bf16_cmm_small() {
+    let (in_f, slices) = (256usize, [128usize, 64, 64]);
+    let wf = rand_f32(256 * in_f, 361);
+    check_linear_woff(DType::Bf16, bf16_bytes(&wf), 6, in_f, &slices, false, 1e-3);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_woff_bf16_rt_multirow() {
+    let (in_f, slices) = (256usize, [96usize, 80, 80]);
+    let wf = rand_f32(256 * in_f, 356);
+    check_linear_woff(DType::Bf16, bf16_bytes(&wf), 32, in_f, &slices, false, 1e-3);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_woff_bf16_cmm() {
+    let (in_f, slices) = (256usize, [128usize, 64, 64]);
+    let wf = rand_f32(256 * in_f, 357);
+    check_linear_woff(DType::Bf16, bf16_bytes(&wf), 40, in_f, &slices, false, 1e-3);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_bf16_cmm_preserves_wide_finite_weights() {
+    let (m, in_f, out_f) = (16usize, 32usize, 64usize);
+    let mut g = Graph::new();
+    let x = g.input(TensorDesc::new(vec![m, in_f], DType::F32));
+    let w = g.weight(TensorDesc::new(vec![out_f, in_f], DType::Bf16));
+    let dst = g.output(TensorDesc::new(vec![m, out_f], DType::F32));
+    g.push(Op::Linear {
+        x,
+        weight: w,
+        dst,
+        m: m as u32,
+        in_f: in_f as u32,
+        out_f: out_f as u32,
+        w_off: 0,
+    });
+    let bound = vec![
+        (x, f32_bytes(&vec![2.0f32.powi(-14); m * in_f])),
+        (w, bf16_bytes(&vec![65536.0; out_f * in_f])),
+    ];
+    assert_parity(&g, &bound, dst, m * out_f, 1e-3);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_woff_f16_rt() {
+    let (in_f, slices) = (256usize, [128usize, 64, 64]);
+    let wf = rand_f32(256 * in_f, 352);
+    check_linear_woff(DType::F16, f16_bytes(&wf), 4, in_f, &slices, false, 1e-3);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_woff_f16_cmm_small() {
+    let (in_f, slices) = (256usize, [128usize, 64, 64]);
+    let wf = rand_f32(256 * in_f, 362);
+    check_linear_woff(DType::F16, f16_bytes(&wf), 8, in_f, &slices, false, 1e-3);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_woff_f16_cmm() {
+    let (in_f, slices) = (256usize, [128usize, 64, 64]);
+    let wf = rand_f32(256 * in_f, 351);
+    check_linear_woff(DType::F16, f16_bytes(&wf), 40, in_f, &slices, false, 1e-3);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
 fn linear_woff_q8_0_coop_gemm() {
     let (in_f, slices) = (256usize, [128usize, 64, 64]);
     let wf = rand_f32(256 * in_f, 36);
@@ -657,6 +785,38 @@ fn linear_f16_parity() {
         (w, f16_bytes(&rand_f32(out_f * in_f, 23))),
     ];
     assert_parity(&g, &bound, dst, m * out_f, 1e-3);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_bf16_parity() {
+    let (m, in_f, out_f) = (2usize, 256usize, 128usize);
+    let mut g = Graph::new();
+    let x = g.input(TensorDesc::new(vec![m, in_f], DType::F32));
+    let w = g.weight(TensorDesc::new(vec![out_f, in_f], DType::Bf16));
+    let dst = g.output(TensorDesc::new(vec![m, out_f], DType::F32));
+    g.push(Op::Linear {
+        x,
+        weight: w,
+        dst,
+        m: m as u32,
+        in_f: in_f as u32,
+        out_f: out_f as u32,
+        w_off: 0,
+    });
+    let bound = vec![
+        (x, f32_bytes(&rand_f32(m * in_f, 231))),
+        (w, bf16_bytes(&rand_f32(out_f * in_f, 232))),
+    ];
+    assert_parity(&g, &bound, dst, m * out_f, 1e-3);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_f16_cmm_parity() {
+    let (m, in_f, out_f) = (40usize, 256usize, 128usize);
+    let wf = rand_f32(out_f * in_f, 230);
+    check_quant_linear_parity_impl(DType::F16, f16_bytes(&wf), m, in_f, out_f, 1e-3, false);
 }
 
 // Quantized Linear: Metal dequants the weight to f32 (via infr_gguf) and matmuls. Compare to a
@@ -1374,6 +1534,44 @@ fn rmsnorm_parity() {
     assert_parity(&g, &bound, dst, rows * dim, 1e-5);
 }
 
+fn check_rmsnorm_parity(rows: usize, dim: usize, seed: u64) {
+    let mut g = Graph::new();
+    let x = g.input(TensorDesc::new(vec![rows, dim], DType::F32));
+    let w = g.weight(TensorDesc::new(vec![dim], DType::F32));
+    let dst = g.output(TensorDesc::new(vec![rows, dim], DType::F32));
+    g.push(Op::RmsNorm {
+        x,
+        weight: w,
+        dst,
+        rows: rows as u32,
+        dim: dim as u32,
+        eps: 1e-6,
+    });
+    let bound = vec![
+        (x, f32_bytes(&rand_f32(rows * dim, seed))),
+        (w, f32_bytes(&rand_f32(dim, seed + 1))),
+    ];
+    assert_parity(&g, &bound, dst, rows * dim, 1e-5);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn rmsnorm_vec4_decode_shape_parity() {
+    check_rmsnorm_parity(1, 5376, 101);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn rmsnorm_vec4_multirow_gate_parity() {
+    check_rmsnorm_parity(4, 2048, 103);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn rmsnorm_scalar_fallback_shape_parity() {
+    check_rmsnorm_parity(1, 2049, 105);
+}
+
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn qknorm_parity() {
@@ -1397,6 +1595,37 @@ fn qknorm_parity() {
         (w, f32_bytes(&rand_f32(hd, 13))),
     ];
     assert_parity(&g, &bound, dst, rows * nh * hd, 1e-5);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn gated_rmsnorm_in_place_parity() {
+    let (rows, nh, hd) = (3usize, 16usize, 128usize);
+    let n = rows * nh * hd;
+    let mut g = Graph::new();
+    let x = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let w = g.weight(TensorDesc::new(vec![hd], DType::F32));
+    let gate = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    g.push(Op::GatedRmsNorm {
+        x,
+        weight: w,
+        gate,
+        dst: x,
+        rows: rows as u32,
+        n_head: nh as u32,
+        head_dim: hd as u32,
+        eps: 1e-6,
+    });
+    let bound = vec![
+        (x, f32_bytes(&rand_f32(n, 107))),
+        (w, f32_bytes(&rand_f32(hd, 108))),
+        (gate, f32_bytes(&rand_f32(n, 109))),
+    ];
+    let cpu = run_multi(&CpuBackend::new(), &g, &bound, &[(x, n)]).remove(0);
+    let metal_be = MetalBackend::new().expect("metal backend");
+    assert!(metal_be.capabilities().gated_rmsnorm);
+    let metal = run_multi(&metal_be, &g, &bound, &[(x, n)]).remove(0);
+    assert_close(&cpu, &metal, 1e-5, "in-place gated rmsnorm");
 }
 
 #[test]

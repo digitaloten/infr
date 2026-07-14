@@ -98,6 +98,35 @@ kernel void rmsnorm_wide_f32(device const float* x   [[buffer(0)]],
     for (uint i = tid; i < p.dim; i += 256u) dst[base + i] = x[base + i] * s * w[i];
 }
 
+// Wide decode RMSNorm with 16-byte loads/stores. Apple GPUs prefer the existing 256-thread
+// launch width here: the float4 stream measured 23-43% faster at dim 2048..5376, while raising
+// the threadgroup to Vulkan's 1024-thread form was slower. Host gating guarantees dim % 4 == 0,
+// so every row base is naturally float4-aligned.
+kernel void rmsnorm_vec4_f32(device const float4* x   [[buffer(0)]],
+                             device const float4* w   [[buffer(1)]],
+                             device float4*       dst [[buffer(2)]],
+                             constant RmsParams& p    [[buffer(3)]],
+                             uint tid  [[thread_position_in_threadgroup]],
+                             uint row  [[threadgroup_position_in_grid]],
+                             uint sg   [[simdgroup_index_in_threadgroup]],
+                             uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[8];
+    if (row >= p.rows) return;
+    uint n4 = p.dim / 4u;
+    uint base = row * n4;
+    float ss = 0.0f;
+    for (uint i = tid; i < n4; i += 256u) {
+        float4 v = x[base + i];
+        ss += dot(v, v);
+    }
+    ss = simd_sum(ss);
+    if (lane == 0u) red[sg] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = red[0] + red[1] + red[2] + red[3] + red[4] + red[5] + red[6] + red[7];
+    float s = 1.0f / sqrt(tot / (float)p.dim + p.eps);
+    for (uint i = tid; i < n4; i += 256u) dst[base + i] = x[base + i] * s * w[i];
+}
+
 // Row-wise softmax: dst[r,:] = softmax(x[r,:] * scale), one threadgroup (8 simdgroups) per row —
 // diffusion-gemma's in-graph self-conditioning (see docs/DIFFUSIONGEMMA.md's Phase-B and the
 // reference's `dg_canvas_embed`). Same wide-launch shape as `rmsnorm_wide_f32` since the row width
@@ -160,6 +189,33 @@ kernel void qknorm_f32(device const float* x   [[buffer(0)]],
     ss = simd_sum(ss) / (float)p.head_dim;
     float s = 1.0f / sqrt(ss + p.eps);
     for (uint i = lane; i < p.head_dim; i += 32u) dst[base + i] = x[base + i] * s * w[i];
+}
+
+// Qwen3.5 DeltaNet output normalization: per-head RMSNorm followed by an elementwise SiLU gate.
+// This keeps qknorm_f32's exact 32-lane reduction and folds the dependent GatedAct dispatch into
+// the store pass. x and dst may alias; simd_sum completes every lane's reads before stores begin.
+kernel void gated_rmsnorm_f32(device const float* x    [[buffer(0)]],
+                              device const float* w    [[buffer(1)]],
+                              device const float* gate [[buffer(2)]],
+                              device float*       dst  [[buffer(3)]],
+                              constant QkNormParams& p [[buffer(4)]],
+                              uint gid  [[thread_position_in_grid]],
+                              uint lane [[thread_index_in_simdgroup]]) {
+    uint grp = gid / 32u;
+    if (grp >= p.rows * p.n_head) return;
+    uint base = grp * p.head_dim;
+    float ss = 0.0f;
+    for (uint i = lane; i < p.head_dim; i += 32u) {
+        float v = x[base + i];
+        ss += v * v;
+    }
+    float s = 1.0f / sqrt(simd_sum(ss) / (float)p.head_dim + p.eps);
+    for (uint i = lane; i < p.head_dim; i += 32u) {
+        uint at = base + i;
+        float z = gate[at];
+        float silu = z / (1.0f + exp(-z));
+        dst[at] = x[at] * s * w[i] * silu;
+    }
 }
 
 // Greedy argmax over `n` logits → token id (one 256-thread threadgroup, strided scan +

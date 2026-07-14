@@ -66,7 +66,7 @@ fn asserts_token_seq(src: &str, needle: &str) {
     );
 }
 
-// The three tripwires below guard OPTIMIZATIONS, not correctness. The parity tests pass whether
+// The four tripwires below guard OPTIMIZATIONS, not correctness. The parity tests pass whether
 // or not these are present (a reverted optimization is still numerically right, just slower), so
 // nothing else in the suite would notice if one silently vanished — the exact failure mode this
 // file's header describes. That is why they assert on shader source at all.
@@ -97,6 +97,118 @@ fn q5k_reconstructs_four_codes_per_word() {
     asserts_token_seq(src, "uint packed = (q & 0x0F0F0F0Fu)");
     asserts_token_seq(src, "(h & 0x01010101u) << 4u");
     asserts_token_seq(src, "packed >> 24u");
+}
+
+#[test]
+fn regular_cmm_unrolls_its_fixed_tile_loops() {
+    let src = include_str!("../shaders/moe.metal");
+    asserts_token_seq(
+        src,
+        "#define CMM_UNROLL(x) _Pragma(\"clang loop unroll(full)\") for (x)",
+    );
+    let compact = despace(src);
+    let cmm = compact
+        .split_once(&despace(
+            "#define CMM_KERNEL_TYPED(NAME, DEC, WTYPE, WMAT, XTYPE, XVEC, XMAT, SHWORDS, SBOFF)",
+        ))
+        .unwrap()
+        .1
+        .split_once(&despace("#define CMMKS_KERNEL(NAME, DEC)"))
+        .unwrap()
+        .0;
+    assert!(cmm.matches("CMM_UNROLL").count() >= 8);
+}
+
+#[test]
+fn f16_linear_reads_the_bound_weight_directly() {
+    let shader = include_str!("../shaders/linear.metal");
+    asserts_token_seq(shader, "kernel void linear_f16");
+
+    let exec = include_str!("../src/exec.rs");
+    asserts_token_seq(exec, "DType::F16 if f16_native => (\"linear_f16\", 2u64)");
+}
+
+#[test]
+fn f16_aligned_multirow_linear_uses_the_cooperative_tile() {
+    let shader = include_str!("../shaders/moe.metal");
+    asserts_token_seq(shader, "CMM_F16_KERNEL(linear_f16_cmm, DEC16_F16)");
+
+    let exec = include_str!("../src/exec.rs");
+    asserts_token_seq(exec, "let f16_cmm = f16_native && m >= 8");
+    asserts_token_seq(exec, "self.pipelines.get(\"linear_f16_cmm\")");
+}
+
+#[test]
+fn f16_small_multirow_linear_uses_the_exact_row_tile() {
+    let shader = include_str!("../shaders/moe.metal");
+    asserts_token_seq(shader, "RT_KERNEL(linear_f16_rt, DEC16_F16)");
+
+    let exec = include_str!("../src/exec.rs");
+    asserts_token_seq(exec, "let f16_rt = f16_native && (2..16).contains(&m)");
+    asserts_token_seq(exec, "Some(\"linear_f16_rt\")");
+}
+
+#[test]
+fn f32_linear_reads_the_bound_weight_directly() {
+    let exec = include_str!("../src/exec.rs");
+    asserts_token_seq(
+        exec,
+        "let f32_native = wdt == DType::F32 && std::env::var(\"INFR_METAL_NO_F32_NATIVE\").is_err()",
+    );
+    asserts_token_seq(exec, "DType::F32 if f32_native => (\"linear_f32\", 4u64)");
+}
+
+#[test]
+fn f32_aligned_multirow_linear_uses_the_cooperative_tile() {
+    let shader = include_str!("../shaders/moe.metal");
+    asserts_token_seq(shader, "CMM_F32_KERNEL(linear_f32_cmm, DEC16_F32)");
+
+    let exec = include_str!("../src/exec.rs");
+    asserts_token_seq(exec, "let f32_cmm = f32_native && m >= 8");
+    asserts_token_seq(exec, "Some(\"linear_f32_cmm\")");
+}
+
+#[test]
+fn f32_small_multirow_linear_uses_the_exact_row_tile() {
+    let shader = include_str!("../shaders/moe.metal");
+    asserts_token_seq(shader, "RT_KERNEL(linear_f32_rt, DEC16_F32)");
+
+    let exec = include_str!("../src/exec.rs");
+    asserts_token_seq(exec, "let f32_rt = f32_native && (2..16).contains(&m)");
+    asserts_token_seq(exec, "Some(\"linear_f32_rt\")");
+}
+
+#[test]
+fn bf16_linear_reads_the_bound_weight_directly() {
+    let shader = include_str!("../shaders/linear.metal");
+    asserts_token_seq(shader, "kernel void linear_bf16");
+    asserts_token_seq(shader, "as_type<float>((uint)wo[i] << 16u)");
+
+    let exec = include_str!("../src/exec.rs");
+    asserts_token_seq(
+        exec,
+        "DType::Bf16 if bf16_native => (\"linear_bf16\", 2u64)",
+    );
+}
+
+#[test]
+fn bf16_multirow_linear_uses_the_exact_row_tile() {
+    let shader = include_str!("../shaders/moe.metal");
+    asserts_token_seq(shader, "RT_KERNEL(linear_bf16_rt, DEC16_BF16)");
+
+    let exec = include_str!("../src/exec.rs");
+    asserts_token_seq(exec, "let bf16_rt = bf16_native && m >= 2");
+    asserts_token_seq(exec, "Some(\"linear_bf16_rt\")");
+}
+
+#[test]
+fn bf16_aligned_multirow_linear_uses_the_cooperative_tile() {
+    let shader = include_str!("../shaders/moe.metal");
+    asserts_token_seq(shader, "CMM_BF16_KERNEL(linear_bf16_cmm, DEC16_BF16)");
+
+    let exec = include_str!("../src/exec.rs");
+    asserts_token_seq(exec, "let bf16_cmm = bf16_native && m >= 6");
+    asserts_token_seq(exec, "Some(\"linear_bf16_cmm\")");
 }
 
 // The two below test the TRIPWIRE ITSELF. A guard nobody has watched fail is not a guard: it can

@@ -179,6 +179,31 @@ mod tests {
     }
 
     #[test]
+    fn rmsnorm_has_vec4_decode_entrypoint() {
+        let src = include_str!("../shaders/elementwise_norms.metal");
+        assert!(src.contains("kernel void rmsnorm_vec4_f32"));
+        assert!(src.contains("device const float4* x"));
+        assert!(src.contains("device const float4* w"));
+        assert!(src.contains("device float4*       dst"));
+    }
+
+    #[test]
+    fn rmsnorm_vec4_policy_only_targets_wide_decode_rows() {
+        assert!(prefer_rmsnorm_vec4(1, 2048));
+        assert!(prefer_rmsnorm_vec4(4, 5376));
+        assert!(!prefer_rmsnorm_vec4(5, 5376));
+        assert!(!prefer_rmsnorm_vec4(1, 1152));
+        assert!(!prefer_rmsnorm_vec4(1, 2049));
+    }
+
+    #[test]
+    fn gated_rmsnorm_msl_fuses_silu_on_store() {
+        let src = include_str!("../shaders/elementwise_norms.metal");
+        assert!(src.contains("kernel void gated_rmsnorm_f32"));
+        assert!(src.contains("float silu = z / (1.0f + exp(-z))"));
+    }
+
+    #[test]
     fn argmax_split_policy_only_targets_vocab_scale_inputs() {
         assert_eq!(argmax_split_groups(151_936), Some(38));
         assert_eq!(argmax_split_groups(32_768), Some(8));
@@ -240,6 +265,19 @@ mod tests {
             theta: 10_000.0,
             freq_factors: None,
             x_stride: 0,
+        });
+
+        let norm_weight = g.weight(TensorDesc::new(vec![64], DType::F32));
+        let norm_dst = g.internal(TensorDesc::new(vec![1, 1, 64], DType::F32));
+        g.push(Op::GatedRmsNorm {
+            x: rope_x,
+            weight: norm_weight,
+            gate: rope_x,
+            dst: norm_dst,
+            rows: 1,
+            n_head: 1,
+            head_dim: 64,
+            eps: 1e-6,
         });
 
         let q = g.input(TensorDesc::new(vec![1, 1, 64], DType::F32));
@@ -305,11 +343,13 @@ mod tests {
         let table_values: Vec<u16> = (0..8)
             .flat_map(|row| std::iter::repeat_n(half::f16::from_f32(row as f32).to_bits(), 64))
             .collect();
+        let norm_weight_values = [1.0f32; 64];
         let logits_values: Vec<f32> = (0..128).map(|i| -(i as f32) * 0.1).collect();
         let mut uniform_values = [0.0f32; 64];
         uniform_values[0] = 0.01;
 
         let rope_x_buf = alloc(&zeros_f32);
+        let norm_weight_buf = alloc(bytemuck::cast_slice(&norm_weight_values));
         let positions_buf = alloc(bytemuck::cast_slice(&[0i32]));
         let q_buf = alloc(&zeros_f32);
         let k_buf = alloc(&zeros_f16_cache);
@@ -324,6 +364,7 @@ mod tests {
 
         let mut bindings = Bindings::new();
         bindings.bind(rope_x, rope_x_buf.as_ref());
+        bindings.bind(norm_weight, norm_weight_buf.as_ref());
         bindings.bind(positions, positions_buf.as_ref());
         bindings.bind(q, q_buf.as_ref());
         bindings.bind(k_cache, k_buf.as_ref());
@@ -390,6 +431,7 @@ mod tests {
 
         let mut chain_bindings = Bindings::new();
         chain_bindings.bind(rope_x, rope_x_buf.as_ref());
+        chain_bindings.bind(norm_weight, norm_weight_buf.as_ref());
         chain_bindings.bind(positions, positions_buf.as_ref());
         chain_bindings.bind(q, q_buf.as_ref());
         chain_bindings.bind(k_cache, k_buf.as_ref());
@@ -673,6 +715,10 @@ fn prefer_iq4nl_rt(kern: &str, m: usize) -> bool {
     kern == "linear_iq4nl" && (2..=4).contains(&m)
 }
 
+fn prefer_rmsnorm_vec4(rows: usize, dim: usize) -> bool {
+    rows <= 4 && dim >= 2048 && dim.is_multiple_of(4)
+}
+
 fn counter_linear_label(enabled: bool, kern: &'static str) -> Option<&'static str> {
     enabled.then_some(kern)
 }
@@ -717,7 +763,11 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
             // qwen35 (Qwen3-Next) decode ops: all pos-independent, on-device, recurrent state
             // updated in the BOUND buffer — tape-safe when the arm's device gate holds (the
             // host fallbacks can't tape, so the gates mirror the arms').
-            Op::QkNorm { .. } | Op::Scale { .. } | Op::Copy { .. } | Op::CopyStrided { .. } => {}
+            Op::QkNorm { .. }
+            | Op::GatedRmsNorm { .. }
+            | Op::Scale { .. }
+            | Op::Copy { .. }
+            | Op::CopyStrided { .. } => {}
             Op::Conv1dSilu { state, kernel, .. } => {
                 if *kernel > 8
                     || std::env::var("INFR_METAL_NODELTA").is_ok()
@@ -1927,13 +1977,22 @@ impl MetalBackend {
                 // Decode (few rows): the WIDE kernel — 8 simdgroups per row; the 32-lane form
                 // is latency-bound on dim/32 serial loads (~20 us/launch at dim 1152). Prefill
                 // keeps one simdgroup per row (the rows themselves fill the GPU).
+                let vec4 = std::env::var_os("INFR_METAL_NO_RMSNORM_VEC4").is_none()
+                    && prefer_rmsnorm_vec4(rows, dim)
+                    && self
+                        .pipelines
+                        .get("rmsnorm_vec4_f32")
+                        .map(|pl| pl.max_total_threads_per_threadgroup() >= 256)
+                        .unwrap_or(false);
                 let wide = rows <= 4
                     && self
                         .pipelines
                         .get("rmsnorm_wide_f32")
                         .map(|pl| pl.max_total_threads_per_threadgroup() >= 256)
                         .unwrap_or(false);
-                let pso = self.pipelines.get(if wide {
+                let pso = self.pipelines.get(if vec4 {
+                    "rmsnorm_vec4_f32"
+                } else if wide {
                     "rmsnorm_wide_f32"
                 } else {
                     "rmsnorm_f32"
@@ -1941,7 +2000,7 @@ impl MetalBackend {
                 let mut p = (rows as u32).to_ne_bytes().to_vec();
                 p.extend_from_slice(&(dim as u32).to_ne_bytes());
                 p.extend_from_slice(&eps.to_ne_bytes());
-                let tgw = if wide { 256 } else { 32 };
+                let tgw = if vec4 || wide { 256 } else { 32 };
                 self.encode_tg_w(
                     r,
                     &pso,
@@ -2048,6 +2107,37 @@ impl MetalBackend {
                     &pso,
                     &[bx.as_ref(), bw.as_ref(), bd.as_ref()],
                     1 << 2,
+                    &p,
+                    rows * nh * 32,
+                    32,
+                );
+                r.loc[dst.0 as usize] = Loc::Device;
+            }
+            Op::GatedRmsNorm {
+                x,
+                weight,
+                gate,
+                dst,
+                rows,
+                n_head,
+                head_dim,
+                eps,
+            } => {
+                let (rows, nh, hd) = (rows as usize, n_head as usize, head_dim as usize);
+                let bx = self.ensure_device(r, x);
+                let bw = self.weight_buf(weight, g, bindings)?;
+                let bg = self.ensure_device(r, gate);
+                let bd = self.dev_dst(r, dst, rows * nh * hd);
+                let pso = self.pipelines.get("gated_rmsnorm_f32")?;
+                let mut p = (rows as u32).to_ne_bytes().to_vec();
+                p.extend_from_slice(&(nh as u32).to_ne_bytes());
+                p.extend_from_slice(&(hd as u32).to_ne_bytes());
+                p.extend_from_slice(&eps.to_ne_bytes());
+                self.encode_tg_w(
+                    r,
+                    &pso,
+                    &[bx.as_ref(), bw.as_ref(), bg.as_ref(), bd.as_ref()],
+                    1 << 3,
                     &p,
                     rows * nh * 32,
                     32,
@@ -2514,27 +2604,170 @@ impl MetalBackend {
                         );
                     }
                 } else {
-                    // f16/f32/bf16 weight: dequant-to-f32 device buffer, cached.
-                    let bw = self.weight_buf(weight, g, bindings)?;
-                    let pso = self.pipelines.get("linear_f32")?;
-                    if let Some(label) =
-                        counter_linear_label(self.counter_set.is_some(), "linear_f32")
-                    {
-                        r.cur_op = label;
+                    let f16_native =
+                        wdt == DType::F16 && std::env::var("INFR_METAL_NO_F16_NATIVE").is_err();
+                    let f32_native =
+                        wdt == DType::F32 && std::env::var("INFR_METAL_NO_F32_NATIVE").is_err();
+                    let bf16_native =
+                        wdt == DType::Bf16 && std::env::var("INFR_METAL_NO_BF16_NATIVE").is_err();
+                    let f16_cmm = f16_native
+                        && m >= 8
+                        && out_f % 64 == 0
+                        && std::env::var("INFR_METAL_NO_F16_CMM").is_err()
+                        && self
+                            .pipelines
+                            .get("linear_f16_cmm")?
+                            .max_total_threads_per_threadgroup()
+                            >= 128;
+                    let bf16_cmm = bf16_native
+                        && m >= 6
+                        && out_f % 64 == 0
+                        && std::env::var("INFR_METAL_NO_BF16_CMM").is_err()
+                        && self
+                            .pipelines
+                            .get("linear_bf16_cmm")?
+                            .max_total_threads_per_threadgroup()
+                            >= 128;
+                    let f32_cmm = f32_native
+                        && m >= 8
+                        && out_f % 64 == 0
+                        && std::env::var("INFR_METAL_NO_F32_CMM").is_err()
+                        && self
+                            .pipelines
+                            .get("linear_f32_cmm")?
+                            .max_total_threads_per_threadgroup()
+                            >= 128;
+                    let native_cmm = if f16_cmm {
+                        Some("linear_f16_cmm")
+                    } else if bf16_cmm {
+                        Some("linear_bf16_cmm")
+                    } else if f32_cmm {
+                        Some("linear_f32_cmm")
+                    } else {
+                        None
+                    };
+                    let f16_rt = f16_native
+                        && (2..16).contains(&m)
+                        && std::env::var("INFR_METAL_NO_F16_RT").is_err();
+                    let bf16_rt =
+                        bf16_native && m >= 2 && std::env::var("INFR_METAL_NO_BF16_RT").is_err();
+                    let f32_rt = f32_native
+                        && (2..16).contains(&m)
+                        && std::env::var("INFR_METAL_NO_F32_RT").is_err();
+                    let native_rt = if f16_rt {
+                        Some("linear_f16_rt")
+                    } else if bf16_rt {
+                        Some("linear_bf16_rt")
+                    } else if f32_rt {
+                        Some("linear_f32_rt")
+                    } else {
+                        None
+                    };
+                    let (kern, elem_bytes) = match wdt {
+                        DType::F16 if f16_native => ("linear_f16", 2u64),
+                        DType::F32 if f32_native => ("linear_f32", 4u64),
+                        DType::Bf16 if bf16_native => ("linear_bf16", 2u64),
+                        _ => ("linear_f32", 4u64),
+                    };
+                    if let Some(cmm_kern) = native_cmm {
+                        let cmm = self.pipelines.get(cmm_kern)?;
+                        if let Some(label) =
+                            counter_linear_label(self.counter_set.is_some(), cmm_kern)
+                        {
+                            r.cur_op = label;
+                        }
+                        let bw =
+                            metal_buf(bindings.get(weight).expect("metal backend: unbound Weight"));
+                        let dummy = self.scratch_buf(1, 14);
+                        let mut cp = p.clone();
+                        cp.extend_from_slice(&0u32.to_ne_bytes());
+                        self.encode_tg_off(
+                            r,
+                            &cmm,
+                            &[
+                                (bx.as_ref(), 0),
+                                (&bw.raw, w_off as u64 * elem_bytes),
+                                (dummy.as_ref(), 0),
+                                (dummy.as_ref(), 0),
+                                (bd.as_ref(), 0),
+                            ],
+                            1 << 4,
+                            &cp,
+                            m.div_ceil(32) * (out_f / 64) * 128,
+                            128,
+                        );
+                    } else if let Some(rt_kern) = native_rt {
+                        let rt = self.pipelines.get(rt_kern)?;
+                        if let Some(label) =
+                            counter_linear_label(self.counter_set.is_some(), rt_kern)
+                        {
+                            r.cur_op = label;
+                        }
+                        let bw =
+                            metal_buf(bindings.get(weight).expect("metal backend: unbound Weight"));
+                        let dummy = self.scratch_buf(1, 14);
+                        let mut rp = p.clone();
+                        rp.extend_from_slice(&0u32.to_ne_bytes());
+                        self.encode_tg_off(
+                            r,
+                            &rt,
+                            &[
+                                (bx.as_ref(), 0),
+                                (&bw.raw, w_off as u64 * elem_bytes),
+                                (dummy.as_ref(), 0),
+                                (dummy.as_ref(), 0),
+                                (bd.as_ref(), 0),
+                            ],
+                            1 << 4,
+                            &rp,
+                            m.div_ceil(8) * out_f * 32,
+                            32,
+                        );
+                    } else if f16_native || f32_native || bf16_native {
+                        // Read uploaded float weights directly. F16 also halves the stream; both
+                        // avoid a host read and redundant f32 device-cache allocation.
+                        let bw =
+                            metal_buf(bindings.get(weight).expect("metal backend: unbound Weight"));
+                        let pso = self.pipelines.get(kern)?;
+                        if let Some(label) = counter_linear_label(self.counter_set.is_some(), kern)
+                        {
+                            r.cur_op = label;
+                        }
+                        self.encode_tg_off(
+                            r,
+                            &pso,
+                            &[
+                                (bx.as_ref(), 0),
+                                (&bw.raw, w_off as u64 * elem_bytes),
+                                (bd.as_ref(), 0),
+                            ],
+                            1 << 2,
+                            &p,
+                            m * out_f * 32,
+                            32,
+                        );
+                    } else {
+                        // bf16 or a forced-control float weight: dequant-to-f32 device cache.
+                        let bw = self.weight_buf(weight, g, bindings)?;
+                        let pso = self.pipelines.get(kern)?;
+                        if let Some(label) = counter_linear_label(self.counter_set.is_some(), kern)
+                        {
+                            r.cur_op = label;
+                        }
+                        self.encode_tg_off(
+                            r,
+                            &pso,
+                            &[
+                                (bx.as_ref(), 0),
+                                (bw.as_ref(), w_off as u64 * elem_bytes),
+                                (bd.as_ref(), 0),
+                            ],
+                            1 << 2,
+                            &p,
+                            m * out_f * 32,
+                            32,
+                        );
                     }
-                    self.encode_tg_off(
-                        r,
-                        &pso,
-                        &[
-                            (bx.as_ref(), 0),
-                            (bw.as_ref(), w_off as u64 * 4),
-                            (bd.as_ref(), 0),
-                        ],
-                        1 << 2,
-                        &p,
-                        m * out_f * 32,
-                        32,
-                    );
                 }
                 r.loc[dst.0 as usize] = Loc::Device;
             }
@@ -4378,15 +4611,6 @@ impl MetalBackend {
                 // silent wrong-output run rather than pretending to support it blind.
                 return Err(Error::Unsupported(
                     "Metal Op::MoeSharedExpertAdd (qwen35moe shared expert) not yet implemented"
-                        .into(),
-                ));
-            }
-            Op::GatedRmsNorm { .. } => {
-                // Fused per-head RMSNorm + SiLU gate multiply (qwen35 DeltaNet z-gate) — landed on
-                // CPU + Vulkan only so far (`Capabilities::gated_rmsnorm` is false here, so the
-                // runner never emits this for Metal); fails loudly rather than pretending.
-                return Err(Error::Unsupported(
-                    "Metal Op::GatedRmsNorm (qwen35 DeltaNet z-gate fusion) not yet implemented"
                         .into(),
                 ));
             }

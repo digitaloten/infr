@@ -140,6 +140,260 @@ fn q5k_swar_probe() {
     bench_chained(DType::Q5K, &wq5k, 1152, 65536, 5.5, "q5k head");
 }
 
+#[test]
+#[ignore = "requires a Metal GPU; evidence probe, not a correctness test"]
+fn f16_native_probe() {
+    let (in_f, out_f) = (1152usize, 65536usize);
+    let wf: Vec<f32> = (0..out_f * in_f).map(|i| (i % 13) as f32 * 0.01).collect();
+    let w16: Vec<u8> = wf
+        .into_iter()
+        .flat_map(|v| half::f16::from_f32(v).to_le_bytes())
+        .collect();
+
+    std::env::set_var("INFR_METAL_NO_F16_NATIVE", "1");
+    bench_chained(DType::F16, &w16, in_f, out_f, 32.0, "f16 cached-f32");
+    std::env::remove_var("INFR_METAL_NO_F16_NATIVE");
+    bench_chained(DType::F16, &w16, in_f, out_f, 16.0, "f16 native");
+}
+
+#[test]
+#[ignore = "requires a Metal GPU; evidence probe, not a correctness test"]
+fn bf16_native_probe() {
+    let (in_f, out_f) = (1152usize, 65536usize);
+    let w16: Vec<u8> = (0..out_f * in_f)
+        .flat_map(|i| {
+            let v = (i % 13) as f32 * 0.01;
+            ((v.to_bits() >> 16) as u16).to_le_bytes()
+        })
+        .collect();
+
+    std::env::set_var("INFR_METAL_NO_BF16_NATIVE", "1");
+    bench_chained(DType::Bf16, &w16, in_f, out_f, 32.0, "bf16 cached-f32");
+    std::env::remove_var("INFR_METAL_NO_BF16_NATIVE");
+    bench_chained(DType::Bf16, &w16, in_f, out_f, 16.0, "bf16 native");
+}
+
+#[test]
+#[ignore = "requires a Metal GPU; evidence probe, not a correctness test"]
+fn bf16_rt_probe() {
+    let (in_f, out_f) = (1152usize, 8192usize);
+    let w16: Vec<u8> = (0..out_f * in_f)
+        .flat_map(|i| {
+            let v = (i % 13) as f32 * 0.01;
+            ((v.to_bits() >> 16) as u16).to_le_bytes()
+        })
+        .collect();
+
+    std::env::set_var("INFR_METAL_NO_BF16_CMM", "1");
+    for m in [2usize, 4, 8, 16, 32] {
+        std::env::set_var("INFR_METAL_NO_BF16_RT", "1");
+        bench_chained_m(
+            DType::Bf16,
+            &w16,
+            m,
+            in_f,
+            out_f,
+            16.0 * m as f64,
+            "bf16 native-gemv",
+        );
+        std::env::remove_var("INFR_METAL_NO_BF16_RT");
+        bench_chained_m(
+            DType::Bf16,
+            &w16,
+            m,
+            in_f,
+            out_f,
+            16.0 * m.div_ceil(8) as f64,
+            "bf16 rt",
+        );
+    }
+    std::env::remove_var("INFR_METAL_NO_BF16_CMM");
+}
+
+#[test]
+#[ignore = "requires a Metal GPU; evidence probe, not a correctness test"]
+fn bf16_cmm_probe() {
+    let (in_f, out_f) = (1152usize, 8192usize);
+    let w16: Vec<u8> = (0..out_f * in_f)
+        .flat_map(|i| {
+            let v = (i % 13) as f32 * 0.01;
+            ((v.to_bits() >> 16) as u16).to_le_bytes()
+        })
+        .collect();
+
+    for m in [6usize, 8, 12, 16, 32] {
+        std::env::set_var("INFR_METAL_NO_BF16_CMM", "1");
+        bench_chained_m(
+            DType::Bf16,
+            &w16,
+            m,
+            in_f,
+            out_f,
+            16.0 * m.div_ceil(8) as f64,
+            "bf16 rt",
+        );
+        std::env::remove_var("INFR_METAL_NO_BF16_CMM");
+        bench_chained_m(DType::Bf16, &w16, m, in_f, out_f, 16.0, "bf16 cmm");
+    }
+}
+
+fn bench_f32_cold(wbytes: &[u8], in_f: usize, out_f: usize, force_cache: bool, label: &str) {
+    if force_cache {
+        std::env::set_var("INFR_METAL_NO_F32_NATIVE", "1");
+    } else {
+        std::env::remove_var("INFR_METAL_NO_F32_NATIVE");
+    }
+    let be = MetalBackend::new().unwrap();
+    let xs = vec![0.01f32; in_f];
+    let mut g = Graph::new();
+    let x = g.input(TensorDesc::new(vec![1, in_f], DType::F32));
+    let w = g.weight(TensorDesc::new(vec![out_f, in_f], DType::F32));
+    let dst = g.output(TensorDesc::new(vec![1, out_f], DType::F32));
+    g.push(Op::Linear {
+        x,
+        weight: w,
+        dst,
+        m: 1,
+        in_f: in_f as u32,
+        out_f: out_f as u32,
+        w_off: 0,
+    });
+    let xb = be.alloc(in_f * 4, BufferUsage::Activations).unwrap();
+    let wb = be.alloc(wbytes.len(), BufferUsage::Weights).unwrap();
+    let ob = be.alloc(out_f * 4, BufferUsage::Activations).unwrap();
+    be.upload(xb.as_ref(), bytemuck::cast_slice(&xs)).unwrap();
+    be.upload(wb.as_ref(), wbytes).unwrap();
+    let mut bindings = Bindings::new();
+    bindings.bind(x, xb.as_ref());
+    bindings.bind(w, wb.as_ref());
+    bindings.bind(dst, ob.as_ref());
+    let plan = be.compile(&g).unwrap();
+
+    let t0 = std::time::Instant::now();
+    be.execute(plan.as_ref(), &bindings).unwrap();
+    println!(
+        "{label}: {:.3} ms cold execute",
+        t0.elapsed().as_secs_f64() * 1e3
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU; evidence probe, not a correctness test"]
+fn f32_native_cold_probe() {
+    let (in_f, out_f) = (1024usize, 16384usize);
+    let wf: Vec<f32> = (0..out_f * in_f).map(|i| (i % 13) as f32 * 0.01).collect();
+    let wbytes = bytemuck::cast_slice(&wf);
+    bench_f32_cold(wbytes, in_f, out_f, true, "f32 cached copy");
+    bench_f32_cold(wbytes, in_f, out_f, false, "f32 direct");
+    std::env::remove_var("INFR_METAL_NO_F32_NATIVE");
+}
+
+#[test]
+#[ignore = "requires a Metal GPU; evidence probe, not a correctness test"]
+fn f32_rt_probe() {
+    let (in_f, out_f) = (1152usize, 8192usize);
+    let w32: Vec<u8> = (0..out_f * in_f)
+        .flat_map(|i| ((i % 13) as f32 * 0.01).to_le_bytes())
+        .collect();
+
+    for m in [2usize, 4, 8] {
+        std::env::set_var("INFR_METAL_NO_F32_RT", "1");
+        bench_chained_m(
+            DType::F32,
+            &w32,
+            m,
+            in_f,
+            out_f,
+            32.0 * m as f64,
+            "f32 native-gemv",
+        );
+        std::env::remove_var("INFR_METAL_NO_F32_RT");
+        bench_chained_m(DType::F32, &w32, m, in_f, out_f, 32.0, "f32 rt");
+    }
+}
+
+#[test]
+#[ignore = "requires a Metal GPU; evidence probe, not a correctness test"]
+fn f32_cmm_probe() {
+    let (in_f, out_f) = (1152usize, 8192usize);
+    let w32: Vec<u8> = (0..out_f * in_f)
+        .flat_map(|i| ((i % 13) as f32 * 0.01).to_le_bytes())
+        .collect();
+
+    for m in [8usize, 12, 16, 32] {
+        std::env::set_var("INFR_METAL_NO_F32_CMM", "1");
+        let (fallback_bpw, fallback_label) = if m < 16 {
+            (32.0, "f32 rt")
+        } else {
+            (32.0 * m as f64, "f32 native-gemv")
+        };
+        bench_chained_m(
+            DType::F32,
+            &w32,
+            m,
+            in_f,
+            out_f,
+            fallback_bpw,
+            fallback_label,
+        );
+        std::env::remove_var("INFR_METAL_NO_F32_CMM");
+        bench_chained_m(DType::F32, &w32, m, in_f, out_f, 32.0, "f32 cmm");
+    }
+}
+
+#[test]
+#[ignore = "requires a Metal GPU; evidence probe, not a correctness test"]
+fn f16_cmm_probe() {
+    let (in_f, out_f) = (1152usize, 8192usize);
+    let w16: Vec<u8> = (0..out_f * in_f)
+        .flat_map(|i| half::f16::from_f32((i % 13) as f32 * 0.01).to_le_bytes())
+        .collect();
+
+    for m in [8usize, 12, 16, 32] {
+        std::env::set_var("INFR_METAL_NO_F16_CMM", "1");
+        let (fallback_bpw, fallback_label) = if m < 16 {
+            (16.0 * m.div_ceil(8) as f64, "f16 rt")
+        } else {
+            (16.0 * m as f64, "f16 native-gemv")
+        };
+        bench_chained_m(
+            DType::F16,
+            &w16,
+            m,
+            in_f,
+            out_f,
+            fallback_bpw,
+            fallback_label,
+        );
+        std::env::remove_var("INFR_METAL_NO_F16_CMM");
+        bench_chained_m(DType::F16, &w16, m, in_f, out_f, 16.0, "f16 cmm");
+    }
+}
+
+#[test]
+#[ignore = "requires a Metal GPU; evidence probe, not a correctness test"]
+fn f16_rt_probe() {
+    let (in_f, out_f) = (1152usize, 8192usize);
+    let w16: Vec<u8> = (0..out_f * in_f)
+        .flat_map(|i| half::f16::from_f32((i % 13) as f32 * 0.01).to_le_bytes())
+        .collect();
+
+    for m in [2usize, 4, 8] {
+        std::env::set_var("INFR_METAL_NO_F16_RT", "1");
+        bench_chained_m(
+            DType::F16,
+            &w16,
+            m,
+            in_f,
+            out_f,
+            16.0 * m as f64,
+            "f16 native-gemv",
+        );
+        std::env::remove_var("INFR_METAL_NO_F16_RT");
+        bench_chained_m(DType::F16, &w16, m, in_f, out_f, 16.0, "f16 rt");
+    }
+}
+
 fn synth_q5_0(n_elem: usize, seed: u32) -> Vec<u8> {
     let mut out = Vec::new();
     for blk_i in 0..(n_elem / 32) {

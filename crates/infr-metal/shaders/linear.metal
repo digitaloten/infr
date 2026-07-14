@@ -22,6 +22,48 @@ kernel void linear_f32(device const float* x   [[buffer(0)]],
     if (lane == 0u) dst[sg] = acc;
 }
 
+// Native f16-weight twin of linear_f32. Activations and accumulation stay f32; only the bound
+// weight stream is half-width, matching the GGUF value exactly without a host f16->f32 cache.
+kernel void linear_f16(device const float* x   [[buffer(0)]],
+                       device const half*  w   [[buffer(1)]],
+                       device float*       dst [[buffer(2)]],
+                       constant LinearParams& p [[buffer(3)]],
+                       uint gid [[thread_position_in_grid]],
+                       uint lane [[thread_index_in_simdgroup]]) {
+    uint sg = gid / 32u;
+    if (sg >= p.m * p.out_f) return;
+    uint r = sg / p.out_f;
+    uint o = sg % p.out_f;
+    device const float* xr = x + (ulong)r * p.in_f;
+    device const half* wo = w + (ulong)o * p.in_f;
+    float acc = 0.0f;
+    for (uint i = lane; i < p.in_f; i += 32u) acc += xr[i] * (float)wo[i];
+    acc = simd_sum(acc);
+    if (lane == 0u) dst[sg] = acc;
+}
+
+// Native bf16-weight GEMV without requiring Metal bfloat support: GGUF BF16 stores the top 16
+// bits of each f32, so widening is the exact integer shift used by the CPU and gather kernels.
+kernel void linear_bf16(device const float*  x   [[buffer(0)]],
+                        device const ushort* w   [[buffer(1)]],
+                        device float*        dst [[buffer(2)]],
+                        constant LinearParams& p [[buffer(3)]],
+                        uint gid [[thread_position_in_grid]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+    uint sg = gid / 32u;
+    if (sg >= p.m * p.out_f) return;
+    uint r = sg / p.out_f;
+    uint o = sg % p.out_f;
+    device const float* xr = x + (ulong)r * p.in_f;
+    device const ushort* wo = w + (ulong)o * p.in_f;
+    float acc = 0.0f;
+    for (uint i = lane; i < p.in_f; i += 32u) {
+        acc += xr[i] * as_type<float>((uint)wo[i] << 16u);
+    }
+    acc = simd_sum(acc);
+    if (lane == 0u) dst[sg] = acc;
+}
+
 // ---- Linear over a NATIVE quantized weight. Two on-device forms:
 //
 // * FACTORED (`dequant_factored`): bit-packed 4/6/8-bit codes + one (sc, m) i16 pair per
@@ -40,6 +82,23 @@ kernel void linear_f32(device const float* x   [[buffer(0)]],
 // GEMV (one simdgroup per output, decode), RT (row-tiled, small m), MM (simdgroup_matrix GEMM,
 // prefill).
 struct QLinParams { uint m; uint in_f; uint out_f; uint dshift; };
+
+// Native f16 weights for the cooperative multi-row tile. `codes` is the raw half buffer;
+// scm/dd/dshift are unused so this decoder can share the quantized CMM template unchanged.
+#define DEC16_F16(wk)                                                                             \
+    device const half* hp = (device const half*)codes + (ulong)bi * 16ul;                         \
+    _Pragma("clang loop unroll(full)")                                                            \
+    for (uint i = 0; i < 16u; i++) wk[i] = (float)hp[i];
+
+#define DEC16_BF16(wk)                                                                            \
+    device const ushort* bp = (device const ushort*)codes + (ulong)bi * 16ul;                     \
+    _Pragma("clang loop unroll(full)")                                                            \
+    for (uint i = 0; i < 16u; i++) wk[i] = as_type<float>((uint)bp[i] << 16u);
+
+#define DEC16_F32(wk)                                                                             \
+    device const float* fp = (device const float*)codes + (ulong)bi * 16ul;                       \
+    _Pragma("clang loop unroll(full)")                                                            \
+    for (uint i = 0; i < 16u; i++) wk[i] = fp[i];
 
 // factored, 4-bit codes: one uint2 = 8 bytes = one 16-element block, code k at bits 4k.
 #define DEC16_K4(wk)                                                                              \
