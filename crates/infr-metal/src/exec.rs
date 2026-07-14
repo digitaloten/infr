@@ -2532,6 +2532,16 @@ impl MetalBackend {
                     let f16_rt = f16_native
                         && (2..16).contains(&m)
                         && std::env::var("INFR_METAL_NO_F16_RT").is_err();
+                    let bf16_rt = bf16_native
+                        && (2..16).contains(&m)
+                        && std::env::var("INFR_METAL_NO_BF16_RT").is_err();
+                    let native_rt = if f16_rt {
+                        Some("linear_f16_rt")
+                    } else if bf16_rt {
+                        Some("linear_bf16_rt")
+                    } else {
+                        None
+                    };
                     let (kern, elem_bytes) = match wdt {
                         DType::F16 if f16_native => ("linear_f16", 2u64),
                         DType::F32 if f32_native => ("linear_f32", 4u64),
@@ -2565,10 +2575,10 @@ impl MetalBackend {
                             m.div_ceil(32) * (out_f / 64) * 128,
                             128,
                         );
-                    } else if f16_rt {
-                        let rt = self.pipelines.get("linear_f16_rt")?;
+                    } else if let Some(rt_kern) = native_rt {
+                        let rt = self.pipelines.get(rt_kern)?;
                         if let Some(label) =
-                            counter_linear_label(self.counter_set.is_some(), "linear_f16_rt")
+                            counter_linear_label(self.counter_set.is_some(), rt_kern)
                         {
                             r.cur_op = label;
                         }

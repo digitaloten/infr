@@ -143,7 +143,7 @@ fn f16_small_multirow_linear_uses_the_exact_row_tile() {
 
     let exec = include_str!("../src/exec.rs");
     asserts_token_seq(exec, "let f16_rt = f16_native && (2..16).contains(&m)");
-    asserts_token_seq(exec, "self.pipelines.get(\"linear_f16_rt\")");
+    asserts_token_seq(exec, "Some(\"linear_f16_rt\")");
 }
 
 #[test]
@@ -167,6 +167,16 @@ fn bf16_linear_reads_the_bound_weight_directly() {
         exec,
         "DType::Bf16 if bf16_native => (\"linear_bf16\", 2u64)",
     );
+}
+
+#[test]
+fn bf16_small_multirow_linear_uses_the_exact_row_tile() {
+    let shader = include_str!("../shaders/moe.metal");
+    asserts_token_seq(shader, "RT_KERNEL(linear_bf16_rt, DEC16_BF16)");
+
+    let exec = include_str!("../src/exec.rs");
+    asserts_token_seq(exec, "let bf16_rt = bf16_native && (2..16).contains(&m)");
+    asserts_token_seq(exec, "Some(\"linear_bf16_rt\")");
 }
 
 // The two below test the TRIPWIRE ITSELF. A guard nobody has watched fail is not a guard: it can

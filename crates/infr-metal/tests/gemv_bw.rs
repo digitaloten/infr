@@ -173,6 +173,33 @@ fn bf16_native_probe() {
     bench_chained(DType::Bf16, &w16, in_f, out_f, 16.0, "bf16 native");
 }
 
+#[test]
+#[ignore = "requires a Metal GPU; evidence probe, not a correctness test"]
+fn bf16_rt_probe() {
+    let (in_f, out_f) = (1152usize, 8192usize);
+    let w16: Vec<u8> = (0..out_f * in_f)
+        .flat_map(|i| {
+            let v = (i % 13) as f32 * 0.01;
+            ((v.to_bits() >> 16) as u16).to_le_bytes()
+        })
+        .collect();
+
+    for m in [2usize, 4, 8] {
+        std::env::set_var("INFR_METAL_NO_BF16_RT", "1");
+        bench_chained_m(
+            DType::Bf16,
+            &w16,
+            m,
+            in_f,
+            out_f,
+            16.0 * m as f64,
+            "bf16 native-gemv",
+        );
+        std::env::remove_var("INFR_METAL_NO_BF16_RT");
+        bench_chained_m(DType::Bf16, &w16, m, in_f, out_f, 16.0, "bf16 rt");
+    }
+}
+
 fn bench_f32_cold(wbytes: &[u8], in_f: usize, out_f: usize, force_cache: bool, label: &str) {
     if force_cache {
         std::env::set_var("INFR_METAL_NO_F32_NATIVE", "1");

@@ -282,6 +282,7 @@ RT_KERNEL(linear_iq3s_rt, DEC16_IQ3S)
 RT_KERNEL(linear_iq2s_rt, DEC16_IQ2S)
 RT_KERNEL(linear_iq2xs_rt, DEC16_IQ2XS)
 RT_KERNEL(linear_f16_rt, DEC16_F16)
+RT_KERNEL(linear_bf16_rt, DEC16_BF16)
 // Cooperative-tile half-fragment GEMM, mul_mm-shape: one 64-output x 32-token tile per 128-thread
 // threadgroup, NK=32 K-steps. What the simpler cooperative tile above lacked (each of its shapes
 // measured and replaced): weights AND activations are staged into threadgroup memory as
