@@ -56,6 +56,20 @@ fn q5k_reconstructs_four_codes_per_word() {
 }
 
 #[test]
+fn regular_cmm_unrolls_its_fixed_tile_loops() {
+    let src = include_str!("../shaders/moe.metal");
+    assert!(src.contains("#define CMM_UNROLL(x) _Pragma(\"clang loop unroll(full)\") for (x)"));
+    let cmm = src
+        .split_once("#define CMM_KERNEL(NAME, DEC)")
+        .unwrap()
+        .1
+        .split_once("#define CMMKS_KERNEL(NAME, DEC)")
+        .unwrap()
+        .0;
+    assert!(cmm.matches("CMM_UNROLL").count() >= 8);
+}
+
+#[test]
 #[ignore = "requires a Metal GPU"]
 fn every_dispatchable_kernel_exists_in_the_library() {
     let src = include_str!("../src/exec.rs");
