@@ -203,11 +203,24 @@ mod tests {
         assert!(src.contains("float silu = z / (1.0f + exp(-z))"));
     }
 
+    /// Match a shader tripwire on TOKENS, not on exact source formatting — the same helper the
+    /// `kernel_names` suite uses, and for the same reason: these `.metal` files are macro bodies
+    /// with column-aligned `\` continuations, so adding one long line re-pads its neighbours and a
+    /// formatter may respace an expression without changing a bit of generated code. A raw
+    /// `contains` tripwire goes red on both, and a guard that cries wolf is one the next person
+    /// relaxes.
+    fn contains_tokens(src: &str, needle: &str) -> bool {
+        let despace = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+        despace(src).contains(&despace(needle))
+    }
+
     #[test]
     fn deltanet_msl_has_hoisted_gate_scan() {
         let src = include_str!("../shaders/deltanet.metal");
-        assert!(src.contains("kernel void deltanet_gates_f32"));
-        assert!(src.contains("host_name(\"deltanet_gates_k4\")"));
+        assert!(contains_tokens(src, "kernel void deltanet_gates_f32"));
+        assert!(contains_tokens(src, "host_name(\"deltanet_gates_k4\")"));
+        // The 8-row crossover itself: rows=4 measured NEUTRAL and rows=2 REGRESSED, so the
+        // prepared path must not be taken below 8 (see `prefer_deltanet_gate_prep`).
         assert!(!prefer_deltanet_gate_prep(4));
         assert!(prefer_deltanet_gate_prep(8));
     }
