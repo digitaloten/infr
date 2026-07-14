@@ -184,7 +184,7 @@ fn bf16_rt_probe() {
         })
         .collect();
 
-    for m in [2usize, 4, 8] {
+    for m in [2usize, 4, 8, 16, 32] {
         std::env::set_var("INFR_METAL_NO_BF16_RT", "1");
         bench_chained_m(
             DType::Bf16,
@@ -196,7 +196,15 @@ fn bf16_rt_probe() {
             "bf16 native-gemv",
         );
         std::env::remove_var("INFR_METAL_NO_BF16_RT");
-        bench_chained_m(DType::Bf16, &w16, m, in_f, out_f, 16.0, "bf16 rt");
+        bench_chained_m(
+            DType::Bf16,
+            &w16,
+            m,
+            in_f,
+            out_f,
+            16.0 * m.div_ceil(8) as f64,
+            "bf16 rt",
+        );
     }
 }
 

@@ -584,6 +584,14 @@ fn linear_woff_bf16_rt() {
 
 #[test]
 #[ignore = "requires a Metal GPU"]
+fn linear_woff_bf16_rt_multirow() {
+    let (in_f, slices) = (256usize, [128usize, 64, 64]);
+    let wf = rand_f32(256 * in_f, 356);
+    check_linear_woff(DType::Bf16, bf16_bytes(&wf), 32, in_f, &slices, false, 1e-3);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
 fn linear_woff_f16_rt() {
     let (in_f, slices) = (256usize, [128usize, 64, 64]);
     let wf = rand_f32(256 * in_f, 352);
