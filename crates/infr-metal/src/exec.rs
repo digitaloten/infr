@@ -2003,7 +2003,9 @@ impl MetalBackend {
                 // Decode (few rows): the WIDE kernel — 8 simdgroups per row; the 32-lane form
                 // is latency-bound on dim/32 serial loads (~20 us/launch at dim 1152). Prefill
                 // keeps one simdgroup per row (the rows themselves fill the GPU).
-                let vec4 = std::env::var_os("INFR_METAL_NO_RMSNORM_VEC4").is_none()
+                // `var(..).is_err()` (not `var_os(..).is_none()`) to match every other
+                // INFR_METAL_NO_* kill-switch in this file — one spelling for one meaning.
+                let vec4 = std::env::var("INFR_METAL_NO_RMSNORM_VEC4").is_err()
                     && prefer_rmsnorm_vec4(rows, dim)
                     && self
                         .pipelines
