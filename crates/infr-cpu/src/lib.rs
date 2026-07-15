@@ -317,7 +317,6 @@ impl Backend for CpuBackend {
             // system memory", which is what `unified_memory` below already says.)
             integrated: false,
             compute_units: 0,
-            max_buffer_bytes: u64::MAX,
             buffer_device_address: false, // CPU interpreter has no device-address concept
             max_shared_memory_bytes: u32::MAX, // scalar interpreter: no shared-memory tiling
             unified_memory: true,

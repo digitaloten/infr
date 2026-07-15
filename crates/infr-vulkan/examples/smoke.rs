@@ -30,12 +30,7 @@ fn main() -> infr_core::Result<()> {
     let backend = VulkanBackend::new()?;
     let caps = backend.capabilities();
     println!("=== Vulkan device: {} ===", caps.name);
-    println!(
-        "    f16={} coop_matrix={} max_buf={}MiB",
-        caps.f16,
-        caps.f16_coopmat(),
-        caps.max_buffer_bytes / (1024 * 1024)
-    );
+    println!("    f16={} coop_matrix={}", caps.f16, caps.f16_coopmat(),);
     println!();
 
     // ── problem size ──────────────────────────────────────────────────────────

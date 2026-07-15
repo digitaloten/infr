@@ -1,5 +1,6 @@
 //! Proves the MoE expert pager's LUT indirection (`infr_vulkan::pager::GpuPager` +
-//! `native_gemv_id_*_paged` shaders, `nw_base = lut[expert_id]` word-base addressing) computes the SAME GEMV a host
+//! `native_gemv_id_*_paged` shaders, `nw_ptr = arena_base + uint64_t(lut[expert_id]) *
+//! slot_bytes` slot-index addressing) computes the SAME GEMV a host
 //! reference does, across a token sequence that churns the cache (more distinct experts than
 //! slots — every step but the first two is a miss that evicts the LRU resident expert). This is
 //! the "pages a synthetic bank through a small arena and checks GEMV results match a host
@@ -76,7 +77,7 @@ fn paged_gemv_matches_host_reference_under_eviction_churn() {
     be.upload(x_buf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
 
     // 2 slots for 5 experts: every step past the first two is an eviction.
-    let mut pager = GpuPager::new(&be, n_expert, 2, stride_bytes, true).unwrap();
+    let mut pager = GpuPager::new(&be, n_expert, 2, stride_bytes).unwrap();
     let staging = be.alloc_uninit(stride_bytes, BufferUsage::Staging).unwrap();
 
     let ids_buf = be.alloc(4, BufferUsage::Activations).unwrap();

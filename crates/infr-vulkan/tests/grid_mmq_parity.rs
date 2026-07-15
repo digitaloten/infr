@@ -336,8 +336,8 @@ fn grid_mmq_paged_expert_gemm_matches_host_under_eviction() {
         .map(|b| infr_gguf::dequant::dequant_block(DType::Iq3S, b).unwrap())
         .collect();
 
-    let mut gate_pager = GpuPager::new(&be, n_expert, 3, gate_slot_bytes, true).unwrap();
-    let mut down_pager = GpuPager::new(&be, n_expert, 3, down_slot_bytes, true).unwrap();
+    let mut gate_pager = GpuPager::new(&be, n_expert, 3, gate_slot_bytes).unwrap();
+    let mut down_pager = GpuPager::new(&be, n_expert, 3, down_slot_bytes).unwrap();
     let staging = be
         .alloc_uninit(gate_slot_bytes.max(down_slot_bytes), BufferUsage::Staging)
         .unwrap();

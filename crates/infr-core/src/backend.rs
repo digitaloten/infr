@@ -127,7 +127,6 @@ pub struct Capabilities {
     /// else 0 = UNKNOWN. ADVISORY only — it scales the `integrated` chunk budget where present.
     /// Never gate correctness on it: most drivers report nothing.
     pub compute_units: u32,
-    pub max_buffer_bytes: u64,
     /// `VkPhysicalDeviceVulkan12Features.bufferDeviceAddress` — the device can hand a shader a
     /// 64-bit `VkDeviceAddress` for a buffer (`GL_EXT_buffer_reference`), so a kernel may read a
     /// buffer LARGER than `maxStorageBufferRange` (one SSBO binding's ~4 GiB reach on RADV). infr's

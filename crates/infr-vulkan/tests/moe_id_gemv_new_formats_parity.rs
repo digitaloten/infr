@@ -287,7 +287,7 @@ fn new_dtype_id_gemv_paged_matches_host_under_eviction_churn() {
         be.upload(x_buf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
 
         // 2 slots for 4 experts: each pair below evicts the previous pair.
-        let mut pager = GpuPager::new(&be, n_expert, 2, stride_bytes, true).unwrap();
+        let mut pager = GpuPager::new(&be, n_expert, 2, stride_bytes).unwrap();
         let staging = be.alloc_uninit(stride_bytes, BufferUsage::Staging).unwrap();
         let ids_buf = be.alloc(2 * 4, BufferUsage::Activations).unwrap();
         let y_id = be.alloc(out_f * 4, BufferUsage::Activations).unwrap();

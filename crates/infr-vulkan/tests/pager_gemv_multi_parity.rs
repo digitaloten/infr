@@ -88,8 +88,8 @@ fn multi_paged_gemv_chained_in_one_recorder_matches_host() {
     let x_buf = be.alloc(in_f * 4, BufferUsage::Activations).unwrap();
     be.upload(x_buf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
 
-    let mut gate_pager = GpuPager::new(&be, n_expert, n_expert, stride_bytes, true).unwrap();
-    let mut up_pager = GpuPager::new(&be, n_expert, n_expert, stride_bytes, true).unwrap();
+    let mut gate_pager = GpuPager::new(&be, n_expert, n_expert, stride_bytes).unwrap();
+    let mut up_pager = GpuPager::new(&be, n_expert, n_expert, stride_bytes).unwrap();
     let staging = be.alloc_uninit(stride_bytes, BufferUsage::Staging).unwrap();
 
     let n_used = 3usize;

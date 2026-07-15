@@ -1,7 +1,7 @@
 //! Proves `matmul_mmq_experts_paged` (the batched-MoE dp4a expert GEMM reading a `GpuPager`
-//! arena through the word-base LUT — Scout's batched paged prefill) matches a host reference,
+//! arena through the slot-index LUT — Scout's batched paged prefill) matches a host reference,
 //! INCLUDING under eviction churn: experts are made resident, evicted by touching others, and
-//! re-uploaded into DIFFERENT slots before the routed dispatch — so a slot-index/word-base mixup
+//! re-uploaded into DIFFERENT slots before the routed dispatch — so a slot-index mixup
 //! or a stale-LUT read produces wrong numbers, not a crash (the coherent-but-wrong bug class the
 //! `NW(i)` doc in native_decode.glsl records). Covers both new paged dtypes in one pipeline
 //! (Q2_K gate GEMM, Q3_K down-style GEMM on the gate's output re-quantized) at a ragged bucket
@@ -355,8 +355,8 @@ fn paged_mmq_expert_gemm_matches_host_under_eviction() {
     let gate_host: Vec<Vec<f32>> = gate_banks.iter().map(|b| deq_q2_k(b)).collect();
     let down_host: Vec<Vec<f32>> = down_banks.iter().map(|b| deq_q3_k(b)).collect();
 
-    let mut gate_pager = GpuPager::new(&be, n_expert, 3, gate_slot_bytes, true).unwrap();
-    let mut down_pager = GpuPager::new(&be, n_expert, 3, down_slot_bytes, true).unwrap();
+    let mut gate_pager = GpuPager::new(&be, n_expert, 3, gate_slot_bytes).unwrap();
+    let mut down_pager = GpuPager::new(&be, n_expert, 3, down_slot_bytes).unwrap();
     let staging = be
         .alloc_uninit(gate_slot_bytes.max(down_slot_bytes), BufferUsage::Staging)
         .unwrap();
@@ -568,8 +568,8 @@ fn paged_mmq_expert_gemm_new_formats_matches_host() {
     let gate_host: Vec<Vec<f32>> = gate_banks.iter().map(|b| deq_q4_1(b)).collect();
     let down_host: Vec<Vec<f32>> = down_banks.iter().map(|b| deq_iq4_xs(b)).collect();
 
-    let mut gate_pager = GpuPager::new(&be, n_expert, 3, gate_slot_bytes, true).unwrap();
-    let mut down_pager = GpuPager::new(&be, n_expert, 3, down_slot_bytes, true).unwrap();
+    let mut gate_pager = GpuPager::new(&be, n_expert, 3, gate_slot_bytes).unwrap();
+    let mut down_pager = GpuPager::new(&be, n_expert, 3, down_slot_bytes).unwrap();
     let staging = be
         .alloc_uninit(gate_slot_bytes.max(down_slot_bytes), BufferUsage::Staging)
         .unwrap();

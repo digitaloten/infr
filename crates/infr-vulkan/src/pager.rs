@@ -51,17 +51,15 @@ use super::{as_vk_buf, be, VulkanBackend};
 pub struct GpuPager {
     pager: Pager,
     slot_bytes: usize,
-    /// Device-local arena: `n_slots * slot_bytes`, one contiguous buffer. Both the MoE pools AND
-    /// the dense-streaming pools allocate this as a `bufferDeviceAddress` buffer their paged/streamed
-    /// kernels read through a 64-bit pointer (see [`Self::arena_addr`]) — no `maxStorageBufferRange`
-    /// cap. The `arena_bda = false` (plain SSBO, u32 element offsets) path remains available for a
-    /// caller that opts into it, but no production pool does today.
+    /// Device-local arena: `n_slots * slot_bytes`, one contiguous `bufferDeviceAddress` buffer.
+    /// Both the MoE pools and the dense-streaming pools allocate this and their paged/streamed
+    /// kernels read it through a 64-bit pointer (see [`Self::arena_addr`]) — no
+    /// `maxStorageBufferRange` cap.
     arena: Box<dyn Buffer>,
-    /// This arena's 64-bit `VkDeviceAddress` when it was allocated as a `bufferDeviceAddress`
-    /// buffer (MoE pools and dense-streaming pools), else `0` (the plain-SSBO path). The MoE paged
-    /// kernels compute a slot's byte address as `arena_addr + lut[...] * slot_bytes`; the dense
-    /// streamed kernels take the resident slot's full base address `arena_addr + slot * slot_bytes`
-    /// (host-computed in [`DensePagerSession::stage`]) directly as a push constant.
+    /// This arena's 64-bit `VkDeviceAddress`. The MoE paged kernels compute a slot's byte address
+    /// as `arena_addr + lut[...] * slot_bytes`; the dense streamed kernels take the resident
+    /// slot's full base address `arena_addr + slot * slot_bytes` (host-computed in
+    /// [`DensePagerSession::stage`]) directly as a push constant.
     arena_addr: u64,
     /// Host-visible LUT mirror (mutated in place, re-uploaded on change) + the device buffer it's
     /// pushed to. `n_blocks` entries, each the resident block's SLOT INDEX
@@ -84,50 +82,26 @@ impl GpuPager {
     /// within-batch sizing note on `infr_core::pager::Pager::new`, which applies unchanged here).
     /// `slot_bytes`: one block's PADDED byte size (the largest block the model will ever page —
     /// MoE experts of one model are uniform per role, so this is exact, not a worst-case pad).
-    /// Must be u32-aligned (`% 4 == 0`) — the LUT addresses slots in u32 words.
+    /// Must be u32-aligned (`% 4 == 0`) — the arena is read back a word at a time (see
+    /// `shaders/native_arena_ref.glsl`'s `arena_word`).
     ///
-    /// `arena_bda`: allocate the arena as a `bufferDeviceAddress` buffer, read through a 64-bit
-    /// pointer, so it may be as large as VRAM allows, no cap. Both the MoE pools and the
-    /// dense-streaming pool pass `true` (the dense pool switched over in `36bcbf5`). A caller may
-    /// still pass `false` for a plain-SSBO arena with a baked u32 element offset — capped at
-    /// [`GpuPager::max_arena_bytes`] (one SSBO binding's `maxStorageBufferRange`, ~4 GiB on RADV);
-    /// exceeding it silently out-of-ranges the reads into coherent-but-wrong output, so `new`
-    /// hard-errors above the cap on that path — but no production pool takes it today (see the
-    /// `arena` field doc above). Callers sizing `n_slots` from a VRAM budget on the SSBO path
-    /// should clamp below the cap first — this check is the backstop, not the policy.
+    /// The arena always allocates as a `bufferDeviceAddress` buffer, read through a 64-bit
+    /// pointer, so it may be as large as VRAM allows — no `maxStorageBufferRange` cap (both the
+    /// MoE pools and the dense-streaming pool have taken this path since `36bcbf5`).
     pub fn new(
         vk: &VulkanBackend,
         n_blocks: usize,
         n_slots: usize,
         slot_bytes: usize,
-        arena_bda: bool,
     ) -> Result<Self> {
         assert!(n_slots > 0, "GpuPager needs at least one slot");
         assert!(
             slot_bytes.is_multiple_of(4),
             "GpuPager slot_bytes must be u32-aligned (the arena is read as u32 words)"
         );
-        let (arena, arena_addr) = if arena_bda {
-            // Pointer-addressed: no per-arena binding cap — a pool spans as much VRAM as the budget
-            // allows (the alloc-time VRAM budget guard is the only backstop).
-            vk.alloc_arena_bda(n_slots * slot_bytes)?
-        } else {
-            let arena_bytes = n_slots as u64 * slot_bytes as u64;
-            let cap = Self::max_arena_bytes(vk);
-            if arena_bytes > cap {
-                return Err(be(format!(
-                    "GpuPager SSBO arena of {n_slots} x {slot_bytes} B = {:.2} GiB exceeds the \
-                     per-arena addressing cap of {:.2} GiB (this device's maxStorageBufferRange) — \
-                     clamp n_slots",
-                    arena_bytes as f64 / (1u64 << 30) as f64,
-                    cap as f64 / (1u64 << 30) as f64,
-                )));
-            }
-            (
-                vk.alloc_uninit(n_slots * slot_bytes, BufferUsage::Weights)?,
-                0u64,
-            )
-        };
+        // Pointer-addressed: no per-arena binding cap — a pool spans as much VRAM as the budget
+        // allows (the alloc-time VRAM budget guard is the only backstop).
+        let (arena, arena_addr) = vk.alloc_arena_bda(n_slots * slot_bytes)?;
         let lut_dev = vk.alloc_uninit(n_blocks.max(1) * 4, BufferUsage::Staging)?;
         let lut_host = vec![NOT_RESIDENT; n_blocks.max(1)];
         // Seed the device LUT with the same all-absent state (arena/LUT start coherent).
@@ -143,17 +117,8 @@ impl GpuPager {
         })
     }
 
-    /// Largest SSBO arena (bytes) one [`GpuPager`] can bind on this device: the storage-buffer
-    /// binding range (`maxStorageBufferRange`, 4 GiB on RADV). Both the MoE pools and the
-    /// dense-streaming pool are pointer-addressed (`arena_bda = true`) today and have no such
-    /// cap; this only bounds the `arena_bda = false` plain-SSBO path (see `GpuPager::new`'s doc),
-    /// which no production pool takes.
-    pub fn max_arena_bytes(vk: &VulkanBackend) -> u64 {
-        vk.caps().max_buffer_bytes
-    }
-
-    /// The arena's 64-bit `VkDeviceAddress` (MoE pools; `0` for the SSBO dense pool). The paged
-    /// kernels take this as a push constant and add `lut_slot * slot_bytes` to reach an expert.
+    /// The arena's 64-bit `VkDeviceAddress`. The paged kernels take this as a push constant and
+    /// add `lut_slot * slot_bytes` to reach an expert.
     pub fn arena_addr(&self) -> u64 {
         self.arena_addr
     }
@@ -553,8 +518,8 @@ pub struct MoePagerSession {
 }
 
 /// One pool's spec in [`MoePagerLayout`]: slot counts are INDEPENDENT per pool. Each pool's arena
-/// is a `bufferDeviceAddress` buffer (`arena_bda = true`, `48ad9c1`) addressed by 64-bit pointer —
-/// no per-arena [`GpuPager::max_arena_bytes`]/`maxStorageBufferRange` ceiling — but per-pool sizing
+/// is a `bufferDeviceAddress` buffer (`48ad9c1`) addressed by 64-bit pointer — no per-arena
+/// `maxStorageBufferRange` ceiling — but per-pool sizing
 /// still matters because of unequal per-expert sizes (Scout: gate/up 13.8 MB, down 18 MB): a
 /// shared slot count is dragged down to fit the LARGEST pool's per-slot bytes within the VRAM
 /// budget and strands budget the smaller pools could have used as real hit rate (Scout: uniform
@@ -615,7 +580,7 @@ impl MoePagerSession {
                 role: spec.role,
                 slot_bytes: spec.slot_bytes,
                 // MoE pools are pointer-addressed (`bufferDeviceAddress`) — no per-arena SSBO cap.
-                pager: GpuPager::new(vk, layout.n_blocks, spec.n_slots, spec.slot_bytes, true)?,
+                pager: GpuPager::new(vk, layout.n_blocks, spec.n_slots, spec.slot_bytes)?,
             });
             staging_bytes = staging_bytes.max(spec.slot_bytes);
         }
@@ -1050,10 +1015,10 @@ impl DensePagerSession {
             max_slot = max_slot.max(spec.slot_bytes);
             pools.push(DensePool {
                 // Dense-streaming pool: the arena is a `bufferDeviceAddress` buffer the streamed
-                // kernels read through a 64-bit pointer (`arena_bda = true`), so it may span as
-                // much VRAM as the budget allows — no `maxStorageBufferRange` cap (the pre-BDA
-                // ~4 GiB-per-pool ceiling this lifts), no u32 element-reach cap.
-                pager: GpuPager::new(vk, spec.n_blocks, spec.n_slots, spec.slot_bytes, true)?,
+                // kernels read through a 64-bit pointer, so it may span as much VRAM as the
+                // budget allows — no `maxStorageBufferRange` cap (the pre-BDA ~4 GiB-per-pool
+                // ceiling this lifts), no u32 element-reach cap.
+                pager: GpuPager::new(vk, spec.n_blocks, spec.n_slots, spec.slot_bytes)?,
                 spec,
             });
         }

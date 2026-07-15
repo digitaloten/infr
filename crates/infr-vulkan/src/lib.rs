@@ -1545,7 +1545,6 @@ impl VulkanBackend {
             vendor_intel,
             integrated,
             compute_units,
-            max_buffer_bytes: props.limits.max_storage_buffer_range as u64,
             buffer_device_address: has_bda,
             max_shared_memory_bytes: props.limits.max_compute_shared_memory_size,
             // An INTEGRATED_GPU has no VRAM to be separate FROM: its "device-local" heap is system

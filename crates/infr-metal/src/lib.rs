@@ -225,7 +225,6 @@ impl Backend for MetalBackend {
             // for, so leave it false and keep Metal's chunk exactly as tuned.
             integrated: false,
             compute_units: 0,
-            max_buffer_bytes: self.device.max_buffer_length(),
             buffer_device_address: false, // Metal backend has no Vulkan buffer-device-address path
             // Metal's per-threadgroup memory limit (MTLDevice.maxThreadgroupMemoryLength) — the
             // analogue of Vulkan's maxComputeSharedMemorySize (typically 32 KB, 64 KB on Apple GPUs).

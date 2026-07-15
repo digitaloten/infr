@@ -140,8 +140,8 @@ fn run_config(
     if let Some((slots, _)) = paged {
         let gate_sb = gate_stride / 32 * 17;
         let down_sb = down_stride / 64 * 36;
-        let mut gp = GpuPager::new(be, n_expert, slots, gate_sb, true).unwrap();
-        let mut dp = GpuPager::new(be, n_expert, slots, down_sb, true).unwrap();
+        let mut gp = GpuPager::new(be, n_expert, slots, gate_sb).unwrap();
+        let mut dp = GpuPager::new(be, n_expert, slots, down_sb).unwrap();
         let staging = be
             .alloc_uninit(gate_sb.max(down_sb), BufferUsage::Staging)
             .unwrap();

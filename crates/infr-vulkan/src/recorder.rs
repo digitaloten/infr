@@ -5862,11 +5862,13 @@ impl<'a> Recorder<'a> {
     }
 
     /// [`Self::matmul_mmq_experts`]'s paged twin: `arena` is a `GpuPager` arena (uniform slots)
-    /// and `lut` a buffer of arena WORD bases; the kernel resolves each bucket's weight base as
-    /// `lut[lut_base + expert]` instead of `w_base + expert·stride` (the shaders' `-DPAGED`
-    /// build — word-base indirection at the `rb()` chokepoint, same u32-overflow lesson as the
-    /// paged GEMVs). `lut`/`lut_base` name a run of `n_expert` word bases for exactly this layer
-    /// — the session's write-once LUT tape window (`MoePagerSession::lut_window`), frozen at
+    /// and `lut` a buffer of resident SLOT INDICES; the kernel resolves each bucket's arena
+    /// address as `arena_base + uint64_t(lut[lut_base + expert]) * slot_bytes` instead of
+    /// `w_base + expert·stride` (the shaders' `-DPAGED` build — slot indirection through
+    /// `nw_ptr`/`arena_word()` at the `rb()` chokepoint, replacing the old u32-element-space
+    /// multiply that overflowed past ~102 Scout-sized slots). `lut`/`lut_base` name a run of
+    /// `n_expert` slot indices for exactly this layer — the session's write-once LUT tape window
+    /// (`MoePagerSession::lut_window`), frozen at
     /// record time so later staging can't mutate what an in-flight segment reads. The caller must
     /// have staged every ROUTED expert of this layer resident (all of them simultaneously —
     /// buckets run in one dispatch) before recording this; buckets with count 0 exit before any
@@ -6254,11 +6256,11 @@ impl<'a> Recorder<'a> {
     }
 
     /// [`linear_native_id`]'s paged twin: `w` is a `GpuPager` arena (fixed uniform slots, not one
-    /// contiguous per-expert tensor) and `lut` a run of per-expert arena WORD bases for exactly
-    /// this layer — the kernel reads `nw_base = lut[lut_base + ids[slot_idx]]` with the layer-
-    /// LOCAL expert ids moe_topk produced (no host global-id rewrite; see
-    /// `shaders/native_gemv_id.comp`'s `-DPAGED` branch — `lut_base` rides the otherwise-unused
-    /// `stride` push slot). `lut` is the session's write-once LUT tape window in the inline paths
+    /// contiguous per-expert tensor) and `lut` a run of per-expert resident SLOT INDICES for
+    /// exactly this layer — the kernel sets `nw_ptr = arena_base + uint64_t(lut[lut_base +
+    /// ids[slot_idx]]) * slot_bytes` with the layer-LOCAL expert ids moe_topk produced (no host
+    /// global-id rewrite; see `shaders/native_gemv_id.comp`'s `-DPAGED` branch — `lut_base` rides
+    /// the otherwise-unused `stride` push slot). `lut` is the session's write-once LUT tape window in the inline paths
     /// (see `MoePagerSession::lut_window`). Always the tree kernel — the SG variant has no paged
     /// build (Q6_K/Q5_K only, gated off; see `native_id_sg_choice`'s doc — a paged model never
     /// reaches that gate today since MoE auto-fit picks the pager only on overflow, but this
@@ -6317,8 +6319,9 @@ impl<'a> Recorder<'a> {
     }
 
     /// [`linear_native_id_multi`]'s paged twin — same local-ids + LUT-window hop as
-    /// [`linear_native_id_paged`] (`nw_base = lut[lut_base + ids[slot]]`), for the decode/small-m
-    /// all-`n_used`-experts-in-one-dispatch path. Always the tree kernel (see
+    /// [`linear_native_id_paged`] (`nw_ptr = arena_base + uint64_t(lut[lut_base + ids[slot]]) *
+    /// slot_bytes`), for the decode/small-m all-`n_used`-experts-in-one-dispatch path. Always the
+    /// tree kernel (see
     /// [`linear_native_id_paged`]'s doc for why the SG fast path is skipped).
     #[allow(clippy::too_many_arguments)]
     pub fn linear_native_id_multi_paged(
