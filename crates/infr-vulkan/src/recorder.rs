@@ -6667,22 +6667,36 @@ impl<'a> Recorder<'a> {
         *self.barriers.borrow_mut() += 1;
     }
 
-    /// End recording WITHOUT submitting, returning a [`RecordedCmd`] the caller can replay across
-    /// tokens (skipping per-token re-recording). Only meaningful for a `new_persistent` recorder; the
+    /// End recording WITHOUT submitting, returning ONE resubmittable [`RecordedSegment`] — the
+    /// building block of a [`RecordedCmd`]. Only meaningful for a `new_persistent` recorder; the
     /// descriptor sets bind the (persistent) decode buffers, so replays stay valid as long as those
     /// buffers live.
-    pub fn finish_record(self) -> Result<RecordedCmd> {
+    ///
+    /// A decode recording that must be watchdog-split records several segments back to back
+    /// (`adapter::record_decode_replay`): each continuation recorder opens with [`Self::seed_barrier`]
+    /// and its own segment is a SEPARATE submit at replay time, so no single submit can trip the
+    /// per-submit GPU hang watchdog. A discrete GPU records the whole decode into one segment.
+    pub(crate) fn end_segment(self) -> Result<RecordedSegment> {
         if self.prof {
             eprintln!("[prof] barriers emitted = {}", self.barriers.borrow());
         }
         unsafe { self.be.shared.device.end_command_buffer(self.cmd) }
             .map_err(|e| be(format!("end cmd: {e}")))?;
-        Ok(RecordedCmd {
-            shared: std::sync::Arc::clone(&self.be.shared),
+        Ok(RecordedSegment {
             cmd: self.cmd,
             pools: self.pools.borrow().clone(),
             dispatches: self.dispatches.get(),
         })
+    }
+
+    /// End recording WITHOUT submitting, returning a single-segment [`RecordedCmd`] the caller can
+    /// replay across tokens (skipping per-token re-recording). The one-segment shape is the tuned
+    /// fast path taken by every discrete GPU; a device that watchdog-splits its decode builds a
+    /// multi-segment [`RecordedCmd`] from [`Self::end_segment`] instead.
+    pub fn finish_record(self) -> Result<RecordedCmd> {
+        let shared = std::sync::Arc::clone(&self.be.shared);
+        let seg = self.end_segment()?;
+        Ok(RecordedCmd::from_shared_segments(shared, vec![seg]))
     }
 
     /// Read back per-dispatch timestamps and print GPU time aggregated by label (the kernel
@@ -6761,17 +6775,58 @@ impl VulkanBackend {
     }
 }
 
-/// A pre-recorded, resubmittable command buffer (from [`Recorder::finish_record`]). Replaying it skips
-/// per-token re-recording in the GPU-resident decode loop. Owns its command buffer + descriptor pool
-/// (whose sets bind the persistent decode buffers); both are freed on drop after the GPU drains.
-pub struct RecordedCmd {
-    shared: std::sync::Arc<crate::VulkanShared>,
+/// One resubmittable command buffer of a [`RecordedCmd`] (from [`Recorder::end_segment`]). Owns
+/// its command buffer + descriptor pools (whose sets bind the persistent decode buffers); a
+/// `RecordedCmd` frees them all on drop after the GPU drains.
+pub(crate) struct RecordedSegment {
     cmd: vk::CommandBuffer,
     pools: Vec<vk::DescriptorPool>,
-    /// Dispatches in ONE replay of this recording. `replay_n(n)` puts `n` copies of them into a
-    /// single submit, so this is what bounds a chain against the GPU hang watchdog — see
-    /// `Self::max_chain`.
+    /// Dispatches recorded into this one segment.
     dispatches: usize,
+}
+
+/// A pre-recorded, resubmittable decode step (from [`Recorder::finish_record`], or accumulated from
+/// [`Recorder::end_segment`] on a splitting device). Replaying it skips per-token re-recording in
+/// the GPU-resident decode loop.
+///
+/// The step is one or more [`RecordedSegment`]s. A discrete GPU (no submit cap) records the whole
+/// decode into ONE segment and replays it in a single submit — the tuned fast path, unchanged. A
+/// device that must split its forward against the per-submit GPU hang watchdog records the decode
+/// across several watchdog-sized segments (`adapter::record_decode_replay`), and [`Self::replay`]
+/// submits each SEPARATELY so no single submit is ever the whole (potentially >2 s) decode. The
+/// same `_dyn`/params/ring decode semantics are preserved either way — splitting only distributes
+/// the identical dispatch stream across command buffers, with a seeded global barrier at each
+/// segment head carrying cross-segment ordering.
+pub struct RecordedCmd {
+    shared: std::sync::Arc<crate::VulkanShared>,
+    /// One (discrete) or several (watchdog-split) resubmittable segments, in execution order.
+    segments: Vec<RecordedSegment>,
+    /// Dispatches in ONE replay of the WHOLE recording (summed across segments). `replay_n(n)` puts
+    /// `n` copies of a single-segment recording into one submit, so this is what bounds a chain
+    /// against the GPU hang watchdog — see `Self::max_chain`.
+    dispatches: usize,
+}
+
+impl RecordedCmd {
+    pub(crate) fn from_shared_segments(
+        shared: std::sync::Arc<crate::VulkanShared>,
+        segments: Vec<RecordedSegment>,
+    ) -> Self {
+        let dispatches = segments.iter().map(|s| s.dispatches).sum();
+        Self {
+            shared,
+            segments,
+            dispatches,
+        }
+    }
+
+    /// Assemble a (possibly multi-segment) recording — the watchdog-split decode path.
+    pub(crate) fn from_segments(
+        be_: &crate::VulkanBackend,
+        segments: Vec<RecordedSegment>,
+    ) -> Self {
+        Self::from_shared_segments(std::sync::Arc::clone(&be_.shared), segments)
+    }
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -6781,7 +6836,9 @@ impl RecordedCmd {
     /// the same device-lost trap the forward-pass splitter exists to close (on the surveyed 2-CU
     /// iGPU a decode step is ~213 ms, so the old ceiling of 64 would have been ~13.6 s in a single
     /// command buffer). Bounded by the SAME measured dispatch cap the splitter uses; `usize::MAX`
-    /// (no bound) on a device that never splits, which is every discrete GPU.
+    /// (no bound) on a device that never splits, which is every discrete GPU. A multi-segment
+    /// recording only exists on a splitting device whose decode already EXCEEDS the cap, so this
+    /// returns 1 there — `replay_n` never packs copies of a split decode.
     pub fn max_chain(&self) -> usize {
         let cap = self
             .shared
@@ -6795,13 +6852,22 @@ impl RecordedCmd {
         (cap / self.dispatches).max(1)
     }
 
-    /// Resubmit the recorded command buffer `n` times in ONE queue submission (legal via
-    /// SIMULTANEOUS_USE) and wait once — the chained decode's n back-to-back iterations. The
-    /// recording's leading global barrier orders consecutive iterations. Callers must clamp `n` to
-    /// [`Self::max_chain`] — see `adapter::execute_chain`.
+    /// Resubmit the recording `n` times back to back and wait once — the chained decode's n
+    /// iterations. On the single-segment (discrete) fast path this is ONE queue submission of `n`
+    /// copies (legal via SIMULTANEOUS_USE); the recording's leading global barrier orders
+    /// consecutive iterations. Callers must clamp `n` to [`Self::max_chain`] — see
+    /// `adapter::execute_chain`. A multi-segment (watchdog-split) recording only ever reaches here
+    /// with `n == 1` (its `max_chain` is 1), and each iteration is a full `Self::replay`.
     pub fn replay_n(&self, n: usize) -> Result<()> {
+        let [seg] = &self.segments[..] else {
+            // Watchdog-split recording: replay the whole (already per-segment-split) decode n times.
+            for _ in 0..n {
+                self.replay()?;
+            }
+            return Ok(());
+        };
         let device = &self.shared.device;
-        let cmds = vec![self.cmd; n];
+        let cmds = vec![seg.cmd; n];
         unsafe {
             device
                 .queue_submit(
@@ -6817,17 +6883,26 @@ impl RecordedCmd {
         Ok(())
     }
 
-    /// Resubmit the recorded command buffer and wait for completion.
+    /// Resubmit the recording and wait for completion. Each segment is a SEPARATE `vkQueueSubmit`,
+    /// so the GPU hang watchdog — armed per submit — sees a split decode as several short jobs
+    /// running back-to-back on the queue rather than one long one. The segments still execute in
+    /// submission order and each continuation segment's leading `seed_barrier` carries the
+    /// cross-segment RAW/WAR memory dependency (a pipeline barrier's first scope spans everything
+    /// submitted earlier on the same queue). A discrete GPU has exactly ONE segment, so this is a
+    /// single submit + wait — byte-identical to the record-once fast path.
     pub fn replay(&self) -> Result<()> {
         let device = &self.shared.device;
         unsafe {
-            device
-                .queue_submit(
-                    self.shared.queue,
-                    &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.cmd))],
-                    vk::Fence::null(),
-                )
-                .map_err(|e| be(format!("replay submit: {e}")))?;
+            for seg in &self.segments {
+                device
+                    .queue_submit(
+                        self.shared.queue,
+                        &[vk::SubmitInfo::default()
+                            .command_buffers(std::slice::from_ref(&seg.cmd))],
+                        vk::Fence::null(),
+                    )
+                    .map_err(|e| be(format!("replay submit: {e}")))?;
+            }
             device
                 .queue_wait_idle(self.shared.queue)
                 .map_err(|e| be(format!("replay wait: {e}")))?;
@@ -6843,9 +6918,11 @@ impl Drop for RecordedCmd {
         unsafe {
             let _ = device.queue_wait_idle(self.shared.queue);
             let cmd_pool = *self.shared.cmd_pool.lock().unwrap();
-            device.free_command_buffers(cmd_pool, &[self.cmd]);
-            for p in &self.pools {
-                device.destroy_descriptor_pool(*p, None);
+            for seg in &self.segments {
+                device.free_command_buffers(cmd_pool, &[seg.cmd]);
+                for p in &seg.pools {
+                    device.destroy_descriptor_pool(*p, None);
+                }
             }
         }
     }

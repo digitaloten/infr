@@ -3946,7 +3946,18 @@ fn record_decode_replay(
     let mut transient: Vec<Box<dyn Buffer>> = Vec::new();
     let mut dyn_args: Vec<DynAttnCtx> = Vec::new();
     let mut pool: ScratchPool = HashMap::new();
-    let rec = be_.recorder_persistent()?;
+    // Watchdog splitter (mirrors `execute_static`): the GPU hang watchdog is armed per SUBMIT, so
+    // recording the whole decode into ONE command buffer makes it one indivisible watchdog job —
+    // fine on a discrete GPU (tens of ms) and fatal on a slow integrated one, where a big-model
+    // decode step in a single submit exceeds the ~2 s TDR budget and hard-lasts the device. `cap`
+    // (0 = unlimited, the discrete default) bounds the dispatches per segment; each segment becomes
+    // a SEPARATE submit at replay (`RecordedCmd::replay`) so the watchdog sees several short jobs
+    // instead of one long one. This preserves the `_dyn`/params/ring decode semantics exactly — the
+    // identical dispatch stream is just distributed across command buffers, with a seeded global
+    // barrier at each continuation segment's head carrying the cross-segment ordering.
+    let cap = be_.submit_dispatch_cap();
+    let mut segments: Vec<crate::recorder::RecordedSegment> = Vec::new();
+    let mut rec = be_.recorder_persistent()?;
     // Device-side position stream: seed params to [pos0-1, pos0] and record a one-thread
     // increment FIRST — every replay self-advances and the host never writes pos/params again
     // (no dyn kernel reads the `positions` buffer; they all read params). INFR_NO_GPU_POS=1
@@ -3969,6 +3980,21 @@ fn record_decode_replay(
     for (op_idx, op) in graph.ops.iter().enumerate() {
         if skip_op.contains(&op_idx) {
             continue;
+        }
+        // Split BETWEEN ops, never inside one (a single op can lower to several dispatches sharing
+        // transient scratch whose ordering is per-recorder): once the current segment reaches the
+        // cap, close it and open a fresh persistent recorder. Its leading `seed_barrier` seeds the
+        // cross-segment RAW/WAR ordering that per-recorder hazard tracking (which starts empty)
+        // can't otherwise see — every layer reads the residual stream a prior segment wrote. cap ==
+        // 0 (discrete) never trips this — ONE segment, byte-identical to the record-once fast path.
+        if cap > 0 && rec.dispatches() >= cap {
+            let fresh = be_.recorder_persistent()?;
+            fresh.seed_barrier();
+            segments.push(
+                std::mem::replace(&mut rec, fresh)
+                    .end_segment()
+                    .map_err(|e| be(e.to_string()))?,
+            );
         }
         // Peephole: fuse Op::Linear (f32, m<=4) + Op::GatedAct (Gelu, strided up) into one
         // e2b_gate dispatch for E2B per-layer inp_gate projections.
@@ -4066,7 +4092,11 @@ fn record_decode_replay(
     } else {
         None
     };
-    let recorded = rec.finish_record().map_err(|e| be(e.to_string()))?;
+    // Close the final segment (holds the trailing `id_log`) and assemble the recording. A discrete
+    // GPU (cap == 0) never split, so `segments` is exactly this one — a single-segment `RecordedCmd`
+    // that replays in one submit, unchanged.
+    segments.push(rec.end_segment().map_err(|e| be(e.to_string()))?);
+    let recorded = crate::recorder::RecordedCmd::from_segments(be_, segments);
     // dummy is unused in an eligible decode (m=1 GEMV path), but hold it (and any transient) so the
     // recording can't reference a freed buffer.
     transient.push(dummy);

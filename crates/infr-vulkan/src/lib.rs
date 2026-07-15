@@ -95,13 +95,19 @@ pub fn device_class() -> Option<DeviceClass> {
 
 // ── shared GPU state ──────────────────────────────────────────────────────────
 
-/// Device-local VRAM snapshot from [`VulkanBackend::vram`]. `available` is live free bytes when
+/// Device memory snapshot from [`VulkanBackend::vram`]. `available` is live free bytes when
 /// `live` is true (VK_EXT_memory_budget present), otherwise it equals `total` (best-effort).
+///
+/// WHICH HEAPS THIS COUNTS depends on the device class (see [`vram_info`]): device-local only on a
+/// discrete card, ALL heaps on a unified-memory part where they are the same physical DDR.
 #[derive(Clone, Copy, Debug)]
 pub struct VramInfo {
     pub total: u64,
     pub available: u64,
     pub live: bool,
+    /// True when this snapshot counted every heap because the device has unified memory (see
+    /// [`Capabilities::unified_memory`]) — only affects how the guard words its error.
+    pub uma: bool,
 }
 
 struct VulkanShared {
@@ -169,6 +175,16 @@ struct VulkanShared {
     /// `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT` type sitting on the device's LARGEST
     /// device-local heap — i.e. the whole of VRAM is host-visible, not just a 256 MiB BAR window.
     rebar_type: Option<u32>,
+    /// UNIFIED-MEMORY parts only (`None` on every discrete GPU): the host-visible memory type on
+    /// the non-device-local heap that `GpuOnly` allocations SPILL into once the device-local heap
+    /// is full. See [`probe_uma_overflow_type`] for why counting that heap in the budget is not
+    /// enough on its own — the bytes have to be able to land there too.
+    uma_overflow_type: Option<u32>,
+    /// Bytes this process has placed on the UMA OVERFLOW heap (`uma_overflow_type`). Counted apart
+    /// from `device_used`, which stays "bytes on the DEVICE-LOCAL heaps" — the spill decision is
+    /// exactly "would this push the device-local heap past its declared size", so it must not see
+    /// the bytes already diverted. Always 0 on a discrete GPU.
+    uma_spilled: AtomicU64,
     /// Whether the CURRENT weight load writes straight into VRAM through `rebar_type`. Decided
     /// once per load in `weight_progress_scope` (needs `rebar_type` AND enough room on its heap
     /// for the model), so a ReBAR-less box — or a model too big for the host-visible heap —
@@ -289,6 +305,12 @@ enum Backing {
     Vram {
         memory: vk::DeviceMemory,
         ptr: *mut u8,
+        /// True when this is a UNIFIED-MEMORY SPILL (see `probe_uma_overflow_type`) rather than a
+        /// ReBAR weight: the memory came from the non-device-local overflow heap, so it is charged
+        /// to `VulkanShared::uma_spilled` instead of `device_used`. Keeping the two counters apart
+        /// is what lets the spill decision ask "is the DEVICE-LOCAL heap full?" without the answer
+        /// being polluted by the bytes it already spilled elsewhere.
+        spilled: bool,
     },
 }
 
@@ -336,12 +358,18 @@ impl Drop for VkBuffer {
                     }
                     self.shared.allocator.lock().unwrap().free(alloc).ok();
                 }
-                // ReBAR weight: we own the VkDeviceMemory outright. It lives in the device-local
-                // heap, so it IS charged to the budget guard (see `make_buf_ex`) — balance it here.
-                Backing::Vram { memory, .. } => {
-                    self.shared
-                        .device_used
-                        .fetch_sub(self.mem_size, Ordering::Relaxed);
+                // A dedicated VkDeviceMemory we own outright: either a ReBAR weight (device-local)
+                // or a UMA spill (the overflow heap). Both are charged to the budget guard at
+                // allocation (see `make_buf_ex`) — balance the counter each was charged to.
+                Backing::Vram {
+                    memory, spilled, ..
+                } => {
+                    let counter = if *spilled {
+                        &self.shared.uma_spilled
+                    } else {
+                        &self.shared.device_used
+                    };
+                    counter.fetch_sub(self.mem_size, Ordering::Relaxed);
                     self.shared.device.unmap_memory(*memory);
                     self.shared.device.free_memory(*memory, None);
                 }
@@ -439,6 +467,90 @@ fn probe_rebar_type(mp: &vk::PhysicalDeviceMemoryProperties) -> Option<u32> {
 /// The size of the heap backing memory type `ty`.
 fn heap_size_of(mp: &vk::PhysicalDeviceMemoryProperties, ty: u32) -> u64 {
     mp.memory_heaps[mp.memory_types[ty as usize].heap_index as usize].size
+}
+
+/// The UMA OVERFLOW memory type: a host-visible type on a NON-device-local heap. `None` on a
+/// discrete GPU (never probed) and on any UMA part that doesn't expose one.
+///
+/// This is the other half of the unified-memory fix, and without it widening the budget is not
+/// merely useless but actively harmful. `vram_info` budgets a UMA part against ALL heaps, but
+/// gpu-allocator resolves `MemoryLocation::GpuOnly` to the FIRST DEVICE_LOCAL memory type and
+/// never falls back — so every allocation lands on the device-local heap no matter how full it is.
+/// RADV does not enforce the heap size (a 41 GiB run of 1 GiB allocations succeeded on a
+/// "21.47 GiB" heap), so nothing errors; the kernel simply can no longer validate the buffer list
+/// and the next SUBMIT dies with "Not enough memory for command submission" — a device-lost, i.e.
+/// exactly the silent-degradation failure the guard exists to prevent, just moved later.
+/// MEASURED on RAPHAEL_MENDOCINO with gemma-4-31B: weights + KV + activations cross the
+/// device-local heap's 21.47 GiB and the guard sits there reporting 10.70 GiB "available" (which
+/// is precisely heap 0's size — capacity nothing could reach) while the submit fails.
+///
+/// So the overflow must be PLACED, not just counted. On an APU heap 0 is the same DDR at the same
+/// bandwidth as the synthetic device-local heap — the weights are read out of GTT either way
+/// (`mem_info_gtt_used` accounts for them on both paths) — so spilling there costs no bandwidth.
+/// It is only on a DISCRETE card that the non-device-local heap means "across PCIe", which is why
+/// this is probed for UMA parts alone.
+fn probe_uma_overflow_type(mp: &vk::PhysicalDeviceMemoryProperties) -> Option<u32> {
+    let want = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+    (0..mp.memory_type_count).find(|&i| {
+        let t = mp.memory_types[i as usize];
+        let heap = mp.memory_heaps[t.heap_index as usize];
+        t.property_flags.contains(want)
+            && !t
+                .property_flags
+                .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            && !heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+    })
+}
+
+/// Free bytes on the DEVICE-LOCAL heaps alone — what the UMA spill decision keys off (unlike
+/// [`vram_info`]'s UMA figure, which spans every heap). Live VK_EXT_memory_budget when present, so
+/// a device-local heap another process has filled reads as full here too; otherwise the heap size
+/// minus this process's tracked device-local bytes (`device_used`; spilled bytes are charged to
+/// `uma_spilled` and correctly excluded).
+fn device_local_room(s: &VulkanShared) -> u64 {
+    let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+    let mut props2 = vk::PhysicalDeviceMemoryProperties2::default();
+    if s.has_mem_budget {
+        props2 = props2.push_next(&mut budget);
+    }
+    unsafe {
+        s.instance
+            .get_physical_device_memory_properties2(s.physical_device, &mut props2)
+    };
+    let mp = props2.memory_properties;
+    let (mut size, mut avail) = (0u64, 0u64);
+    for i in 0..mp.memory_heap_count as usize {
+        if mp.memory_heaps[i]
+            .flags
+            .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+        {
+            size += mp.memory_heaps[i].size;
+            avail += budget.heap_budget[i]
+                .saturating_sub(budget.heap_usage[i])
+                .min(mp.memory_heaps[i].size);
+        }
+    }
+    if s.has_mem_budget {
+        avail
+    } else {
+        size.saturating_sub(s.device_used.load(Ordering::Relaxed))
+    }
+}
+
+/// Human byte count for the budget guard's error, in the LARGEST unit that keeps a significant
+/// digit. A fixed `{:.2} GiB` printed "0.00 GiB requested" for anything under ~5 MiB — a guard
+/// error that reads as nonsense exactly when it fires on a small allocation (the last straw on a
+/// budget the big tensors already filled).
+fn fmt_bytes(b: u64) -> String {
+    const KIB: u64 = 1 << 10;
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    match b {
+        b if b >= GIB => format!("{:.2} GiB", b as f64 / GIB as f64),
+        b if b >= MIB => format!("{:.1} MiB", b as f64 / MIB as f64),
+        b if b >= KIB => format!("{:.1} KiB", b as f64 / KIB as f64),
+        b => format!("{b} B"),
+    }
 }
 
 /// Copy `src` into a persistently-mapped destination, in PARALLEL for large buffers.
@@ -597,9 +709,37 @@ pub struct VulkanBackend {
     shared: Arc<VulkanShared>,
 }
 
-/// Device-local VRAM info for a backend's shared state — the body of [`VulkanBackend::vram`],
+/// Device memory info for a backend's shared state — the body of [`VulkanBackend::vram`],
 /// factored out so scopes that only hold the `Arc<VulkanShared>` (e.g. [`WeightProgress`]'s
 /// post-load log) can read it too.
+///
+/// WHICH HEAPS COUNT — the whole point of this function, and the difference between refusing a
+/// model the box could run and TDR-ing one it could not:
+///
+/// DISCRETE card — device-local heaps ONLY. The other heap is host RAM reachable over PCIe (GTT).
+/// It is NOT capacity: RADV happily accepts a device-local allocation past the VRAM heap's size and
+/// quietly spills the excess into GTT — MEASURED on a 7900 XTX, where a 41 GiB run of 1 GiB
+/// device-local allocations succeeded and landed as `mem_info_vram_used` 23.08 GiB +
+/// `mem_info_gtt_used` 18.01 GiB. Every byte on the GTT side is then read across PCIe at a fraction
+/// of VRAM bandwidth. Counting it would turn a clean load error into a mysteriously slow model, so
+/// the guard budgets device-local alone. THIS IS THE PRE-EXISTING BEHAVIOR AND MUST NOT CHANGE.
+///
+/// UNIFIED-MEMORY part (an APU — see [`Capabilities::unified_memory`]) — ALL heaps. There is no
+/// VRAM here to spill out of; both heaps are the same DDR at the same bandwidth, and the driver's
+/// split between them is bookkeeping, not physics. MEASURED on RADV RAPHAEL_MENDOCINO: it
+/// advertises a 21.47 GiB "DEVICE_LOCAL" heap and a 10.73 GiB host-visible one, which sum to
+/// EXACTLY `mem_info_vram_total` (2 GiB carveout) + `mem_info_gtt_total` (30.20 GiB) — RADV
+/// synthesizes the device-local heap as 2/3 of (carveout + GTT). The same 41 GiB device-local probe
+/// on that device landed as `mem_info_gtt_used` 30.01 GiB and `mem_info_vram_used` 1.03 GiB: the
+/// "device-local" heap IS system RAM through the GART, and the 2 GiB carveout is not where the
+/// weights go. So the honest capacity is the SUM of the heaps, and budgeting against the
+/// device-local slice alone refuses models (gemma-4-31B UD-Q5_K_XL: 20.37 GiB of weights against a
+/// 21.22 GiB budget) that fit the machine with room to spare.
+///
+/// Counting the overflow heap is only half of it — `probe_uma_overflow_type` is what lets bytes
+/// actually LAND there once the device-local heap is full. Above the summed budget the failure mode
+/// is the same on both classes (the driver oversubscribes and starts evicting), which is why the
+/// guard exists at all — it just now guards the right number on each.
 fn vram_info(s: &VulkanShared) -> VramInfo {
     let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
     let mut props2 = vk::PhysicalDeviceMemoryProperties2::default();
@@ -611,15 +751,24 @@ fn vram_info(s: &VulkanShared) -> VramInfo {
             .get_physical_device_memory_properties2(s.physical_device, &mut props2)
     };
     let mp = props2.memory_properties;
+    let uma = s.caps.unified_memory;
+
+    // Discrete: device-local heaps only. UMA: every heap (they are one pool of DDR). The live
+    // VK_EXT_memory_budget figure is used on BOTH — it is what accounts for other processes, and
+    // on a shared-memory part that matters more, not less: a second infr holding 21 GiB of the
+    // same DDR is exactly the thing a UMA guard must see.
     let mut total = 0u64;
     let mut available = 0u64;
     for i in 0..mp.memory_heap_count as usize {
-        if mp.memory_heaps[i]
+        let device_local = mp.memory_heaps[i]
             .flags
-            .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
-        {
+            .contains(vk::MemoryHeapFlags::DEVICE_LOCAL);
+        if uma || device_local {
             total += mp.memory_heaps[i].size;
             available += if s.has_mem_budget {
+                // Live free = budget - usage (the budget is a CEILING, not free bytes). Clamped to
+                // the heap size so a driver that reports usage past the heap (RADV on an APU, once
+                // something has oversubscribed the synthetic split) can't hand back a bogus figure.
                 budget.heap_budget[i]
                     .saturating_sub(budget.heap_usage[i])
                     .min(mp.memory_heaps[i].size)
@@ -632,6 +781,7 @@ fn vram_info(s: &VulkanShared) -> VramInfo {
         total,
         available,
         live: s.has_mem_budget,
+        uma,
     }
 }
 
@@ -1301,7 +1451,14 @@ impl VulkanBackend {
             compute_units,
             max_buffer_bytes: props.limits.max_storage_buffer_range as u64,
             max_shared_memory_bytes: props.limits.max_compute_shared_memory_size,
-            unified_memory: false, // discrete GPU
+            // An INTEGRATED_GPU has no VRAM to be separate FROM: its "device-local" heap is system
+            // DDR reached through the GART (proven on RADV RAPHAEL_MENDOCINO — see `vram_info`,
+            // which is the only consumer that matters today). A DISCRETE_GPU is never UMA, and
+            // that is the class this must not perturb, so key off the device type exactly like
+            // `integrated` above (llama.cpp's Vulkan backend sets its `uma` flag the same way).
+            // Note this is a strictly WEAKER claim than `integrated`, which additionally means
+            // "submits must stay under a TDR watchdog" — the two happen to coincide on Vulkan.
+            unified_memory: integrated,
             // The seam adapter records the decode graph once and replays it (params-driven `_dyn`
             // kernels); the runner compiles the eligible qwen3 decode graph once.
             decode_replay: true,
@@ -1384,6 +1541,30 @@ impl VulkanBackend {
                 submit_dispatch_cap,
             );
         }
+        // On a unified-memory part the budget guard counts EVERY heap, not just the device-local
+        // one (see `vram_info`) — a materially different capacity, and the second thing to check
+        // when an iGPU either loads a model you didn't expect to fit or starts swapping. Print the
+        // number it will actually budget against. Silent on every discrete device.
+        if caps.unified_memory {
+            let mp = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+            let (mut all, mut dev_local) = (0u64, 0u64);
+            for i in 0..mp.memory_heap_count as usize {
+                all += mp.memory_heaps[i].size;
+                if mp.memory_heaps[i]
+                    .flags
+                    .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+                {
+                    dev_local += mp.memory_heaps[i].size;
+                }
+            }
+            eprintln!(
+                "[infr] GPU: UNIFIED MEMORY — budgeting against all {} heaps ({}), not the \
+                 device-local slice alone ({}); this GPU's memory IS system RAM",
+                mp.memory_heap_count,
+                fmt_bytes(all),
+                fmt_bytes(dev_local),
+            );
+        }
 
         // ── gpu-allocator ──────────────────────────────────────────────────────
         let allocator = Allocator::new(&AllocatorCreateDesc {
@@ -1419,6 +1600,12 @@ impl VulkanBackend {
         // `weight_progress_scope` (it also has to fit).
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
         let rebar_type = probe_rebar_type(&mem_props);
+        // Probed for UMA parts ONLY — on a discrete card the non-device-local heap is host RAM
+        // across PCIe and must never receive a GpuOnly buffer (see `probe_uma_overflow_type`).
+        let uma_overflow_type = caps
+            .unified_memory
+            .then(|| probe_uma_overflow_type(&mem_props))
+            .flatten();
 
         Ok(Self {
             moe_pager: Mutex::new(None),
@@ -1444,6 +1631,8 @@ impl VulkanBackend {
                 device_used: AtomicU64::new(0),
                 submit_dispatch_cap: AtomicUsize::new(submit_dispatch_cap),
                 rebar_type,
+                uma_overflow_type,
+                uma_spilled: AtomicU64::new(0),
                 weights_direct: AtomicBool::new(false),
                 staging_ring: Mutex::new(None),
             }),
@@ -1626,15 +1815,20 @@ impl VulkanBackend {
         vram_info(&self.shared)
     }
 
-    /// VRAM budget guard: hard-error BEFORE a device-local allocation of `want` bytes that would
-    /// exceed the budget. Over-committing VRAM does not fail cleanly on GPUs — on AMD it TDRs
-    /// (VK_ERROR_DEVICE_LOST) mid-inference or silently degrades once the driver starts evicting,
-    /// so the only safe failure point is here, at allocation time (mirrors the Metal backend's
-    /// working-set guard). Uses the LIVE per-heap budget when VK_EXT_memory_budget is present
-    /// (it accounts for other processes and everything we already hold); otherwise falls back to
-    /// this backend's tracked bytes against the total heap. `GUARD_HEADROOM` absorbs allocation
-    /// slop (alignment, gpu-allocator block rounding) and driver-internal allocations.
-    /// `INFR_NO_VRAM_GUARD=1` disables the check (restoring the old fail-late behavior).
+    /// Device-memory budget guard: hard-error BEFORE a device-local allocation of `want` bytes
+    /// that would exceed the budget. Over-committing does not fail cleanly on GPUs — the driver
+    /// accepts the allocation and then evicts, which on a discrete card means reading weights back
+    /// across PCIe (measured: a 41 GiB device-local run on a 24 GiB 7900 XTX quietly placed 18 GiB
+    /// in GTT) and can end in a device-lost (TDR) mid-inference. The only safe failure point is
+    /// here, at allocation time (mirrors the Metal backend's working-set guard).
+    ///
+    /// The budget comes from [`vram_info`], which counts device-local heaps on a discrete card and
+    /// EVERY heap on a unified-memory part (where they are one pool of DDR — see its doc). Uses the
+    /// LIVE per-heap budget when VK_EXT_memory_budget is present (it accounts for other processes
+    /// and everything we already hold); otherwise falls back to this backend's tracked bytes
+    /// against the total heap. `GUARD_HEADROOM` absorbs allocation slop (alignment, gpu-allocator
+    /// block rounding) and driver-internal allocations. `INFR_NO_VRAM_GUARD=1` disables the check
+    /// (restoring the old fail-late behavior).
     ///
     /// Sub-MiB allocations skip the check (no per-tiny-alloc driver query; they cannot
     /// individually blow the budget and stay covered by the next large allocation's check).
@@ -1652,23 +1846,28 @@ impl VulkanBackend {
         };
         let budget = v.total.saturating_sub(GUARD_HEADROOM);
         if used + want > budget {
-            let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+            let pool = if v.uma {
+                "unified memory (all heaps — this GPU shares system RAM)"
+            } else {
+                "device-local"
+            };
             return Err(be(format!(
-                "VRAM budget exceeded: {:.2} GiB requested + {:.2} GiB already in use ({}) > \
-                 {:.2} GiB budget ({:.2} GiB device-local minus 256 MiB headroom). Refusing to \
-                 over-commit: exceeding VRAM doesn't fail cleanly — it causes device-lost (TDR) \
-                 or silent corruption mid-inference. Use a smaller context (INFR_CTX), a \
-                 smaller/more-quantized model, close other GPU processes, or run on the CPU \
-                 backend (INFR_CPU=1). INFR_NO_VRAM_GUARD=1 overrides at your own risk.",
-                gib(want),
-                gib(used),
+                "{} budget exceeded: {} requested + {} already in use ({}) > {} budget ({} {pool} \
+                 minus 256 MiB headroom). Refusing to over-commit: exceeding it doesn't fail \
+                 cleanly — the driver evicts (weights get read back over the bus) or the device is \
+                 lost (TDR) mid-inference. Use a smaller context (INFR_CTX), a smaller/more- \
+                 quantized model, close other GPU processes, or run on the CPU backend \
+                 (INFR_CPU=1). INFR_NO_VRAM_GUARD=1 overrides at your own risk.",
+                if v.uma { "Unified-memory" } else { "VRAM" },
+                fmt_bytes(want),
+                fmt_bytes(used),
                 if v.live {
                     "live driver budget"
                 } else {
                     "tracked by this process; no VK_EXT_memory_budget"
                 },
-                gib(budget),
-                gib(v.total),
+                fmt_bytes(budget),
+                fmt_bytes(v.total),
             )));
         }
         Ok(())
@@ -1735,17 +1934,20 @@ impl VulkanBackend {
         Ok(())
     }
 
-    /// Bind `buffer` to a fresh, PERSISTENTLY MAPPED dedicated allocation of memory type `ty` (the
-    /// ReBAR type — device-local VRAM the host can write through). See [`Backing::Vram`].
+    /// Bind `buffer` to a fresh, PERSISTENTLY MAPPED dedicated allocation of memory type `ty`. Two
+    /// callers, distinguished by `spilled`: the ReBAR weight path (`false` — device-local VRAM the
+    /// host can write through) and the UMA overflow spill (`true` — the non-device-local heap of a
+    /// unified-memory part). See [`Backing::Vram`].
     ///
     /// The caller owns `buffer` and must destroy it if this returns `Err`. Budget-guarded and
-    /// charged to `device_used` exactly like any other device-local allocation.
+    /// charged to `device_used` (or `uma_spilled` when `spilled`) like any other allocation.
     fn alloc_vram_mapped(
         &self,
         buffer: vk::Buffer,
         size: usize,
         requirements: &vk::MemoryRequirements,
         ty: u32,
+        spilled: bool,
     ) -> Result<VkBuffer> {
         self.check_vram_budget(requirements.size)?;
 
@@ -1779,14 +1981,22 @@ impl VulkanBackend {
             return Err(be(format!("rebar bind_buffer_memory: {e}")));
         }
 
-        self.shared
-            .device_used
-            .fetch_add(requirements.size, Ordering::Relaxed);
+        // Charge the counter this allocation's heap belongs to (see `VulkanShared::uma_spilled`).
+        if spilled {
+            &self.shared.uma_spilled
+        } else {
+            &self.shared.device_used
+        }
+        .fetch_add(requirements.size, Ordering::Relaxed);
 
         Ok(VkBuffer {
             shared: Arc::clone(&self.shared),
             buffer,
-            backing: Backing::Vram { memory, ptr },
+            backing: Backing::Vram {
+                memory,
+                ptr,
+                spilled,
+            },
             // Logical size = what the caller asked for; `requirements.size` only rounds it up for
             // alignment, and `fill_buf`/`upload` must not touch past the logical extent.
             size,
@@ -1835,7 +2045,7 @@ impl VulkanBackend {
             if let Some(ty) = self.shared.rebar_type {
                 // Only if the buffer's requirements actually permit that memory type.
                 if requirements.memory_type_bits & (1 << ty) != 0 {
-                    match self.alloc_vram_mapped(buffer, size, &requirements, ty) {
+                    match self.alloc_vram_mapped(buffer, size, &requirements, ty, false) {
                         Ok(b) => return Ok(b),
                         Err(e) => {
                             // Out of host-visible VRAM (or map failed): fall through to the normal
@@ -1922,6 +2132,48 @@ impl VulkanBackend {
                 return Err(e);
             }
         }
+
+        // ── UMA spill: device-local heap full, put this on the other heap ─────────────────────
+        // UNIFIED-MEMORY PARTS ONLY (`uma_overflow_type` is `None` on every discrete GPU, so a
+        // dGPU never even evaluates this — it falls straight through to gpu-allocator exactly as
+        // before). Once the synthetic device-local heap is full, gpu-allocator would keep resolving
+        // GpuOnly to it and RADV would keep saying yes, right up until the kernel can't validate
+        // the buffer list and the SUBMIT dies. Place the overflow on the non-device-local heap
+        // instead: same DDR, same bandwidth on an APU. See `probe_uma_overflow_type`.
+        if location == MemoryLocation::GpuOnly {
+            if let Some(ty) = self.shared.uma_overflow_type {
+                // Leave the device-local heap a little slack rather than filling it to the last
+                // byte: the driver makes its own internal allocations there (descriptor pools,
+                // pipeline/shader memory, the command buffers themselves), and a heap with zero
+                // room is how the "not enough memory for command submission" failure starts.
+                const UMA_SPILL_MARGIN: u64 = 256 * 1024 * 1024;
+                let dl_avail = device_local_room(&self.shared);
+                let fits_device_local =
+                    dl_avail >= requirements.size.saturating_add(UMA_SPILL_MARGIN);
+                if !fits_device_local && requirements.memory_type_bits & (1 << ty) != 0 {
+                    // Both heaps are out if this fails, so report it rather than retrying on the
+                    // device-local heap we just established has no room (that path would recurse
+                    // straight back to here, and RADV would accept the allocation anyway and hand
+                    // the failure to the next submit as a device-lost — the exact thing this
+                    // spill exists to prevent).
+                    return match self.alloc_vram_mapped(buffer, size, &requirements, ty, true) {
+                        Ok(b) => Ok(b),
+                        Err(e) => {
+                            // `alloc_vram_mapped` leaves the buffer to us on failure.
+                            unsafe { self.shared.device.destroy_buffer(buffer, None) };
+                            Err(be(format!(
+                                "unified memory exhausted: {} for {label} did not fit the \
+                                 device-local heap ({} free) and the overflow heap rejected it \
+                                 too ({e})",
+                                fmt_bytes(requirements.size),
+                                fmt_bytes(dl_avail),
+                            )))
+                        }
+                    };
+                }
+            }
+        }
+
         let allocation = {
             let mut alloc = self.shared.allocator.lock().unwrap();
             alloc
