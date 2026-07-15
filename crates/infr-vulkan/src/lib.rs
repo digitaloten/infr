@@ -867,7 +867,31 @@ impl VulkanBackend {
 
     /// Initialize Vulkan: create instance, pick a GPU (prefer discrete), create a logical
     /// device + compute queue with the required extensions/features, set up the allocator.
+    /// `Err` on Apple (Vulkan is unsupported there — use the Metal backend), `Ok(())` everywhere
+    /// else. Split into two `cfg` bodies so the guard is a runtime `Result` the caller `?`s: that
+    /// keeps the Vulkan body in [`new`](Self::new) compiling on macOS while never executing it.
+    #[cfg(target_os = "macos")]
+    fn reject_on_apple() -> Result<()> {
+        Err(be(
+            "Vulkan is not supported on Apple. Use the native Metal backend: it is the default on \
+             macOS, or select it explicitly with `--dev metal` (or INFR_METAL=1). (The only Vulkan \
+             on Apple is MoltenVK, which this backend deliberately does not target.)",
+        ))
+    }
+    #[cfg(not(target_os = "macos"))]
+    fn reject_on_apple() -> Result<()> {
+        Ok(())
+    }
+
     pub fn new() -> Result<Self> {
+        // Apple: the Vulkan backend is DELIBERATELY unsupported (the only Vulkan on Apple is
+        // MoltenVK, which lacks features this backend depends on — e.g. `bufferDeviceAddress` for
+        // the paged MoE arena — and is slower than talking to Metal directly). infr ships a NATIVE
+        // Metal backend for Apple GPUs. The `?` on a runtime `Result` here does NOT trip
+        // `unreachable_code`, so the Vulkan body below still compiles clean on macOS (it is simply
+        // never reached). See `reject_on_apple`.
+        Self::reject_on_apple()?;
+
         // ── entry ──────────────────────────────────────────────────────────────
         let entry =
             unsafe { ash::Entry::load() }.map_err(|e| be(format!("ash::Entry::load: {e}")))?;
@@ -880,28 +904,12 @@ impl VulkanBackend {
             .engine_version(vk::make_api_version(0, 0, 1, 0))
             .api_version(vk::API_VERSION_1_3);
 
-        // Portability drivers (MoltenVK on macOS) are HIDDEN by the loader unless the instance
-        // opts in with VK_KHR_portability_enumeration + the matching create flag — without it,
-        // create_instance on a Mac reports "unable to find a Vulkan driver" even with MoltenVK
-        // installed. Probe and opt in when available; a no-op on platforms with native drivers.
-        let inst_exts =
-            unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap_or_default();
-        let has_portability = inst_exts.iter().any(|e| {
-            e.extension_name_as_c_str()
-                .is_ok_and(|n| n == c"VK_KHR_portability_enumeration")
-        });
-        let mut inst_ext_ptrs: Vec<*const i8> = Vec::new();
-        let mut inst_flags = vk::InstanceCreateFlags::empty();
-        if has_portability {
-            inst_ext_ptrs.push(c"VK_KHR_portability_enumeration".as_ptr());
-            inst_flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
-        }
+        // Native Vulkan drivers only (Linux/Windows AMD/NVIDIA/Intel). The MoltenVK portability
+        // opt-in that used to live here was removed with the Apple guard above — Apple is the only
+        // place a portability driver is enumerated, and infr no longer runs Vulkan there.
         let instance = unsafe {
             entry.create_instance(
-                &vk::InstanceCreateInfo::default()
-                    .application_info(&app_info)
-                    .enabled_extension_names(&inst_ext_ptrs)
-                    .flags(inst_flags),
+                &vk::InstanceCreateInfo::default().application_info(&app_info),
                 None,
             )
         }
