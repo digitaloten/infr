@@ -18,6 +18,11 @@ fn spv_words(bytes: &[u8]) -> Vec<u32> {
         .collect()
 }
 
+// Generated `native_gemm_streamed_spv(name) -> &'static [u32]`: resident dense-GEMM kernel name to
+// its `-DSTREAMED` arena-addressed twin (see build.rs and the Recorder's `matmul_native_*` streamed
+// remap). Uses `spv_words`/`OnceLock` from this module scope.
+include!(concat!(env!("OUT_DIR"), "/native_streamed_gemm_map.rs"));
+
 /// Build-compiled multi-row native GEMV SPIR-V (m = 2..8, weight streamed once — the spec-decode
 /// verify / short-suffix-prefill shape). `None` for formats without an mrow build (they keep the
 /// tiled GEMM route).

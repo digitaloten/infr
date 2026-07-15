@@ -235,6 +235,7 @@ fn qwen3_8b_gemm_shapes_bench() {
                             m,
                             k,
                             n,
+                            None,
                         );
                     } else {
                         rec.matmul_native(
@@ -306,7 +307,7 @@ fn wide_square_occupancy_sweep() {
         std::env::set_var("INFR_GEMM_WIDE_TILE", "1");
         let us = time(&|rec| {
             rec.store_f16(a.as_ref(), a16.as_ref(), m * k, 0);
-            rec.matmul_native_f16a(dt, a16.as_ref(), w.as_ref(), 0, c.as_ref(), m, k, n);
+            rec.matmul_native_f16a(dt, a16.as_ref(), w.as_ref(), 0, c.as_ref(), m, k, n, None);
         });
         std::env::remove_var("INFR_GEMM_WIDE_TILE");
         println!(
@@ -317,7 +318,7 @@ fn wide_square_occupancy_sweep() {
         // n128 ag (BN=128 → 2× workgroups) — the new default
         let us = time(&|rec| {
             rec.store_f16(a.as_ref(), a16.as_ref(), m * k, 0);
-            rec.matmul_native_f16a(dt, a16.as_ref(), w.as_ref(), 0, c.as_ref(), m, k, n);
+            rec.matmul_native_f16a(dt, a16.as_ref(), w.as_ref(), 0, c.as_ref(), m, k, n, None);
         });
         println!(
             "[{label:>5}] [{k}x{n}] n128_ag      {us:7.1} us  {:5.1} TF",
@@ -343,6 +344,7 @@ fn wide_square_occupancy_sweep() {
                     n,
                     splits,
                     true,
+                    None,
                 );
             });
             println!(
@@ -398,7 +400,7 @@ fn wide_n128_crossover_sweep() {
                 std::env::set_var("INFR_GEMM_WIDE_TILE", "1");
             }
             let f = |rec: &infr_vulkan::Recorder| {
-                rec.matmul_native_f16a(dt, a16.as_ref(), w.as_ref(), 0, c.as_ref(), m, k, n);
+                rec.matmul_native_f16a(dt, a16.as_ref(), w.as_ref(), 0, c.as_ref(), m, k, n, None);
             };
             let rec = be.recorder().unwrap();
             f(&rec);
@@ -1304,7 +1306,17 @@ fn dense_small_m_row_tile_bench() {
                     std::env::remove_var("INFR_NO_SMALL_BM");
                 }
                 let rec = be_.recorder().unwrap();
-                rec.matmul_native_f16a(dtype, a16.as_ref(), w.as_ref(), 0, c.as_ref(), m, k_, n_);
+                rec.matmul_native_f16a(
+                    dtype,
+                    a16.as_ref(),
+                    w.as_ref(),
+                    0,
+                    c.as_ref(),
+                    m,
+                    k_,
+                    n_,
+                    None,
+                );
                 rec.finish().unwrap(); // warmup (pipeline compile)
                 let t0 = std::time::Instant::now();
                 let rec = be_.recorder().unwrap();
@@ -1318,6 +1330,7 @@ fn dense_small_m_row_tile_bench() {
                         m,
                         k_,
                         n_,
+                        None,
                     );
                 }
                 rec.finish().unwrap();
@@ -1379,6 +1392,7 @@ fn dense_small_m_row_tile_bench() {
                     n_,
                     splits,
                     true,
+                    None,
                 );
                 rec.finish().unwrap(); // warmup (pipeline compile)
                 let t0 = std::time::Instant::now();
@@ -1396,6 +1410,7 @@ fn dense_small_m_row_tile_bench() {
                         n_,
                         splits,
                         true,
+                        None,
                     );
                 }
                 rec.finish().unwrap();
@@ -1478,7 +1493,17 @@ fn bm16_crossover_bench() {
                     std::env::remove_var("INFR_NO_BM16");
                 }
                 let rec = be_.recorder().unwrap();
-                rec.matmul_native_f16a(dtype, a16.as_ref(), w.as_ref(), 0, c.as_ref(), m, k_, n_);
+                rec.matmul_native_f16a(
+                    dtype,
+                    a16.as_ref(),
+                    w.as_ref(),
+                    0,
+                    c.as_ref(),
+                    m,
+                    k_,
+                    n_,
+                    None,
+                );
                 rec.finish().unwrap(); // warmup (pipeline compile)
                 let t0 = std::time::Instant::now();
                 let rec = be_.recorder().unwrap();
@@ -1492,6 +1517,7 @@ fn bm16_crossover_bench() {
                         m,
                         k_,
                         n_,
+                        None,
                     );
                 }
                 rec.finish().unwrap();

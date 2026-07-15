@@ -962,15 +962,19 @@ fn lower_op(
     // `Op::Linear` whose weight is a streamed block — `arena_addr` is the resident slot's arena base
     // BYTE address. The pool arena is a `bufferDeviceAddress` buffer read purely by 64-bit pointer
     // (NOT a bound SSBO), so the ~4 GiB `maxStorageBufferRange` cap is gone entirely (no descriptor
-    // binds it). The op lowers through the single streamed GEMV with the op's own `w_off` (a
-    // fused-QKV slice offset, usually 0) riding on top — a short-circuit that bypasses the resident
-    // GEMM/mmv selection below (streamed weights only ever dispatch the ONE converted kernel, which
-    // is what makes dropping the pool caps safe). The ring→arena copy hazard is ordered explicitly
-    // by `arena_stream_barrier` at the staging site (see `stage_dense_linear`). Every other op — and
-    // every non-streamed model — passes `None` (zero change). Only the `Op::Linear` arm reads it;
-    // the seam's placement guarantees a streamed weight's dtype rides the offset-capable native
-    // paths (`native_dense_supported`) and never the fused-residual peephole (filtered by
-    // `execute_static` before the loop).
+    // binds it). The op is lowered by an m-split that MIRRORS the resident selection, just
+    // arena-addressed: a genuine prefill chunk (`streamed_gemm_applies`) routes through the SAME
+    // coopmat-warp GEMM tile the resident path would pick (`streamed_prefill_gemm` → the -DSTREAMED
+    // twins of native_gemm/native_gemm_warp), while decode/small-m keep the single streamed GEMV
+    // (`linear_native_streamed`) — the arena-addressed kernels are the ONLY ones a >4 GiB pool ever
+    // dispatches, which is what makes dropping the caps safe. `w_off` (a fused-QKV slice offset,
+    // usually 0) rides on top as a within-slot element offset in both. The ring→arena copy hazard is
+    // ordered explicitly by `arena_stream_barrier` at the staging site (`stage_dense_linear`) — the
+    // SAME slot/RAW barrier already covers the prefill dispatch. Every other op — and every
+    // non-streamed model — passes `None` (zero change). Only the `Op::Linear` arm reads it; the
+    // seam's placement guarantees a streamed weight's dtype rides the offset-capable native paths
+    // (`native_dense_supported`) and never the fused-residual peephole (filtered by `execute_static`
+    // before the loop).
     wsub: Option<u64>,
 ) -> Result<()> {
     let memo_prev = mmv_memo.take();
@@ -1059,13 +1063,12 @@ fn lower_op(
             let (w, xb, y) = (r(*weight)?, r(*x)?, r(*dst)?);
             let dt = graph.desc(*weight).dtype;
             // Dense layer streaming: the weight lives in a `bufferDeviceAddress` arena pool (see
-            // the `wsub` param doc). Short-circuit to the single streamed GEMV — it reads the arena
-            // by 64-bit address (`arena_addr`), with the op's own `w_off` (a fused-qkv slice offset,
-            // usually 0) riding on top as a within-slot element offset. This deliberately bypasses
-            // the resident GEMM/mmv selection below: routing EVERY streamed Linear (any m) through
-            // one converted kernel is what lets the seam drop the pool caps safely (a >4 GiB pool
-            // is only ever read by this cap-free kernel, never an unconverted SSBO one). The rows
-            // loop handles m>1 (streaming is already a memory-bound fallback — see the recorder doc).
+            // the `wsub` param doc). The op reads the arena by 64-bit address (`arena_addr`), with
+            // the op's own `w_off` (a fused-qkv slice offset, usually 0) riding on top as a
+            // within-slot element offset. A genuine prefill chunk routes to the SAME coopmat-warp
+            // GEMM tile the resident path would pick (arena-addressed) — the prefill perf win;
+            // decode/small-m keep the single streamed GEMV. Both dispatch ONLY arena-addressed
+            // kernels, never an unconverted SSBO one, which is what lets the seam drop the pool caps.
             if let Some(arena_addr) = wsub {
                 // Placement guarantees an offset-capable native dtype (the f16/f32 fallback arms
                 // take no weight offset) — a violation here would read the wrong arena bytes.
@@ -1073,7 +1076,14 @@ fn lower_op(
                     return Err(be("vulkan adapter: streamed Linear weight of a dtype \
                                    without offset-capable kernels"));
                 }
-                rec.linear_native_streamed(dt, arena_addr, w_off, xb, y, m, in_f, out_f);
+                if streamed_gemm_applies(be_, dt, m, in_f, out_f) {
+                    streamed_prefill_gemm(
+                        be_, graph, dt, arena_addr, w, w_off, xb, y, dst, m, in_f, out_f, rec,
+                        pool, transient,
+                    )?;
+                } else {
+                    rec.linear_native_streamed(dt, arena_addr, w_off, xb, y, m, in_f, out_f);
+                }
                 return Ok(());
             }
             // `w_off` (fused-QKV slices) only rides the offset-capable native paths — the runner
@@ -1599,6 +1609,7 @@ fn lower_op(
                             out_f,
                             splits,
                             a16.is_some(),
+                            None,
                         );
                     } else if let Some(k16) = &a16 {
                         rec.matmul_native_f16a(
@@ -1610,9 +1621,10 @@ fn lower_op(
                             m,
                             in_f,
                             out_f,
+                            None,
                         );
                     } else {
-                        rec.matmul_native_off(dt, xb, w, w_off, out, m, in_f, out_f);
+                        rec.matmul_native_off(dt, xb, w, w_off, out, m, in_f, out_f, None);
                     }
                 } else {
                     // F16 deep-k narrow-n → SPLIT-K warptile (DG slice-7 comparative
@@ -1654,6 +1666,7 @@ fn lower_op(
                             out_f,
                             splits,
                             false,
+                            None,
                         );
                     } else {
                         // f16 coopmat GEMM (dummy scales/mins unused at bits=16).
@@ -4463,6 +4476,130 @@ fn sync_stream<'a>(
     ps.cursor = 0;
     ps.tape_cursor = 0;
     *rec = Some(be_.recorder()?);
+    Ok(())
+}
+
+/// Does a streamed dense `Op::Linear` at `(dt, m, in_f, out_f)` route to the arena-addressed
+/// coopmat-warp prefill GEMM (`streamed_prefill_gemm`), or fall back to the streamed GEMV? Mirrors
+/// the RESIDENT `is_gemm && native_dense_supported` gate so the streamed route tracks the resident
+/// route exactly — just arena-addressed. A genuine prefill chunk (m>16, past the resident mrow
+/// window) with a coopmat-warp-eligible native quant takes the GEMM; decode/small-m/verify keep the
+/// GEMV (the task's "small-m keeps the GEMV"). The one native-quant shape the resident path routes
+/// to the dp4a `mmq` GEMM instead of the coopmat-warp arm — Q4_K with out_f%128!=0 (no warp tile) —
+/// is NOT arena-converted (its shader reads the weight outside native_decode's NW chokepoint), so it
+/// too keeps the GEMV; every other native quant reaches the coopmat-warp arm `streamed_prefill_gemm`
+/// mirrors.
+fn streamed_gemm_applies(
+    be_: &VulkanBackend,
+    dt: infr_core::DType,
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+) -> bool {
+    m > 16
+        && out_f.is_multiple_of(64)
+        && in_f.is_multiple_of(32)
+        && be_.caps().f16_coopmat()
+        && native_dense_supported(dt)
+        && !(matches!(dt, infr_core::DType::Q4K)
+            && !out_f.is_multiple_of(128)
+            && be_.caps().i8_dot
+            && std::env::var("INFR_NO_MMQ").is_err())
+}
+
+/// Arena-addressed twin of the resident `Op::Linear` `is_gemm && native_dense_supported` coopmat-
+/// warp prefill arm (see the `is_gemm` block in `lower_op`): the SAME tile selection (A_GLOBAL
+/// f16-A cast, narrow-n split-K, or the direct tile) and the SAME padded-dst dance, but the weight
+/// is read from the pool arena by 64-bit address (`arena_addr`) — the recorder methods swap to the
+/// `-DSTREAMED` twin of whatever tile they pick and bind the activation as the binding-1 filler, so
+/// the arena is NEVER a bound descriptor. `w` is the streamed weight placeholder (passed through but
+/// unread by the twins — the tile pick needs only shape/caps). `w_off` (a fused-QKV slice offset)
+/// rides on top as a within-slot element offset. The ring→arena copy is already ordered before this
+/// dispatch by `stage_dense_linear`'s RAW `arena_stream_barrier` (same slot, same segment).
+#[allow(clippy::too_many_arguments)]
+fn streamed_prefill_gemm(
+    be_: &VulkanBackend,
+    graph: &Graph,
+    dt: infr_core::DType,
+    arena_addr: u64,
+    w: &dyn Buffer,
+    w_off: usize,
+    xb: &dyn Buffer,
+    y: &dyn Buffer,
+    dst: &TensorId,
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+    rec: &Recorder<'_>,
+    pool: &mut ScratchPool,
+    transient: &mut Vec<Box<dyn Buffer>>,
+) -> Result<()> {
+    // Padded-dst dance (identical to the resident arm): the GEMM writes ceil(m/64)*64 rows —
+    // Internal dsts are row-padded up front, a non-Internal dst gets a padded temp + copy of m rows.
+    let dst_internal = matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal);
+    let eb = graph.desc(*dst).dtype.dense_bytes(1).unwrap_or(4);
+    let tmp = if dst_internal {
+        None
+    } else {
+        let mpad = m.div_ceil(64) * 64;
+        Some(be_.alloc_uninit((mpad * out_f * eb).max(4), BufferUsage::Activations)?)
+    };
+    let out: &dyn Buffer = match &tmp {
+        Some(t) => t.as_ref(),
+        None => y,
+    };
+    let arena = Some(arena_addr);
+    // A_GLOBAL: cast A to f16 once and let the warptiles coopMatLoad it from global (drops the As
+    // stage — the occupancy win). Same gate as the resident arm.
+    let use_ag = out_f.is_multiple_of(128)
+        && in_f.is_multiple_of(32)
+        && crate::gemm::native_gemm_warp_ag_build_spv(dt).is_some()
+        && std::env::var("INFR_NO_GEMM_WARP").is_err();
+    let a16 = if use_ag {
+        let mpad = m.div_ceil(64) * 64;
+        let key = pooled(pool, be_, "lin_a16", mpad * in_f * 2)?;
+        rec.store_f16(xb, pool[&key].as_ref(), m * in_f, 0);
+        Some(key)
+    } else {
+        None
+    };
+    // SPLIT-K for narrow-n deep-k shapes — same narrow-grid policy as the resident arm.
+    let narrow_grid = m.div_ceil(64) * (out_f / 128).max(1);
+    let splits = if out_f.is_multiple_of(128) && in_f >= 1024 && narrow_grid < 128 {
+        (256 / narrow_grid).next_power_of_two().clamp(1, 8)
+    } else {
+        1
+    };
+    if splits > 1 && crate::gemm::native_gemm_warp_sk_build_spv(dt).is_some() {
+        let mpad = m.div_ceil(64) * 64;
+        let pk = pooled(pool, be_, "splitk_part", splits * mpad * out_f * 4)?;
+        let a: &dyn Buffer = match &a16 {
+            Some(k16) => pool[k16].as_ref(),
+            None => xb,
+        };
+        rec.matmul_native_splitk(
+            dt,
+            a,
+            w,
+            w_off,
+            pool[&pk].as_ref(),
+            out,
+            m,
+            in_f,
+            out_f,
+            splits,
+            a16.is_some(),
+            arena,
+        );
+    } else if let Some(k16) = &a16 {
+        rec.matmul_native_f16a(dt, pool[k16].as_ref(), w, w_off, out, m, in_f, out_f, arena);
+    } else {
+        rec.matmul_native_off(dt, xb, w, w_off, out, m, in_f, out_f, arena);
+    }
+    if let Some(t) = tmp {
+        rec.copy(t.as_ref(), 0, y, 0, m * out_f * eb);
+        transient.push(t);
+    }
     Ok(())
 }
 

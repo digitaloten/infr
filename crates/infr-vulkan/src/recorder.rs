@@ -1013,7 +1013,7 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
-        self.matmul_native_off(dtype, a, w, 0, c, m, k, n);
+        self.matmul_native_off(dtype, a, w, 0, c, m, k, n, None);
     }
 
     /// Native-block tiled coopmat GEMM reading the weight from element offset `w_base` — lets one
@@ -1030,6 +1030,11 @@ impl<'a> Recorder<'a> {
         m: usize,
         k: usize,
         n: usize,
+        // `Some(arena_addr)` = the weight is a streamed dense block: read the -DSTREAMED twin of the
+        // picked tile by 64-bit arena address (native_arena_ref.glsl) instead of the bound SSBO. The
+        // resident tile selection is unchanged — only the weight SOURCE differs. See adapter.rs
+        // `streamed_prefill_gemm`. `None` everywhere else (resident weights, MoE, tests).
+        arena: Option<u64>,
     ) {
         // Large-warptile variant (8-warp BM=64×BN=256): 4× the math per staged A-row / decoded
         // W-column vs the 64×64 tile, and the extra warps hide the dequant latency. Needs k%32;
@@ -1083,22 +1088,39 @@ impl<'a> Recorder<'a> {
             ),
         };
         self.label_gemm(name, m, k, n);
-        let kern = self.be.kernel_sg(name, spv, 3, 16, 32);
+        // Streamed dense weight: swap to the -DSTREAMED twin of the SAME tile, append the arena
+        // base to the push, and bind `a` as the binding-1 filler (the twin reads the weight by
+        // 64-bit address, never that SSBO — the arena is NEVER bound as a descriptor).
+        let (kname, kspv): (&'static str, &[u32]) = match arena {
+            Some(_) => crate::gemm::native_gemm_streamed_spv(name),
+            None => (name, spv),
+        };
+        let push_size: u32 = if arena.is_some() { 24 } else { 16 };
+        let kern = self.be.kernel_sg(kname, kspv, 3, push_size, 32);
         let groups_n = match warp {
             Some((_, bn)) => n / bn,
             None => n / 64,
         };
-        let mut push = [0u8; 16];
+        let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        if let Some(addr) = arena {
+            push[16..20].copy_from_slice(&(addr as u32).to_ne_bytes());
+            push[20..24].copy_from_slice(&((addr >> 32) as u32).to_ne_bytes());
+        }
         let groups = (m.div_ceil(64) * groups_n) as u32;
+        let wbind = if arena.is_some() {
+            Self::vkb(a)
+        } else {
+            Self::vkb(w)
+        };
         self.dispatch(
             kern,
-            &[Self::vkb(a), Self::vkb(w), Self::vkb(c)],
+            &[Self::vkb(a), wbind, Self::vkb(c)],
             1,
-            &push,
+            &push[..push_size as usize],
             groups,
         );
     }
@@ -1160,6 +1182,8 @@ impl<'a> Recorder<'a> {
         m: usize,
         k: usize,
         n: usize,
+        // `Some(arena_addr)` = streamed dense block — see `matmul_native_off`'s `arena` doc.
+        arena: Option<u64>,
     ) {
         // The BN=128 (n128) ag tile beats the BN=256 (wide) ag tile on EVERY shape this decision
         // can reach, measured on RDNA3 (7900 XTX): the wide tile's WN=64 → 2×4 = 8 accumulator
@@ -1216,18 +1240,34 @@ impl<'a> Recorder<'a> {
             (name, spv, 128, 64)
         };
         self.label_gemm(name, m, k, n);
-        let kern = self.be.kernel_sg(name, spv, 3, 16, 32);
-        let mut push = [0u8; 16];
+        // Streamed dense weight: -DSTREAMED twin of the picked A_GLOBAL tile, arena base appended to
+        // the push, `a16` doubles as the binding-1 filler (weight read by 64-bit address).
+        let (kname, kspv): (&'static str, &[u32]) = match arena {
+            Some(_) => crate::gemm::native_gemm_streamed_spv(name),
+            None => (name, spv),
+        };
+        let push_size: u32 = if arena.is_some() { 24 } else { 16 };
+        let kern = self.be.kernel_sg(kname, kspv, 3, push_size, 32);
+        let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        if let Some(addr) = arena {
+            push[16..20].copy_from_slice(&(addr as u32).to_ne_bytes());
+            push[20..24].copy_from_slice(&((addr >> 32) as u32).to_ne_bytes());
+        }
         let groups = (m.div_ceil(bm) * (n / bn)) as u32;
+        let wbind = if arena.is_some() {
+            Self::vkb(a16)
+        } else {
+            Self::vkb(w)
+        };
         self.dispatch(
             kern,
-            &[Self::vkb(a16), Self::vkb(w), Self::vkb(c)],
+            &[Self::vkb(a16), wbind, Self::vkb(c)],
             1,
-            &push,
+            &push[..push_size as usize],
             groups,
         );
     }
@@ -1252,6 +1292,9 @@ impl<'a> Recorder<'a> {
         n: usize,
         splits: usize,
         a_is_f16: bool,
+        // `Some(arena_addr)` = streamed dense block — see `matmul_native_off`'s `arena` doc. Only
+        // the k-partial GEMM reads the weight; the reduce pass (partials→c) is unchanged.
+        arena: Option<u64>,
     ) {
         // NB: `dense_small_m_row_tile_bench` also probed a BM=32 tile here (mirroring
         // `matmul_native_f16a`'s small-m gate) and found a NET LOSS across the whole m≈4-64
@@ -1279,21 +1322,37 @@ impl<'a> Recorder<'a> {
             (name, spv)
         };
         self.label_gemm(name, m, k, n);
+        // Streamed dense weight: -DSTREAMED twin of the picked split-K tile, arena base appended
+        // AFTER the splits/mpad fields, `a` doubles as the binding-1 filler.
+        let (kname, kspv): (&'static str, &[u32]) = match arena {
+            Some(_) => crate::gemm::native_gemm_streamed_spv(name),
+            None => (name, spv),
+        };
+        let push_size: u32 = if arena.is_some() { 32 } else { 24 };
         let mpad = m.div_ceil(64) * 64;
-        let kern = self.be.kernel_sg(name, spv, 3, 24, 32);
-        let mut push = [0u8; 24];
+        let kern = self.be.kernel_sg(kname, kspv, 3, push_size, 32);
+        let mut push = [0u8; 32];
         push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(splits as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&(mpad as u32).to_ne_bytes());
+        if let Some(addr) = arena {
+            push[24..28].copy_from_slice(&(addr as u32).to_ne_bytes());
+            push[28..32].copy_from_slice(&((addr >> 32) as u32).to_ne_bytes());
+        }
         let groups = ((mpad / 64) * (n / 128) * splits) as u32;
+        let wbind = if arena.is_some() {
+            Self::vkb(a)
+        } else {
+            Self::vkb(w)
+        };
         self.dispatch(
             kern,
-            &[Self::vkb(a), Self::vkb(w), Self::vkb(partials)],
+            &[Self::vkb(a), wbind, Self::vkb(partials)],
             1,
-            &push,
+            &push[..push_size as usize],
             groups,
         );
         // reduce: out[i] = Σ_s partials[s·plane + i]
@@ -8296,6 +8355,7 @@ mod tests {
             n,
             splits,
             false,
+            None,
         );
         rec.finish().unwrap();
         let mut bytes = vec![0u8; mpad * n * 4];
@@ -8416,6 +8476,7 @@ mod tests {
                 m,
                 k,
                 n,
+                None,
             );
             rec.finish().unwrap();
         }
@@ -8441,6 +8502,7 @@ mod tests {
                 n,
                 splits,
                 a_is_f16,
+                None,
             );
             rec.finish().unwrap();
             check(bc.as_ref(), n, label);

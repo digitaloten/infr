@@ -16,18 +16,39 @@ const uint BN = 64u;
 const uint BK = 32u;
 
 // w_base: element offset into the weight grid (for stacked MoE experts: expert_id * out_f * in_f).
+// -DSTREAMED (dense layer streaming, see pager.rs `DensePagerSession`): the weight is read from the
+// arena pool by 64-bit device address instead of the bound binding-1 SSBO — `w_base` keeps its
+// element-offset meaning (a fused-QKV slice offset), while `arena_lo`/`arena_hi` carry the resident
+// slot's arena base BYTE address (native_arena_ref.glsl). Mirrors native_gemv.comp's arm exactly:
+// weight reads funnel through native_decode's NW(i) chokepoint, so redefining NW to arena_word is
+// the only weight-source change. The default (non-STREAMED) build is byte-identical to before it
+// existed (the guard pattern the MoE -DPAGED / GEMV -DSTREAMED builds prove is additive).
+#ifdef STREAMED
+layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; uint arena_lo; uint arena_hi; } pc;
+#else
 layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; } pc;
+#endif
 layout(binding = 0) readonly buffer ABuf { float a[]; };   // [M, K] f32 activations
+#ifndef STREAMED
 layout(binding = 1) readonly buffer WBuf { uint nw[]; };   // weights: raw GGUF blocks (native)
+#endif
 layout(binding = 2) writeonly buffer CBuf { float c[]; };
 
 shared float16_t As[BM * BK];
 shared float16_t Bs[BK * BN];
 
+#ifdef STREAMED
+#include "native_arena_ref.glsl"
+#define NW(i) arena_word(i)
+#endif
+
 #include "native_decode.glsl"
 
 void main() {
     GRID_INIT; // barrier inside — must run in uniform control flow before any dqblk()
+#ifdef STREAMED
+    nw_ptr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
+#endif
     uint tilesN = pc.n / BN;
     uint wgRow = (gl_WorkGroupID.x / tilesN) * BM;
     uint wgCol = (gl_WorkGroupID.x % tilesN) * BN;

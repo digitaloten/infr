@@ -2035,6 +2035,63 @@ fn gpu_seam_dense_stream_matches_resident_qwen3_14b() {
     );
 }
 
+/// Streamed dense PREFILL parity — the perf-critical path this change adds. A LONG prompt forces a
+/// prefill chunk of m ≫ 16 tokens, which `streamed_gemm_applies` routes through the arena-addressed
+/// coopmat-warp GEMM twins (`native_gemm_warp_*_streamed`: the n128_ag / sk_ag tiles) instead of the
+/// per-row GEMV. Those are the SAME kernels the resident prefill picks, with the weight bytes merely
+/// relocated to an arena slot, so the streamed run must be token-identical to the all-resident run.
+/// (The tests above cover decode's small-m GEMV; a short prompt would never leave it — hence the
+/// length assertion.) Two streamed reps guard the barrier-drop class: the ring→arena copy vs the
+/// 64-bit pointer read is ordered by an explicit barrier the buffer hazard tracker can't see, so a
+/// dropped barrier surfaces as run-to-run nondeterminism.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_dense_stream_prefill_matches_resident() {
+    let path = need_model!(qwen3_17b(), "Qwen3-1.7B");
+    let _tlk = test_serial_lock();
+    std::env::set_var("INFR_TEMP", "0");
+    let n = 8usize;
+
+    let model = infr_llama::SeamModel::load(&path, None).expect("load");
+    // A long user turn → a prefill chunk of well over 16 tokens (the streamed-GEMM gate), so the
+    // arena-addressed warptiles actually engage (a short prompt would stay on the streamed GEMV).
+    let long = "Explain, step by step and in thorough detail, how a transformer language model \
+        processes a sequence of tokens through its embedding, attention, and feed-forward layers. "
+        .repeat(6);
+    let rendered = model.render_chat(&long).expect("render chat");
+    let prompt_ids = model.encode(&rendered).expect("encode");
+    assert!(
+        prompt_ids.len() > 64,
+        "prompt must be a real prefill chunk (m ≫ 16); got {}",
+        prompt_ids.len()
+    );
+
+    std::env::remove_var("INFR_CACHE");
+    let mut resident_ids = Vec::new();
+    model
+        .generate_vulkan_ids(&prompt_ids, n, |id| resident_ids.push(id))
+        .expect("resident gpu gen");
+
+    // Below the model's ~1.4 GB of streamable projections → real eviction every pass.
+    std::env::set_var("INFR_CACHE", "200m");
+    let mut streamed_a = Vec::new();
+    let ra = model.generate_vulkan_ids(&prompt_ids, n, |id| streamed_a.push(id));
+    let mut streamed_b = Vec::new();
+    let rb = model.generate_vulkan_ids(&prompt_ids, n, |id| streamed_b.push(id));
+    std::env::remove_var("INFR_CACHE");
+    ra.expect("streamed gpu gen (rep a)");
+    rb.expect("streamed gpu gen (rep b)");
+
+    assert_eq!(
+        streamed_a, resident_ids,
+        "streamed dense prefill diverged from the all-resident GPU run"
+    );
+    assert_eq!(
+        streamed_a, streamed_b,
+        "streamed dense prefill nondeterministic across reps (barrier-drop class)"
+    );
+}
+
 /// CPU-only: Gemma 4 E2B golden-hash lock.
 #[test]
 fn cpu_golden_gemma4_e2b() {

@@ -116,13 +116,29 @@ const uint SAK = BK + 8u;
 const uint SBK = BK + 8u;     // Bs is [BN][BK]
 
 // w_base: element offset into the weight grid (for stacked MoE experts: expert_id * out_f * in_f).
+// -DSTREAMED (dense layer streaming, see pager.rs `DensePagerSession` and native_gemm.comp's arm):
+// the weight is read from the arena pool by 64-bit device address (native_arena_ref.glsl) instead
+// of the bound binding-1 SSBO — `arena_lo`/`arena_hi` (appended LAST so the split-K fields keep
+// their offsets) carry the resident slot's base BYTE address; the NW(i) chokepoint in
+// native_decode's dqblk is redefined to read the arena, the only weight-source change. Composes
+// with every tile/format define (NARROW_N/A_GLOBAL/SPLIT_K/BM*/…): STREAMED touches only the
+// weight binding, push tail, and NW macro, all orthogonal to the tiling. The default (non-STREAMED)
+// build is byte-identical — additive, exactly like the -DBF16CM and -DSPLIT_K arms.
 #ifdef SPLIT_K
 // Split-K (narrow-n occupancy fix, rides NARROW_N): the grid gains a k-split dimension — split s
 // computes a partial over its k-range and stores it at plane s of the [splits, mpad, n] partials
 // buffer; a tiny reduce pass sums the planes. mpad = tilesM·BM (the store plane's row pitch).
+#ifdef STREAMED
+layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; uint splits; uint mpad; uint arena_lo; uint arena_hi; } pc;
+#else
 layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; uint splits; uint mpad; } pc;
+#endif
+#else
+#ifdef STREAMED
+layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; uint arena_lo; uint arena_hi; } pc;
 #else
 layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; } pc;
+#endif
 #endif
 #ifdef A_GLOBAL
 // A pre-converted to f16 by the caller (one store_f16 pass, padded to the row tile): A fragments
@@ -132,7 +148,9 @@ layout(binding = 0) readonly buffer ABuf { CMTYPE a[]; }; // [Mpad, K] f16 (or b
 #else
 layout(binding = 0) readonly buffer ABuf { float a[]; };   // [M, K] f32 activations
 #endif
+#ifndef STREAMED
 layout(binding = 1) readonly buffer WBuf { uint nw[]; };   // weights: raw GGUF blocks (native)
+#endif
 layout(binding = 2) writeonly buffer CBuf { float c[]; };
 
 #ifndef A_GLOBAL
@@ -140,9 +158,17 @@ shared CMTYPE As[BM * SAK];
 #endif
 shared CMTYPE Bs[BN * SBK];
 
+#ifdef STREAMED
+#include "native_arena_ref.glsl"
+#define NW(i) arena_word(i)
+#endif
+
 #include "native_decode.glsl"
 
 void main() {
+#ifdef STREAMED
+    nw_ptr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
+#endif
     uint tilesN = pc.n / BN;
 #ifdef SPLIT_K
     uint tilesMN = (pc.mpad / BM) * tilesN;
