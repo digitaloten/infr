@@ -4488,7 +4488,11 @@ fn sync_stream<'a>(
 /// to the dp4a `mmq` GEMM instead of the coopmat-warp arm — Q4_K with out_f%128!=0 (no warp tile) —
 /// is NOT arena-converted (its shader reads the weight outside native_decode's NW chokepoint), so it
 /// too keeps the GEMV; every other native quant reaches the coopmat-warp arm `streamed_prefill_gemm`
-/// mirrors.
+/// mirrors. Also mirrors the resident `warp_ok` gate's `INFR_NO_GEMM_WARP` escape hatch: with it
+/// set, the resident path drops out of the coopmat-warp arm entirely (falling to mmq/off-tier), so
+/// the streamed route must fall back to the GEMV too — otherwise a Q4_K out_f%128==0 shape would
+/// diverge (resident: mmq: streamed: still the coopmat GEMM twin), which can panic the twin-SPV
+/// lookup under that debug knob.
 fn streamed_gemm_applies(
     be_: &VulkanBackend,
     dt: infr_core::DType,
@@ -4501,6 +4505,7 @@ fn streamed_gemm_applies(
         && in_f.is_multiple_of(32)
         && be_.caps().f16_coopmat()
         && native_dense_supported(dt)
+        && std::env::var("INFR_NO_GEMM_WARP").is_err()
         && !(matches!(dt, infr_core::DType::Q4K)
             && !out_f.is_multiple_of(128)
             && be_.caps().i8_dot
@@ -4716,9 +4721,18 @@ fn stage_and_window<'a>(
 /// Every path reads layer-LOCAL expert ids against a frozen per-(layer, role) LUT window in the
 /// session's tape (`lut[window + local_id]` — see `MoePagerSession::lut_window`), never the live
 /// pool LUT, which later layers' staging keeps mutating while earlier recorded work is still in
-/// flight. Evicting a block an in-flight segment reads is safe by construction: the evictor's
-/// arena copy is recorded LATER on the same queue and the hazard barriers (or a rotation's
-/// `seed_barrier`) order it after every prior read.
+/// flight. The arena itself is BDA-addressed (`48ad9c1`): the paged dispatches deref it by 64-bit
+/// pointer (`native_arena_ref.glsl`) and deliberately never bind it as a descriptor (binding 0
+/// takes a small `lut` filler instead), so the generic buffer hazard tracker (`Recorder::sync`)
+/// never sees the read and cannot order it against the ring→arena staging copies on its own.
+/// Ordering is instead explicit, mirroring the dense streamer's `arena_stream_barrier` (`36bcbf5`):
+/// one WAR `arena_stream_barrier()` before this op's staging begins (orders every prior arena read
+/// — this layer's or an earlier one's — before any copy that may overwrite a slot still being
+/// read) and one RAW `arena_stream_barrier()` after all of this op's staging completes and before
+/// the first dispatch that reads the arena (`matmul_mmq_experts_paged` batched /
+/// `linear_native_id_multi_paged` small-m). A rotation's `seed_barrier` additionally covers the
+/// cross-segment case (a miss that spills into a fresh ring half); the two `arena_stream_barrier`
+/// calls here cover the within-segment case a rotation never reaches.
 ///
 /// Only reached from `execute_static`'s loop, and only for a `MoeFfn` whose `gate_exps` buffer is
 /// registered in the backend's `MoePagerSession` (see `pager.rs`'s module doc for why that check —
@@ -4874,6 +4888,15 @@ fn execute_paged_moe<'a>(
             stage_ids = bytemuck::cast_slice(&id_bytes).to_vec();
         }
     }
+    // WAR: order every arena read recorded so far (this layer's prior roles, or an earlier
+    // layer's dispatch still in the ambient segment — a raw pointer deref, invisible to the buffer
+    // hazard tracker) before this op's staging copies below, which may overwrite a slot that read
+    // still targets. One call covers all three roles' copy loops (`stage_and_window` batches many
+    // misses per role); harmless when `stage_ids` is empty (the inline all-resident path records
+    // no copies at all).
+    rec.as_ref()
+        .expect("segment always Some between ops")
+        .arena_stream_barrier();
     let gate_w = stage_and_window(be_, rec, ps, gate_id, &stage_ids, n_expert, touch_all)?;
     let up_w = if *fused_gate_up {
         gate_w // never dispatched (no Up GEMV on the fused shape) — placeholder
@@ -4881,6 +4904,13 @@ fn execute_paged_moe<'a>(
         stage_and_window(be_, rec, ps, up_id, &stage_ids, n_expert, touch_all)?
     };
     let down_w = stage_and_window(be_, rec, ps, down_id, &stage_ids, n_expert, touch_all)?;
+    // RAW: order every ring→arena copy this op just staged (gate/up/down, TRANSFER writes
+    // invisible to the buffer hazard tracker) before the first dispatch below that reads the
+    // arena by pointer — covers both the batched `matmul_mmq_experts_paged` arm and the small-m
+    // `linear_native_id_multi_paged` arm, whichever this op takes.
+    rec.as_ref()
+        .expect("segment always Some between ops")
+        .arena_stream_barrier();
 
     // ── BATCHED arm (rows > threshold, Scout's chunked prefill): the same GPU-resident
     // bucket count/scan/scatter → dp4a mmq expert-GEMM pipeline as the resident batched arm

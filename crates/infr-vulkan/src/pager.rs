@@ -86,14 +86,15 @@ impl GpuPager {
     /// MoE experts of one model are uniform per role, so this is exact, not a worst-case pad).
     /// Must be u32-aligned (`% 4 == 0`) — the LUT addresses slots in u32 words.
     ///
-    /// `arena_bda`: allocate the arena as a `bufferDeviceAddress` buffer (MoE pools — the paged
-    /// kernels read it through a 64-bit pointer, so it may be as large as VRAM allows, no cap). The
-    /// dense-streaming pool passes `false`: its arena is bound as a plain SSBO and its kernels bake
-    /// a u32 element offset, so it is still capped at [`GpuPager::max_arena_bytes`] (one SSBO
-    /// binding's `maxStorageBufferRange`, ~4 GiB on RADV) — exceeding it silently out-of-ranges the
-    /// reads into coherent-but-wrong output, so `new` hard-errors above the cap on that path.
-    /// Callers sizing `n_slots` from a VRAM budget on the SSBO path should clamp below the cap
-    /// first (see the dense placement policy) — this check is the backstop, not the policy.
+    /// `arena_bda`: allocate the arena as a `bufferDeviceAddress` buffer, read through a 64-bit
+    /// pointer, so it may be as large as VRAM allows, no cap. Both the MoE pools and the
+    /// dense-streaming pool pass `true` (the dense pool switched over in `36bcbf5`). A caller may
+    /// still pass `false` for a plain-SSBO arena with a baked u32 element offset — capped at
+    /// [`GpuPager::max_arena_bytes`] (one SSBO binding's `maxStorageBufferRange`, ~4 GiB on RADV);
+    /// exceeding it silently out-of-ranges the reads into coherent-but-wrong output, so `new`
+    /// hard-errors above the cap on that path — but no production pool takes it today (see the
+    /// `arena` field doc above). Callers sizing `n_slots` from a VRAM budget on the SSBO path
+    /// should clamp below the cap first — this check is the backstop, not the policy.
     pub fn new(
         vk: &VulkanBackend,
         n_blocks: usize,
@@ -143,9 +144,10 @@ impl GpuPager {
     }
 
     /// Largest SSBO arena (bytes) one [`GpuPager`] can bind on this device: the storage-buffer
-    /// binding range (`maxStorageBufferRange`, 4 GiB on RADV). Only the dense-streaming pool is
-    /// bound by this (its kernels read the arena as a plain SSBO); a MoE pool is pointer-addressed
-    /// (`arena_bda = true`) and has no such cap.
+    /// binding range (`maxStorageBufferRange`, 4 GiB on RADV). Both the MoE pools and the
+    /// dense-streaming pool are pointer-addressed (`arena_bda = true`) today and have no such
+    /// cap; this only bounds the `arena_bda = false` plain-SSBO path (see `GpuPager::new`'s doc),
+    /// which no production pool takes.
     pub fn max_arena_bytes(vk: &VulkanBackend) -> u64 {
         vk.caps().max_buffer_bytes
     }
@@ -550,15 +552,16 @@ pub struct MoePagerSession {
     print_stats: bool,
 }
 
-/// One pool's spec in [`MoePagerLayout`]: slot counts are INDEPENDENT per pool, because each
-/// pool's arena is its own SSBO with its own [`GpuPager::max_arena_bytes`] ceiling: with 4 GiB
-/// bindings (RADV) and unequal per-expert sizes (Scout: gate/up 13.8 MB, down 18 MB), a shared
-/// count is dragged down to the LARGEST pool's cap and strands budget the smaller pools could
-/// have used as real hit rate (Scout: uniform 238 slots everywhere left ~6 GB of a 19 GB budget
-/// unused; per-pool caps give gate/up 312 each). Each pool has its own LRU/LUT and `touch_role`
-/// resolves pools independently, so unequal counts are correctness-neutral — a pool with fewer
-/// slots just misses more often. Computed by the caller (budget-driven count, then per-pool cap —
-/// see `seam::mod`'s placement policy).
+/// One pool's spec in [`MoePagerLayout`]: slot counts are INDEPENDENT per pool. Each pool's arena
+/// is a `bufferDeviceAddress` buffer (`arena_bda = true`, `48ad9c1`) addressed by 64-bit pointer —
+/// no per-arena [`GpuPager::max_arena_bytes`]/`maxStorageBufferRange` ceiling — but per-pool sizing
+/// still matters because of unequal per-expert sizes (Scout: gate/up 13.8 MB, down 18 MB): a
+/// shared slot count is dragged down to fit the LARGEST pool's per-slot bytes within the VRAM
+/// budget and strands budget the smaller pools could have used as real hit rate (Scout: uniform
+/// 238 slots everywhere left ~6 GB of a 19 GB budget unused; per-pool sizing gives gate/up 312
+/// each). Each pool has its own LRU/LUT and `touch_role` resolves pools independently, so unequal
+/// counts are correctness-neutral — a pool with fewer slots just misses more often. Computed by
+/// the caller (budget-driven count, then per-pool split — see `seam::mod`'s placement policy).
 pub struct MoePoolSpec {
     pub role: Role,
     pub slot_bytes: usize,
@@ -958,8 +961,10 @@ pub type MoePagerCell = Mutex<Option<MoePagerSession>>;
 // and needs NO readbacks, NO LUT hop and NO paged kernel twins at all. One block = one per-layer
 // weight tensor GROUP exactly as the seam uploads it (a fused qkv or gate_up concat is one
 // block; split tensors are one block each) — every dense kernel already reads its weight from a
-// `w_off` ELEMENT offset (the stacked-MoE-tensor convention), so a streamed dispatch binds the
-// pool's arena as the weight buffer and adds `slot * elems_per_slot` to the op's own `w_off`.
+// `w_off` ELEMENT offset (the stacked-MoE-tensor convention), so a streamed dispatch computes the
+// resident slot's base BYTE address (`arena_addr + slot * slot_bytes`, 64-bit — see
+// `GpuPager::arena_addr`/`DensePagerSession::stage`) and rides the op's own `w_off` on top as a
+// within-slot element offset, exactly like the resident path's binding + offset.
 // Pools are keyed per (dtype, padded byte stride) tensor class — same reasoning as the MoE
 // per-(role, slot_bytes) pools (fixed slot offsets require uniform strides; mixed-precision GGUFs
 // bump a subset of layers' tensors to a wider format).
