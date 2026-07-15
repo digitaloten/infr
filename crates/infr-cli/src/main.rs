@@ -55,19 +55,112 @@ impl CompletionShell {
     }
 }
 
-/// Publish `--dev` to the backend as `INFR_DEV`, the process-global GPU pick that
-/// `VulkanBackend::new()` reads (the backend is constructed deep inside the session seam, far from
-/// argv — the same channel `--dev Metal`/`INFR_METAL` already uses).
+/// The backend `--dev` resolved to. Returned by [`DeviceOpts::resolve`] so a caller that forwards
+/// to `llama-bench` still has the concrete pick; `run`/`serve` ignore it (the env vars `resolve`
+/// sets are the whole channel their deep backend construction reads).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Backend {
+    /// A Vulkan GPU. `Some("Vulkan1")` pins a device (published as `INFR_DEV`); `None` = the
+    /// default "first discrete GPU, else device 0".
+    Vulkan(Option<String>),
+    /// The Apple GPU (`INFR_METAL`).
+    Metal,
+    /// The CPU reference backend (`INFR_CPU`).
+    Cpu,
+}
+
+/// The shared device/config flags for `run`/`serve`/`bench`. Every field funnels through a
+/// process-global env var that the backends read deep inside the session seam (far from argv), so
+/// this struct is a FRONT-END: [`resolve`](DeviceOpts::resolve) publishes the envs, replacing the
+/// per-command setters that used to do it piecemeal.
 ///
-/// Only `VulkanN` specs are forwarded: `--dev Metal` selects the Metal session via its own branch
-/// in `cmd_bench`/`cmd_run` and must not be handed to the Vulkan device picker. `None` (flag not
-/// passed) leaves `INFR_DEV` unset, preserving the default "first discrete GPU, else device 0" —
-/// so this flag can only ever *narrow* behavior, never silently change an existing invocation.
-fn apply_dev(dev: Option<&str>) {
-    if let Some(d) = dev {
-        if d.to_ascii_lowercase().starts_with("vulkan") {
-            std::env::set_var("INFR_DEV", d);
+/// The unified `--dev` matches llama.cpp: a Vulkan GPU (`Vulkan0`/`Vulkan1`/…), `metal`, or `cpu`,
+/// case-insensitive. This is the fix for `--dev metal`/`--dev cpu` being silent no-ops on
+/// `run`/`serve` (they only honoured `INFR_METAL`/`INFR_CPU` before).
+#[derive(clap::Args)]
+struct DeviceOpts {
+    /// Device for the forward: a Vulkan GPU (`Vulkan0`/`Vulkan1`/…), `metal` (Apple GPU), or `cpu`
+    /// (reference backend). Case-insensitive; matches llama.cpp's --dev. Unset = the first discrete
+    /// Vulkan GPU, else device 0.
+    #[arg(long)]
+    dev: Option<String>,
+    /// Context window in tokens (`8192`, `256k`, or `50%` of the free-VRAM KV capacity). Sets
+    /// INFR_CTX. Default: the model's trained context, clamped to VRAM.
+    #[arg(long, value_name = "TOKENS")]
+    ctx: Option<String>,
+    /// Physical batch = tokens per forward = the prefill chunk (matches llama-bench -ub). Sets
+    /// INFR_UBATCH. Unset = the engine's adaptive chunk policy.
+    #[arg(long, visible_alias = "ub", short = 'u', value_name = "N")]
+    ubatch: Option<usize>,
+    /// CPU threads (matches llama-bench -t). Sets RAYON_NUM_THREADS. Unset = all cores.
+    #[arg(long, short = 't', value_name = "N")]
+    threads: Option<usize>,
+}
+
+/// The concrete values [`DeviceOpts::resolve`] published, for a caller that needs them after the
+/// envs are set (e.g. forwarding to `llama-bench`). `run`/`serve`/`bench` read the envs directly and
+/// can ignore this.
+struct ResolvedDevice {
+    backend: Backend,
+    ctx: Option<String>,
+    ubatch: Option<usize>,
+    threads: Option<usize>,
+}
+
+impl DeviceOpts {
+    /// Publish the flags to the process-global env vars the backends read, and report the resolved
+    /// [`Backend`]. Called once, up front, before the model loads (so `RAYON_NUM_THREADS` lands
+    /// before any parallel work spins the rayon pool up, and `INFR_DEV`/`INFR_METAL`/`INFR_CPU`
+    /// before the session seam constructs a backend).
+    ///
+    /// `--dev` is parsed case-insensitively: `vulkan*` → `INFR_DEV`; `metal` → `INFR_METAL`; `cpu`
+    /// → `INFR_CPU`; anything else bails with the accepted forms. Unset leaves all three unset,
+    /// preserving the default "first discrete GPU, else device 0" — so `--dev` can only ever narrow
+    /// behavior.
+    fn resolve(&self) -> anyhow::Result<ResolvedDevice> {
+        let backend = match self.dev.as_deref() {
+            None => Backend::Vulkan(None),
+            Some(d) => {
+                let lower = d.to_ascii_lowercase();
+                if lower.starts_with("vulkan") {
+                    std::env::set_var("INFR_DEV", d);
+                    Backend::Vulkan(Some(d.to_string()))
+                } else if lower == "metal" {
+                    std::env::set_var("INFR_METAL", "1");
+                    Backend::Metal
+                } else if lower == "cpu" {
+                    std::env::set_var("INFR_CPU", "1");
+                    Backend::Cpu
+                } else {
+                    anyhow::bail!(
+                        "invalid --dev `{d}` (expected a Vulkan GPU like `Vulkan0`/`Vulkan1`, \
+                         `metal`, or `cpu`)"
+                    );
+                }
+            }
+        };
+        // `--ctx` shares the size grammar (`8192`, `256k`, `50%`) with INFR_CTX, which it sets; a
+        // typo fails fast here (the check `cmd_serve` used to own).
+        if let Some(c) = &self.ctx {
+            if infr_core::parse_size(c).is_none() {
+                anyhow::bail!("invalid --ctx `{c}` (expected e.g. 8192, 256k, or 50%)");
+            }
+            std::env::set_var("INFR_CTX", c);
         }
+        // INFR_UBATCH=0 is read as "adaptive" (`ubatch_rows` filters `v > 0`), matching the old
+        // `-u 0` default; likewise RAYON_NUM_THREADS=0 falls back to all cores in rayon.
+        if let Some(u) = self.ubatch {
+            std::env::set_var("INFR_UBATCH", u.to_string());
+        }
+        if let Some(t) = self.threads {
+            std::env::set_var("RAYON_NUM_THREADS", t.to_string());
+        }
+        Ok(ResolvedDevice {
+            backend,
+            ctx: self.ctx.clone(),
+            ubatch: self.ubatch,
+            threads: self.threads,
+        })
     }
 }
 
@@ -80,20 +173,14 @@ enum Cmd {
         model: String,
         /// Optional one-shot message (otherwise drop into a REPL).
         message: Option<String>,
-        /// GPU device for the Vulkan forward (matches llama.cpp's --dev, e.g. Vulkan0/Vulkan1).
-        /// Defaults to the first discrete GPU, else device 0.
-        #[arg(long)]
-        dev: Option<String>,
+        #[command(flatten)]
+        device: DeviceOpts,
     },
     /// Start the OpenAI-compatible HTTP API (auto-pulls if missing).
     Serve {
         model: String,
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: String,
-        /// GPU device for the Vulkan forward (matches llama.cpp's --dev, e.g. Vulkan0/Vulkan1).
-        /// Defaults to the first discrete GPU, else device 0.
-        #[arg(long)]
-        dev: Option<String>,
         /// Concurrent generation slots (llama-server's `-np`). N requests generate at once, each
         /// with its own KV cache, taking turns on the GPU at token granularity; the (N+1)'th queues.
         ///
@@ -112,11 +199,10 @@ enum Cmd {
             value_name = "N"
         )]
         parallel: usize,
-        /// Per-slot context window in tokens (`8192`, `256k`, or `50%` of the free-VRAM KV
-        /// capacity). Default: the model's trained context, clamped to VRAM and divided by
-        /// `--parallel`. Overrides INFR_CTX.
-        #[arg(long, value_name = "TOKENS")]
-        ctx: Option<String>,
+        /// `--ctx` here is the PER-SLOT window (divided from the VRAM fit by `--parallel` when
+        /// unset); see the shared `DeviceOpts` flags below.
+        #[command(flatten)]
+        device: DeviceOpts,
     },
     /// Benchmark prefill/decode tok/s — same interface as llama.cpp's `llama-bench` (-p/-n/-d/-r),
     /// so the two are directly comparable. Prefill (pp) when -n 0; decode (tg) when -p 0.
@@ -140,10 +226,6 @@ enum Cmd {
         /// chunks by ubatch, so only -ub affects per-forward work.
         #[arg(short = 'b', long = "batch-size", default_value_t = 2048)]
         batch: usize,
-        /// Physical batch = tokens per forward = our prefill chunk (matches llama-bench -ub). 0 =
-        /// the engine's adaptive chunk policy; >0 pins the chunk so both tools sweep identically.
-        #[arg(short = 'u', long = "ubatch-size", default_value_t = 0)]
-        ubatch: usize,
         /// Repetitions (reported value is the average).
         #[arg(short = 'r', long, default_value_t = 3)]
         reps: usize,
@@ -151,16 +233,13 @@ enum Cmd {
         /// reference backend (no GPU), so `infr bench -ngl 0` is directly comparable to llama.cpp CPU.
         #[arg(long = "n-gpu-layers", visible_alias = "ngl", default_value_t = 999)]
         ngl: usize,
-        /// CPU threads for the `-ngl 0` path (matches llama-bench -t). 0 = all cores.
-        #[arg(short = 't', long, default_value_t = 0)]
-        threads: usize,
-        /// GPU device for the Vulkan forward (matches llama-bench --dev, e.g. Vulkan0/Vulkan1).
-        /// Unset = the first discrete GPU, else device 0.
-        #[arg(long)]
-        dev: Option<String>,
         /// Emit `[{"avg_ts": X}]` (same shape as `llama-bench -o json`) for scripted comparison.
         #[arg(long)]
         json: bool,
+        /// Shared device/config flags: `--dev` (Vulkan/metal/cpu), `-u`/`--ubatch`, `-t`/`--threads`
+        /// (`--ctx` is accepted too; it just sets INFR_CTX).
+        #[command(flatten)]
+        device: DeviceOpts,
     },
     /// Compare infr vs llama.cpp on coding-agent-shaped workloads (long context, replies at depth,
     /// whole turns). Shells out to `infr bench` and `llama-bench` with matching flags, same model+GPU.
@@ -328,20 +407,19 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
         Cmd::Run {
             model,
             message,
-            dev,
+            device,
         } => {
-            apply_dev(dev.as_deref());
+            device.resolve()?;
             cmd_run(&model, message.as_deref())
         }
         Cmd::Serve {
             model,
             addr,
             parallel,
-            ctx,
-            dev,
+            device,
         } => {
-            apply_dev(dev.as_deref());
-            cmd_serve(&model, &addr, parallel, ctx.as_deref())
+            device.resolve()?;
+            cmd_serve(&model, &addr, parallel)
         }
         Cmd::Bench {
             model,
@@ -350,27 +428,13 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
             depth,
             pg,
             batch,
-            ubatch,
             reps,
             ngl,
-            threads,
-            dev,
             json,
+            device,
         } => {
-            apply_dev(dev.as_deref());
-            cmd_bench(
-                &model,
-                n_prompt,
-                n_gen,
-                depth,
-                pg,
-                ubatch,
-                reps,
-                ngl,
-                threads,
-                dev.as_deref().unwrap_or_default(),
-                json,
-            )
+            device.resolve()?;
+            cmd_bench(&model, n_prompt, n_gen, depth, pg, reps, ngl, json)
         }
         Cmd::Compare {
             models,
@@ -1378,18 +1442,14 @@ fn cmd_bench(
     n_gen: usize,
     depth: usize,
     pg: Option<String>,
-    ubatch: usize,
     reps: usize,
     ngl: usize,
-    threads: usize,
-    dev: &str,
     json: bool,
 ) -> anyhow::Result<()> {
-    // -t: pin the CPU thread count (the backend's rayon pool reads RAYON_NUM_THREADS on first use).
-    // Must be set before any parallel work spins the pool up — do it here, before the model loads.
-    if threads > 0 {
-        std::env::set_var("RAYON_NUM_THREADS", threads.to_string());
-    }
+    // `--dev`/`-u`/`-t` were already published to the process-global envs (INFR_DEV / INFR_METAL /
+    // INFR_CPU, INFR_UBATCH, RAYON_NUM_THREADS) by `DeviceOpts::resolve` in `dispatch`, before the
+    // model loads — the backend picks and thread pool read them there. So `--dev metal`/`--dev cpu`
+    // now route here through those envs, same as a raw `INFR_METAL=1`/`INFR_CPU=1` invocation.
     // Benchmarks decode a FIXED token count (llama-bench semantics): never stop at EOS — a model
     // that emits EOS instantly on the dummy context would otherwise report fictional tok/s.
     std::env::set_var("INFR_IGNORE_EOS", "1");
@@ -1405,14 +1465,11 @@ fn cmd_bench(
     // `infr bench` measures infr's OWN decode shape (block prefill + canvas denoise, see
     // `cmd_bench_diffusion_gemma`'s doc) instead of routing through the AR pp/tg arms below.
     // Backend selection mirrors `cmd_run`/`cmd_serve`: -ngl 0 or INFR_CPU picks the CPU reference
-    // session; INFR_METAL (or --dev Metal) picks the Metal session (Phase D — macOS only, see
-    // `cmd_bench_diffusion_gemma`'s own cfg-gated dispatch).
+    // session; INFR_METAL (set by `--dev metal` or a raw env) picks the Metal session (Phase D —
+    // macOS only, see `cmd_bench_diffusion_gemma`'s own cfg-gated dispatch).
     if infr_llama::diffusion::is_diffusion_gemma(&gguf) {
-        let metal = std::env::var("INFR_METAL").is_ok() || dev.eq_ignore_ascii_case("metal");
+        let metal = std::env::var("INFR_METAL").is_ok();
         let cpu = ngl == 0 || std::env::var("INFR_CPU").is_ok();
-        if ubatch > 0 {
-            std::env::set_var("INFR_UBATCH", ubatch.to_string());
-        }
         return cmd_bench_diffusion_gemma(
             &gguf,
             tok.as_deref(),
@@ -1430,10 +1487,10 @@ fn cmd_bench(
     // `bench_vulkan` / `cmd_bench_metal`) — `SeamModel::load` drives it through the unified runner
     // (`Config::from_gguf` + `MixerW::DeltaNet`), reusing the exact same pp/tg/depth methodology
     // every other arch gets (no more qwen35-only bench arm or depth-accounting artifacts).
-    // -ngl 0: run on the CPU reference backend (no GPU), comparable to `llama-bench -ngl 0`.
-    // llama4 benches through the standard Vulkan arm below like every other model now (the paged
-    // expert cache) — only -ngl 0 forces it onto this CPU arm.
-    if ngl == 0 {
+    // -ngl 0 (or `--dev cpu` → INFR_CPU): run on the CPU reference backend (no GPU), comparable to
+    // `llama-bench -ngl 0`. llama4 benches through the standard Vulkan arm below like every other
+    // model now (the paged expert cache) — only these force it onto this CPU arm.
+    if ngl == 0 || std::env::var("INFR_CPU").is_ok() {
         return cmd_bench_cpu(
             &gguf,
             tok.as_deref(),
@@ -1445,10 +1502,10 @@ fn cmd_bench(
             json,
         );
     }
-    // INFR_METAL=1 (or --dev Metal): bench the dense forward on the Metal backend through the
-    // agnostic seam — same pp/tg/pg + depth methodology as the CPU arm, directly comparable to
-    // `llama-bench` on the Metal build.
-    if std::env::var("INFR_METAL").is_ok() || dev.eq_ignore_ascii_case("metal") {
+    // INFR_METAL=1 (set by `--dev metal` or a raw env): bench the dense forward on the Metal backend
+    // through the agnostic seam — same pp/tg/pg + depth methodology as the CPU arm, directly
+    // comparable to `llama-bench` on the Metal build.
+    if std::env::var("INFR_METAL").is_ok() {
         return cmd_bench_metal(
             &gguf,
             tok.as_deref(),
@@ -1460,14 +1517,9 @@ fn cmd_bench(
             json,
         );
     }
-    // `--dev VulkanN` was already published to the backend as INFR_DEV by `apply_dev` in main();
-    // `VulkanBackend::new()` reads it when picking the physical device. Nothing to do here — the
-    // remaining uses of `dev` above are the Metal-session branch.
-    let _ = dev;
-    // ubatch>0 pins the seam's prefill chunk (= llama-bench -ub); 0 = the default (1024).
-    if ubatch > 0 {
-        std::env::set_var("INFR_UBATCH", ubatch.to_string());
-    }
+    // `--dev VulkanN` was already published to the backend as INFR_DEV by `DeviceOpts::resolve`;
+    // `VulkanBackend::new()` reads it when picking the physical device, and the prefill chunk
+    // (`-u`/INFR_UBATCH) landed there too. Nothing to set here — straight to the Vulkan seam.
     let model = infr_llama::SeamModel::load(&gguf, tok.as_deref())?;
     let samples = model.bench_vulkan(n_prompt, n_gen, depth, pg, reps)?;
     let label = if let Some((p, g)) = pg {
@@ -2885,7 +2937,7 @@ fn set_default_sampling_env() {
     }
 }
 
-fn cmd_serve(model: &str, addr: &str, parallel: usize, ctx: Option<&str>) -> anyhow::Result<()> {
+fn cmd_serve(model: &str, addr: &str, parallel: usize) -> anyhow::Result<()> {
     let (gguf, tok) = resolve(model)?;
     let model_id = gguf
         .file_stem()
@@ -2895,15 +2947,9 @@ fn cmd_serve(model: &str, addr: &str, parallel: usize, ctx: Option<&str>) -> any
     let sockaddr: std::net::SocketAddr = addr.parse().context("invalid --addr")?;
     let parallel = parallel.max(1);
 
-    // `--ctx` is the per-slot context. It shares the size grammar (`8192`, `256k`, `50%`) with
-    // INFR_CTX, which it overrides — one grammar, one meaning (`infr_core::parse_size`).
-    if let Some(c) = ctx {
-        if infr_core::parse_size(c).is_none() {
-            anyhow::bail!("invalid --ctx `{c}` (expected e.g. 8192, 256k, or 50%)");
-        }
-        std::env::set_var("INFR_CTX", c);
-    }
-
+    // `--ctx` is the PER-SLOT context. `DeviceOpts::resolve` already validated it and published it
+    // as INFR_CTX (shared size grammar `8192`/`256k`/`50%`); the ParallelSeam below reads INFR_CTX
+    // and divides it across the slots. One grammar, one meaning (`infr_core::parse_size`).
     let is_dg = infr_llama::diffusion::is_diffusion_gemma(&gguf);
     let is_vulkan =
         !is_dg && std::env::var("INFR_METAL").is_err() && std::env::var("INFR_CPU").is_err();
