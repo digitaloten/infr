@@ -429,13 +429,38 @@ void dqblk(uint gstart, out float v[32]) {  // hf/og/d constant; hoist branch, o
     float dsc0 = d * float(sgn8(rb(scbase)));
     float dsc1 = d * float(sgn8(rb(scbase + 1u)));
     uint nsh = high ? 4u : 0u;
-    for (uint w8 = 0u; w8 < 8u; w8++) {
-        uint q = ru32u(qoff + w8 * 4u) >> nsh;
-        uint h = ru32u(qhoff + w8 * 4u) >> qshift;
-        float dsc = (w8 < 4u) ? dsc0 : dsc1;
-        for (uint b = 0u; b < 4u; b++) {
-            uint qq = ((q >> (8u * b)) & 0xFu) | (((h >> (8u * b)) & 3u) << 4u);
-            v[w8 * 4u + b] = dsc * (float(qq) - 32.0);
+    // Hoist the 210-byte block's funnel shift out of the per-word loop. qoff/qhoff have a FIXED
+    // alignment for the whole sub-block (bd%4 = 2*(block parity), and hf*64/hf*32/±32 are all
+    // 4-multiples), so ql/qh are BOTH word-aligned (even block) or BOTH +2 misaligned (odd block).
+    // Even block: read NW(base+w8) directly — base+offset addressing, strength-reducible, and no
+    // funnel at all. Odd block: slide one neighbor word (2 initial + 16 in-loop = 18 loads) instead
+    // of ru32u recomputing (off+w8*4)>>2 and doing two loads per element (32). Same funnel integers
+    // as the old ru32u form — bit-identical. Matters under -DSTREAMED: each NW() is a 64-bit BDA
+    // load, so the base+w8 word index and the halved odd-block load count both cut address ALU.
+    uint qwb = qoff >> 2u; uint qsh = (qoff & 3u) << 3u;
+    uint qhb = qhoff >> 2u; uint hsh = (qhoff & 3u) << 3u;
+    if (qsh == 0u) {   // even block: fully word-aligned (qsh==0 <=> hsh==0)
+        for (uint w8 = 0u; w8 < 8u; w8++) {
+            uint q = NW(qwb + w8) >> nsh;
+            uint h = NW(qhb + w8) >> qshift;
+            float dsc = (w8 < 4u) ? dsc0 : dsc1;
+            for (uint b = 0u; b < 4u; b++) {
+                uint qq = ((q >> (8u * b)) & 0xFu) | (((h >> (8u * b)) & 3u) << 4u);
+                v[w8 * 4u + b] = dsc * (float(qq) - 32.0);
+            }
+        }
+    } else {           // odd block: +2 misaligned, funnel a sliding neighbor pair
+        uint qprev = NW(qwb); uint hprev = NW(qhb);
+        for (uint w8 = 0u; w8 < 8u; w8++) {
+            uint qnext = NW(qwb + w8 + 1u); uint hnext = NW(qhb + w8 + 1u);
+            uint q = ((qprev >> qsh) | (qnext << (32u - qsh))) >> nsh;
+            uint h = ((hprev >> hsh) | (hnext << (32u - hsh))) >> qshift;
+            float dsc = (w8 < 4u) ? dsc0 : dsc1;
+            for (uint b = 0u; b < 4u; b++) {
+                uint qq = ((q >> (8u * b)) & 0xFu) | (((h >> (8u * b)) & 3u) << 4u);
+                v[w8 * 4u + b] = dsc * (float(qq) - 32.0);
+            }
+            qprev = qnext; hprev = hnext;
         }
     }
 }
