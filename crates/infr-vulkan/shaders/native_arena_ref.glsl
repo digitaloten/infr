@@ -30,10 +30,9 @@ uint64_t arena_base(uint lo, uint hi) { return (uint64_t(hi) << 32) | uint64_t(l
 // every load materialized its own 64-bit VGPR address via a v_add_co/v_add_co_ci pair (measured
 // ~1.5 carry-adds per load on the Q6K streamed warp GEMM — the 2.2x flag-on regression vs the
 // descriptor-bound twin, which gets base+offset addressing for free from the SGPR descriptor).
-// `nw_ptr` is wave-uniform by construction (push constants, or a LUT slot picked by workgroup id)
-// but it lives in a mutable global, which NIR's divergence analysis treats as divergent — that
-// alone blocks saddr selection. subgroupBroadcastFirst is the standard uniformity hint; ACO CSEs
-// the readfirstlane across all inlined calls.
+// `nw_ptr` is wave-uniform by construction (push constants, or a LUT slot picked by workgroup id);
+// no explicit uniformity hint is needed — this iadd shape alone gets saddr selected (a
+// subgroupBroadcastFirst hint on nw_ptr was tried and measured a wash, so it was dropped).
 uint arena_word(uint wi) {
     return ArenaWords(nw_ptr + uint64_t(wi << 2u)).v[0];
 }
