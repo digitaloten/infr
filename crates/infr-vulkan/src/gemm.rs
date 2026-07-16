@@ -202,6 +202,46 @@ pub(crate) fn native_streamed_build_spv(
     }
 }
 
+/// `-DSTREAMED` twin of [`native_mrow_build_spv`] (kernel-cache name + SPIR-V) — the multi-row
+/// GEMV's weight read from a `bufferDeviceAddress` arena instead of a bound SSBO. Slice A1 build-
+/// variant only: nothing dispatches this yet ([`crate::recorder::Recorder::linear_native_mrow_streamed`]
+/// exists purely so parity tests can exercise it — see `tests/gemv_streamed_parity.rs`). `None` for
+/// a dtype without an mrow build.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_mrow_streamed_build_spv(
+    dtype: infr_core::DType,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            let s = S
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice();
+            Some(($name, s))
+        }};
+    }
+    match dtype {
+        Q8_0 => v!("native_mrow_q8_0_streamed"),
+        Bf16 => v!("native_mrow_bf16_streamed"),
+        Q4_0 => v!("native_mrow_q4_0_streamed"),
+        Q4_1 => v!("native_mrow_q4_1_streamed"),
+        Q5_0 => v!("native_mrow_q5_0_streamed"),
+        Q5_1 => v!("native_mrow_q5_1_streamed"),
+        Q2K => v!("native_mrow_q2k_streamed"),
+        Q3K => v!("native_mrow_q3k_streamed"),
+        Q4K => v!("native_mrow_q4k_streamed"),
+        Q5K => v!("native_mrow_q5k_streamed"),
+        Q6K => v!("native_mrow_q6k_streamed"),
+        Iq4Nl => v!("native_mrow_iq4nl_streamed"),
+        Iq4Xs => v!("native_mrow_iq4xs_streamed"),
+        Q2_0 => v!("native_mrow_q2_0_streamed"),
+        _ => None,
+    }
+}
+
 /// SPIR-V + kernel-cache name for the multi-output-row decode GEMV (`RM` rows/workgroup, bit-
 /// identical per row to the RM=1 native GEMV). Only the K-quant formats that dominate decode
 /// (Q4_K/Q6_K) have RM builds; everything else stays on the RM=1 path. `rm` is 2 or 4.
@@ -232,6 +272,36 @@ pub(crate) fn native_rm_build_spv(
         (Q6K, true, 2) => v!("native_q6k_rm2_res"),
         (Q6K, false, 4) => v!("native_q6k_rm4"),
         (Q6K, true, 4) => v!("native_q6k_rm4_res"),
+        _ => None,
+    }
+}
+
+/// `-DSTREAMED` twin of [`native_rm_build_spv`] (kernel-cache name + SPIR-V). Slice A1 build-variant
+/// only: nothing dispatches this yet ([`crate::recorder::Recorder::linear_native_rm_streamed`]
+/// exists purely so parity tests can exercise it). `rm` is 2 or 4; non-residual only (same
+/// reasoning as [`native_streamed_build_spv`] — the streamed path never carries a fused residual).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_rm_streamed_build_spv(
+    dtype: infr_core::DType,
+    rm: u32,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            let s = S
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice();
+            Some(($name, s))
+        }};
+    }
+    match (dtype, rm) {
+        (Q4K, 2) => v!("native_q4k_rm2_streamed"),
+        (Q4K, 4) => v!("native_q4k_rm4_streamed"),
+        (Q6K, 2) => v!("native_q6k_rm2_streamed"),
+        (Q6K, 4) => v!("native_q6k_rm4_streamed"),
         _ => None,
     }
 }
@@ -267,6 +337,37 @@ pub(crate) fn native_rm_variant_spv(
         ("wg128", Q4K, true) => v!("native_q4k_rm2_wg128_res"),
         ("reg", Q4K, false) => v!("native_q4k_rm2_reg"),
         ("reg", Q4K, true) => v!("native_q4k_rm2_reg_res"),
+        _ => None,
+    }
+}
+
+/// `-DSTREAMED` twin of [`native_rm_variant_spv`] (kernel-cache name + SPIR-V). Slice A1 build-
+/// variant only: nothing dispatches this yet
+/// ([`crate::recorder::Recorder::linear_native_rm_v2_streamed`] exists purely so parity tests can
+/// exercise it). Non-residual only, same reasoning as the other streamed twins.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_rm_v2_streamed_build_spv(
+    variant: &str,
+    dtype: infr_core::DType,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            let s = S
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice();
+            Some(($name, s))
+        }};
+    }
+    match (variant, dtype) {
+        ("sg", Q4K) => v!("native_q4k_rm2_sg_streamed"),
+        ("sg", Q6K) => v!("native_q6k_rm2_sg_streamed"),
+        ("dbuf", Q4K) => v!("native_q4k_rm2_dbuf_streamed"),
+        ("wg128", Q4K) => v!("native_q4k_rm2_wg128_streamed"),
+        ("reg", Q4K) => v!("native_q4k_rm2_reg_streamed"),
         _ => None,
     }
 }
@@ -309,6 +410,39 @@ pub(crate) fn native_sg_build_spv(
         (Q6K, true, 4, true) => v!("native_q6k_sg4_res_sg16"),
         (Q6K, false, 8, true) => v!("native_q6k_sg8_sg16"),
         (Q6K, true, 8, true) => v!("native_q6k_sg8_res_sg16"),
+        _ => None,
+    }
+}
+
+/// `-DSTREAMED` twin of [`native_sg_build_spv`] (kernel-cache name + SPIR-V). Slice A1 build-variant
+/// only: nothing dispatches this yet ([`crate::recorder::Recorder::linear_native_sg_streamed`]
+/// exists purely so parity tests can exercise it). `nr` ∈ {2,4,8}; non-residual only, same reasoning
+/// as the other streamed twins.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_sg_streamed_build_spv(
+    dtype: infr_core::DType,
+    nr: u32,
+    sg16: bool,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            let s = S
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice();
+            Some(($name, s))
+        }};
+    }
+    match (dtype, nr, sg16) {
+        (Q6K, 2, false) => v!("native_q6k_sg2_streamed"),
+        (Q6K, 4, false) => v!("native_q6k_sg4_streamed"),
+        (Q6K, 8, false) => v!("native_q6k_sg8_streamed"),
+        (Q6K, 2, true) => v!("native_q6k_sg2_sg16_streamed"),
+        (Q6K, 4, true) => v!("native_q6k_sg4_sg16_streamed"),
+        (Q6K, 8, true) => v!("native_q6k_sg8_sg16_streamed"),
         _ => None,
     }
 }

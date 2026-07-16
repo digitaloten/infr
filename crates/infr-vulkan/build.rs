@@ -2641,13 +2641,24 @@ fn main() {
     //     (-DCM_M=8) coopmat variants (opt-in, RDNA4/Intel — the streamed dense path never
     //     dispatches them) and -DFMT_F16 (floats aren't streamed — they upload resident), so no dead
     //     twins are compiled.
+    //   * native_gemv_mrow / native_gemv_sg / native_gemv_rm / native_gemv_rm_v2 — the resident
+    //     decode-GEMV tuning family (spec-decode multi-row, subgroup-reduce projection band,
+    //     multi-output-row, and its experimental variants). Same additive guard as native_gemv; same
+    //     non-residual-only reasoning (the fused-add peephole is weight-source-agnostic, so no
+    //     streamed build ever sees USE_RES in production). `native_gemv_sg` also rides the SG16
+    //     twin expansion above (this closure runs AFTER it), so both the SG=32 and SG=16 builds get
+    //     their own `_streamed` twin by construction — no separate SG16 handling needed here.
     let wants_streamed_twin = |src_stem: &str, defines: &[String]| -> bool {
         let excluded = defines
             .iter()
             .any(|d| d == "-DBF16CM" || d == "-DCM_M=8" || d == "-DFMT_F16");
+        let no_res = !defines.iter().any(|d| d == "-DUSE_RES");
         match src_stem {
-            "native_gemv" => !defines.iter().any(|d| d == "-DUSE_RES"),
+            "native_gemv" => no_res,
             "native_gemm" | "native_gemm_warp" => !excluded,
+            "native_gemv_mrow" | "native_gemv_sg" | "native_gemv_rm" | "native_gemv_rm_v2" => {
+                no_res
+            }
             _ => false,
         }
     };

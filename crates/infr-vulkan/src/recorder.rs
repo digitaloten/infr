@@ -2010,6 +2010,111 @@ impl<'a> Recorder<'a> {
         self.linear_native_off(dtype, w, 0, x, y, rows, in_f, out_f);
     }
 
+    /// Resident direct dispatch of the reassociation-tolerant subgroup+NUM_ROWS decode GEMV
+    /// (`native_gemv_sg.comp`) for a caller that already knows `dtype`/`nr` have a build (bypasses
+    /// [`native_sg_choice`]'s shape heuristic — [`Self::linear_native_off`] uses that heuristic for
+    /// production routing; this is the explicit entry point, same dispatch shape). `m=1` decode
+    /// only. Added alongside [`Self::linear_native_sg_streamed`] so parity tests can pick the exact
+    /// resident kernel a `_streamed` twin should match, without depending on the heuristic.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_native_sg(
+        &self,
+        dtype: infr_core::DType,
+        w: &dyn Buffer,
+        w_base: usize,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        in_f: usize,
+        out_f: usize,
+        nr: u32,
+    ) {
+        self.label_gemv("gemv_sg", 1, in_f, out_f);
+        let (name, spv) =
+            crate::gemm::native_sg_build_spv(dtype, false, nr, self.sg16()).expect("native sg spv");
+        let k = self.be.kernel_sg(name, spv, 3, 16, self.sgp());
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&1u32.to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        self.dispatch_wide(
+            k,
+            &[Self::vkb(w), Self::vkb(x), Self::vkb(y)],
+            1,
+            &push,
+            (out_f as u32).div_ceil(nr),
+        );
+    }
+
+    /// Resident direct dispatch of the multi-output-row decode GEMV (`native_gemv_rm.comp`) for a
+    /// caller that already knows `dtype`/`rm` have a build (bypasses [`native_rm_choice`]'s
+    /// heuristic — same dispatch shape [`Self::linear_native_off`] uses internally). `m=1` decode
+    /// only. Added alongside [`Self::linear_native_rm_streamed`] so parity tests can pick the exact
+    /// resident kernel a `_streamed` twin should match.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_native_rm(
+        &self,
+        dtype: infr_core::DType,
+        w: &dyn Buffer,
+        w_base: usize,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        in_f: usize,
+        out_f: usize,
+        rm: u32,
+    ) {
+        self.label_gemv("gemv_rm", 1, in_f, out_f);
+        let (name, spv) =
+            crate::gemm::native_rm_build_spv(dtype, false, rm).expect("native rm spv");
+        let k = self.be.kernel(name, spv, 3, 16);
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&1u32.to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        self.dispatch_wide(
+            k,
+            &[Self::vkb(w), Self::vkb(x), Self::vkb(y)],
+            1,
+            &push,
+            (out_f as u32).div_ceil(rm),
+        );
+    }
+
+    /// Resident direct dispatch of an experimental RM kernel variant (`native_gemv_rm_v2.comp`),
+    /// same shape [`Self::linear_native_off`] uses internally under `INFR_GEMV_VARIANT`. `m=1`
+    /// decode only, `RM=2` fixed. Added alongside [`Self::linear_native_rm_v2_streamed`] so parity
+    /// tests can pick the exact resident kernel a `_streamed` twin should match.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_native_rm_v2(
+        &self,
+        variant: &str,
+        dtype: infr_core::DType,
+        w: &dyn Buffer,
+        w_base: usize,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.label_gemv("gemv_rm_v2", 1, in_f, out_f);
+        let (name, spv) =
+            crate::gemm::native_rm_variant_spv(variant, dtype, false).expect("native rm_v2 spv");
+        let k = self.be.kernel(name, spv, 3, 16);
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&1u32.to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        self.dispatch_wide(
+            k,
+            &[Self::vkb(w), Self::vkb(x), Self::vkb(y)],
+            1,
+            &push,
+            (out_f as u32).div_ceil(2),
+        );
+    }
+
     /// Native-block dequant GEMV reading the weight from element offset `w_base` — lets one stacked
     /// MoE expert tensor serve all experts (`w_base = expert_id * out_f * in_f`).
     #[allow(clippy::too_many_arguments)]
@@ -2206,6 +2311,153 @@ impl<'a> Recorder<'a> {
             1,
             &push,
             out_f as u32, // one workgroup per OUTPUT — all rows share its weight stream
+        );
+    }
+
+    /// `-DSTREAMED` twin of [`Self::linear_native_mrow`] (slice A1 build-variant: see
+    /// `crate::gemm::native_mrow_streamed_build_spv`). Same arena-by-address convention as
+    /// [`Self::linear_native_streamed`] — binding 0 (the resident build's weight SSBO) takes a
+    /// small FILLER (`x`) since the arena is never bound as a descriptor. Not wired into any
+    /// production dispatch yet; exists so a parity test can exercise the `_streamed` SPV directly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_native_mrow_streamed(
+        &self,
+        dtype: infr_core::DType,
+        arena_addr: u64,
+        w_base: usize,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        debug_assert!((2..=8).contains(&rows));
+        self.label_gemv("mrow_streamed", rows, in_f, out_f);
+        let (name, spv) =
+            crate::gemm::native_mrow_streamed_build_spv(dtype).expect("native mrow streamed spv");
+        let k = self.be.kernel(name, spv, 3, 24);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch_wide(
+            k,
+            &[Self::vkb(x), Self::vkb(x), Self::vkb(y)],
+            1,
+            &push,
+            out_f as u32,
+        );
+    }
+
+    /// `-DSTREAMED` twin of the reassociation-tolerant subgroup+NUM_ROWS decode GEMV
+    /// (`native_gemv_sg.comp`, slice A1 build-variant: see `crate::gemm::native_sg_streamed_build_spv`).
+    /// `m=1` decode only (matches the resident SG route's own gate); `nr` ∈ {2,4,8}. Not wired into
+    /// any production dispatch yet; exists so a parity test can exercise the `_streamed` SPV
+    /// directly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_native_sg_streamed(
+        &self,
+        dtype: infr_core::DType,
+        arena_addr: u64,
+        w_base: usize,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        in_f: usize,
+        out_f: usize,
+        nr: u32,
+    ) {
+        self.label_gemv("gemv_sg_streamed", 1, in_f, out_f);
+        let (name, spv) = crate::gemm::native_sg_streamed_build_spv(dtype, nr, self.sg16())
+            .expect("native sg streamed spv");
+        let k = self.be.kernel_sg(name, spv, 3, 24, self.sgp());
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&1u32.to_ne_bytes()); // rows: SG serves m=1 decode only
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch_wide(
+            k,
+            &[Self::vkb(x), Self::vkb(x), Self::vkb(y)],
+            1,
+            &push,
+            (out_f as u32).div_ceil(nr),
+        );
+    }
+
+    /// `-DSTREAMED` twin of the multi-output-row decode GEMV (`native_gemv_rm.comp`, slice A1
+    /// build-variant: see `crate::gemm::native_rm_streamed_build_spv`). `m=1` decode only (matches
+    /// the resident RM route's own gate); `rm` ∈ {2,4}. Not wired into any production dispatch yet;
+    /// exists so a parity test can exercise the `_streamed` SPV directly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_native_rm_streamed(
+        &self,
+        dtype: infr_core::DType,
+        arena_addr: u64,
+        w_base: usize,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        in_f: usize,
+        out_f: usize,
+        rm: u32,
+    ) {
+        self.label_gemv("gemv_rm_streamed", 1, in_f, out_f);
+        let (name, spv) =
+            crate::gemm::native_rm_streamed_build_spv(dtype, rm).expect("native rm streamed spv");
+        let k = self.be.kernel(name, spv, 3, 24);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&1u32.to_ne_bytes()); // rows: RM serves m=1 decode only
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch_wide(
+            k,
+            &[Self::vkb(x), Self::vkb(x), Self::vkb(y)],
+            1,
+            &push,
+            (out_f as u32).div_ceil(rm),
+        );
+    }
+
+    /// `-DSTREAMED` twin of an experimental RM kernel variant (`native_gemv_rm_v2.comp`, slice A1
+    /// build-variant: see `crate::gemm::native_rm_v2_streamed_build_spv`). `m=1` decode only, `RM=2`
+    /// fixed (all current variant builds). Not wired into any production dispatch yet; exists so a
+    /// parity test can exercise the `_streamed` SPV directly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_native_rm_v2_streamed(
+        &self,
+        variant: &str,
+        dtype: infr_core::DType,
+        arena_addr: u64,
+        w_base: usize,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.label_gemv("gemv_rm_v2_streamed", 1, in_f, out_f);
+        let (name, spv) = crate::gemm::native_rm_v2_streamed_build_spv(variant, dtype)
+            .expect("native rm_v2 streamed spv");
+        let k = self.be.kernel(name, spv, 3, 24);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&1u32.to_ne_bytes()); // rows: rm_v2 serves m=1 decode only
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch_wide(
+            k,
+            &[Self::vkb(x), Self::vkb(x), Self::vkb(y)],
+            1,
+            &push,
+            (out_f as u32).div_ceil(2),
         );
     }
 
