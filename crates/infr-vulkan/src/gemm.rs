@@ -3357,6 +3357,22 @@ pub(crate) fn conv1d_shift_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(CONV1D_SHIFT_SPV_BYTES))
 }
+/// `-DSTREAMED` twin SPIR-V of `conv1d_silu` (the qwen35 SSM input conv weight read through a
+/// typed 64-bit buffer_reference — see the shader's STREAMED doc). Parity-test entry.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn conv1d_silu_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/conv1d_silu_streamed.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+/// `-DSTREAMED` twin SPIR-V of `conv1d_silu_par` (BATCH pass 1; same STREAMED convention as
+/// `conv1d_silu`). Parity-test entry.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn conv1d_silu_par_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/conv1d_silu_par_streamed.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for the batched strided row copy (Op::CopyStrided in one dispatch).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn copy_strided_spv() -> &'static [u32] {
@@ -3472,6 +3488,30 @@ pub(crate) fn e2b_gate_spv() -> &'static [u32] {
 pub(crate) fn e2b_proj_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/e2b_proj.spv"))))
+}
+/// `-DSTREAMED` twin SPIR-V of `e2b_gate` (weight read through a typed 64-bit buffer_reference —
+/// see the shader's STREAMED doc). Parity-test entry.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn e2b_gate_streamed_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/e2b_gate_streamed.spv"
+        )))
+    })
+}
+/// `-DSTREAMED` twin SPIR-V of `e2b_proj` (same STREAMED convention as `e2b_gate`). Parity-test
+/// entry.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn e2b_proj_streamed_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/e2b_proj_streamed.spv"
+        )))
+    })
 }
 /// SPIR-V for fused QkNormRope reading from interleaved q+g buffer (qwen35 CopyStrided elim).
 #[cfg_attr(infr_profile, infr_prof::instrument)]

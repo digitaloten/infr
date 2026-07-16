@@ -1172,6 +1172,46 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// `-DSTREAMED` twin of [`Self::e2b_gate`] (weight read through a typed 64-bit
+    /// buffer_reference — see `shaders/e2b_gate.comp`'s STREAMED doc). Binding 0 (the resident
+    /// build's weight SSBO) takes a harmless FILLER (`x`). Parity-test entry, not dispatched in
+    /// production.
+    pub fn e2b_gate_streamed(
+        &self,
+        arena_addr: u64,
+        x: &dyn Buffer,
+        up: &dyn Buffer,
+        up_off: usize,
+        up_stride: usize,
+        y: &dyn Buffer,
+        m: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        let k = self.be.kernel(
+            "e2b_gate_streamed",
+            crate::gemm::e2b_gate_streamed_spv(),
+            4,
+            28,
+        );
+        let mut push = [0u8; 28];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(up_off as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(up_stride as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        let groups = out_f as u32 * (m as u32).div_ceil(4);
+        self.dispatch_wide(
+            k,
+            &[Self::vkb(x), Self::vkb(x), Self::vkb(up), Self::vkb(y)],
+            1,
+            &push,
+            groups,
+        );
+    }
+
     /// Prefill projection GEMM: `c[m,n] = a[m,k] · Wᵀ` on the matrix cores (coopmat). `a` is f32;
     /// `wq` is the weight (f16 packed 2/u32 with bits=16, or quant idx with bits=4|8 + scales/mins).
     /// `c` MUST be allocated `ceil(m/64)*64` rows (the kernel writes padded rows as 0). `n%64==0`,
@@ -3371,6 +3411,44 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             k,
             &[Self::vkb(x), Self::vkb(w), Self::vkb(pn), Self::vkb(h)],
+            1,
+            &push,
+            m as u32, // one workgroup per row
+        );
+    }
+
+    /// `-DSTREAMED` twin of [`Self::e2b_proj`] (weight read through a typed 64-bit
+    /// buffer_reference — see `shaders/e2b_proj.comp`'s STREAMED doc). Binding 1 (the resident
+    /// build's weight SSBO) takes a harmless FILLER (`x`). Parity-test entry, not dispatched in
+    /// production.
+    pub fn e2b_proj_streamed(
+        &self,
+        x: &dyn Buffer,  // [m, in_f] plg input
+        arena_addr: u64, // proj weight arena base address [out_f, in_f] f32
+        pn: &dyn Buffer, // [out_f] post_norm weight
+        h: &dyn Buffer,  // [m, out_f] hidden (read+write)
+        m: usize,
+        in_f: usize,
+        out_f: usize,
+        eps: f32,
+    ) {
+        let k = self.be.kernel_sg(
+            "e2b_proj_streamed",
+            crate::gemm::e2b_proj_streamed_spv(),
+            4,
+            24,
+            32,
+        );
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&eps.to_ne_bytes());
+        push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(x), Self::vkb(pn), Self::vkb(h)],
             1,
             &push,
             m as u32, // one workgroup per row
@@ -5647,6 +5725,103 @@ impl<'a> Recorder<'a> {
             &[Self::vkb(qkv), Self::vkb(state)],
             1, // state out
             &push,
+            (((kconv - 1) * cc) as u32).div_ceil(256),
+        );
+    }
+
+    /// `-DSTREAMED` twin of [`Self::conv1d_silu`] (the qwen35 SSM input conv; see
+    /// `shaders/conv1d_silu.comp`'s STREAMED doc). Binding 1 (the resident build's weight SSBO)
+    /// takes a harmless FILLER (`qkv`). Parity-test entry, not dispatched in production.
+    pub fn conv1d_silu_streamed(
+        &self,
+        qkv: &dyn Buffer,
+        arena_addr: u64,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        rows: usize,
+        cc: usize,
+        kconv: usize,
+    ) {
+        let kern = self.be.kernel(
+            "conv1d_silu_streamed",
+            crate::gemm::conv1d_silu_streamed_spv(),
+            4,
+            20,
+        );
+        let mut push = [0u8; 20];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(cc as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(kconv as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch(
+            kern,
+            &[
+                Self::vkb(qkv),
+                Self::vkb(qkv),
+                Self::vkb(state),
+                Self::vkb(out),
+            ],
+            2, // state (in/out) + out
+            &push,
+            (cc as u32).div_ceil(256),
+        );
+    }
+
+    /// `-DSTREAMED` twin of [`Self::conv1d_silu_batch`]'s pass-1 dispatch (see
+    /// `shaders/conv1d_silu_par.comp`'s STREAMED doc). Pass 2 (`conv1d_shift`) never reads the
+    /// weight, so it stays the resident dispatch unchanged — both legs share it. Binding 1 takes
+    /// a harmless FILLER (`qkv`). Parity-test entry, not dispatched in production.
+    pub fn conv1d_silu_batch_streamed(
+        &self,
+        qkv: &dyn Buffer,
+        arena_addr: u64,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        rows: usize,
+        cc: usize,
+        kconv: usize,
+    ) {
+        debug_assert!(
+            rows >= kconv - 1,
+            "conv1d_silu_batch_streamed needs rows ≥ kconv-1"
+        );
+        let mut push = [0u8; 20];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(cc as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(kconv as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        let k1 = self.be.kernel(
+            "conv1d_silu_par_streamed",
+            crate::gemm::conv1d_silu_par_streamed_spv(),
+            4,
+            20,
+        );
+        self.dispatch(
+            k1,
+            &[
+                Self::vkb(qkv),
+                Self::vkb(qkv),
+                Self::vkb(state),
+                Self::vkb(out),
+            ],
+            1, // out only (state is read-only here)
+            &push,
+            ((rows * cc) as u32).div_ceil(256),
+        );
+        let mut push2 = [0u8; 12];
+        push2[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push2[4..8].copy_from_slice(&(cc as u32).to_ne_bytes());
+        push2[8..12].copy_from_slice(&(kconv as u32).to_ne_bytes());
+        let k2 = self
+            .be
+            .kernel("conv1d_shift", crate::gemm::conv1d_shift_spv(), 2, 12);
+        self.dispatch(
+            k2,
+            &[Self::vkb(qkv), Self::vkb(state)],
+            1, // state out
+            &push2,
             (((kconv - 1) * cc) as u32).div_ceil(256),
         );
     }

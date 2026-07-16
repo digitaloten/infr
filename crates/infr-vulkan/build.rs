@@ -2684,6 +2684,12 @@ fn main() {
             // the resident-BDA endgame deletes every bound-SSBO weight path.
             "linear_f16" | "linear_f16_noext" | "linear_bf16" | "linear_f32" | "linear_f32r"
             | "linear_res" | "native_gemm_fma" => true,
+            // Model-specific float-weight kernels: qwen35's SSM depthwise conv1d+SiLU (both the
+            // sequential and batch-pass-1 variants — conv1d_shift never reads the weight) and
+            // gemma4 E2B's per-layer fused gate/proj GEMVs. Same typed buffer_reference seam as
+            // the linear family above (see conv1d_silu.comp's STREAMED doc). Every variant of
+            // these sources gets a twin.
+            "conv1d_silu" | "conv1d_silu_par" | "e2b_gate" | "e2b_proj" => true,
             _ => false,
         }
     };

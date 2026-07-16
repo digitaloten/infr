@@ -1231,3 +1231,361 @@ fn embed_gather_streamed_matches_resident() {
         println!("ok: embed_gather dtype={dtype:?}");
     }
 }
+
+// ─── model-specific float-weight kernels — qwen35 conv1d + gemma4 E2B ─────────────────────────
+// Same typed buffer_reference seam as the float-weight linear family (slice A4); these are
+// per-model fused kernels rather than a generic GEMV shape, so each gets a bespoke runner.
+
+/// conv1d_silu (single-token) and conv1d_silu_par (BATCH pass 1, via conv1d_silu_batch) both read
+/// the per-channel conv kernel `wconv` through the SAME typed seam. Neither shape fits `run_case`
+/// — there's a THIRD input, the per-channel history `state`, that is read AND written in place —
+/// so `state` is re-uploaded to its initial value before EACH leg (resident, streamed@0,
+/// streamed@nonzero-offset) to keep the legs from drifting off each other's mutated history.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn conv1d_silu_streamed_matches_resident() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let dtype = DType::F32;
+    let (cc, kconv) = (40usize, 4usize);
+    let w_bytes = weight_bytes_for(dtype, cc * kconv);
+    let w = synth_weight_bytes(w_bytes, cc * 31 + kconv);
+    let state0 = synth_x((kconv - 1) * cc);
+    let off = nonzero_off(dtype);
+    let mut backing = synth_weight_bytes(off, 0xBAD);
+    backing.extend_from_slice(&w);
+
+    // ── single-token path (conv1d_silu) ───────────────────────────────────────────────────────
+    {
+        let qkv = synth_x(cc);
+        let qkv_buf = be.alloc(cc * 4, BufferUsage::Activations).unwrap();
+        be.upload(qkv_buf.as_ref(), bytemuck::cast_slice(&qkv))
+            .unwrap();
+        let out_buf = be.alloc(cc * 4, BufferUsage::Activations).unwrap();
+        let fresh_state = |be: &VulkanBackend| {
+            let s = be
+                .alloc((kconv - 1) * cc * 4, BufferUsage::Activations)
+                .unwrap();
+            be.upload(s.as_ref(), bytemuck::cast_slice(&state0))
+                .unwrap();
+            s
+        };
+        let download = |be: &VulkanBackend| {
+            let mut out = vec![0u8; cc * 4];
+            be.download(out_buf.as_ref(), &mut out).unwrap();
+            bits(&out)
+        };
+
+        let state_buf = fresh_state(&be);
+        let w_buf = be.alloc(w_bytes, BufferUsage::Weights).unwrap();
+        be.upload(w_buf.as_ref(), &w).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.conv1d_silu(
+            qkv_buf.as_ref(),
+            w_buf.as_ref(),
+            state_buf.as_ref(),
+            out_buf.as_ref(),
+            1,
+            cc,
+            kconv,
+        );
+        rec.finish().unwrap();
+        let resident = download(&be);
+
+        let state_buf = fresh_state(&be);
+        let (arena0, addr0) = be.alloc_arena_bda(w_bytes).unwrap();
+        be.upload(arena0.as_ref(), &w).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.conv1d_silu_streamed(
+            qkv_buf.as_ref(),
+            addr0,
+            state_buf.as_ref(),
+            out_buf.as_ref(),
+            1,
+            cc,
+            kconv,
+        );
+        rec.finish().unwrap();
+        let streamed_at0 = download(&be);
+
+        let state_buf = fresh_state(&be);
+        let (arena1, addr1) = be.alloc_arena_bda(backing.len()).unwrap();
+        be.upload(arena1.as_ref(), &backing).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.conv1d_silu_streamed(
+            qkv_buf.as_ref(),
+            addr1 + off as u64,
+            state_buf.as_ref(),
+            out_buf.as_ref(),
+            1,
+            cc,
+            kconv,
+        );
+        rec.finish().unwrap();
+        let streamed_atoff = download(&be);
+
+        let c = Case {
+            name: "conv1d_silu (single-token)".to_string(),
+            resident,
+            streamed_at0,
+            streamed_atoff,
+        };
+        assert_case(&c);
+        println!("ok: {}", c.name);
+    }
+
+    // ── batch path (conv1d_silu_par + conv1d_shift, rows >= kconv-1) ─────────────────────────
+    {
+        let rows = 6usize;
+        let qkv = synth_x(rows * cc);
+        let qkv_buf = be.alloc(rows * cc * 4, BufferUsage::Activations).unwrap();
+        be.upload(qkv_buf.as_ref(), bytemuck::cast_slice(&qkv))
+            .unwrap();
+        let out_buf = be.alloc(rows * cc * 4, BufferUsage::Activations).unwrap();
+        let fresh_state = |be: &VulkanBackend| {
+            let s = be
+                .alloc((kconv - 1) * cc * 4, BufferUsage::Activations)
+                .unwrap();
+            be.upload(s.as_ref(), bytemuck::cast_slice(&state0))
+                .unwrap();
+            s
+        };
+        let download = |be: &VulkanBackend| {
+            let mut out = vec![0u8; rows * cc * 4];
+            be.download(out_buf.as_ref(), &mut out).unwrap();
+            bits(&out)
+        };
+
+        let state_buf = fresh_state(&be);
+        let w_buf = be.alloc(w_bytes, BufferUsage::Weights).unwrap();
+        be.upload(w_buf.as_ref(), &w).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.conv1d_silu_batch(
+            qkv_buf.as_ref(),
+            w_buf.as_ref(),
+            state_buf.as_ref(),
+            out_buf.as_ref(),
+            rows,
+            cc,
+            kconv,
+        );
+        rec.finish().unwrap();
+        let resident = download(&be);
+
+        let state_buf = fresh_state(&be);
+        let (arena0, addr0) = be.alloc_arena_bda(w_bytes).unwrap();
+        be.upload(arena0.as_ref(), &w).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.conv1d_silu_batch_streamed(
+            qkv_buf.as_ref(),
+            addr0,
+            state_buf.as_ref(),
+            out_buf.as_ref(),
+            rows,
+            cc,
+            kconv,
+        );
+        rec.finish().unwrap();
+        let streamed_at0 = download(&be);
+
+        let state_buf = fresh_state(&be);
+        let (arena1, addr1) = be.alloc_arena_bda(backing.len()).unwrap();
+        be.upload(arena1.as_ref(), &backing).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.conv1d_silu_batch_streamed(
+            qkv_buf.as_ref(),
+            addr1 + off as u64,
+            state_buf.as_ref(),
+            out_buf.as_ref(),
+            rows,
+            cc,
+            kconv,
+        );
+        rec.finish().unwrap();
+        let streamed_atoff = download(&be);
+
+        let c = Case {
+            name: "conv1d_silu_par (batch)".to_string(),
+            resident,
+            streamed_at0,
+            streamed_atoff,
+        };
+        assert_case(&c);
+        println!("ok: {}", c.name);
+    }
+}
+
+/// E2B per-layer inp_gate: fused f32 GEMV + GELU * strided up-read. Fits `run_case`'s weight/x/y
+/// shape (the extra `up` buffer is captured by the dispatch closures, same trick the float-linear
+/// tests use for their externally-sized multi-row `x`). `up_off` is non-zero and `up_stride` is
+/// wider than `out_f`, so a twin that drops either would read the wrong slice of `up`.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn e2b_gate_streamed_matches_resident() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let dtype = DType::F32;
+    let (m, in_f, out_f) = (4usize, 64usize, 8usize);
+    let (up_off, up_stride) = (3usize, 16usize);
+
+    let x = synth_x(m * in_f);
+    let x_buf = be.alloc(m * in_f * 4, BufferUsage::Activations).unwrap();
+    be.upload(x_buf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+
+    let up_elems = up_off + (m - 1) * up_stride + out_f;
+    let up: Vec<f32> = (0..up_elems)
+        .map(|i| ((i % 13) as f32 - 6.0) * 0.05)
+        .collect();
+    let up_buf = be.alloc(up_elems * 4, BufferUsage::Activations).unwrap();
+    be.upload(up_buf.as_ref(), bytemuck::cast_slice(&up))
+        .unwrap();
+
+    let c = run_case(
+        &be,
+        "e2b_gate".to_string(),
+        dtype,
+        in_f,
+        out_f,
+        m * out_f,
+        &|rec, w, _x, y| {
+            rec.e2b_gate(
+                w,
+                x_buf.as_ref(),
+                up_buf.as_ref(),
+                up_off,
+                up_stride,
+                y,
+                m,
+                in_f,
+                out_f,
+            )
+        },
+        &|rec, addr, _x, y| {
+            rec.e2b_gate_streamed(
+                addr,
+                x_buf.as_ref(),
+                up_buf.as_ref(),
+                up_off,
+                up_stride,
+                y,
+                m,
+                in_f,
+                out_f,
+            )
+        },
+    );
+    assert_case(&c);
+    println!("ok: {}", c.name);
+}
+
+/// E2B per-layer proj: fused f32 GEMV + RMSNorm + in-place add (`h += ...`). `h` is read AND
+/// written, so — like the conv1d test above — it must be reset to its initial value before EACH
+/// leg; reusing it directly across legs would accumulate the previous leg's write on top.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn e2b_proj_streamed_matches_resident() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let dtype = DType::F32;
+    let (m, in_f, out_f) = (4usize, 64usize, 8usize);
+    let eps = 1e-6f32;
+
+    let w_bytes = weight_bytes_for(dtype, in_f * out_f);
+    let w = synth_weight_bytes(w_bytes, in_f * 31 + out_f);
+
+    let x = synth_x(m * in_f);
+    let x_buf = be.alloc(m * in_f * 4, BufferUsage::Activations).unwrap();
+    be.upload(x_buf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+
+    let pn: Vec<f32> = (0..out_f).map(|i| 0.5 + (i as f32) * 0.1).collect();
+    let pn_buf = be.alloc(out_f * 4, BufferUsage::Activations).unwrap();
+    be.upload(pn_buf.as_ref(), bytemuck::cast_slice(&pn))
+        .unwrap();
+
+    let h0: Vec<f32> = (0..m * out_f)
+        .map(|i| ((i % 9) as f32 - 4.0) * 0.02)
+        .collect();
+    let h_buf = be.alloc(m * out_f * 4, BufferUsage::Activations).unwrap();
+    let fresh_h = |be: &VulkanBackend| {
+        be.upload(h_buf.as_ref(), bytemuck::cast_slice(&h0))
+            .unwrap();
+    };
+    let download = |be: &VulkanBackend| {
+        let mut out = vec![0u8; m * out_f * 4];
+        be.download(h_buf.as_ref(), &mut out).unwrap();
+        bits(&out)
+    };
+
+    fresh_h(&be);
+    let w_buf = be.alloc(w_bytes, BufferUsage::Weights).unwrap();
+    be.upload(w_buf.as_ref(), &w).unwrap();
+    let rec = be.recorder().unwrap();
+    rec.e2b_proj(
+        x_buf.as_ref(),
+        w_buf.as_ref(),
+        pn_buf.as_ref(),
+        h_buf.as_ref(),
+        m,
+        in_f,
+        out_f,
+        eps,
+    );
+    rec.finish().unwrap();
+    let resident = download(&be);
+    assert!(
+        resident.iter().any(|&b| b != 0),
+        "e2b_proj: resident output is all zeros"
+    );
+
+    fresh_h(&be);
+    let (arena0, addr0) = be.alloc_arena_bda(w_bytes).unwrap();
+    be.upload(arena0.as_ref(), &w).unwrap();
+    let rec = be.recorder().unwrap();
+    rec.e2b_proj_streamed(
+        x_buf.as_ref(),
+        addr0,
+        pn_buf.as_ref(),
+        h_buf.as_ref(),
+        m,
+        in_f,
+        out_f,
+        eps,
+    );
+    rec.finish().unwrap();
+    let streamed_at0 = download(&be);
+
+    let off = nonzero_off(dtype);
+    let mut backing = synth_weight_bytes(off, 0xBAD);
+    backing.extend_from_slice(&w);
+    fresh_h(&be);
+    let (arena1, addr1) = be.alloc_arena_bda(backing.len()).unwrap();
+    be.upload(arena1.as_ref(), &backing).unwrap();
+    let rec = be.recorder().unwrap();
+    rec.e2b_proj_streamed(
+        x_buf.as_ref(),
+        addr1 + off as u64,
+        pn_buf.as_ref(),
+        h_buf.as_ref(),
+        m,
+        in_f,
+        out_f,
+        eps,
+    );
+    rec.finish().unwrap();
+    let streamed_atoff = download(&be);
+
+    let c = Case {
+        name: "e2b_proj".to_string(),
+        resident,
+        streamed_at0,
+        streamed_atoff,
+    };
+    assert_case(&c);
+    println!("ok: {}", c.name);
+}
