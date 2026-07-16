@@ -787,6 +787,14 @@ const BDA_WEIGHT_ALIGN: u64 = 256;
 /// reasoning applies unchanged.
 const BDA_BLOCK_MIN: u64 = ARENA_OVERFLOW_BLOCK;
 
+/// Upper bound on ONE resident-BDA addressing unit's byte size (see [`BdaWeightArena`]'s addressing
+/// invariant). The 64-bit promotion protects the arena/expert BASE, but a tensor's (or a per-expert
+/// slice's) intra-unit byte offsets ride u32 push-constants / u32 in-kernel indices — a unit >= 4
+/// GiB truncates into a coherent-but-wrong pointer. This is also `maxStorageBufferRange` on RADV,
+/// the cap on the sub-range a `vkb` descriptor can bind. Enforced today by model reality; a single
+/// >4 GiB tensor would need a wider addressing scheme, not just a bigger allocation.
+const BDA_ADDRESSING_UNIT_MAX: u64 = 1 << 32;
+
 /// Keepalive + addressing info for one [`BdaWeightArena`] block: a single dedicated
 /// `bufferDeviceAddress` buffer (exactly what [`VulkanBackend::alloc_arena_bda`] builds) that
 /// resident weight tensors bump-allocate BYTE RANGES within, never separate buffer objects (see
@@ -2395,6 +2403,21 @@ impl VulkanBackend {
     /// offset within it — see that variant's doc for why the handle must never be bound as a
     /// descriptor at its full range.
     fn bda_weight_alloc(&self, size: usize) -> Result<VkBuffer> {
+        // Load-time guard for the BYTE half of the addressing invariant (see
+        // [`BDA_ADDRESSING_UNIT_MAX`] / [`BdaWeightArena`]): a single arena tensor at or above 4 GiB
+        // would wrap the u32 intra-unit byte offsets the STREAMED kernels apply, silently reading
+        // the wrong weights. Reject it LOUDLY here rather than let it corrupt output in-kernel. This
+        // is distinct from the `max_mem_alloc_size` block error below (a device-allocation limit) —
+        // this is an addressing limit that a bigger device or heap does NOT lift. The ELEMENT half
+        // of the invariant (< 4 Gi elements, the binding cap for sub-byte quants) needs shape+dtype
+        // and is enforced at the geometry chokepoints (`expert_stride_bytes`, the loader seam).
+        if size as u64 >= BDA_ADDRESSING_UNIT_MAX {
+            return Err(be(format!(
+                "resident-BDA weight tensor ({size} bytes) exceeds the u32 addressing unit \
+                 ({BDA_ADDRESSING_UNIT_MAX} bytes / 4 GiB) — intra-tensor offsets are u32; a single \
+                 tensor this large needs a wider addressing scheme, not a bigger allocation"
+            )));
+        }
         let want = (size as u64).max(1).next_multiple_of(BDA_WEIGHT_ALIGN);
         let mut guard = self.bda_weight_arena.lock().unwrap();
         let arena = guard.get_or_insert_with(BdaWeightArena::default);

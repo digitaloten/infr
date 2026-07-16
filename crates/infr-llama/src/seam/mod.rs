@@ -428,6 +428,28 @@ pub(crate) fn kv_ring_wanted(cfg: &Config) -> bool {
         && fmt_ok("INFR_KV_TYPE_V")
 }
 
+/// One resident-BDA / streamed-arena addressing unit's ELEMENT-count cap (the invariant's element
+/// half; see `infr_vulkan`'s `BdaWeightArena` doc and `BDA_ADDRESSING_UNIT_MAX`). In-kernel element
+/// indices are u32, so an addressing unit — one dense tensor, or one per-expert slice of a stacked
+/// bank — must stay under 2^32 ELEMENTS. This is the binding limit for sub-byte / low-bpw quants
+/// (Q2_K etc.), where 4 Gi elements is only ~1.3 GiB of bytes and so trips well before the 4 GiB
+/// BYTE cap `bda_weight_alloc` enforces. Load-time guard: reject LOUDLY here (shape+dtype are known)
+/// instead of letting a u32 index wrap into coherent-but-wrong reads in-shader. Enforced today by
+/// model reality (no single tensor / expert slice is anywhere near 4 Gi elements); a model that
+/// crossed it would need a wider in-kernel addressing scheme, not just a bigger allocation.
+const BDA_ELEMENT_UNIT_MAX: usize = 1 << 32;
+
+fn check_bda_element_cap(name: &str, unit: &str, elems: usize) -> AResult<()> {
+    if elems as u64 >= BDA_ELEMENT_UNIT_MAX as u64 {
+        return Err(anyhow!(
+            "weight tensor {name}: {unit} has {elems} elements, at/above the u32 addressing unit \
+             cap (2^32) — in-kernel element indices are u32 and would wrap; this needs a wider \
+             addressing scheme, not a bigger allocation"
+        ));
+    }
+    Ok(())
+}
+
 /// Decide this model's MoE expert placement, install the pager session when the decision pages
 /// (FIRST load only), and return the Vulkan weight binder that implements it. Shared by every
 /// Vulkan weight-uploading session — [`generate_dense_vulkan_session`] and the DiffusionGemma
@@ -1031,7 +1053,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
         }
     }
 
-    Ok(Box::new(move |name, tb, dt, _n| {
+    Ok(Box::new(move |name, tb, dt, numel| {
         // Raw upload for EVERY dtype — the file's bytes go straight to VRAM (u32-padded) and the
         // kernel reads/dequants the native dtype in-shader. F16 → f16 coopmat GEMM / f16 GEMV;
         // F32 stays native (rmsnorm/qk_norm_rope read f32); bf16 → in-shader expand (bf16 is the
@@ -1090,6 +1112,10 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     .expect("a paged tensor implies an MoE config")
                     .n_expert
                     .max(1);
+                // The ADDRESSING UNIT of a stacked bank is ONE per-expert slice, not the whole
+                // bank (the arena kernels index `arena + expert * stride`), so the whole-bank
+                // element count may legitimately exceed 2^32 while each slice must not.
+                check_bda_element_cap(name, "per-expert slice", numel / n_expert)?;
                 let stride_bytes = bytes.len() / n_expert;
                 let placeholder = vk
                     .alloc_uninit(4, BufferUsage::Weights)
@@ -1106,6 +1132,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 return Ok((placeholder, dt));
             }
         }
+        // Ordinary (non-paged, non-streamed) weight: the whole tensor is one addressing unit.
+        check_bda_element_cap(name, "tensor", numel)?;
         let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
         // alloc_uninit: the `upload` right below writes the buffer's FULL extent (it is sized to
         // exactly `padded.len()`), so the calloc contract's zero-fill is dead work — and an
@@ -1560,4 +1588,30 @@ fn e2b_ipl_rows(g: &Gguf, ple: &PerLayerEmbd, tokens: &[u32]) -> AResult<Vec<f32
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+#[cfg(test)]
+mod bda_cap_tests {
+    use super::{check_bda_element_cap, BDA_ELEMENT_UNIT_MAX};
+
+    #[test]
+    fn element_cap_accepts_realistic_and_boundary_below() {
+        // A big-but-real per-expert slice (2112 * 5120 ≈ 10.8M elems) and the last legal count
+        // both pass — model reality stays well under the cap.
+        check_bda_element_cap(
+            "blk.0.ffn_gate_exps.weight",
+            "per-expert slice",
+            2112 * 5120,
+        )
+        .expect("realistic expert slice must pass");
+        check_bda_element_cap("t", "tensor", BDA_ELEMENT_UNIT_MAX - 1)
+            .expect("2^32 - 1 elements is the last legal count");
+    }
+
+    #[test]
+    fn element_cap_rejects_at_and_above_2p32() {
+        // At the cap and above it fail LOUDLY (u32 index would wrap) rather than corrupt output.
+        assert!(check_bda_element_cap("t", "tensor", BDA_ELEMENT_UNIT_MAX).is_err());
+        assert!(check_bda_element_cap("t", "per-expert slice", BDA_ELEMENT_UNIT_MAX + 7).is_err());
+    }
 }

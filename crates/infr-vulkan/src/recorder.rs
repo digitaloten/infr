@@ -238,7 +238,17 @@ fn expert_stride_bytes(dtype: infr_core::DType, stride: usize) -> u32 {
         stride.is_multiple_of(block_elems),
         "expert stride {stride} is not a whole number of {dtype:?} blocks ({block_elems} elems/block)"
     );
-    ((stride / block_elems) * block_bytes) as u32
+    let bytes = (stride / block_elems) * block_bytes;
+    // The kernels index this byte stride as u32 (`arena + uint64_t(ids[slot]) * uint64_t(stride)`
+    // promotes to 64-bit, but the stride VALUE itself rides a u32 push-constant). A per-expert
+    // slice >= 4 GiB would truncate here into a coherent-but-wrong pointer — the same class of
+    // bug as the old u32 element-space multiply. `bda_weight_alloc`'s byte cap already rejects
+    // any single arena tensor this large, so this only ever fires on a geometry bug upstream.
+    debug_assert!(
+        bytes < u32::MAX as usize,
+        "per-expert byte stride {bytes} ({dtype:?}) exceeds the u32 addressing unit (4 GiB)"
+    );
+    bytes as u32
 }
 
 pub struct Recorder<'a> {
