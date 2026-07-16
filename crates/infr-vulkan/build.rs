@@ -21,7 +21,6 @@ fn main() {
         ("gemm_warp", "gemm_warp", &[]),
         ("gemm_dp4a", "gemm_dp4a", &[]),
         ("quant_q8", "quant_q8", &[]),
-        ("gemm_proj_mmq", "gemm_proj_mmq", &[]),
         ("gemm_proj", "gemm_proj", &[]),
         ("gemm_proj_warp", "gemm_proj_warp", &[]),
         ("attn_partial", "attn_partial", &[]),
@@ -246,9 +245,7 @@ fn main() {
         ("e2b_gate", "e2b_gate", &[]),
         ("e2b_proj", "e2b_proj", &[]),
         ("matmul_f32", "matmul_f32", &[]),
-        ("linear_q", "linear_q", &[]),
         ("linear_res", "linear_res", &[]),
-        ("linear_res_q", "linear_res_q", &[]),
         ("attention", "attention", &[]),
         ("attn_combine", "attn_combine", &[]),
         ("attn_combine", "attn_combine_live", &["-DUSE_LIVE"]),
@@ -2580,19 +2577,6 @@ fn main() {
             "native_gemm_iq1m",
             &["-DFMT_IQ1M", "-DUSE_GRID"],
         ),
-        // Decode GEMV: q4/q8 × plain/residual specializations from one source.
-        ("mul_mat_vec_q", "mul_mat_vec_q4", &["-DQBITS=4"]),
-        ("mul_mat_vec_q", "mul_mat_vec_q8", &["-DQBITS=8"]),
-        (
-            "mul_mat_vec_q",
-            "mul_mat_vec_q4_res",
-            &["-DQBITS=4", "-DUSE_RES"],
-        ),
-        (
-            "mul_mat_vec_q",
-            "mul_mat_vec_q8_res",
-            &["-DQBITS=8", "-DUSE_RES"],
-        ),
     ];
     // Subgroup-16 twins for the bandwidth-critical decode GEMV/reduction family (Intel R2, see
     // caps.sg_pref): every build of these SOURCES also gets a `<stem>_sg16` variant compiled with
@@ -2605,7 +2589,6 @@ fn main() {
         "native_gemv_id_multi_sg",
         "native_mmv_mw",
         "quant_q8_row",
-        "mul_mat_vec_q",
     ];
     let builds: Vec<(String, String, Vec<String>)> = builds
         .iter()
@@ -2698,8 +2681,7 @@ fn main() {
             // these sources gets a twin.
             "conv1d_silu" | "conv1d_silu_par" | "e2b_gate" | "e2b_proj" => true,
             // The coopmat f16/repacked-quant projection GEMM (prefill C=A·Wᵀ): the quant arms ride
-            // along on the shared WQ() seam — see gemm_proj.comp's STREAMED doc. gemm_proj_mmq is
-            // test-only (a deletion candidate) and does NOT get a twin here.
+            // along on the shared WQ() seam — see gemm_proj.comp's STREAMED doc.
             "gemm_proj" | "gemm_proj_warp" => true,
             // int8-coopmat Q8_0 prefill GEMM (INFR_I8_COOPMAT=1 measurement kernel, base +
             // -DROW_SCALE): the raw Q8_0 weight byte read (a local `rb()`/`NW()` chokepoint, not

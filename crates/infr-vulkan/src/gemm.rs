@@ -2534,8 +2534,6 @@ const GEMM_TILED_SPV_BYTES: &[u8] =
 const GEMM_WARP_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_warp.spv"));
 const GEMM_DP4A_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_dp4a.spv"));
 const QUANT_Q8_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quant_q8.spv"));
-const GEMM_PROJ_MMQ_SPV_BYTES: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/gemm_proj_mmq.spv"));
 const GEMM_PROJ_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_proj.spv"));
 const GEMM_PROJ_WARP_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemm_proj_warp.spv"));
@@ -2606,27 +2604,18 @@ const LINEAR_F16_NOEXT_SPV_BYTES: &[u8] =
 const LINEAR_F32_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f32.spv"));
 const LINEAR_F32R_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f32r.spv"));
 const LINEAR_BF16_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_bf16.spv"));
-const LINEAR_Q_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_q.spv"));
 const LINEAR_RES_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_res.spv"));
-const LINEAR_RES_Q_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_res_q.spv"));
 const ATTENTION_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attention.spv"));
 const ATTN_COMBINE_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_combine.spv"));
 const ATTENTION_KV_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attention_kv.spv"));
 const QK_NORM_ROPE_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/qk_norm_rope.spv"));
 const QK_NORM_ROPE_FF_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/qk_norm_rope_ff.spv"));
-const MMV_Q4_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q4.spv"));
-const MMV_Q8_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q8.spv"));
-const MMV_Q4_RES_SPV_BYTES: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q4_res.spv"));
-const MMV_Q8_RES_SPV_BYTES: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q8_res.spv"));
 static GEMM_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static GEMM_TILED_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static GEMM_WARP_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static GEMM_DP4A_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static QUANT_Q8_SPV: OnceLock<Vec<u32>> = OnceLock::new();
-static GEMM_PROJ_MMQ_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static GEMM_PROJ_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static GEMM_PROJ_WARP_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_PARTIAL_SPV: OnceLock<Vec<u32>> = OnceLock::new();
@@ -2646,10 +2635,6 @@ static ATTN_PV_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_PV_WARP_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_PV_REDUCE_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static RMSNORM_SPV: OnceLock<Vec<u32>> = OnceLock::new();
-static MMV_Q4_SPV: OnceLock<Vec<u32>> = OnceLock::new();
-static MMV_Q8_SPV: OnceLock<Vec<u32>> = OnceLock::new();
-static MMV_Q4_RES_SPV: OnceLock<Vec<u32>> = OnceLock::new();
-static MMV_Q8_RES_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn gemm_spv() -> &'static [u32] {
@@ -2671,11 +2656,6 @@ fn gemm_dp4a_spv() -> &'static [u32] {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn quant_q8_spv() -> &'static [u32] {
     QUANT_Q8_SPV.get_or_init(|| spv_words(QUANT_Q8_SPV_BYTES))
-}
-/// SPIR-V for the integer (dp4a) u4 projection GEMM. Weights stay quantized; no per-GEMM dequant.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn gemm_proj_mmq_spv() -> &'static [u32] {
-    GEMM_PROJ_MMQ_SPV.get_or_init(|| spv_words(GEMM_PROJ_MMQ_SPV_BYTES))
 }
 /// SPIR-V for the prefill projection GEMM (`C=A·Wᵀ`, f16/quant W). Used by the recorder.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -4039,23 +4019,11 @@ pub(crate) fn linear_bf16_spv() -> &'static [u32] {
     static LINEAR_BF16_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     LINEAR_BF16_SPV.get_or_init(|| spv_words(LINEAR_BF16_SPV_BYTES))
 }
-/// SPIR-V for the unified affine-quant dequant GEMV (`y=x·Wᵀ`).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn linear_q_spv() -> &'static [u32] {
-    static LINEAR_Q_SPV: OnceLock<Vec<u32>> = OnceLock::new();
-    LINEAR_Q_SPV.get_or_init(|| spv_words(LINEAR_Q_SPV_BYTES))
-}
 /// SPIR-V for the f16-weight GEMV with fused residual.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn linear_res_spv() -> &'static [u32] {
     static LINEAR_RES_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     LINEAR_RES_SPV.get_or_init(|| spv_words(LINEAR_RES_SPV_BYTES))
-}
-/// SPIR-V for the affine-quant dequant GEMV with fused residual.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn linear_res_q_spv() -> &'static [u32] {
-    static LINEAR_RES_Q_SPV: OnceLock<Vec<u32>> = OnceLock::new();
-    LINEAR_RES_Q_SPV.get_or_init(|| spv_words(LINEAR_RES_Q_SPV_BYTES))
 }
 /// SPIR-V for the online-softmax GQA attention (hd<=128).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -4274,59 +4242,6 @@ pub(crate) fn attn_live_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(ATTN_LIVE_SPV_BYTES))
 }
-/// SPIR-V + cache name for the subgroup decode GEMV (`y=x·Wᵀ`). `bits`=4/8 picks the quant
-/// variant; `res` adds a fused residual; `sg16` selects the `-DSG=16` twin (`caps.sg_pref == 16`).
-/// Used by the recorder's `linear_q` / `linear_add_q`.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn mul_mat_vec_q_spv(
-    bits: u32,
-    res: bool,
-    sg16: bool,
-) -> (&'static str, &'static [u32]) {
-    macro_rules! v {
-        ($name:literal) => {{
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            let s = S
-                .get_or_init(|| {
-                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
-                })
-                .as_slice();
-            ($name, s)
-        }};
-    }
-    match (bits, res, sg16) {
-        (4, false, false) => (
-            "mul_mat_vec_q4",
-            MMV_Q4_SPV
-                .get_or_init(|| spv_words(MMV_Q4_SPV_BYTES))
-                .as_slice(),
-        ),
-        (8, false, false) => (
-            "mul_mat_vec_q8",
-            MMV_Q8_SPV
-                .get_or_init(|| spv_words(MMV_Q8_SPV_BYTES))
-                .as_slice(),
-        ),
-        (4, true, false) => (
-            "mul_mat_vec_q4_res",
-            MMV_Q4_RES_SPV
-                .get_or_init(|| spv_words(MMV_Q4_RES_SPV_BYTES))
-                .as_slice(),
-        ),
-        (8, true, false) => (
-            "mul_mat_vec_q8_res",
-            MMV_Q8_RES_SPV
-                .get_or_init(|| spv_words(MMV_Q8_RES_SPV_BYTES))
-                .as_slice(),
-        ),
-        (4, false, true) => v!("mul_mat_vec_q4_sg16"),
-        (8, false, true) => v!("mul_mat_vec_q8_sg16"),
-        (4, true, true) => v!("mul_mat_vec_q4_res_sg16"),
-        (8, true, true) => v!("mul_mat_vec_q8_res_sg16"),
-        _ => panic!("mul_mat_vec_q: unsupported bits={bits}"),
-    }
-}
-
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl VulkanBackend {
     /// Untiled coopmat GEMM (m,n,k multiples of 16). Correct but memory-bound; use `matmul_f16`
