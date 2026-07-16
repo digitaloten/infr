@@ -64,6 +64,13 @@ layout(binding = 4) buffer YB { float y_buf[]; };
 #else
 #define NW(i) nw[i]
 #endif
+// Wide 4-word read: streamed builds get NW4 (b128, saddr) from native_arena_ref.glsl; non-streamed
+// reads the SSBO array directly (ACO already fuses to buffer_load_b128). Lets the dp4a weight
+// loads issue one b128 instead of four b32 — the streamed-vs-resident decode gap (see the arena ref
+// doc). Same words as NW(base+j) — bit-identical.
+#ifndef NW4
+#define NW4(wbase) uvec4(nw[(wbase)], nw[(wbase) + 1u], nw[(wbase) + 2u], nw[(wbase) + 3u])
+#endif
 
 uint rb(uint byte) { return (NW(byte >> 2) >> ((byte & 3u) * 8u)) & 0xFFu; }
 uint ru16(uint byte) { return rb(byte) | (rb(byte + 1u) << 8u); }
@@ -106,8 +113,9 @@ float dpsub(uint gelem, uint qaw[8], float da, float sa) {
     uint qword = (bd + 16u + (sub >> 1u) * 32u) >> 2u;
     bool lo = (sub & 1u) == 0u;
     int dp = 0;
+    uvec4 wA = NW4(qword); uvec4 wB = NW4(qword + 4u); // b128: qword is 16B-aligned (144%16==0)
     for (uint j = 0u; j < 8u; j++) {
-        uint w = NW(qword + j);
+        uint w = (j < 4u) ? wA[j] : wB[j - 4u];
         uint qp = lo ? (w & 0x0F0F0F0Fu) : ((w >> 4u) & 0x0F0F0F0Fu);
         dp = dotPacked4x8AccSatEXT(int(qp), int(qaw[j]), dp);
     }
@@ -133,9 +141,11 @@ float dpsub(uint gelem, uint qaw[8], float da, float sa) {
     uint qhword = qhword_q5k(bd);
     bool lo = (sub & 1u) == 0u;
     int dp = 0;
+    uvec4 lA = NW4(qlword); uvec4 lB = NW4(qlword + 4u); // 16B-aligned (176%16==0, +48)
+    uvec4 hA = NW4(qhword); uvec4 hB = NW4(qhword + 4u); // 16B-aligned (+16)
     for (uint j = 0u; j < 8u; j++) {
-        uint wl = NW(qlword + j);
-        uint wh = NW(qhword + j);
+        uint wl = (j < 4u) ? lA[j] : lB[j - 4u];
+        uint wh = (j < 4u) ? hA[j] : hB[j - 4u];
         uint nib = lo ? (wl & 0x0F0F0F0Fu) : ((wl >> 4u) & 0x0F0F0F0Fu);
         uint bit5 = ((wh >> sub) & 0x01010101u) << 4u;
         uint qp = nib | bit5;
