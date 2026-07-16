@@ -150,15 +150,19 @@ pub(crate) fn native_build_spv(dtype: infr_core::DType, res: bool) -> Option<&'s
     })
 }
 
-/// `-DSTREAMED` twin of the non-residual [`native_build_spv`] (kernel-cache name + SPIR-V): the
-/// dense layer-streaming GEMV reads the weight from a `bufferDeviceAddress` arena pool by 64-bit
-/// address (native_arena_ref.glsl) instead of a bound SSBO, lifting the ~4 GiB
-/// `maxStorageBufferRange` cap. All streamed dense Linears (any m) route through this one kernel's
-/// rows loop — see [`crate::recorder::Recorder::linear_native_streamed`] and
-/// [`crate::pager::DensePagerSession`]. `None` for a dtype without a native GEMV build.
+/// `-DSTREAMED` twin of [`native_build_spv`] (kernel-cache name + SPIR-V): the dense layer-streaming
+/// GEMV reads the weight from a `bufferDeviceAddress` arena pool by 64-bit address
+/// (native_arena_ref.glsl) instead of a bound SSBO, lifting the ~4 GiB `maxStorageBufferRange` cap.
+/// All streamed dense Linears (any m) route through this one kernel's rows loop — see
+/// [`crate::recorder::Recorder::linear_native_streamed`] and [`crate::pager::DensePagerSession`].
+/// `res` mirrors [`native_build_spv`]'s residual arm — production dispatches fused-residual GEMVs on
+/// resident weights (the decode Linear+Add fusion, [`crate::recorder::Recorder::linear_add_native`]),
+/// so the resident-BDA endgame needs the `-DUSE_RES` twin too, not just the plain one. `None` for a
+/// dtype without a native GEMV build.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_streamed_build_spv(
     dtype: infr_core::DType,
+    res: bool,
 ) -> Option<(&'static str, &'static [u32])> {
     use infr_core::DType::*;
     macro_rules! v {
@@ -172,32 +176,57 @@ pub(crate) fn native_streamed_build_spv(
             Some(($name, s))
         }};
     }
-    match dtype {
-        Q8_0 => v!("native_q8_0_streamed"),
-        Bf16 => v!("native_bf16_streamed"),
-        Q4_0 => v!("native_q4_0_streamed"),
-        Q4_1 => v!("native_q4_1_streamed"),
-        Q5_0 => v!("native_q5_0_streamed"),
-        Q5_1 => v!("native_q5_1_streamed"),
-        Q2K => v!("native_q2k_streamed"),
-        Q3K => v!("native_q3k_streamed"),
-        Q4K => v!("native_q4k_streamed"),
-        Q5K => v!("native_q5k_streamed"),
-        Q6K => v!("native_q6k_streamed"),
-        Iq4Nl => v!("native_iq4nl_streamed"),
-        Iq4Xs => v!("native_iq4xs_streamed"),
-        Mxfp4 => v!("native_mxfp4_streamed"),
-        Nvfp4 => v!("native_nvfp4_streamed"),
-        Tq1_0 => v!("native_tq1_0_streamed"),
-        Tq2_0 => v!("native_tq2_0_streamed"),
-        Q2_0 => v!("native_q2_0_streamed"),
-        Iq2Xxs => v!("native_iq2xxs_streamed"),
-        Iq2Xs => v!("native_iq2xs_streamed"),
-        Iq2S => v!("native_iq2s_streamed"),
-        Iq3Xxs => v!("native_iq3xxs_streamed"),
-        Iq3S => v!("native_iq3s_streamed"),
-        Iq1S => v!("native_iq1s_streamed"),
-        Iq1M => v!("native_iq1m_streamed"),
+    match (dtype, res) {
+        (Q8_0, false) => v!("native_q8_0_streamed"),
+        (Q8_0, true) => v!("native_q8_0_res_streamed"),
+        (Bf16, false) => v!("native_bf16_streamed"),
+        (Bf16, true) => v!("native_bf16_res_streamed"),
+        (Q4_0, false) => v!("native_q4_0_streamed"),
+        (Q4_0, true) => v!("native_q4_0_res_streamed"),
+        (Q4_1, false) => v!("native_q4_1_streamed"),
+        (Q4_1, true) => v!("native_q4_1_res_streamed"),
+        (Q5_0, false) => v!("native_q5_0_streamed"),
+        (Q5_0, true) => v!("native_q5_0_res_streamed"),
+        (Q5_1, false) => v!("native_q5_1_streamed"),
+        (Q5_1, true) => v!("native_q5_1_res_streamed"),
+        (Q2K, false) => v!("native_q2k_streamed"),
+        (Q2K, true) => v!("native_q2k_res_streamed"),
+        (Q3K, false) => v!("native_q3k_streamed"),
+        (Q3K, true) => v!("native_q3k_res_streamed"),
+        (Q4K, false) => v!("native_q4k_streamed"),
+        (Q4K, true) => v!("native_q4k_res_streamed"),
+        (Q5K, false) => v!("native_q5k_streamed"),
+        (Q5K, true) => v!("native_q5k_res_streamed"),
+        (Q6K, false) => v!("native_q6k_streamed"),
+        (Q6K, true) => v!("native_q6k_res_streamed"),
+        (Iq4Nl, false) => v!("native_iq4nl_streamed"),
+        (Iq4Nl, true) => v!("native_iq4nl_res_streamed"),
+        (Iq4Xs, false) => v!("native_iq4xs_streamed"),
+        (Iq4Xs, true) => v!("native_iq4xs_res_streamed"),
+        (Mxfp4, false) => v!("native_mxfp4_streamed"),
+        (Mxfp4, true) => v!("native_mxfp4_res_streamed"),
+        (Nvfp4, false) => v!("native_nvfp4_streamed"),
+        (Nvfp4, true) => v!("native_nvfp4_res_streamed"),
+        (Tq1_0, false) => v!("native_tq1_0_streamed"),
+        (Tq1_0, true) => v!("native_tq1_0_res_streamed"),
+        (Tq2_0, false) => v!("native_tq2_0_streamed"),
+        (Tq2_0, true) => v!("native_tq2_0_res_streamed"),
+        (Q2_0, false) => v!("native_q2_0_streamed"),
+        (Q2_0, true) => v!("native_q2_0_res_streamed"),
+        (Iq2Xxs, false) => v!("native_iq2xxs_streamed"),
+        (Iq2Xxs, true) => v!("native_iq2xxs_res_streamed"),
+        (Iq2Xs, false) => v!("native_iq2xs_streamed"),
+        (Iq2Xs, true) => v!("native_iq2xs_res_streamed"),
+        (Iq2S, false) => v!("native_iq2s_streamed"),
+        (Iq2S, true) => v!("native_iq2s_res_streamed"),
+        (Iq3Xxs, false) => v!("native_iq3xxs_streamed"),
+        (Iq3Xxs, true) => v!("native_iq3xxs_res_streamed"),
+        (Iq3S, false) => v!("native_iq3s_streamed"),
+        (Iq3S, true) => v!("native_iq3s_res_streamed"),
+        (Iq1S, false) => v!("native_iq1s_streamed"),
+        (Iq1S, true) => v!("native_iq1s_res_streamed"),
+        (Iq1M, false) => v!("native_iq1m_streamed"),
+        (Iq1M, true) => v!("native_iq1m_res_streamed"),
         _ => None,
     }
 }
@@ -276,13 +305,16 @@ pub(crate) fn native_rm_build_spv(
     }
 }
 
-/// `-DSTREAMED` twin of [`native_rm_build_spv`] (kernel-cache name + SPIR-V). Slice A1 build-variant
-/// only: nothing dispatches this yet ([`crate::recorder::Recorder::linear_native_rm_streamed`]
-/// exists purely so parity tests can exercise it). `rm` is 2 or 4; non-residual only (same
-/// reasoning as [`native_streamed_build_spv`] — the streamed path never carries a fused residual).
+/// `-DSTREAMED` twin of [`native_rm_build_spv`] (kernel-cache name + SPIR-V). `rm` is 2 or 4; `res`
+/// mirrors [`native_rm_build_spv`]'s residual arm: `linear_add_native`'s fallback route (RM=1..8
+/// out_f band, reached when the SG route and the default "reg" variant route both miss — e.g.
+/// `INFR_NO_GEMV_REG`) dispatches this table with `res = true`, so the residual twin is load-bearing
+/// for [`crate::recorder::Recorder::linear_add_native_streamed`], not just a parity-test convenience
+/// like the plain arm ([`crate::recorder::Recorder::linear_native_rm_streamed`]).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_rm_streamed_build_spv(
     dtype: infr_core::DType,
+    res: bool,
     rm: u32,
 ) -> Option<(&'static str, &'static [u32])> {
     use infr_core::DType::*;
@@ -297,11 +329,15 @@ pub(crate) fn native_rm_streamed_build_spv(
             Some(($name, s))
         }};
     }
-    match (dtype, rm) {
-        (Q4K, 2) => v!("native_q4k_rm2_streamed"),
-        (Q4K, 4) => v!("native_q4k_rm4_streamed"),
-        (Q6K, 2) => v!("native_q6k_rm2_streamed"),
-        (Q6K, 4) => v!("native_q6k_rm4_streamed"),
+    match (dtype, res, rm) {
+        (Q4K, false, 2) => v!("native_q4k_rm2_streamed"),
+        (Q4K, true, 2) => v!("native_q4k_rm2_res_streamed"),
+        (Q4K, false, 4) => v!("native_q4k_rm4_streamed"),
+        (Q4K, true, 4) => v!("native_q4k_rm4_res_streamed"),
+        (Q6K, false, 2) => v!("native_q6k_rm2_streamed"),
+        (Q6K, true, 2) => v!("native_q6k_rm2_res_streamed"),
+        (Q6K, false, 4) => v!("native_q6k_rm4_streamed"),
+        (Q6K, true, 4) => v!("native_q6k_rm4_res_streamed"),
         _ => None,
     }
 }
@@ -341,14 +377,17 @@ pub(crate) fn native_rm_variant_spv(
     }
 }
 
-/// `-DSTREAMED` twin of [`native_rm_variant_spv`] (kernel-cache name + SPIR-V). Slice A1 build-
-/// variant only: nothing dispatches this yet
-/// ([`crate::recorder::Recorder::linear_native_rm_v2_streamed`] exists purely so parity tests can
-/// exercise it). Non-residual only, same reasoning as the other streamed twins.
+/// `-DSTREAMED` twin of [`native_rm_variant_spv`] (kernel-cache name + SPIR-V). `res` mirrors
+/// [`native_rm_variant_spv`]'s residual arm: `linear_add_native`'s default route (the "reg" variant,
+/// `INFR_GEMV_VARIANT`/`INFR_NO_GEMV_REG` escapes aside) dispatches THIS table with `res = true`, so
+/// the residual twin is load-bearing for [`crate::recorder::Recorder::linear_add_native_streamed`],
+/// not just a parity-test convenience like the plain arm
+/// ([`crate::recorder::Recorder::linear_native_rm_v2_streamed`]).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_rm_v2_streamed_build_spv(
     variant: &str,
     dtype: infr_core::DType,
+    res: bool,
 ) -> Option<(&'static str, &'static [u32])> {
     use infr_core::DType::*;
     macro_rules! v {
@@ -362,12 +401,17 @@ pub(crate) fn native_rm_v2_streamed_build_spv(
             Some(($name, s))
         }};
     }
-    match (variant, dtype) {
-        ("sg", Q4K) => v!("native_q4k_rm2_sg_streamed"),
-        ("sg", Q6K) => v!("native_q6k_rm2_sg_streamed"),
-        ("dbuf", Q4K) => v!("native_q4k_rm2_dbuf_streamed"),
-        ("wg128", Q4K) => v!("native_q4k_rm2_wg128_streamed"),
-        ("reg", Q4K) => v!("native_q4k_rm2_reg_streamed"),
+    match (variant, dtype, res) {
+        ("sg", Q4K, false) => v!("native_q4k_rm2_sg_streamed"),
+        ("sg", Q4K, true) => v!("native_q4k_rm2_sg_res_streamed"),
+        ("sg", Q6K, false) => v!("native_q6k_rm2_sg_streamed"),
+        ("sg", Q6K, true) => v!("native_q6k_rm2_sg_res_streamed"),
+        ("dbuf", Q4K, false) => v!("native_q4k_rm2_dbuf_streamed"),
+        ("dbuf", Q4K, true) => v!("native_q4k_rm2_dbuf_res_streamed"),
+        ("wg128", Q4K, false) => v!("native_q4k_rm2_wg128_streamed"),
+        ("wg128", Q4K, true) => v!("native_q4k_rm2_wg128_res_streamed"),
+        ("reg", Q4K, false) => v!("native_q4k_rm2_reg_streamed"),
+        ("reg", Q4K, true) => v!("native_q4k_rm2_reg_res_streamed"),
         _ => None,
     }
 }
@@ -414,13 +458,16 @@ pub(crate) fn native_sg_build_spv(
     }
 }
 
-/// `-DSTREAMED` twin of [`native_sg_build_spv`] (kernel-cache name + SPIR-V). Slice A1 build-variant
-/// only: nothing dispatches this yet ([`crate::recorder::Recorder::linear_native_sg_streamed`]
-/// exists purely so parity tests can exercise it). `nr` ∈ {2,4,8}; non-residual only, same reasoning
-/// as the other streamed twins.
+/// `-DSTREAMED` twin of [`native_sg_build_spv`] (kernel-cache name + SPIR-V). `nr` ∈ {2,4,8}; `res`
+/// mirrors [`native_sg_build_spv`]'s residual arm — `linear_add_native`'s SG route
+/// ([`crate::recorder::Recorder::linear_add_native`]) dispatches this with `res = true` before ever
+/// falling to RM, so the residual twin is load-bearing for
+/// [`crate::recorder::Recorder::linear_add_native_streamed`], not just a parity-test convenience
+/// like the plain arm ([`crate::recorder::Recorder::linear_native_sg_streamed`]).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_sg_streamed_build_spv(
     dtype: infr_core::DType,
+    res: bool,
     nr: u32,
     sg16: bool,
 ) -> Option<(&'static str, &'static [u32])> {
@@ -436,13 +483,19 @@ pub(crate) fn native_sg_streamed_build_spv(
             Some(($name, s))
         }};
     }
-    match (dtype, nr, sg16) {
-        (Q6K, 2, false) => v!("native_q6k_sg2_streamed"),
-        (Q6K, 4, false) => v!("native_q6k_sg4_streamed"),
-        (Q6K, 8, false) => v!("native_q6k_sg8_streamed"),
-        (Q6K, 2, true) => v!("native_q6k_sg2_sg16_streamed"),
-        (Q6K, 4, true) => v!("native_q6k_sg4_sg16_streamed"),
-        (Q6K, 8, true) => v!("native_q6k_sg8_sg16_streamed"),
+    match (dtype, res, nr, sg16) {
+        (Q6K, false, 2, false) => v!("native_q6k_sg2_streamed"),
+        (Q6K, true, 2, false) => v!("native_q6k_sg2_res_streamed"),
+        (Q6K, false, 4, false) => v!("native_q6k_sg4_streamed"),
+        (Q6K, true, 4, false) => v!("native_q6k_sg4_res_streamed"),
+        (Q6K, false, 8, false) => v!("native_q6k_sg8_streamed"),
+        (Q6K, true, 8, false) => v!("native_q6k_sg8_res_streamed"),
+        (Q6K, false, 2, true) => v!("native_q6k_sg2_sg16_streamed"),
+        (Q6K, true, 2, true) => v!("native_q6k_sg2_res_sg16_streamed"),
+        (Q6K, false, 4, true) => v!("native_q6k_sg4_sg16_streamed"),
+        (Q6K, true, 4, true) => v!("native_q6k_sg4_res_sg16_streamed"),
+        (Q6K, false, 8, true) => v!("native_q6k_sg8_sg16_streamed"),
+        (Q6K, true, 8, true) => v!("native_q6k_sg8_res_sg16_streamed"),
         _ => None,
     }
 }
@@ -1216,13 +1269,16 @@ pub(crate) fn native_mmv_kernel_name(dtype: infr_core::DType, res: bool) -> &'st
     }
 }
 /// `-DSTREAMED` twin of [`native_mmv_build_spv`] (kernel-cache name + SPIR-V) — the int8 dp4a
-/// decode GEMV's weight read from a `bufferDeviceAddress` arena instead of a bound SSBO. Slice A2
-/// build-variant only: nothing dispatches this yet
-/// ([`crate::recorder::Recorder::linear_mmv_streamed`] exists purely so parity tests can exercise
-/// it). Non-residual only (the streamed path never carries a fused residual).
+/// decode GEMV's weight read from a `bufferDeviceAddress` arena instead of a bound SSBO. `res`
+/// mirrors [`native_mmv_build_spv`]'s residual arm: `linear_add_mmv`
+/// ([`crate::recorder::Recorder::linear_add_mmv`]) dispatches this table with `res = true` for its
+/// fused-residual int8 decode GEMV, so the residual twin
+/// ([`crate::recorder::Recorder::linear_add_mmv_streamed`]) is load-bearing, not just a parity-test
+/// convenience like the plain arm ([`crate::recorder::Recorder::linear_mmv_streamed`]).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_mmv_streamed_build_spv(
     dtype: infr_core::DType,
+    res: bool,
 ) -> Option<(&'static str, &'static [u32])> {
     use infr_core::DType::*;
     macro_rules! v {
@@ -1236,22 +1292,29 @@ pub(crate) fn native_mmv_streamed_build_spv(
             Some(($name, s))
         }};
     }
-    match dtype {
-        Q4K => v!("native_mmv_q4k_streamed"),
-        Q6K => v!("native_mmv_q6k_streamed"),
-        Iq4Xs => v!("native_mmv_iq4xs_streamed"),
+    match (dtype, res) {
+        (Q4K, false) => v!("native_mmv_q4k_streamed"),
+        (Q4K, true) => v!("native_mmv_q4k_res_streamed"),
+        (Q6K, false) => v!("native_mmv_q6k_streamed"),
+        (Q6K, true) => v!("native_mmv_q6k_res_streamed"),
+        (Iq4Xs, false) => v!("native_mmv_iq4xs_streamed"),
+        (Iq4Xs, true) => v!("native_mmv_iq4xs_res_streamed"),
         _ => None,
     }
 }
 /// `-DSTREAMED` twin of [`native_mmv_mrow_variant_spv`] (kernel-cache name + SPIR-V), covering the
-/// rows<=8 layout matrix (`o4`/`m4`). Slice A2 build-variant only: nothing dispatches this yet
-/// ([`crate::recorder::Recorder::linear_mmv_mrow_streamed`] exists purely so parity tests can
-/// exercise it). Non-residual only, same reasoning as the other streamed twins.
+/// rows<=8 layout matrix (`o4`/`m4`/`res`). `res` mirrors [`native_mmv_mrow_variant_spv`]'s residual
+/// arm — build-declared ONLY at `m4 = true` (the decode Linear+Add fusion always dispatches this
+/// shader at `rows = 1`, which forces `m4 = true`; see [`crate::recorder::Recorder::linear_mmv_mrow`]'s
+/// doc) and NEVER for `Iq4Xs` (no `-DUSE_RES` build exists for that dtype in this family). `res =
+/// true` is load-bearing for [`crate::recorder::Recorder::linear_mmv_mrow_streamed`]'s residual
+/// path, not just a parity-test convenience.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_mmv_mrow_streamed_variant_spv(
     dtype: infr_core::DType,
     o4: bool,
     m4: bool,
+    res: bool,
 ) -> Option<(&'static str, &'static [u32])> {
     use infr_core::DType::*;
     macro_rules! v {
@@ -1265,55 +1328,77 @@ pub(crate) fn native_mmv_mrow_streamed_variant_spv(
             Some(($name, s))
         }};
     }
-    match (dtype, o4, m4) {
-        (Q4K, false, false) => v!("native_mmv_mrow_q4k_streamed"),
-        (Q4K, false, true) => v!("native_mmv_mrow_q4k_m4_streamed"),
-        (Q4K, true, false) => v!("native_mmv_mrow_q4k_o4_streamed"),
-        (Q4K, true, true) => v!("native_mmv_mrow_q4k_o4_m4_streamed"),
-        (Q6K, false, false) => v!("native_mmv_mrow_q6k_streamed"),
-        (Q6K, false, true) => v!("native_mmv_mrow_q6k_m4_streamed"),
-        (Q6K, true, false) => v!("native_mmv_mrow_q6k_o4_streamed"),
-        (Q6K, true, true) => v!("native_mmv_mrow_q6k_o4_m4_streamed"),
-        (Iq4Xs, false, false) => v!("native_mmv_mrow_iq4xs_streamed"),
-        (Iq4Xs, false, true) => v!("native_mmv_mrow_iq4xs_m4_streamed"),
-        (Iq4Xs, true, false) => v!("native_mmv_mrow_iq4xs_o4_streamed"),
-        (Iq4Xs, true, true) => v!("native_mmv_mrow_iq4xs_o4_m4_streamed"),
-        (Q2K, false, false) => v!("native_mmv_mrow_q2k_streamed"),
-        (Q2K, false, true) => v!("native_mmv_mrow_q2k_m4_streamed"),
-        (Q2K, true, false) => v!("native_mmv_mrow_q2k_o4_streamed"),
-        (Q2K, true, true) => v!("native_mmv_mrow_q2k_o4_m4_streamed"),
-        (Q3K, false, false) => v!("native_mmv_mrow_q3k_streamed"),
-        (Q3K, false, true) => v!("native_mmv_mrow_q3k_m4_streamed"),
-        (Q3K, true, false) => v!("native_mmv_mrow_q3k_o4_streamed"),
-        (Q3K, true, true) => v!("native_mmv_mrow_q3k_o4_m4_streamed"),
-        (Q5K, false, false) => v!("native_mmv_mrow_q5k_streamed"),
-        (Q5K, false, true) => v!("native_mmv_mrow_q5k_m4_streamed"),
-        (Q5K, true, false) => v!("native_mmv_mrow_q5k_o4_streamed"),
-        (Q5K, true, true) => v!("native_mmv_mrow_q5k_o4_m4_streamed"),
-        (Q8_0, false, false) => v!("native_mmv_mrow_q8_0_streamed"),
-        (Q8_0, false, true) => v!("native_mmv_mrow_q8_0_m4_streamed"),
-        (Q8_0, true, false) => v!("native_mmv_mrow_q8_0_o4_streamed"),
-        (Q8_0, true, true) => v!("native_mmv_mrow_q8_0_o4_m4_streamed"),
-        (Q4_0, false, false) => v!("native_mmv_mrow_q4_0_streamed"),
-        (Q4_0, false, true) => v!("native_mmv_mrow_q4_0_m4_streamed"),
-        (Q4_0, true, false) => v!("native_mmv_mrow_q4_0_o4_streamed"),
-        (Q4_0, true, true) => v!("native_mmv_mrow_q4_0_o4_m4_streamed"),
-        (Q5_0, false, false) => v!("native_mmv_mrow_q5_0_streamed"),
-        (Q5_0, false, true) => v!("native_mmv_mrow_q5_0_m4_streamed"),
-        (Q5_0, true, false) => v!("native_mmv_mrow_q5_0_o4_streamed"),
-        (Q5_0, true, true) => v!("native_mmv_mrow_q5_0_o4_m4_streamed"),
-        (Q4_1, false, false) => v!("native_mmv_mrow_q4_1_streamed"),
-        (Q4_1, false, true) => v!("native_mmv_mrow_q4_1_m4_streamed"),
-        (Q4_1, true, false) => v!("native_mmv_mrow_q4_1_o4_streamed"),
-        (Q4_1, true, true) => v!("native_mmv_mrow_q4_1_o4_m4_streamed"),
-        (Q5_1, false, false) => v!("native_mmv_mrow_q5_1_streamed"),
-        (Q5_1, false, true) => v!("native_mmv_mrow_q5_1_m4_streamed"),
-        (Q5_1, true, false) => v!("native_mmv_mrow_q5_1_o4_streamed"),
-        (Q5_1, true, true) => v!("native_mmv_mrow_q5_1_o4_m4_streamed"),
-        (Iq4Nl, false, false) => v!("native_mmv_mrow_iq4nl_streamed"),
-        (Iq4Nl, false, true) => v!("native_mmv_mrow_iq4nl_m4_streamed"),
-        (Iq4Nl, true, false) => v!("native_mmv_mrow_iq4nl_o4_streamed"),
-        (Iq4Nl, true, true) => v!("native_mmv_mrow_iq4nl_o4_m4_streamed"),
+    match (dtype, o4, m4, res) {
+        (Q4K, false, false, false) => v!("native_mmv_mrow_q4k_streamed"),
+        (Q4K, false, true, false) => v!("native_mmv_mrow_q4k_m4_streamed"),
+        (Q4K, true, false, false) => v!("native_mmv_mrow_q4k_o4_streamed"),
+        (Q4K, true, true, false) => v!("native_mmv_mrow_q4k_o4_m4_streamed"),
+        (Q4K, false, true, true) => v!("native_mmv_mrow_q4k_m4_res_streamed"),
+        (Q4K, true, true, true) => v!("native_mmv_mrow_q4k_o4_m4_res_streamed"),
+        (Q6K, false, false, false) => v!("native_mmv_mrow_q6k_streamed"),
+        (Q6K, false, true, false) => v!("native_mmv_mrow_q6k_m4_streamed"),
+        (Q6K, true, false, false) => v!("native_mmv_mrow_q6k_o4_streamed"),
+        (Q6K, true, true, false) => v!("native_mmv_mrow_q6k_o4_m4_streamed"),
+        (Q6K, false, true, true) => v!("native_mmv_mrow_q6k_m4_res_streamed"),
+        (Q6K, true, true, true) => v!("native_mmv_mrow_q6k_o4_m4_res_streamed"),
+        (Iq4Xs, false, false, false) => v!("native_mmv_mrow_iq4xs_streamed"),
+        (Iq4Xs, false, true, false) => v!("native_mmv_mrow_iq4xs_m4_streamed"),
+        (Iq4Xs, true, false, false) => v!("native_mmv_mrow_iq4xs_o4_streamed"),
+        (Iq4Xs, true, true, false) => v!("native_mmv_mrow_iq4xs_o4_m4_streamed"),
+        (Q2K, false, false, false) => v!("native_mmv_mrow_q2k_streamed"),
+        (Q2K, false, true, false) => v!("native_mmv_mrow_q2k_m4_streamed"),
+        (Q2K, true, false, false) => v!("native_mmv_mrow_q2k_o4_streamed"),
+        (Q2K, true, true, false) => v!("native_mmv_mrow_q2k_o4_m4_streamed"),
+        (Q2K, false, true, true) => v!("native_mmv_mrow_q2k_m4_res_streamed"),
+        (Q2K, true, true, true) => v!("native_mmv_mrow_q2k_o4_m4_res_streamed"),
+        (Q3K, false, false, false) => v!("native_mmv_mrow_q3k_streamed"),
+        (Q3K, false, true, false) => v!("native_mmv_mrow_q3k_m4_streamed"),
+        (Q3K, true, false, false) => v!("native_mmv_mrow_q3k_o4_streamed"),
+        (Q3K, true, true, false) => v!("native_mmv_mrow_q3k_o4_m4_streamed"),
+        (Q3K, false, true, true) => v!("native_mmv_mrow_q3k_m4_res_streamed"),
+        (Q3K, true, true, true) => v!("native_mmv_mrow_q3k_o4_m4_res_streamed"),
+        (Q5K, false, false, false) => v!("native_mmv_mrow_q5k_streamed"),
+        (Q5K, false, true, false) => v!("native_mmv_mrow_q5k_m4_streamed"),
+        (Q5K, true, false, false) => v!("native_mmv_mrow_q5k_o4_streamed"),
+        (Q5K, true, true, false) => v!("native_mmv_mrow_q5k_o4_m4_streamed"),
+        (Q5K, false, true, true) => v!("native_mmv_mrow_q5k_m4_res_streamed"),
+        (Q5K, true, true, true) => v!("native_mmv_mrow_q5k_o4_m4_res_streamed"),
+        (Q8_0, false, false, false) => v!("native_mmv_mrow_q8_0_streamed"),
+        (Q8_0, false, true, false) => v!("native_mmv_mrow_q8_0_m4_streamed"),
+        (Q8_0, true, false, false) => v!("native_mmv_mrow_q8_0_o4_streamed"),
+        (Q8_0, true, true, false) => v!("native_mmv_mrow_q8_0_o4_m4_streamed"),
+        (Q8_0, false, true, true) => v!("native_mmv_mrow_q8_0_m4_res_streamed"),
+        (Q8_0, true, true, true) => v!("native_mmv_mrow_q8_0_o4_m4_res_streamed"),
+        (Q4_0, false, false, false) => v!("native_mmv_mrow_q4_0_streamed"),
+        (Q4_0, false, true, false) => v!("native_mmv_mrow_q4_0_m4_streamed"),
+        (Q4_0, true, false, false) => v!("native_mmv_mrow_q4_0_o4_streamed"),
+        (Q4_0, true, true, false) => v!("native_mmv_mrow_q4_0_o4_m4_streamed"),
+        (Q4_0, false, true, true) => v!("native_mmv_mrow_q4_0_m4_res_streamed"),
+        (Q4_0, true, true, true) => v!("native_mmv_mrow_q4_0_o4_m4_res_streamed"),
+        (Q5_0, false, false, false) => v!("native_mmv_mrow_q5_0_streamed"),
+        (Q5_0, false, true, false) => v!("native_mmv_mrow_q5_0_m4_streamed"),
+        (Q5_0, true, false, false) => v!("native_mmv_mrow_q5_0_o4_streamed"),
+        (Q5_0, true, true, false) => v!("native_mmv_mrow_q5_0_o4_m4_streamed"),
+        (Q5_0, false, true, true) => v!("native_mmv_mrow_q5_0_m4_res_streamed"),
+        (Q5_0, true, true, true) => v!("native_mmv_mrow_q5_0_o4_m4_res_streamed"),
+        (Q4_1, false, false, false) => v!("native_mmv_mrow_q4_1_streamed"),
+        (Q4_1, false, true, false) => v!("native_mmv_mrow_q4_1_m4_streamed"),
+        (Q4_1, true, false, false) => v!("native_mmv_mrow_q4_1_o4_streamed"),
+        (Q4_1, true, true, false) => v!("native_mmv_mrow_q4_1_o4_m4_streamed"),
+        (Q4_1, false, true, true) => v!("native_mmv_mrow_q4_1_m4_res_streamed"),
+        (Q4_1, true, true, true) => v!("native_mmv_mrow_q4_1_o4_m4_res_streamed"),
+        (Q5_1, false, false, false) => v!("native_mmv_mrow_q5_1_streamed"),
+        (Q5_1, false, true, false) => v!("native_mmv_mrow_q5_1_m4_streamed"),
+        (Q5_1, true, false, false) => v!("native_mmv_mrow_q5_1_o4_streamed"),
+        (Q5_1, true, true, false) => v!("native_mmv_mrow_q5_1_o4_m4_streamed"),
+        (Q5_1, false, true, true) => v!("native_mmv_mrow_q5_1_m4_res_streamed"),
+        (Q5_1, true, true, true) => v!("native_mmv_mrow_q5_1_o4_m4_res_streamed"),
+        (Iq4Nl, false, false, false) => v!("native_mmv_mrow_iq4nl_streamed"),
+        (Iq4Nl, false, true, false) => v!("native_mmv_mrow_iq4nl_m4_streamed"),
+        (Iq4Nl, true, false, false) => v!("native_mmv_mrow_iq4nl_o4_streamed"),
+        (Iq4Nl, true, true, false) => v!("native_mmv_mrow_iq4nl_o4_m4_streamed"),
+        (Iq4Nl, false, true, true) => v!("native_mmv_mrow_iq4nl_m4_res_streamed"),
+        (Iq4Nl, true, true, true) => v!("native_mmv_mrow_iq4nl_o4_m4_res_streamed"),
         _ => None,
     }
 }
@@ -1352,12 +1437,14 @@ pub(crate) fn native_mmv_mrow_streamed_m16_spv(
     }
 }
 /// `-DSTREAMED` twin of [`native_mmv_mw_build_spv`] (kernel-cache name + SPIR-V) — the multi-warp
-/// int8 dp4a decode GEMV. Slice A2 build-variant only; parity-test entry, not dispatched in
-/// production. Same non-res arm coverage as the resident table (the res arms have no streamed
-/// twin by construction).
+/// int8 dp4a decode GEMV. `res` mirrors [`native_mmv_mw_build_spv`]'s residual arm, present at every
+/// `(dtype, warps, sg16)` combination the resident table has (Intel's default-on `mmv_mw_choice`
+/// route dispatches the residual arm for its decode Linear+Add fusion — see
+/// [`crate::recorder::Recorder::linear_mmv_mw`] — so the twin isn't just a parity-test convenience).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_mmv_mw_streamed_build_spv(
     dtype: infr_core::DType,
+    res: bool,
     warps: u32,
     sg16: bool,
 ) -> Option<(&'static str, &'static [u32])> {
@@ -1373,28 +1460,49 @@ pub(crate) fn native_mmv_mw_streamed_build_spv(
             Some(($name, s))
         }};
     }
-    match (dtype, warps, sg16) {
-        (Q4K, 1, false) => v!("native_mmv_mw_q4k_w1_streamed"),
-        (Q4K, 2, false) => v!("native_mmv_mw_q4k_w2_streamed"),
-        (Q4K, 16, false) => v!("native_mmv_mw_q4k_w16_streamed"),
-        (Q4K, 4, false) => v!("native_mmv_mw_q4k_w4_streamed"),
-        (Q4K, 8, false) => v!("native_mmv_mw_q4k_w8_streamed"),
-        (Q6K, 4, false) => v!("native_mmv_mw_q6k_w4_streamed"),
-        (Q6K, 8, false) => v!("native_mmv_mw_q6k_w8_streamed"),
-        (Q2K, 4, false) => v!("native_mmv_mw_q2k_w4_streamed"),
-        (Q2K, 8, false) => v!("native_mmv_mw_q2k_w8_streamed"),
-        (Q3K, 4, false) => v!("native_mmv_mw_q3k_w4_streamed"),
-        (Q3K, 8, false) => v!("native_mmv_mw_q3k_w8_streamed"),
-        (Q4K, 4, true) => v!("native_mmv_mw_q4k_w4_sg16_streamed"),
-        (Q4K, 8, true) => v!("native_mmv_mw_q4k_w8_sg16_streamed"),
-        (Q6K, 4, true) => v!("native_mmv_mw_q6k_w4_sg16_streamed"),
-        (Q6K, 8, true) => v!("native_mmv_mw_q6k_w8_sg16_streamed"),
-        (Q2K, 4, true) => v!("native_mmv_mw_q2k_w4_sg16_streamed"),
-        (Q2K, 8, true) => v!("native_mmv_mw_q2k_w8_sg16_streamed"),
-        (Q3K, 4, true) => v!("native_mmv_mw_q3k_w4_sg16_streamed"),
-        (Q3K, 8, true) => v!("native_mmv_mw_q3k_w8_sg16_streamed"),
-        (Q5K, 4, false) => v!("native_mmv_mw_q5k_w4_streamed"),
-        (Q5K, 8, false) => v!("native_mmv_mw_q5k_w8_streamed"),
+    match (dtype, res, warps, sg16) {
+        (Q4K, false, 1, false) => v!("native_mmv_mw_q4k_w1_streamed"),
+        (Q4K, true, 1, false) => v!("native_mmv_mw_q4k_w1_res_streamed"),
+        (Q4K, false, 2, false) => v!("native_mmv_mw_q4k_w2_streamed"),
+        (Q4K, true, 2, false) => v!("native_mmv_mw_q4k_w2_res_streamed"),
+        (Q4K, false, 16, false) => v!("native_mmv_mw_q4k_w16_streamed"),
+        (Q4K, true, 16, false) => v!("native_mmv_mw_q4k_w16_res_streamed"),
+        (Q4K, false, 4, false) => v!("native_mmv_mw_q4k_w4_streamed"),
+        (Q4K, true, 4, false) => v!("native_mmv_mw_q4k_w4_res_streamed"),
+        (Q4K, false, 8, false) => v!("native_mmv_mw_q4k_w8_streamed"),
+        (Q4K, true, 8, false) => v!("native_mmv_mw_q4k_w8_res_streamed"),
+        (Q6K, false, 4, false) => v!("native_mmv_mw_q6k_w4_streamed"),
+        (Q6K, true, 4, false) => v!("native_mmv_mw_q6k_w4_res_streamed"),
+        (Q6K, false, 8, false) => v!("native_mmv_mw_q6k_w8_streamed"),
+        (Q6K, true, 8, false) => v!("native_mmv_mw_q6k_w8_res_streamed"),
+        (Q2K, false, 4, false) => v!("native_mmv_mw_q2k_w4_streamed"),
+        (Q2K, true, 4, false) => v!("native_mmv_mw_q2k_w4_res_streamed"),
+        (Q2K, false, 8, false) => v!("native_mmv_mw_q2k_w8_streamed"),
+        (Q2K, true, 8, false) => v!("native_mmv_mw_q2k_w8_res_streamed"),
+        (Q3K, false, 4, false) => v!("native_mmv_mw_q3k_w4_streamed"),
+        (Q3K, true, 4, false) => v!("native_mmv_mw_q3k_w4_res_streamed"),
+        (Q3K, false, 8, false) => v!("native_mmv_mw_q3k_w8_streamed"),
+        (Q3K, true, 8, false) => v!("native_mmv_mw_q3k_w8_res_streamed"),
+        (Q4K, false, 4, true) => v!("native_mmv_mw_q4k_w4_sg16_streamed"),
+        (Q4K, true, 4, true) => v!("native_mmv_mw_q4k_w4_res_sg16_streamed"),
+        (Q4K, false, 8, true) => v!("native_mmv_mw_q4k_w8_sg16_streamed"),
+        (Q4K, true, 8, true) => v!("native_mmv_mw_q4k_w8_res_sg16_streamed"),
+        (Q6K, false, 4, true) => v!("native_mmv_mw_q6k_w4_sg16_streamed"),
+        (Q6K, true, 4, true) => v!("native_mmv_mw_q6k_w4_res_sg16_streamed"),
+        (Q6K, false, 8, true) => v!("native_mmv_mw_q6k_w8_sg16_streamed"),
+        (Q6K, true, 8, true) => v!("native_mmv_mw_q6k_w8_res_sg16_streamed"),
+        (Q2K, false, 4, true) => v!("native_mmv_mw_q2k_w4_sg16_streamed"),
+        (Q2K, true, 4, true) => v!("native_mmv_mw_q2k_w4_res_sg16_streamed"),
+        (Q2K, false, 8, true) => v!("native_mmv_mw_q2k_w8_sg16_streamed"),
+        (Q2K, true, 8, true) => v!("native_mmv_mw_q2k_w8_res_sg16_streamed"),
+        (Q3K, false, 4, true) => v!("native_mmv_mw_q3k_w4_sg16_streamed"),
+        (Q3K, true, 4, true) => v!("native_mmv_mw_q3k_w4_res_sg16_streamed"),
+        (Q3K, false, 8, true) => v!("native_mmv_mw_q3k_w8_sg16_streamed"),
+        (Q3K, true, 8, true) => v!("native_mmv_mw_q3k_w8_res_sg16_streamed"),
+        (Q5K, false, 4, false) => v!("native_mmv_mw_q5k_w4_streamed"),
+        (Q5K, true, 4, false) => v!("native_mmv_mw_q5k_w4_res_streamed"),
+        (Q5K, false, 8, false) => v!("native_mmv_mw_q5k_w8_streamed"),
+        (Q5K, true, 8, false) => v!("native_mmv_mw_q5k_w8_res_streamed"),
         _ => None,
     }
 }

@@ -556,6 +556,7 @@ fn mmv_mrow_streamed_matches_resident() {
                             q.qa.as_ref(),
                             q.dact.as_ref(),
                             q.sact.as_ref(),
+                            None,
                             y,
                             rows,
                             in_f,
@@ -1870,4 +1871,169 @@ fn repack_streamed_matches_resident() {
     );
 
     println!("ok: repack_q8_to_f8 streamed");
+}
+
+// ─── fused-residual family (this slice): native/mmv/mmv_mrow `-DUSE_RES` streamed twins ───────
+// The decode Linear+Add fusion (`linear_add_native` / `linear_add_mmv` / `linear_mmv_mrow` with
+// `Some(residual)`) dispatches resident weights today — the fused-add peephole filters streamed
+// weights OUT before this path is ever reached (adapter.rs). This slice adds the matching
+// `_res_streamed` SPIR-V + Rust plumbing so the resident-BDA endgame (deleting every bound-SSBO
+// weight path) has a residual twin ready when that filter is eventually lifted. Same bitwise
+// contract as the rest of this file (offset 0 AND a non-zero offset with a garbage prefix), with a
+// non-trivial MIXED-SIGN residual buffer so a dropped or zeroed residual add shows up as a visibly
+// wrong answer instead of an accidental pass.
+
+/// Mixed-sign residual values — deliberately not all-positive/all-zero so a broken (or missing)
+/// residual add can't pass by producing a coincidentally-plausible magnitude.
+fn synth_residual(n: usize) -> Vec<f32> {
+    (0..n).map(|i| ((i % 23) as f32 - 11.0) * 0.07).collect()
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn linear_add_native_streamed_matches_resident() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    // out_f=2048, in_f%32==0: Q6_K lands on the SG route (`native_sg_choice`) and Q4_K on the
+    // default "reg" RM-variant route (`native_rm_v2_streamed_build_spv`'s res arm) — see
+    // recorder.rs's `linear_add_native`/`linear_add_native_streamed` routing precedence. Both are
+    // exercised here rather than falling through to the plain-GEMV arm.
+    let (in_f, out_f) = (256usize, 2048usize);
+    let res = synth_residual(out_f);
+    let res_buf = be.alloc(out_f * 4, BufferUsage::Activations).unwrap();
+    be.upload(res_buf.as_ref(), bytemuck::cast_slice(&res))
+        .unwrap();
+
+    for dtype in [DType::Q4K, DType::Q6K] {
+        let c = run_case(
+            &be,
+            format!("linear_add_native dtype={dtype:?}"),
+            dtype,
+            in_f,
+            out_f,
+            out_f,
+            &|rec, w, x, y| rec.linear_add_native(dtype, w, x, res_buf.as_ref(), y, 1, in_f, out_f),
+            &|rec, addr, x, y| {
+                rec.linear_add_native_streamed(dtype, addr, x, res_buf.as_ref(), y, 1, in_f, out_f)
+            },
+        );
+        assert_case(&c);
+        println!("ok: {}", c.name);
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn linear_add_mmv_streamed_matches_resident() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let (in_f, out_f) = (256usize, 8usize);
+    let dtype = DType::Q4K;
+    let q = quantize_x(&be, 1, in_f);
+    let res = synth_residual(out_f);
+    let res_buf = be.alloc(out_f * 4, BufferUsage::Activations).unwrap();
+    be.upload(res_buf.as_ref(), bytemuck::cast_slice(&res))
+        .unwrap();
+
+    let c = run_mmv_case(
+        &be,
+        format!("linear_add_mmv dtype={dtype:?}"),
+        dtype,
+        in_f,
+        out_f,
+        out_f,
+        &q,
+        &|rec, w, y| {
+            rec.linear_add_mmv(
+                dtype,
+                w,
+                q.qa.as_ref(),
+                q.dact.as_ref(),
+                q.sact.as_ref(),
+                res_buf.as_ref(),
+                y,
+                in_f,
+                out_f,
+            )
+        },
+        &|rec, addr, y| {
+            rec.linear_add_mmv_streamed(
+                dtype,
+                addr,
+                q.qa.as_ref(),
+                q.dact.as_ref(),
+                q.sact.as_ref(),
+                res_buf.as_ref(),
+                y,
+                in_f,
+                out_f,
+            )
+        },
+    );
+    assert_case(&c);
+    println!("ok: {}", c.name);
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn linear_mmv_mrow_residual_streamed_matches_resident() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    // rows=1: the only shape a fused residual is ever legal at (the decode Linear+Add fusion) —
+    // see linear_mmv_mrow's doc.
+    let (in_f, out_f, rows) = (256usize, 8usize, 1usize);
+    let dtype = DType::Q4K;
+    let q = quantize_x(&be, rows, in_f);
+    let res = synth_residual(out_f);
+    let res_buf = be.alloc(out_f * 4, BufferUsage::Activations).unwrap();
+    be.upload(res_buf.as_ref(), bytemuck::cast_slice(&res))
+        .unwrap();
+
+    let c = run_mmv_case(
+        &be,
+        format!("linear_mmv_mrow residual dtype={dtype:?}"),
+        dtype,
+        in_f,
+        out_f,
+        rows * out_f,
+        &q,
+        &|rec, w, y| {
+            rec.linear_mmv_mrow(
+                dtype,
+                w,
+                0,
+                q.qa.as_ref(),
+                q.dact.as_ref(),
+                q.sact.as_ref(),
+                Some(res_buf.as_ref()),
+                y,
+                rows,
+                in_f,
+                out_f,
+            )
+        },
+        &|rec, addr, y| {
+            rec.linear_mmv_mrow_streamed(
+                dtype,
+                addr,
+                0,
+                q.qa.as_ref(),
+                q.dact.as_ref(),
+                q.sact.as_ref(),
+                Some(res_buf.as_ref()),
+                y,
+                rows,
+                in_f,
+                out_f,
+            )
+        },
+    );
+    assert_case(&c);
+    println!("ok: {}", c.name);
 }

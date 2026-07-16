@@ -2632,8 +2632,13 @@ fn main() {
     // .glsl) instead of a bound SSBO, lifting the ~4 GiB `maxStorageBufferRange` cap one SSBO
     // binding imposes. Additive: the default (non-STREAMED) build is byte-identical (the define
     // only activates #ifdef arms that expand to nothing when off).
-    //   * native_gemv — decode/small-m GEMV (any-m rows loop). Non-residual only: the fused-add
-    //     peephole filters streamed weights out (adapter.rs), so no USE_RES twin is needed.
+    //   * native_gemv — decode/small-m GEMV (any-m rows loop). Both plain and -DUSE_RES builds get
+    //     a twin: production DOES dispatch fused-residual GEMVs on resident weights (the decode
+    //     Linear+Add fusion — recorder.rs `linear_add_native`), and the resident-BDA endgame needs
+    //     every bound-SSBO weight path covered, residual or not. The STREAMED arm only reroutes the
+    //     weight-word chokepoint (NW), which is independent of the USE_RES residual-buffer binding
+    //     shuffle — see native_gemv.comp's binding layout (WB dropped under STREAMED; RB2/YB shift
+    //     is driven purely by USE_RES, unaffected by STREAMED).
     //   * native_gemm / native_gemm_warp — the prefill coopmat-dequant GEMM family (base 64×64 and
     //     the 8-warp warptile: wide/NARROW_N/A_GLOBAL/SPLIT_K/BM* × every quant format, plus the
     //     opt-in -DBF16CM / `_cm8` (-DCM_M=8) coopmat variants and the -DFMT_F16 split-K build). A
@@ -2647,26 +2652,27 @@ fn main() {
     //     native_gemm_warp variant now gets a twin.
     //   * native_gemv_mrow / native_gemv_sg / native_gemv_rm / native_gemv_rm_v2 — the resident
     //     decode-GEMV tuning family (spec-decode multi-row, subgroup-reduce projection band,
-    //     multi-output-row, and its experimental variants). Same additive guard as native_gemv; same
-    //     non-residual-only reasoning (the fused-add peephole is weight-source-agnostic, so no
-    //     streamed build ever sees USE_RES in production). `native_gemv_sg` also rides the SG16
-    //     twin expansion above (this closure runs AFTER it), so both the SG=32 and SG=16 builds get
-    //     their own `_streamed` twin by construction — no separate SG16 handling needed here.
+    //     multi-output-row, and its experimental variants). Same additive guard as native_gemv,
+    //     including the -DUSE_RES arms (`native_gemv_mrow` itself has none declared today — the
+    //     multi-row spec-decode path never fuses a residual — so lifting the guard is a no-op there;
+    //     `_sg`/`_rm`/`_rm_v2` all have real `_res` builds and now get streamed twins for them too).
+    //     `native_gemv_sg` also rides the SG16 twin expansion above (this closure runs AFTER it), so
+    //     both the SG=32 and SG=16 builds get their own `_streamed` twin by construction — no
+    //     separate SG16 handling needed here.
     let wants_streamed_twin = |src_stem: &str, defines: &[String]| -> bool {
-        let no_res = !defines.iter().any(|d| d == "-DUSE_RES");
         match src_stem {
-            "native_gemv" => no_res,
+            "native_gemv" => true,
             "native_gemm" | "native_gemm_warp" => true,
-            "native_gemv_mrow" | "native_gemv_sg" | "native_gemv_rm" | "native_gemv_rm_v2" => {
-                no_res
-            }
+            "native_gemv_mrow" | "native_gemv_sg" | "native_gemv_rm" | "native_gemv_rm_v2" => true,
             // Token-embedding gather (Op::EmbedGather): reads the GGUF table via the shared NW()
             // chokepoint, same as native_gemv. Every format variant gets a twin.
             "embed_gather" => true,
-            // The int8 dp4a GEMV family. Same additive/non-residual reasoning as the dequant GEMVs
-            // above; these carry their own decode (not native_decode.glsl's), so each declares the
-            // `NW(i)` chokepoint locally — see native_mmv.comp.
-            "native_mmv" | "native_mmv_mrow" | "native_mmv_mw" => no_res,
+            // The int8 dp4a GEMV family. Same additive reasoning as the dequant GEMVs above
+            // (including -DUSE_RES: production dispatches fused-residual int8 GEMVs on resident
+            // weights too — recorder.rs `linear_add_mmv`/`linear_mmv_mrow`); these carry their own
+            // decode (not native_decode.glsl's), so each declares the `NW(i)` chokepoint locally —
+            // see native_mmv.comp.
+            "native_mmv" | "native_mmv_mrow" | "native_mmv_mw" => true,
             // The tiled dp4a expert-GEMM family (base + every EXPERT_GRID tile variant). The
             // `-DPAGED` builds already read the arena by device address (LUT/slot form) and never
             // get a `_streamed` twin — STREAMED is the LUT-less resident form of the same read.

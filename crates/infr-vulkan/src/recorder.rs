@@ -2731,7 +2731,7 @@ impl<'a> Recorder<'a> {
     ) {
         self.label_gemv("gemv_streamed", rows, in_f, out_f);
         let (name, spv) =
-            crate::gemm::native_streamed_build_spv(dtype).expect("native streamed GEMV spv");
+            crate::gemm::native_streamed_build_spv(dtype, false).expect("native streamed GEMV spv");
         let k = self.be.kernel(name, spv, 3, 24);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
@@ -2846,7 +2846,7 @@ impl<'a> Recorder<'a> {
         nr: u32,
     ) {
         self.label_gemv("gemv_sg_streamed", 1, in_f, out_f);
-        let (name, spv) = crate::gemm::native_sg_streamed_build_spv(dtype, nr, self.sg16())
+        let (name, spv) = crate::gemm::native_sg_streamed_build_spv(dtype, false, nr, self.sg16())
             .expect("native sg streamed spv");
         let k = self.be.kernel_sg(name, spv, 3, 24, self.sgp());
         let mut push = [0u8; 24];
@@ -2882,8 +2882,8 @@ impl<'a> Recorder<'a> {
         rm: u32,
     ) {
         self.label_gemv("gemv_rm_streamed", 1, in_f, out_f);
-        let (name, spv) =
-            crate::gemm::native_rm_streamed_build_spv(dtype, rm).expect("native rm streamed spv");
+        let (name, spv) = crate::gemm::native_rm_streamed_build_spv(dtype, false, rm)
+            .expect("native rm streamed spv");
         let k = self.be.kernel(name, spv, 3, 24);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&1u32.to_ne_bytes()); // rows: RM serves m=1 decode only
@@ -2918,7 +2918,7 @@ impl<'a> Recorder<'a> {
         out_f: usize,
     ) {
         self.label_gemv("gemv_rm_v2_streamed", 1, in_f, out_f);
-        let (name, spv) = crate::gemm::native_rm_v2_streamed_build_spv(variant, dtype)
+        let (name, spv) = crate::gemm::native_rm_v2_streamed_build_spv(variant, dtype, false)
             .expect("native rm_v2 streamed spv");
         let k = self.be.kernel(name, spv, 3, 24);
         let mut push = [0u8; 24];
@@ -2956,8 +2956,8 @@ impl<'a> Recorder<'a> {
         out_f: usize,
     ) {
         self.label_gemv("mmv_streamed", 1, in_f, out_f);
-        let (name, spv) =
-            crate::gemm::native_mmv_streamed_build_spv(dtype).expect("native mmv streamed spv");
+        let (name, spv) = crate::gemm::native_mmv_streamed_build_spv(dtype, false)
+            .expect("native mmv streamed spv");
         let k = self.be.kernel(name, spv, 5, 24);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&1u32.to_ne_bytes());
@@ -2984,8 +2984,11 @@ impl<'a> Recorder<'a> {
     /// `-DSTREAMED` twin of [`Self::linear_mmv_mrow`] (slice A2 build-variant: see
     /// `crate::gemm::native_mmv_mrow_streamed_variant_spv`). Mirrors the resident dispatcher's
     /// o4/m4/m16 routing EXACTLY (same env escapes) so a parity test comparing the two at the same
-    /// shape lands on the same layout variant. Non-residual only. Not wired into any production
-    /// dispatch yet.
+    /// shape lands on the same layout variant. `residual`: fused `y = residual + x·Wᵀ`, same
+    /// legality rule as the resident dispatcher (`rows == 1` only — asserted; never legal at the
+    /// `rows > 8` m16 tier). Binding count grows 5→6 when `Some`, same shape as
+    /// [`Self::linear_mmv_mrow`]'s res arm — the arena address still rides the FILLER'd binding 0,
+    /// residual inserted right before the trailing `y` write.
     #[allow(clippy::too_many_arguments)]
     pub fn linear_mmv_mrow_streamed(
         &self,
@@ -2995,24 +2998,31 @@ impl<'a> Recorder<'a> {
         qa: &dyn Buffer,
         dact: &dyn Buffer,
         sact: &dyn Buffer,
+        residual: Option<&dyn Buffer>,
         y: &dyn Buffer,
         rows: usize,
         in_f: usize,
         out_f: usize,
     ) {
         debug_assert!((1..=16).contains(&rows));
+        debug_assert!(
+            residual.is_none() || rows == 1,
+            "fused residual is decode-only (rows=1)"
+        );
         self.label_gemv("mmvr_streamed", rows, in_f, out_f);
         let o4 = in_f < 2048 && std::env::var("INFR_NO_MMV_O4").is_err();
         let m4 = rows <= 4 && std::env::var("INFR_NO_MMV_M4").is_err();
+        let res = residual.is_some();
         let (name, spv) = if rows > 8 {
             crate::gemm::native_mmv_mrow_streamed_m16_spv(dtype)
                 .expect("native mmv mrow m16 streamed spv")
         } else {
-            crate::gemm::native_mmv_mrow_streamed_variant_spv(dtype, o4, m4)
+            crate::gemm::native_mmv_mrow_streamed_variant_spv(dtype, o4, m4, res)
                 .expect("native mmv mrow streamed spv")
         };
         let groups = (out_f as u32).div_ceil(if o4 && rows <= 8 { 4 } else { 2 });
-        let k = self.be.kernel(name, spv, 5, 24);
+        let nbind = if res { 6 } else { 5 };
+        let k = self.be.kernel(name, spv, nbind, 24);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
@@ -3020,19 +3030,17 @@ impl<'a> Recorder<'a> {
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch_wide(
-            k,
-            &[
-                Self::vkb(qa),
-                Self::vkb(qa),
-                Self::vkb(dact),
-                Self::vkb(sact),
-                Self::vkb(y),
-            ],
-            1,
-            &push,
-            groups,
-        );
+        let mut bufs = vec![
+            Self::vkb(qa),
+            Self::vkb(qa),
+            Self::vkb(dact),
+            Self::vkb(sact),
+        ];
+        if let Some(r) = residual {
+            bufs.push(Self::vkb(r));
+        }
+        bufs.push(Self::vkb(y));
+        self.dispatch_wide(k, &bufs, 1, &push, groups);
     }
 
     /// `-DSTREAMED` twin of [`Self::linear_mmv_mw`] (slice A2 build-variant: see
@@ -3053,8 +3061,9 @@ impl<'a> Recorder<'a> {
         out_f: usize,
     ) {
         self.label_gemv("mmv_mw_streamed", 1, in_f, out_f);
-        let (name, spv) = crate::gemm::native_mmv_mw_streamed_build_spv(dtype, warps, self.sg16())
-            .expect("native mmv_mw streamed spv");
+        let (name, spv) =
+            crate::gemm::native_mmv_mw_streamed_build_spv(dtype, false, warps, self.sg16())
+                .expect("native mmv_mw streamed spv");
         let k = self.be.kernel_sg(name, spv, 5, 24, self.sgp());
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&1u32.to_ne_bytes());
@@ -3229,6 +3238,89 @@ impl<'a> Recorder<'a> {
         self.dispatch_wide(k, &bufs, 1, &push, (rows * out_f) as u32);
     }
 
+    /// `-DSTREAMED` twin of [`Self::linear_add_native`] (fused-residual native dequant GEMV).
+    /// Mirrors the resident dispatcher's SG → variant → RM → plain-GEMV routing precedence EXACTLY
+    /// (same heuristics, same env escapes) so a parity test comparing the two at the same shape
+    /// lands on the same kernel. Same arena-by-address convention as
+    /// [`Self::linear_native_streamed`] — binding 0 (the resident build's weight SSBO) takes a small
+    /// FILLER (`x`) since the arena is never bound as a descriptor; `arena_lo`/`arena_hi` are
+    /// appended LAST to the push block, after the resident `w_base` slot (always 0 — the residual
+    /// native GEMV is not used for stacked experts). Not wired into any production dispatch yet
+    /// (today's fused-add peephole filters streamed weights out before this path is ever reached —
+    /// see adapter.rs's Linear+Add lowering); exists so a parity test can exercise the `_streamed`
+    /// SPV directly ahead of the resident-BDA endgame that will need it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_add_native_streamed(
+        &self,
+        dtype: infr_core::DType,
+        arena_addr: u64,
+        x: &dyn Buffer,
+        residual: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        // push[12..16] = w_base, 0 (residual native GEMV is not used for stacked experts).
+        push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        let bufs = [
+            Self::vkb(x),
+            Self::vkb(x),
+            Self::vkb(residual),
+            Self::vkb(y),
+        ];
+        // Reassociation-tolerant subgroup route — precedence over RM, mirrors linear_add_native.
+        if rows == 1 {
+            if let Some(nr) = native_sg_choice(dtype, in_f, out_f) {
+                if let Some((name, spv)) =
+                    crate::gemm::native_sg_streamed_build_spv(dtype, true, nr, self.sg16())
+                {
+                    let k = self.be.kernel_sg(name, spv, 4, 24, self.sgp());
+                    self.dispatch_wide(k, &bufs, 1, &push, (out_f as u32).div_ceil(nr));
+                    return;
+                }
+            }
+        }
+        // Multi-output-row route — mirrors linear_add_native's variant-then-RM fallback.
+        if rows == 1 {
+            let variant = if std::env::var("INFR_NO_GEMV_REG").is_ok() {
+                None
+            } else {
+                std::env::var("INFR_GEMV_VARIANT")
+                    .ok()
+                    .or_else(|| Some("reg".to_string()))
+            };
+            if let Some(ref v) = variant {
+                if let Some((name, spv)) =
+                    crate::gemm::native_rm_v2_streamed_build_spv(v, dtype, true)
+                {
+                    let rm: u32 = 2;
+                    let k = self.be.kernel(name, spv, 4, 24);
+                    self.dispatch_wide(k, &bufs, 1, &push, (out_f as u32).div_ceil(rm));
+                    return;
+                }
+            }
+            if let Some(rm) = native_rm_choice(dtype, out_f) {
+                if let Some((name, spv)) =
+                    crate::gemm::native_rm_streamed_build_spv(dtype, true, rm)
+                {
+                    let k = self.be.kernel(name, spv, 4, 24);
+                    self.dispatch_wide(k, &bufs, 1, &push, (out_f as u32).div_ceil(rm));
+                    return;
+                }
+            }
+        }
+        let (name, spv) = crate::gemm::native_streamed_build_spv(dtype, true)
+            .expect("native streamed GEMV res spv");
+        let k = self.be.kernel(name, spv, 4, 24);
+        self.dispatch_wide(k, &bufs, 1, &push, (rows * out_f) as u32);
+    }
+
     /// Gather + dequantize embedding rows (`Op::EmbedGather`): `dst[r,:] = table[ids[r],:] *
     /// scale`. One workgroup per row; per-format decode from native_decode.glsl. Caller gates on
     /// [`crate::gemm::embed_gather_build_spv`].
@@ -3364,6 +3456,54 @@ impl<'a> Recorder<'a> {
             k,
             &[
                 Self::vkb(w),
+                Self::vkb(qa),
+                Self::vkb(dact),
+                Self::vkb(sact),
+                Self::vkb(residual),
+                Self::vkb(y),
+            ],
+            1,
+            &push,
+            (out_f as u32).div_ceil(2),
+        );
+    }
+
+    /// `-DSTREAMED` twin of [`Self::linear_add_mmv`] (fused-residual int8 dp4a decode GEMV). Same
+    /// arena-by-address / FILLER convention as [`Self::linear_mmv_streamed`] — binding 0 (the
+    /// resident build's weight SSBO) takes a small FILLER (`qa`) since the arena is never bound as a
+    /// descriptor; `residual` is inserted right before the trailing `y` write (6 bindings total, vs
+    /// the plain arm's 5), and `arena_lo`/`arena_hi` are appended LAST to the push block. Not wired
+    /// into any production dispatch yet (today's fused-add peephole filters streamed weights out
+    /// before this path is ever reached — see adapter.rs's Linear+Add lowering); exists so a parity
+    /// test can exercise the `_streamed` SPV directly ahead of the resident-BDA endgame.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_add_mmv_streamed(
+        &self,
+        dtype: infr_core::DType,
+        arena_addr: u64,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: &dyn Buffer,
+        residual: &dyn Buffer,
+        y: &dyn Buffer,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.label_gemv("mmv_add_streamed", 1, in_f, out_f);
+        let (name, spv) = crate::gemm::native_mmv_streamed_build_spv(dtype, true)
+            .expect("native mmv res streamed spv");
+        let k = self.be.kernel(name, spv, 6, 24);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&1u32.to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        // push[12..16] = w_base, 0 (the residual GEMV never reads stacked experts).
+        push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch_wide(
+            k,
+            &[
+                Self::vkb(qa),
                 Self::vkb(qa),
                 Self::vkb(dact),
                 Self::vkb(sact),
