@@ -295,9 +295,8 @@ fn resolve<'a>(
 /// multiple of 64 so the prefill GEMM / flash kernels — which write ceil(rows/64)*64 output rows —
 /// write DIRECTLY into these buffers (no padded temp + copy). Padding rows are never read (downstream
 /// ops touch only the real `rows`, and row-major layout keeps element (r<rows, c) at the same index).
-/// [`alloc_scratch`]'s result: the per-tensor `Internal` scratch (indexed by `TensorId`) plus the
-/// shared 16-byte `dummy` buffer (bound as the unused scales/mins args of the f16 GEMM).
-type ScratchSet = (Vec<Option<Box<dyn Buffer>>>, Box<dyn Buffer>);
+/// [`alloc_scratch`]'s result: the per-tensor `Internal` scratch, indexed by `TensorId`.
+type ScratchSet = Vec<Option<Box<dyn Buffer>>>;
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn alloc_scratch(be_: &VulkanBackend, graph: &Graph) -> Result<ScratchSet> {
@@ -324,15 +323,11 @@ fn alloc_scratch(be_: &VulkanBackend, graph: &Graph) -> Result<ScratchSet> {
             sizes.push(bytes.max(4));
         }
     }
-    // The 16-byte `dummy` (bound as the unused scales/mins args of the f16 `matmul_proj` GEMM)
-    // rides the same batch — its own `alloc` would pay one more per-execute fill submit.
-    sizes.push(16);
-    let mut bufs = be_.alloc_zeroed_batch(&sizes, BufferUsage::Activations)?;
-    let dummy = bufs.pop().expect("alloc_zeroed_batch returned sizes.len()");
+    let bufs = be_.alloc_zeroed_batch(&sizes, BufferUsage::Activations)?;
     for (i, buf) in idx.into_iter().zip(bufs) {
         scratch[i] = Some(buf);
     }
-    Ok((scratch, dummy))
+    Ok(scratch)
 }
 
 /// Peephole: fuse `QkNormRope(k → k16)` + `WriteKv(k16 → cache, pos)` into a single Qk-norm+RoPE that
@@ -957,7 +952,6 @@ fn lower_op(
     // in between (which may rewrite `x` — e.g. next layer's RmsNorm into the same scratch id)
     // invalidates the memo by construction.
     mmv_memo: &mut Option<(TensorId, usize, usize)>,
-    dummy: &dyn Buffer,
     // Dense layer streaming (see `pager::DensePagerSession`): `Some(arena_addr)` when this op is an
     // `Op::Linear` whose weight is a streamed block — `arena_addr` is the resident slot's arena base
     // BYTE address. The pool arena is a `bufferDeviceAddress` buffer read purely by 64-bit pointer
@@ -1679,10 +1673,9 @@ fn lower_op(
                             w.device_addr(),
                         );
                     } else {
-                        // f16 coopmat GEMM (dummy scales/mins unused at bits=16). `matmul_proj`
-                        // internally forks on `wq.device_addr()` (see its recorder doc) — no
-                        // threading needed here.
-                        rec.matmul_proj(xb, w, dummy, dummy, out, m, in_f, out_f, 16, 0);
+                        // f16 coopmat GEMM. `matmul_proj` internally forks on `wq.device_addr()`
+                        // (see its recorder doc) — no threading needed here.
+                        rec.matmul_proj(xb, w, out, m, in_f, out_f);
                     }
                 }
                 if let Some(t) = tmp {
@@ -3962,7 +3955,7 @@ fn record_decode_replay(
     graph: &Graph,
     bindings: &Bindings,
 ) -> Result<DecodeReplay> {
-    let (scratch, dummy) = alloc_scratch(be_, graph)?;
+    let scratch = alloc_scratch(be_, graph)?;
     // `[pos, kv_len]` — Staging (host-visible mapped) so per-token `upload` is a plain memcpy.
     let params = be_.alloc(8, BufferUsage::Staging)?;
     let positions = graph
@@ -4095,7 +4088,6 @@ fn record_decode_replay(
             &mut dyn_args,
             &mut pool,
             &mut mmv_memo,
-            dummy.as_ref(),
             None,
         )?;
     }
@@ -4131,9 +4123,6 @@ fn record_decode_replay(
     // that replays in one submit, unchanged.
     segments.push(rec.end_segment().map_err(|e| be(e.to_string()))?);
     let recorded = crate::recorder::RecordedCmd::from_segments(be_, segments);
-    // dummy is unused in an eligible decode (m=1 GEMV path), but hold it (and any transient) so the
-    // recording can't reference a freed buffer.
-    transient.push(dummy);
     Ok(DecodeReplay {
         scratch,
         params,
@@ -4150,9 +4139,7 @@ fn record_decode_replay(
 /// batches and every ineligible decode (gemma/E2B/MoE/qwen35).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Result<()> {
-    // `dummy`: a tiny unused buffer bound as the (scales, mins) args of the f16 `matmul_proj`
-    // GEMM — allocated inside `alloc_scratch`'s single zero-init batch.
-    let (scratch, dummy) = alloc_scratch(be_, graph)?;
+    let scratch = alloc_scratch(be_, graph)?;
 
     // RoPE position: the static `qk_norm_rope`/`rope` kernels take a scalar `rope_pos`, but the IR
     // carries a `positions` i32 tensor. Read `positions[0]` (decode rows=1, or the start of a
@@ -4351,7 +4338,6 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                         &mut dyn_args,
                         &mut pool,
                         &mut mmv_memo,
-                        dummy.as_ref(),
                         Some(arena_addr),
                     )?;
                     continue;
@@ -4373,7 +4359,6 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
             &mut dyn_args,
             &mut pool,
             &mut mmv_memo,
-            dummy.as_ref(),
             None,
         )?;
     }

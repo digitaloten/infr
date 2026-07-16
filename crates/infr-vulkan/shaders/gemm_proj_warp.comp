@@ -1,11 +1,11 @@
 #version 460
 // Projection GEMM for prefill: C[M,N] = A[M,K] · Wᵀ, where W is [N,K] (row-major [out,in]). A is f32
-// activations (→f16 in shared); W is f16 OR unified quant (u8/u4 + per-block f16 scale/min) dequant'd
-// during staging. mul_mm-style warp tiling: workgroup BM×BN → warp WM×WN → CMS_M×CMS_N register-
-// blocked 16×16 coopmat frags. W staged Bs[n][k] (k contiguous → coalesced dequant reads) then
-// coopMatLoad ColumnMajor → Wᵀ. M padded to BM (rows ≥ M load 0). 256 threads / 8 warps matches the
-// llama.cpp AMD-RADV large warptile — the extra warps hide the W-dequant latency that a 4-warp tile
-// can't, which is what made small-M (high-ctx) prefill slow. Requires sg32, N%BN(256), K%16.
+// activations (→f16 in shared); W is f16, unpacked from 2/uint during staging. mul_mm-style warp
+// tiling: workgroup BM×BN → warp WM×WN → CMS_M×CMS_N register-blocked 16×16 coopmat frags. W staged
+// Bs[n][k] (k contiguous → coalesced reads) then coopMatLoad ColumnMajor → Wᵀ. M padded to BM (rows
+// ≥ M load 0). 256 threads / 8 warps matches the llama.cpp AMD-RADV large warptile — the extra warps
+// hide the W-unpack latency that a 4-warp tile can't, which is what made small-M (high-ctx) prefill
+// slow. Requires sg32, N%BN(256), K%16.
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
@@ -35,11 +35,9 @@ const uint SBK = BK + 8u;     // Bs is [BN][BK]
 // resident arena (base = arena_lo/arena_hi) instead of a bound SSBO — see linear_f32.comp's
 // header for the campaign rationale. Additive: the non-STREAMED build is byte-identical.
 #ifdef STREAMED
-layout(push_constant) uniform PC {
-    uint m; uint n; uint k; uint bits; uint blk_shift; uint arena_lo; uint arena_hi;
-} pc;
+layout(push_constant) uniform PC { uint m; uint n; uint k; uint arena_lo; uint arena_hi; } pc;
 #else
-layout(push_constant) uniform PC { uint m; uint n; uint k; uint bits; uint blk_shift; } pc;
+layout(push_constant) uniform PC { uint m; uint n; uint k; } pc;
 #endif
 layout(binding = 0) readonly buffer ABuf { float a[]; };       // [M, K] f32 activations
 #ifdef STREAMED
@@ -47,25 +45,16 @@ layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Are
 uint64_t w_ptr = 0ul;
 #define WQ(i) ArenaW(w_ptr).v[i]
 #else
-layout(binding = 1) readonly buffer WBuf { uint wq[]; };       // weights: f16 (2/uint) or quant idx
+layout(binding = 1) readonly buffer WBuf { uint wq[]; };       // weight: f16, 2/uint
 #define WQ(i) wq[i]
 #endif
-layout(binding = 2) readonly buffer SBuf { float16_t scales[]; };
-layout(binding = 3) readonly buffer MBuf { float16_t mins[]; };
-layout(binding = 4) writeonly buffer CBuf { float c[]; };
+layout(binding = 2) writeonly buffer CBuf { float c[]; };
 
 shared float16_t As[BM * SAK];
 shared float16_t Bs[BN * SBK];
 
-// dequantize weight element g (global index into [N,K] = out*K + in)
-float dqf(uint g) {
-    if (pc.bits == 16u) { return unpackHalf2x16(WQ(g >> 1u))[g & 1u]; }
-    uint q;
-    if (pc.bits == 4u) { q = (WQ(g >> 3u) >> ((g & 7u) * 4u)) & 0xFu; }
-    else { q = (WQ(g >> 2u) >> ((g & 3u) * 8u)) & 0xFFu; }
-    uint blk = g >> pc.blk_shift;
-    return float(scales[blk]) * float(q) + float(mins[blk]);
-}
+// f16 weight element g (global index into [N,K] = out*K + in)
+float wf(uint g) { return unpackHalf2x16(WQ(g >> 1u))[g & 1u]; }
 
 void main() {
 #ifdef STREAMED
@@ -95,8 +84,8 @@ void main() {
         }
         for (uint idx = li; idx < BN * BK; idx += THREADS) {
             uint cc = idx / BK; // n
-            uint kk = idx % BK; // k (contiguous → coalesced dequant)
-            Bs[cc * SBK + kk] = float16_t(dqf((wgCol + cc) * pc.k + (k0 + kk)));
+            uint kk = idx % BK; // k (contiguous → coalesced reads)
+            Bs[cc * SBK + kk] = float16_t(wf((wgCol + cc) * pc.k + (k0 + kk)));
         }
         barrier();
         [[unroll]] for (uint kf = 0u; kf < BK; kf += 16u) {

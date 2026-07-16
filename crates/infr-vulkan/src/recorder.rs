@@ -1272,29 +1272,22 @@ impl<'a> Recorder<'a> {
     }
 
     /// Prefill projection GEMM: `c[m,n] = a[m,k] · Wᵀ` on the matrix cores (coopmat). `a` is f32;
-    /// `wq` is the weight (f16 packed 2/u32 with bits=16, or quant idx with bits=4|8 + scales/mins).
-    /// `c` MUST be allocated `ceil(m/64)*64` rows (the kernel writes padded rows as 0). `n%64==0`,
-    /// `k%32==0`. For f16 weights pass any small non-empty buffer for scales/mins (unused).
-    #[allow(clippy::too_many_arguments)]
+    /// `wq` is the f16 weight, packed 2/u32. `c` MUST be allocated `ceil(m/64)*64` rows (the kernel
+    /// writes padded rows as 0). `n%64==0`, `k%32==0`.
     pub fn matmul_proj(
         &self,
         a: &dyn Buffer,
         wq: &dyn Buffer,
-        scales: &dyn Buffer,
-        mins: &dyn Buffer,
         c: &dyn Buffer,
         m: usize,
         k: usize,
         n: usize,
-        bits: u32,
-        blk_shift: u32,
     ) {
         if let Some(arena_addr) = wq.device_addr() {
-            return self
-                .matmul_proj_streamed(a, arena_addr, scales, mins, c, m, k, n, bits, blk_shift);
+            return self.matmul_proj_streamed(a, arena_addr, c, m, k, n);
         }
         // Warp tile (BM=64,BN=256, 256 threads / 8 warps — matches llama.cpp's AMD-RADV large
-        // warptile; the extra warps hide W-dequant latency). Wins big for M≥768 (low/mid ctx:
+        // warptile; the extra warps hide W-unpack latency). Wins big for M≥768 (low/mid ctx:
         // 4k+21% 8k+19% 16k+5%); at very small M (32k chunk≈500) its wide N tile still loses to the
         // BN=64 tiled kernel, so gate on M. Also needs N%256.
         let warp = m >= 768 && n.is_multiple_of(256);
@@ -1304,47 +1297,34 @@ impl<'a> Recorder<'a> {
             ("gemm_proj", crate::gemm::gemm_proj_spv(), n / 64)
         };
         self.label_gemm(name, m, k, n);
-        let kern = self.be.kernel_sg(name, spv, 5, 20, 32);
-        let mut push = [0u8; 20];
+        let kern = self.be.kernel_sg(name, spv, 3, 12, 32);
+        let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
-        push[12..16].copy_from_slice(&bits.to_ne_bytes());
-        push[16..20].copy_from_slice(&blk_shift.to_ne_bytes());
         let groups = (m.div_ceil(64) * tiles_n) as u32; // both kernels use BM=64
         self.dispatch(
             kern,
-            &[
-                Self::vkb(a),
-                Self::vkb(wq),
-                Self::vkb(scales),
-                Self::vkb(mins),
-                Self::vkb(c),
-            ],
+            &[Self::vkb(a), Self::vkb(wq), Self::vkb(c)],
             1,
             &push,
             groups,
         );
     }
 
-    /// `-DSTREAMED` twin of [`Self::matmul_proj`] (the coopmat f16/repacked-quant projection GEMM:
-    /// see `gemm_proj.comp`'s STREAMED doc). Same arena-by-address convention as
+    /// `-DSTREAMED` twin of [`Self::matmul_proj`] (the coopmat f16 projection GEMM: see
+    /// `gemm_proj.comp`'s STREAMED doc). Same arena-by-address convention as
     /// [`Self::matmul_mmq_streamed`] — the resident build's weight-SSBO slot (binding 1) takes a
     /// harmless FILLER (`a`) since the arena is never bound as a descriptor. Not wired into any
     /// production dispatch yet; exists so a parity test can exercise the `_streamed` SPV directly.
-    #[allow(clippy::too_many_arguments)]
     pub fn matmul_proj_streamed(
         &self,
         a: &dyn Buffer,
         arena_addr: u64,
-        scales: &dyn Buffer,
-        mins: &dyn Buffer,
         c: &dyn Buffer,
         m: usize,
         k: usize,
         n: usize,
-        bits: u32,
-        blk_shift: u32,
     ) {
         // Same M/N routing as matmul_proj — see its comment for the warp-tile rationale.
         let warp = m >= 768 && n.is_multiple_of(256);
@@ -1362,25 +1342,17 @@ impl<'a> Recorder<'a> {
             )
         };
         self.label_gemm(name, m, k, n);
-        let kern = self.be.kernel_sg(name, spv, 5, 28, 32);
-        let mut push = [0u8; 28];
+        let kern = self.be.kernel_sg(name, spv, 3, 20, 32);
+        let mut push = [0u8; 20];
         push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
-        push[12..16].copy_from_slice(&bits.to_ne_bytes());
-        push[16..20].copy_from_slice(&blk_shift.to_ne_bytes());
-        push[20..24].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
-        push[24..28].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
         let groups = (m.div_ceil(64) * tiles_n) as u32; // both kernels use BM=64
         self.dispatch(
             kern,
-            &[
-                Self::vkb(a),
-                Self::vkb(a),
-                Self::vkb(scales),
-                Self::vkb(mins),
-                Self::vkb(c),
-            ],
+            &[Self::vkb(a), Self::vkb(a), Self::vkb(c)],
             1,
             &push,
             groups,
@@ -9807,7 +9779,6 @@ mod tests {
             b
         };
         let ba = upf(&a);
-        let dummy = be.alloc(4, BufferUsage::Activations).unwrap();
         let bc = be.alloc(mpad * n * 4, BufferUsage::Readback).unwrap();
         let cpu = |label: &str, c: &[f32]| {
             let mut e = 0f32;
@@ -9821,80 +9792,18 @@ mod tests {
             assert!(e < 5e-3, "matmul_proj {label} mismatch: {e}");
         };
 
-        // --- f16 weights (bits=16) ---
+        // --- f16 weights ---
         let wf16: Vec<u16> = w
             .iter()
             .map(|&x| half::f16::from_f32(x).to_bits())
             .collect();
         let bw = be.upload_weight_bytes(bytemuck::cast_slice(&wf16)).unwrap();
         let rec = be.recorder().unwrap();
-        rec.matmul_proj(
-            ba.as_ref(),
-            bw.as_ref(),
-            dummy.as_ref(),
-            dummy.as_ref(),
-            bc.as_ref(),
-            m,
-            k,
-            n,
-            16,
-            0,
-        );
+        rec.matmul_proj(ba.as_ref(), bw.as_ref(), bc.as_ref(), m, k, n);
         rec.finish().unwrap();
         let mut bytes = vec![0u8; mpad * n * 4];
         be.download(bc.as_ref(), &mut bytes).unwrap();
         cpu("f16", bytemuck::cast_slice(&bytes));
-
-        // --- quant weights (bits=8, per-16 scale/min) ---
-        let blk = 16usize;
-        let mut qu = vec![0u32; n * k / 4];
-        let scales: Vec<u16> = (0..n * k / blk)
-            .map(|_b| half::f16::from_f32(0.02).to_bits())
-            .collect();
-        let mins: Vec<u16> = (0..n * k / blk)
-            .map(|_b| half::f16::from_f32(-1.5).to_bits())
-            .collect();
-        // choose u8 so that scale*u8+min == f16-rounded w (approx): u8 = round((w-min)/scale)
-        let mut wq_ref = vec![0f32; n * k];
-        for g in 0..n * k {
-            let s = half::f16::from_bits(scales[g / blk]).to_f32();
-            let mn = half::f16::from_bits(mins[g / blk]).to_f32();
-            let q = (((w[g] - mn) / s).round().clamp(0.0, 255.0)) as u8;
-            qu[g / 4] |= (q as u32) << (8 * (g % 4));
-            wq_ref[g] = s * q as f32 + mn;
-        }
-        let bwq = be.upload_weight_bytes(bytemuck::cast_slice(&qu)).unwrap();
-        let bs = be
-            .upload_weight_bytes(bytemuck::cast_slice(&scales))
-            .unwrap();
-        let bm = be.upload_weight_bytes(bytemuck::cast_slice(&mins)).unwrap();
-        let bc2 = be.alloc(mpad * n * 4, BufferUsage::Readback).unwrap();
-        let rec = be.recorder().unwrap();
-        rec.matmul_proj(
-            ba.as_ref(),
-            bwq.as_ref(),
-            bs.as_ref(),
-            bm.as_ref(),
-            bc2.as_ref(),
-            m,
-            k,
-            n,
-            8,
-            4,
-        );
-        rec.finish().unwrap();
-        let mut bytes2 = vec![0u8; mpad * n * 4];
-        be.download(bc2.as_ref(), &mut bytes2).unwrap();
-        let got: &[f32] = bytemuck::cast_slice(&bytes2);
-        let mut e = 0f32;
-        for r in 0..m {
-            for col in 0..n {
-                let want: f32 = (0..k).map(|x| a[r * k + x] * wq_ref[col * k + x]).sum();
-                e = e.max((got[r * n + col] - want).abs());
-            }
-        }
-        println!("matmul_proj quant max_err={e:e}");
-        assert!(e < 5e-3, "matmul_proj quant mismatch: {e}");
     }
 
     /// The F16-weight SPLIT-K warptile (DG slice-7: the SC soft-embedding GEMM's route — deep k,

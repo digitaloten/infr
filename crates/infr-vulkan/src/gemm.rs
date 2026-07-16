@@ -2657,7 +2657,7 @@ fn gemm_dp4a_spv() -> &'static [u32] {
 pub(crate) fn quant_q8_spv() -> &'static [u32] {
     QUANT_Q8_SPV.get_or_init(|| spv_words(QUANT_Q8_SPV_BYTES))
 }
-/// SPIR-V for the prefill projection GEMM (`C=A·Wᵀ`, f16/quant W). Used by the recorder.
+/// SPIR-V for the prefill projection GEMM (`C=A·Wᵀ`, f16 W). Used by the recorder.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn gemm_proj_spv() -> &'static [u32] {
     GEMM_PROJ_SPV.get_or_init(|| spv_words(GEMM_PROJ_SPV_BYTES))
@@ -2668,8 +2668,8 @@ pub(crate) fn gemm_proj_spv() -> &'static [u32] {
 pub(crate) fn gemm_proj_warp_spv() -> &'static [u32] {
     GEMM_PROJ_WARP_SPV.get_or_init(|| spv_words(GEMM_PROJ_WARP_SPV_BYTES))
 }
-/// `-DSTREAMED` twin SPIR-V of `gemm_proj` (the coopmat f16/repacked-quant projection GEMM, weight
-/// read through a typed 64-bit buffer_reference — see the shader's STREAMED doc). Parity-test entry.
+/// `-DSTREAMED` twin SPIR-V of `gemm_proj` (the coopmat f16 projection GEMM, weight read through a
+/// typed 64-bit buffer_reference — see the shader's STREAMED doc). Parity-test entry.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn gemm_proj_streamed_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_proj_streamed.spv"));
