@@ -759,19 +759,24 @@ impl WeightArena {
 // Allocation-side plumbing for moving resident weights out of per-tensor SSBOs and into big BDA
 // arena blocks — the same `bufferDeviceAddress` scheme the paged-MoE/dense-streaming kernels
 // already read weights through (see `pager.rs`, `alloc_arena_bda`), just applied to the RESIDENT
-// path instead of a paged/streamed one. Nothing in `adapter.rs`/`recorder.rs`'s dispatch logic
-// reads a sub-tensor's `device_addr()` yet — that wiring is a following slice. Default OFF
-// (`INFR_RESIDENT_BDA` unset): `make_alloc` never calls into any of this, so behavior is unchanged.
+// path instead of a paged/streamed one. Default ON (see [`resident_bda_enabled`]): every
+// `BufferUsage::Weights` alloc routes through here; `INFR_RESIDENT_BDA=0` is the escape hatch back
+// to the u32-SSBO paths, slated for removal with them (U4b, #73).
 
-/// `INFR_RESIDENT_BDA=1` — opt in to sub-allocating resident weight tensors from
-/// [`BdaWeightArena`] blocks instead of the plain per-tensor / [`WeightArena`] paths. Read once and
-/// cached: flipping the env var mid-process would split one model load's tensors across two
-/// allocation strategies, which nothing downstream (a sub-tensor's `Drop`/`device_addr`) expects to
-/// handle. Default OFF — zero behavior change anywhere in this crate.
+/// Sub-allocate resident weight tensors from [`BdaWeightArena`] blocks (the 64-bit device-address
+/// weight path) instead of the plain per-tensor / [`WeightArena`] SSBO paths. Read once and cached:
+/// flipping the env var mid-process would split one model load's tensors across two allocation
+/// strategies, which nothing downstream (a sub-tensor's `Drop`/`device_addr`) expects to handle.
+///
+/// DEFAULT ON since this commit. `INFR_RESIDENT_BDA=0` (or an empty value) is a temporary escape
+/// hatch back to the old u32-SSBO descriptor path, slated for removal together with those u32 paths
+/// (U4b, #73). Only an explicit falsy value ("0" or empty) opts out; any other value keeps the
+/// default on.
 fn resident_bda_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED
-        .get_or_init(|| std::env::var("INFR_RESIDENT_BDA").is_ok_and(|v| !v.is_empty() && v != "0"))
+    *ENABLED.get_or_init(|| {
+        std::env::var("INFR_RESIDENT_BDA").map_or(true, |v| !v.is_empty() && v != "0")
+    })
 }
 
 /// Byte alignment for resident-BDA weight sub-tensors within a block. Sub-tensors share one buffer
@@ -2812,10 +2817,10 @@ impl VulkanBackend {
     /// The shared body of `alloc`/`alloc_uninit`: pick the memory location + tick the weight-load
     /// progress bar. Zero/poison filling is applied by the callers.
     fn make_alloc(&self, bytes: usize, usage: BufferUsage) -> Result<VkBuffer> {
-        // `INFR_RESIDENT_BDA=1` (default OFF): resident weight tensors sub-allocate from the BDA
-        // arena instead of the ReBAR / `WeightArena` / gpu-allocator paths inside `make_buf` — see
-        // `bda_weight_alloc`. Every other `BufferUsage` (and the flag OFF) is byte-for-byte the old
-        // behavior below.
+        // Resident-BDA (default ON, `INFR_RESIDENT_BDA=0` opts out): resident weight tensors
+        // sub-allocate from the BDA arena instead of the ReBAR / `WeightArena` / gpu-allocator paths
+        // inside `make_buf` — see `bda_weight_alloc`. Every other `BufferUsage` (and the escape
+        // hatch off) is byte-for-byte the old behavior below.
         if usage == BufferUsage::Weights && resident_bda_enabled() {
             let buf = self.bda_weight_alloc(bytes)?;
             if let Some(pb) = self.shared.weight_pb.lock().unwrap().as_ref() {
