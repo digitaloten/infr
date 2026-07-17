@@ -21,20 +21,12 @@
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 // Same push layout as native_gemv (w_base = element offset for fused-QKV slices / MoE experts).
-// -DSTREAMED (see native_gemv.comp's header for the full rationale): the weight is read from the
+// Streamed (see native_gemv.comp's header for the full rationale): the weight is read from the
 // arena pool by 64-bit device address instead of a bound SSBO — arena_lo/arena_hi appended LAST,
-// w_base keeps its within-slot element-offset meaning. Additive: the non-STREAMED build is
-// byte-identical.
-#ifdef STREAMED
+// w_base keeps its within-slot element-offset meaning.
 layout(push_constant) uniform PC {
     uint rows; uint in_f; uint out_f; uint w_base; uint arena_lo; uint arena_hi;
 } pc;
-#else
-layout(push_constant) uniform PC { uint rows; uint in_f; uint out_f; uint w_base; } pc;
-#endif
-#ifndef STREAMED
-layout(binding = 0) readonly buffer WB { uint nw[]; };
-#endif
 // Activations as vec4 (in_f % 32 == 0, so every row/sub-block boundary is vec4-aligned): 8 wide
 // loads per (row, sub-block) instead of 32 scalar ones — at m=8 the inner loop is issue-bound
 // (m*32 scalar FMAs + loads per decoded block), and the vec4 form keeps the cost near-flat in m.
@@ -45,10 +37,8 @@ const uint MR = 8u;
 const uint MAX_SG = 8u;             // 64 threads / min 8-wide subgroup
 shared float part[MR * MAX_SG];     // one partial per (row, subgroup)
 
-#ifdef STREAMED
 #include "native_arena_ref.glsl"
 #define NW(i) arena_word(i)
-#endif
 
 #include "native_decode.glsl"
 
@@ -59,9 +49,7 @@ void main() {
     uint o = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x; // grid = out_f: one wg/output
     if (o >= pc.out_f) { return; }
     uint t = gl_LocalInvocationID.x;
-#ifdef STREAMED
     nw_ptr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
-#endif
     uint wbase = pc.w_base + o * pc.in_f;
     uint nsub = pc.in_f / 32u;
     uint in_f4 = pc.in_f >> 2u;

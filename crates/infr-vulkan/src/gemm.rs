@@ -23,45 +23,14 @@ fn spv_words(bytes: &[u8]) -> Vec<u32> {
 // remap). Uses `spv_words`/`OnceLock` from this module scope.
 include!(concat!(env!("OUT_DIR"), "/native_streamed_gemm_map.rs"));
 
-/// Build-compiled multi-row native GEMV SPIR-V (m = 2..8, weight streamed once — the spec-decode
-/// verify / short-suffix-prefill shape). `None` for formats without an mrow build (they keep the
-/// tiled GEMM route).
+/// Kernel-cache NAME of the multi-row native GEMV (m = 2..8 — the spec-decode verify /
+/// short-suffix-prefill shape) for `dtype`, or `None` for formats without an mrow build (they keep
+/// the tiled GEMM route). Availability + name oracle: the resident bound-SSBO build is gone, so the
+/// `_streamed` twin (native_mrow_streamed_build_spv) is the sole weight build that dispatches.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_mrow_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
+pub(crate) fn native_mrow_build_spv(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
-    macro_rules! v {
-        ($name:literal) => {{
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            S.get_or_init(|| {
-                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
-            })
-            .as_slice()
-        }};
-    }
     Some(match dtype {
-        Q8_0 => v!("native_mrow_q8_0"),
-        Bf16 => v!("native_mrow_bf16"),
-        Q4_0 => v!("native_mrow_q4_0"),
-        Q4_1 => v!("native_mrow_q4_1"),
-        Q5_0 => v!("native_mrow_q5_0"),
-        Q5_1 => v!("native_mrow_q5_1"),
-        Q2K => v!("native_mrow_q2k"),
-        Q3K => v!("native_mrow_q3k"),
-        Q4K => v!("native_mrow_q4k"),
-        Q5K => v!("native_mrow_q5k"),
-        Q6K => v!("native_mrow_q6k"),
-        Iq4Nl => v!("native_mrow_iq4nl"),
-        Iq4Xs => v!("native_mrow_iq4xs"),
-        Q2_0 => v!("native_mrow_q2_0"),
-        _ => return None,
-    })
-}
-
-/// Kernel-cache name for the multi-row native GEMV (must pair with [`native_mrow_build_spv`]).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_mrow_kernel_name(dtype: infr_core::DType) -> &'static str {
-    use infr_core::DType::*;
-    match dtype {
         Q8_0 => "native_mrow_q8_0",
         Bf16 => "native_mrow_bf16",
         Q4_0 => "native_mrow_q4_0",
@@ -76,8 +45,8 @@ pub(crate) fn native_mrow_kernel_name(dtype: infr_core::DType) -> &'static str {
         Iq4Nl => "native_mrow_iq4nl",
         Iq4Xs => "native_mrow_iq4xs",
         Q2_0 => "native_mrow_q2_0",
-        _ => "native_mrow_unsupported",
-    }
+        _ => return None,
+    })
 }
 
 /// Build-compiled native-block dequant GEMV SPIR-V for `(dtype, residual)`, or `None` if `dtype`
@@ -500,98 +469,9 @@ pub(crate) fn native_sg_streamed_build_spv(
     }
 }
 
-/// SPIR-V for the id-indexed native GEMV (expert chosen from a GPU buffer). One specialization per
-/// weight format an expert bank can hold — the FULL dense native-GEMV format set plus F16/F32 for
-/// float banks (resident float banks bind as effective f16; paged ones stage raw GGUF bytes, so
-/// both float variants exist). `None` only for non-weight dtypes (I32/U32/...).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_id_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
-    use infr_core::DType::*;
-    macro_rules! v {
-        ($name:literal) => {{
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            S.get_or_init(|| {
-                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
-            })
-            .as_slice()
-        }};
-    }
-    Some(match dtype {
-        Q8_0 => v!("native_id_q8_0"),
-        Q4_0 => v!("native_id_q4_0"),
-        Q4_1 => v!("native_id_q4_1"),
-        Q5_0 => v!("native_id_q5_0"),
-        Q5_1 => v!("native_id_q5_1"),
-        Q2K => v!("native_id_q2k"),
-        Q3K => v!("native_id_q3k"),
-        Q4K => v!("native_id_q4k"),
-        Q5K => v!("native_id_q5k"),
-        Q6K => v!("native_id_q6k"),
-        Iq4Nl => v!("native_id_iq4nl"),
-        Iq4Xs => v!("native_id_iq4xs"),
-        Mxfp4 => v!("native_id_mxfp4"),
-        Nvfp4 => v!("native_id_nvfp4"),
-        Tq1_0 => v!("native_id_tq1_0"),
-        Tq2_0 => v!("native_id_tq2_0"),
-        Q2_0 => v!("native_id_q2_0"),
-        Iq2Xxs => v!("native_id_iq2xxs"),
-        Iq2Xs => v!("native_id_iq2xs"),
-        Iq2S => v!("native_id_iq2s"),
-        Iq3Xxs => v!("native_id_iq3xxs"),
-        Iq3S => v!("native_id_iq3s"),
-        Iq1S => v!("native_id_iq1s"),
-        Iq1M => v!("native_id_iq1m"),
-        Bf16 => v!("native_id_bf16"),
-        F16 => v!("native_id_f16"),
-        F32 => v!("native_id_f32"),
-        _ => return None,
-    })
-}
-/// SPIR-V for the multi-slot id-indexed native GEMV (all n_used experts in one dispatch).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_idm_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
-    use infr_core::DType::*;
-    macro_rules! v {
-        ($name:literal) => {{
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            S.get_or_init(|| {
-                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
-            })
-            .as_slice()
-        }};
-    }
-    Some(match dtype {
-        Q8_0 => v!("native_idm_q8_0"),
-        Q4_0 => v!("native_idm_q4_0"),
-        Q4_1 => v!("native_idm_q4_1"),
-        Q5_0 => v!("native_idm_q5_0"),
-        Q5_1 => v!("native_idm_q5_1"),
-        Q2K => v!("native_idm_q2k"),
-        Q3K => v!("native_idm_q3k"),
-        Q4K => v!("native_idm_q4k"),
-        Q5K => v!("native_idm_q5k"),
-        Q6K => v!("native_idm_q6k"),
-        Iq4Nl => v!("native_idm_iq4nl"),
-        Iq4Xs => v!("native_idm_iq4xs"),
-        Mxfp4 => v!("native_idm_mxfp4"),
-        Nvfp4 => v!("native_idm_nvfp4"),
-        Tq1_0 => v!("native_idm_tq1_0"),
-        Tq2_0 => v!("native_idm_tq2_0"),
-        Q2_0 => v!("native_idm_q2_0"),
-        Iq2Xxs => v!("native_idm_iq2xxs"),
-        Iq2Xs => v!("native_idm_iq2xs"),
-        Iq2S => v!("native_idm_iq2s"),
-        Iq3Xxs => v!("native_idm_iq3xxs"),
-        Iq3S => v!("native_idm_iq3s"),
-        Iq1S => v!("native_idm_iq1s"),
-        Iq1M => v!("native_idm_iq1m"),
-        Bf16 => v!("native_idm_bf16"),
-        F16 => v!("native_idm_f16"),
-        F32 => v!("native_idm_f32"),
-        _ => return None,
-    })
-}
-/// [`native_id_build_spv`]'s paged twin (`infr_vulkan::pager`) — one extra LUT-buffer binding.
+/// Paged variant of the id-indexed native GEMV (`infr_vulkan::pager`) — one extra LUT-buffer
+/// binding. (The old bound-SSBO resident id GEMV is gone; STREAMED / this paged build are the
+/// only weight builds.)
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_id_paged_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
     use infr_core::DType::*;
@@ -635,7 +515,9 @@ pub(crate) fn native_id_paged_build_spv(dtype: infr_core::DType) -> Option<&'sta
         _ => return None,
     })
 }
-/// [`native_idm_build_spv`]'s paged twin (`infr_vulkan::pager`) — one extra LUT-buffer binding.
+/// Paged variant of the multi-slot id-indexed native GEMV (`infr_vulkan::pager`) — one extra
+/// LUT-buffer binding. (The old bound-SSBO resident build is gone; STREAMED / this paged build are
+/// the only weight builds.)
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_idm_paged_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
     use infr_core::DType::*;
@@ -678,51 +560,6 @@ pub(crate) fn native_idm_paged_build_spv(dtype: infr_core::DType) -> Option<&'st
         F32 => v!("native_idm_f32_paged"),
         _ => return None,
     })
-}
-/// SPIR-V + kernel-cache name for the reassociation-tolerant subgroup+NR variant of the multi-slot
-/// id GEMV (`native_gemv_id_multi_sg.comp`, wave32 + subgroupAdd). NOT bit-identical to
-/// `native_idm_*` — reordered accumulation; the caller gates to the Q6_K projection band (see
-/// `native_id_sg_choice`). Q6_K/Q5_K/IQ3_S only (Q4_K idm already saturates; IQ2_S's gate/up
-/// shape REGRESSES on this tier). `nr` ∈ {2,4,8}.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_idm_sg_build_spv(
-    dtype: infr_core::DType,
-    nr: u32,
-    sg16: bool,
-) -> Option<(&'static str, &'static [u32])> {
-    use infr_core::DType::*;
-    macro_rules! v {
-        ($name:literal) => {{
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            let s = S
-                .get_or_init(|| {
-                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
-                })
-                .as_slice();
-            Some(($name, s))
-        }};
-    }
-    match (dtype, nr, sg16) {
-        (Q6K, 2, false) => v!("native_idm_q6k_sg2"),
-        (Q6K, 4, false) => v!("native_idm_q6k_sg4"),
-        (Q6K, 8, false) => v!("native_idm_q6k_sg8"),
-        (Q5K, 2, false) => v!("native_idm_q5k_sg2"),
-        (Q5K, 4, false) => v!("native_idm_q5k_sg4"),
-        (Q5K, 8, false) => v!("native_idm_q5k_sg8"),
-        (Q6K, 2, true) => v!("native_idm_q6k_sg2_sg16"),
-        (Q6K, 4, true) => v!("native_idm_q6k_sg4_sg16"),
-        (Q6K, 8, true) => v!("native_idm_q6k_sg8_sg16"),
-        (Q5K, 2, true) => v!("native_idm_q5k_sg2_sg16"),
-        (Q5K, 4, true) => v!("native_idm_q5k_sg4_sg16"),
-        (Q5K, 8, true) => v!("native_idm_q5k_sg8_sg16"),
-        (Iq3S, 2, false) => v!("native_idm_iq3s_sg2"),
-        (Iq3S, 4, false) => v!("native_idm_iq3s_sg4"),
-        (Iq3S, 8, false) => v!("native_idm_iq3s_sg8"),
-        (Iq3S, 2, true) => v!("native_idm_iq3s_sg2_sg16"),
-        (Iq3S, 4, true) => v!("native_idm_iq3s_sg4_sg16"),
-        (Iq3S, 8, true) => v!("native_idm_iq3s_sg8_sg16"),
-        _ => None,
-    }
 }
 
 /// `-DSTREAMED` twin of the single-slot id-indexed native GEMV lookup (kernel-cache name + SPIR-V) —
@@ -827,8 +664,8 @@ pub(crate) fn native_idm_streamed_build_spv(
         _ => None,
     }
 }
-/// `-DSTREAMED` twin of [`native_idm_sg_build_spv`] (kernel-cache name + SPIR-V). Slice A4
-/// build-variant only; parity-test entry, not dispatched in production.
+/// The `-DSTREAMED` subgroup multi-slot id GEMV (kernel-cache name + SPIR-V); the sole weight build
+/// for this family. Slice A4 build-variant; parity-test entry, not dispatched in production.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_idm_sg_streamed_build_spv(
     dtype: infr_core::DType,
@@ -869,8 +706,8 @@ pub(crate) fn native_idm_sg_streamed_build_spv(
         _ => None,
     }
 }
-/// `-DSTREAMED` twin of [`native_mmv_id_q4k_spv`]. Slice A4 build-variant only; parity-test
-/// entry, not dispatched in production.
+/// The `-DSTREAMED` id-indexed int8 Q4_K decode GEMV; the sole weight build for this variant.
+/// Slice A4 build-variant; parity-test entry, not dispatched in production.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_mmv_id_q4k_streamed_spv() -> &'static [u32] {
     const BYTES: &[u8] =
@@ -881,15 +718,11 @@ pub(crate) fn native_mmv_id_q4k_streamed_spv() -> &'static [u32] {
 /// SPIR-V for the int8 dp4a decode GEMV (m=1, NUM_ROWS=2, `native_mmv.comp`). `None` = format
 /// has no int-dot build (falls back to the dequant `native_gemv`).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_mmv_build_spv(dtype: infr_core::DType, res: bool) -> Option<&'static [u32]> {
+pub(crate) fn native_mmv_build_spv(dtype: infr_core::DType, res: bool) -> Option<&'static str> {
     use infr_core::DType::*;
     macro_rules! v {
         ($name:literal) => {{
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            S.get_or_init(|| {
-                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
-            })
-            .as_slice()
+            $name
         }};
     }
     Some(match (dtype, res) {
@@ -912,17 +745,11 @@ pub(crate) fn native_mmv_mw_build_spv(
     res: bool,
     warps: u32,
     sg16: bool,
-) -> Option<(&'static str, &'static [u32])> {
+) -> Option<&'static str> {
     use infr_core::DType::*;
     macro_rules! v {
         ($name:literal) => {{
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            let s = S
-                .get_or_init(|| {
-                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
-                })
-                .as_slice();
-            Some(($name, s))
+            Some($name)
         }};
     }
     match (dtype, res, warps, sg16) {
@@ -977,15 +804,11 @@ pub(crate) fn native_mmv_mw_build_spv(
 /// SPIR-V for the multi-row int8 dp4a GEMV (m = 2..8, `native_mmv_mrow.comp`). `None` = format
 /// has no int-dot build (falls back to the dequant `native_gemv_mrow`).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_mmv_mrow_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
+pub(crate) fn native_mmv_mrow_build_spv(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
     macro_rules! v {
         ($name:literal) => {{
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            S.get_or_init(|| {
-                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
-            })
-            .as_slice()
+            $name
         }};
     }
     Some(match dtype {
@@ -1004,26 +827,6 @@ pub(crate) fn native_mmv_mrow_build_spv(dtype: infr_core::DType) -> Option<&'sta
         _ => return None,
     })
 }
-/// Kernel-cache name for the multi-row int8 dp4a GEMV.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_mmv_mrow_kernel_name(dtype: infr_core::DType) -> &'static str {
-    use infr_core::DType::*;
-    match dtype {
-        Q4K => "native_mmv_mrow_q4k",
-        Q6K => "native_mmv_mrow_q6k",
-        Iq4Xs => "native_mmv_mrow_iq4xs",
-        Q2K => "native_mmv_mrow_q2k",
-        Q3K => "native_mmv_mrow_q3k",
-        Q5K => "native_mmv_mrow_q5k",
-        Q8_0 => "native_mmv_mrow_q8_0",
-        Q4_0 => "native_mmv_mrow_q4_0",
-        Q5_0 => "native_mmv_mrow_q5_0",
-        Q4_1 => "native_mmv_mrow_q4_1",
-        Q5_1 => "native_mmv_mrow_q5_1",
-        Iq4Nl => "native_mmv_mrow_iq4nl",
-        _ => unreachable!("native_mmv_mrow_kernel_name: gated by native_mmv_mrow_build_spv"),
-    }
-}
 /// SPIR-V for a multi-row int8 dp4a GEMV layout variant: `o4` = the small-in_f 4-outputs ×
 /// 16-K-lanes workgroup split (-DOUTS4), `m4` = the rows<=4 MR specialization (-DMRV=4), `res` =
 /// the fused-residual decode build (-DUSE_RES, only ever paired with rows=1, hence requires
@@ -1035,15 +838,11 @@ pub(crate) fn native_mmv_mrow_variant_spv(
     o4: bool,
     m4: bool,
     res: bool,
-) -> Option<&'static [u32]> {
+) -> Option<&'static str> {
     use infr_core::DType::*;
     macro_rules! v {
         ($name:literal) => {{
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            S.get_or_init(|| {
-                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
-            })
-            .as_slice()
+            $name
         }};
     }
     Some(match (dtype, o4, m4, res) {
@@ -1120,102 +919,15 @@ pub(crate) fn native_mmv_mrow_variant_spv(
         _ => return None,
     })
 }
-/// Kernel-cache name for a multi-row int8 dp4a GEMV layout variant.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_mmv_mrow_variant_name(
-    dtype: infr_core::DType,
-    o4: bool,
-    m4: bool,
-    res: bool,
-) -> &'static str {
-    use infr_core::DType::*;
-    match (dtype, o4, m4, res) {
-        (Q4K, false, false, false) => "native_mmv_mrow_q4k",
-        (Q4K, false, true, false) => "native_mmv_mrow_q4k_m4",
-        (Q4K, true, false, false) => "native_mmv_mrow_q4k_o4",
-        (Q4K, true, true, false) => "native_mmv_mrow_q4k_o4_m4",
-        (Q4K, false, true, true) => "native_mmv_mrow_q4k_m4_res",
-        (Q4K, true, true, true) => "native_mmv_mrow_q4k_o4_m4_res",
-        (Q6K, false, false, false) => "native_mmv_mrow_q6k",
-        (Q6K, false, true, false) => "native_mmv_mrow_q6k_m4",
-        (Q6K, true, false, false) => "native_mmv_mrow_q6k_o4",
-        (Q6K, true, true, false) => "native_mmv_mrow_q6k_o4_m4",
-        (Q6K, false, true, true) => "native_mmv_mrow_q6k_m4_res",
-        (Q6K, true, true, true) => "native_mmv_mrow_q6k_o4_m4_res",
-        (Iq4Xs, false, false, false) => "native_mmv_mrow_iq4xs",
-        (Iq4Xs, false, true, false) => "native_mmv_mrow_iq4xs_m4",
-        (Iq4Xs, true, false, false) => "native_mmv_mrow_iq4xs_o4",
-        (Iq4Xs, true, true, false) => "native_mmv_mrow_iq4xs_o4_m4",
-        (Q2K, false, false, false) => "native_mmv_mrow_q2k",
-        (Q2K, false, true, false) => "native_mmv_mrow_q2k_m4",
-        (Q2K, true, false, false) => "native_mmv_mrow_q2k_o4",
-        (Q2K, true, true, false) => "native_mmv_mrow_q2k_o4_m4",
-        (Q2K, false, true, true) => "native_mmv_mrow_q2k_m4_res",
-        (Q2K, true, true, true) => "native_mmv_mrow_q2k_o4_m4_res",
-        (Q3K, false, false, false) => "native_mmv_mrow_q3k",
-        (Q3K, false, true, false) => "native_mmv_mrow_q3k_m4",
-        (Q3K, true, false, false) => "native_mmv_mrow_q3k_o4",
-        (Q3K, true, true, false) => "native_mmv_mrow_q3k_o4_m4",
-        (Q3K, false, true, true) => "native_mmv_mrow_q3k_m4_res",
-        (Q3K, true, true, true) => "native_mmv_mrow_q3k_o4_m4_res",
-        (Q5K, false, false, false) => "native_mmv_mrow_q5k",
-        (Q5K, false, true, false) => "native_mmv_mrow_q5k_m4",
-        (Q5K, true, false, false) => "native_mmv_mrow_q5k_o4",
-        (Q5K, true, true, false) => "native_mmv_mrow_q5k_o4_m4",
-        (Q5K, false, true, true) => "native_mmv_mrow_q5k_m4_res",
-        (Q5K, true, true, true) => "native_mmv_mrow_q5k_o4_m4_res",
-        (Q8_0, false, false, false) => "native_mmv_mrow_q8_0",
-        (Q8_0, false, true, false) => "native_mmv_mrow_q8_0_m4",
-        (Q8_0, true, false, false) => "native_mmv_mrow_q8_0_o4",
-        (Q8_0, true, true, false) => "native_mmv_mrow_q8_0_o4_m4",
-        (Q8_0, false, true, true) => "native_mmv_mrow_q8_0_m4_res",
-        (Q8_0, true, true, true) => "native_mmv_mrow_q8_0_o4_m4_res",
-        (Q4_0, false, false, false) => "native_mmv_mrow_q4_0",
-        (Q4_0, false, true, false) => "native_mmv_mrow_q4_0_m4",
-        (Q4_0, true, false, false) => "native_mmv_mrow_q4_0_o4",
-        (Q4_0, true, true, false) => "native_mmv_mrow_q4_0_o4_m4",
-        (Q4_0, false, true, true) => "native_mmv_mrow_q4_0_m4_res",
-        (Q4_0, true, true, true) => "native_mmv_mrow_q4_0_o4_m4_res",
-        (Q5_0, false, false, false) => "native_mmv_mrow_q5_0",
-        (Q5_0, false, true, false) => "native_mmv_mrow_q5_0_m4",
-        (Q5_0, true, false, false) => "native_mmv_mrow_q5_0_o4",
-        (Q5_0, true, true, false) => "native_mmv_mrow_q5_0_o4_m4",
-        (Q5_0, false, true, true) => "native_mmv_mrow_q5_0_m4_res",
-        (Q5_0, true, true, true) => "native_mmv_mrow_q5_0_o4_m4_res",
-        (Q4_1, false, false, false) => "native_mmv_mrow_q4_1",
-        (Q4_1, false, true, false) => "native_mmv_mrow_q4_1_m4",
-        (Q4_1, true, false, false) => "native_mmv_mrow_q4_1_o4",
-        (Q4_1, true, true, false) => "native_mmv_mrow_q4_1_o4_m4",
-        (Q4_1, false, true, true) => "native_mmv_mrow_q4_1_m4_res",
-        (Q4_1, true, true, true) => "native_mmv_mrow_q4_1_o4_m4_res",
-        (Q5_1, false, false, false) => "native_mmv_mrow_q5_1",
-        (Q5_1, false, true, false) => "native_mmv_mrow_q5_1_m4",
-        (Q5_1, true, false, false) => "native_mmv_mrow_q5_1_o4",
-        (Q5_1, true, true, false) => "native_mmv_mrow_q5_1_o4_m4",
-        (Q5_1, false, true, true) => "native_mmv_mrow_q5_1_m4_res",
-        (Q5_1, true, true, true) => "native_mmv_mrow_q5_1_o4_m4_res",
-        (Iq4Nl, false, false, false) => "native_mmv_mrow_iq4nl",
-        (Iq4Nl, false, true, false) => "native_mmv_mrow_iq4nl_m4",
-        (Iq4Nl, true, false, false) => "native_mmv_mrow_iq4nl_o4",
-        (Iq4Nl, true, true, false) => "native_mmv_mrow_iq4nl_o4_m4",
-        (Iq4Nl, false, true, true) => "native_mmv_mrow_iq4nl_m4_res",
-        (Iq4Nl, true, true, true) => "native_mmv_mrow_iq4nl_o4_m4_res",
-        _ => unreachable!("native_mmv_mrow_variant_name: gated by native_mmv_mrow_build_spv"),
-    }
-}
 /// SPIR-V for the rows 9..=16 multi-row int8 dp4a GEMV tier (`-DMRV=16`, 2-output layout — no
 /// OUTS4 twin: the tier is gated to >= 8M-element weights, whose in_f is comfortably >= 2048).
 /// `None` = format not covered (same coverage as [`native_mmv_mrow_build_spv`]; those shapes stay
 /// on the split-K GEMM tile).
-pub(crate) fn native_mmv_mrow_m16_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
+pub(crate) fn native_mmv_mrow_m16_spv(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
     macro_rules! v {
         ($name:literal) => {{
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            S.get_or_init(|| {
-                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
-            })
-            .as_slice()
+            $name
         }};
     }
     Some(match dtype {
@@ -1233,40 +945,6 @@ pub(crate) fn native_mmv_mrow_m16_spv(dtype: infr_core::DType) -> Option<&'stati
         Iq4Nl => v!("native_mmv_mrow_iq4nl_m16"),
         _ => return None,
     })
-}
-/// Kernel-cache name for the rows 9..=16 multi-row int8 dp4a GEMV tier.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_mmv_mrow_m16_name(dtype: infr_core::DType) -> &'static str {
-    use infr_core::DType::*;
-    match dtype {
-        Q4K => "native_mmv_mrow_q4k_m16",
-        Q6K => "native_mmv_mrow_q6k_m16",
-        Iq4Xs => "native_mmv_mrow_iq4xs_m16",
-        Q2K => "native_mmv_mrow_q2k_m16",
-        Q3K => "native_mmv_mrow_q3k_m16",
-        Q5K => "native_mmv_mrow_q5k_m16",
-        Q8_0 => "native_mmv_mrow_q8_0_m16",
-        Q4_0 => "native_mmv_mrow_q4_0_m16",
-        Q5_0 => "native_mmv_mrow_q5_0_m16",
-        Q4_1 => "native_mmv_mrow_q4_1_m16",
-        Q5_1 => "native_mmv_mrow_q5_1_m16",
-        Iq4Nl => "native_mmv_mrow_iq4nl_m16",
-        _ => unreachable!("native_mmv_mrow_m16_name: gated by native_mmv_mrow_m16_spv"),
-    }
-}
-/// Kernel-cache name for the int8 dp4a decode GEMV.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_mmv_kernel_name(dtype: infr_core::DType, res: bool) -> &'static str {
-    use infr_core::DType::*;
-    match (dtype, res) {
-        (Q4K, false) => "native_mmv_q4k",
-        (Q4K, true) => "native_mmv_q4k_res",
-        (Q6K, false) => "native_mmv_q6k",
-        (Q6K, true) => "native_mmv_q6k_res",
-        (Iq4Xs, false) => "native_mmv_iq4xs",
-        (Iq4Xs, true) => "native_mmv_iq4xs_res",
-        _ => unreachable!("native_mmv_kernel_name: gated by native_mmv_build_spv"),
-    }
 }
 /// `-DSTREAMED` twin of [`native_mmv_build_spv`] (kernel-cache name + SPIR-V) — the int8 dp4a
 /// decode GEMV's weight read from a `bufferDeviceAddress` arena instead of a bound SSBO. `res`
@@ -1506,13 +1184,6 @@ pub(crate) fn native_mmv_mw_streamed_build_spv(
         _ => None,
     }
 }
-/// SPIR-V for the multi-slot id-indexed Q4_K dp4a (mmq) GEMV.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_mmv_id_q4k_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_mmv_id_q4k.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
 /// SPIR-V for the tiled Q4_K dp4a (mmq) GEMM.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_mmq_q4k_spv() -> &'static [u32] {
@@ -1527,48 +1198,8 @@ pub(crate) fn native_gemm_mmq_q6k_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
-/// Dense (non-expert-grid) dp4a mmq GEMM SPIR-V for every `infr_core::tensor::MOE_MMQ_DTYPES`
-/// member — the non-coopmat prefill tier's kernel table (see adapter.rs `nc_mmq`: devices
-/// without a usable 16x16x16 f16 coopmat but WITH packed int8 dot, e.g. Intel Arc/ANV). Returns
-/// `(kernel_cache_name, spv)`; `None` for non-mmq dtypes. Same shader sources as the
-/// parity-proven `_xp` expert-grid builds — base compile, dense grid. Whether the kernel binds
-/// the activation `sact` buffer follows `infr_core::tensor::moe_mmq_needs_sact` (the SSOT the
-/// `_xp` dispatch uses too).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_dense_spv(
-    dtype: infr_core::DType,
-) -> Option<(&'static str, &'static [u32])> {
-    macro_rules! spv {
-        ($name:literal) => {{
-            const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"));
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            ($name, S.get_or_init(|| spv_words(BYTES)).as_slice())
-        }};
-    }
-    use infr_core::DType::*;
-    Some(match dtype {
-        Q4K => ("native_gemm_mmq_q4k", native_gemm_mmq_q4k_spv()),
-        Q6K => ("native_gemm_mmq_q6k", native_gemm_mmq_q6k_spv()),
-        Q8_0 => spv!("native_gemm_mmq_q8_0"),
-        Q5_0 => spv!("native_gemm_mmq_q5_0"),
-        Q5K => spv!("native_gemm_mmq_q5k"),
-        Q5_1 => spv!("native_gemm_mmq_q5_1"),
-        Q2K => spv!("native_gemm_mmq_q2_k"),
-        Q3K => spv!("native_gemm_mmq_q3_k"),
-        Q4_0 => spv!("native_gemm_mmq_q4_0"),
-        Q4_1 => spv!("native_gemm_mmq_q4_1"),
-        Iq4Nl => spv!("native_gemm_mmq_iq4_nl"),
-        Iq4Xs => spv!("native_gemm_mmq_iq4_xs"),
-        Iq2S => spv!("native_gemm_mmq_iq2_s"),
-        Iq3S => spv!("native_gemm_mmq_iq3_s"),
-        Mxfp4 => spv!("native_gemm_mmq_mxfp4"),
-        Nvfp4 => spv!("native_gemm_mmq_nvfp4"),
-        Q2_0 => spv!("native_gemm_mmq_q2_0"),
-        _ => return None,
-    })
-}
-/// `-DSTREAMED` twin of [`native_gemm_mmq_dense_spv`] (kernel-cache name + SPIR-V) — the tiled
-/// dp4a GEMM's weight read from a `bufferDeviceAddress` arena instead of a bound SSBO. Slice A3
+/// The `-DSTREAMED` dense tiled dp4a (mmq) GEMM (kernel-cache name + SPIR-V) — the weight read from
+/// a `bufferDeviceAddress` arena; the sole weight build for the dense mmq set. Slice A3
 /// build-variant only: nothing dispatches this yet
 /// ([`crate::recorder::Recorder::matmul_mmq_streamed`] exists purely so parity tests can exercise
 /// it). The `_xp*` EXPERT_GRID twins are also emitted (same gate in build.rs) but get their lookup
@@ -1703,21 +1334,12 @@ pub(crate) fn native_gemm_fma_streamed_build_spv(
 /// without a usable f16 coopmat (adapter.rs `nc_fma`). Returns `(kernel_cache_name, spv)`;
 /// `None` for any other dtype.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_fma_build_spv(
-    dtype: infr_core::DType,
-) -> Option<(&'static str, &'static [u32])> {
-    macro_rules! spv {
-        ($name:literal) => {{
-            const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"));
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            ($name, S.get_or_init(|| spv_words(BYTES)).as_slice())
-        }};
-    }
+pub(crate) fn native_gemm_fma_build_spv(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
     Some(match dtype {
-        F16 => spv!("native_gemm_fma_f16"),
-        Bf16 => spv!("native_gemm_fma_bf16"),
-        F32 => spv!("native_gemm_fma_f32"),
+        F16 => "native_gemm_fma_f16",
+        Bf16 => "native_gemm_fma_bf16",
+        F32 => "native_gemm_fma_f32",
         _ => return None,
     })
 }
@@ -1910,15 +1532,11 @@ pub(crate) fn moe_topk_spv() -> &'static [u32] {
 /// SPIR-V for the embedding-row gather+dequant (`Op::EmbedGather`). `None` = format has no
 /// build (grid-table IQ formats) — the runner then keeps the host embed path.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn embed_gather_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
+pub(crate) fn embed_gather_build_spv(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
     macro_rules! v {
         ($name:literal) => {{
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            S.get_or_init(|| {
-                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
-            })
-            .as_slice()
+            $name
         }};
     }
     Some(match dtype {
@@ -1977,29 +1595,6 @@ pub(crate) fn embed_gather_streamed_build_spv(
         Iq4Xs => v!("embed_gather_iq4xs_streamed"),
         Q2_0 => v!("embed_gather_q2_0_streamed"),
         _ => None,
-    }
-}
-/// Kernel-cache name for the embedding-row gather.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn embed_gather_kernel_name(dtype: infr_core::DType) -> &'static str {
-    use infr_core::DType::*;
-    match dtype {
-        Q8_0 => "embed_gather_q8_0",
-        Bf16 => "embed_gather_bf16",
-        F16 => "embed_gather_f16",
-        Q4_0 => "embed_gather_q4_0",
-        Q4_1 => "embed_gather_q4_1",
-        Q5_0 => "embed_gather_q5_0",
-        Q5_1 => "embed_gather_q5_1",
-        Q2K => "embed_gather_q2k",
-        Q3K => "embed_gather_q3k",
-        Q4K => "embed_gather_q4k",
-        Q5K => "embed_gather_q5k",
-        Q6K => "embed_gather_q6k",
-        Iq4Nl => "embed_gather_iq4nl",
-        Iq4Xs => "embed_gather_iq4xs",
-        Q2_0 => "embed_gather_q2_0",
-        _ => unreachable!("embed_gather_kernel_name: gated by embed_gather_build_spv"),
     }
 }
 /// SPIR-V for the chained-decode id ring log (ring[pos & 63] = sampled id).
@@ -2125,19 +1720,17 @@ pub(crate) fn moe_weight_scale_spv() -> &'static [u32] {
     S.get_or_init(|| spv_words(BYTES))
 }
 
-/// SPIR-V for the LARGE-WARPTILE native-block prefill GEMM (8-warp BM=64×BN=256, gemm_proj_warp
-/// structure with in-shader native dequant). Only the hot formats are compiled; `None` falls back
-/// to the 64×64 `native_gemm_build_spv` kernel.
+/// Kernel-cache NAME of the LARGE-WARPTILE native-block prefill GEMM (8-warp BM=64×BN=256,
+/// gemm_proj_warp structure with in-shader native dequant) for `dtype`, or `None` if only the hot
+/// formats are compiled (the caller falls back to the 64×64 `native_gemm` kernel). Availability +
+/// name only — the arena-addressed `_streamed` twin is what actually dispatches (weights are read
+/// by 64-bit device address; no resident SSBO tile is loaded).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_warp_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
+pub(crate) fn native_gemm_warp_build_spv(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
     macro_rules! v {
         ($name:literal) => {{
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            S.get_or_init(|| {
-                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
-            })
-            .as_slice()
+            $name
         }};
     }
     Some(match dtype {
@@ -2160,15 +1753,11 @@ pub(crate) fn native_gemm_warp_build_spv(dtype: infr_core::DType) -> Option<&'st
 /// SPIR-V for the NARROW-N warptile (BN=128/BK=64) — same math per thread, 2× the workgroups; the
 /// occupancy fix for n=1024/2048 GEMMs. `None` for formats without a warp build.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_warp_n128_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
+pub(crate) fn native_gemm_warp_n128_build_spv(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
     macro_rules! v {
         ($name:literal) => {{
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            S.get_or_init(|| {
-                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
-            })
-            .as_slice()
+            $name
         }};
     }
     Some(match dtype {
@@ -2224,141 +1813,54 @@ pub(crate) fn native_gemm_warp_cm8_build_spv(
 /// 2 to 3 workgroups/WGP, which is worth ~1.5x on the 8B prefill shapes (29→44 TF on the o
 /// projection). Name+SPIR-V per tile so `kernel_sg` caches distinct pipelines.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_warp_ag_build_spv(
-    dtype: infr_core::DType,
-) -> Option<(&'static str, &'static [u32])> {
+pub(crate) fn native_gemm_warp_ag_build_spv(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
-    macro_rules! v {
-        ($name:literal) => {{
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            S.get_or_init(|| {
-                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
-            })
-            .as_slice()
-        }};
-    }
     Some(match dtype {
-        Iq4Nl => ("native_gemm_warp_iq4nl_ag", v!("native_gemm_warp_iq4nl_ag")),
-        Iq4Xs => ("native_gemm_warp_iq4xs_ag", v!("native_gemm_warp_iq4xs_ag")),
-        Q2K => ("native_gemm_warp_q2k_ag", v!("native_gemm_warp_q2k_ag")),
-        Q3K => ("native_gemm_warp_q3k_ag", v!("native_gemm_warp_q3k_ag")),
-        Q4_0 => ("native_gemm_warp_q4_0_ag", v!("native_gemm_warp_q4_0_ag")),
-        Q4K => ("native_gemm_warp_q4k_ag", v!("native_gemm_warp_q4k_ag")),
-        Q5K => ("native_gemm_warp_q5k_ag", v!("native_gemm_warp_q5k_ag")),
-        Q6K => ("native_gemm_warp_q6k_ag", v!("native_gemm_warp_q6k_ag")),
-        Q8_0 => ("native_gemm_warp_q8_0_ag", v!("native_gemm_warp_q8_0_ag")),
+        Iq4Nl => "native_gemm_warp_iq4nl_ag",
+        Iq4Xs => "native_gemm_warp_iq4xs_ag",
+        Q2K => "native_gemm_warp_q2k_ag",
+        Q3K => "native_gemm_warp_q3k_ag",
+        Q4_0 => "native_gemm_warp_q4_0_ag",
+        Q4K => "native_gemm_warp_q4k_ag",
+        Q5K => "native_gemm_warp_q5k_ag",
+        Q6K => "native_gemm_warp_q6k_ag",
+        Q8_0 => "native_gemm_warp_q8_0_ag",
         _ => return None,
     })
 }
 
 /// NARROW_N (BN=128) + A_GLOBAL.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_warp_n128_ag_build_spv(
-    dtype: infr_core::DType,
-) -> Option<(&'static str, &'static [u32])> {
+pub(crate) fn native_gemm_warp_n128_ag_build_spv(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
-    macro_rules! v {
-        ($name:literal) => {{
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            S.get_or_init(|| {
-                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
-            })
-            .as_slice()
-        }};
-    }
     Some(match dtype {
-        Iq4Nl => (
-            "native_gemm_warp_iq4nl_n128_ag",
-            v!("native_gemm_warp_iq4nl_n128_ag"),
-        ),
-        Iq4Xs => (
-            "native_gemm_warp_iq4xs_n128_ag",
-            v!("native_gemm_warp_iq4xs_n128_ag"),
-        ),
-        Q2K => (
-            "native_gemm_warp_q2k_n128_ag",
-            v!("native_gemm_warp_q2k_n128_ag"),
-        ),
-        Q3K => (
-            "native_gemm_warp_q3k_n128_ag",
-            v!("native_gemm_warp_q3k_n128_ag"),
-        ),
-        Q4_0 => (
-            "native_gemm_warp_q4_0_n128_ag",
-            v!("native_gemm_warp_q4_0_n128_ag"),
-        ),
-        Q4K => (
-            "native_gemm_warp_q4k_n128_ag",
-            v!("native_gemm_warp_q4k_n128_ag"),
-        ),
-        Q5K => (
-            "native_gemm_warp_q5k_n128_ag",
-            v!("native_gemm_warp_q5k_n128_ag"),
-        ),
-        Q6K => (
-            "native_gemm_warp_q6k_n128_ag",
-            v!("native_gemm_warp_q6k_n128_ag"),
-        ),
-        Q8_0 => (
-            "native_gemm_warp_q8_0_n128_ag",
-            v!("native_gemm_warp_q8_0_n128_ag"),
-        ),
+        Iq4Nl => "native_gemm_warp_iq4nl_n128_ag",
+        Iq4Xs => "native_gemm_warp_iq4xs_n128_ag",
+        Q2K => "native_gemm_warp_q2k_n128_ag",
+        Q3K => "native_gemm_warp_q3k_n128_ag",
+        Q4_0 => "native_gemm_warp_q4_0_n128_ag",
+        Q4K => "native_gemm_warp_q4k_n128_ag",
+        Q5K => "native_gemm_warp_q5k_n128_ag",
+        Q6K => "native_gemm_warp_q6k_n128_ag",
+        Q8_0 => "native_gemm_warp_q8_0_n128_ag",
         _ => return None,
     })
 }
 
 /// SPLIT_K (NARROW_N tile) + A_GLOBAL.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_warp_sk_ag_build_spv(
-    dtype: infr_core::DType,
-) -> Option<(&'static str, &'static [u32])> {
+pub(crate) fn native_gemm_warp_sk_ag_build_spv(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
-    macro_rules! v {
-        ($name:literal) => {{
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            S.get_or_init(|| {
-                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
-            })
-            .as_slice()
-        }};
-    }
     Some(match dtype {
-        Iq4Nl => (
-            "native_gemm_warp_iq4nl_sk_ag",
-            v!("native_gemm_warp_iq4nl_sk_ag"),
-        ),
-        Iq4Xs => (
-            "native_gemm_warp_iq4xs_sk_ag",
-            v!("native_gemm_warp_iq4xs_sk_ag"),
-        ),
-        Q2K => (
-            "native_gemm_warp_q2k_sk_ag",
-            v!("native_gemm_warp_q2k_sk_ag"),
-        ),
-        Q3K => (
-            "native_gemm_warp_q3k_sk_ag",
-            v!("native_gemm_warp_q3k_sk_ag"),
-        ),
-        Q4_0 => (
-            "native_gemm_warp_q4_0_sk_ag",
-            v!("native_gemm_warp_q4_0_sk_ag"),
-        ),
-        Q4K => (
-            "native_gemm_warp_q4k_sk_ag",
-            v!("native_gemm_warp_q4k_sk_ag"),
-        ),
-        Q5K => (
-            "native_gemm_warp_q5k_sk_ag",
-            v!("native_gemm_warp_q5k_sk_ag"),
-        ),
-        Q6K => (
-            "native_gemm_warp_q6k_sk_ag",
-            v!("native_gemm_warp_q6k_sk_ag"),
-        ),
-        Q8_0 => (
-            "native_gemm_warp_q8_0_sk_ag",
-            v!("native_gemm_warp_q8_0_sk_ag"),
-        ),
+        Iq4Nl => "native_gemm_warp_iq4nl_sk_ag",
+        Iq4Xs => "native_gemm_warp_iq4xs_sk_ag",
+        Q2K => "native_gemm_warp_q2k_sk_ag",
+        Q3K => "native_gemm_warp_q3k_sk_ag",
+        Q4_0 => "native_gemm_warp_q4_0_sk_ag",
+        Q4K => "native_gemm_warp_q4k_sk_ag",
+        Q5K => "native_gemm_warp_q5k_sk_ag",
+        Q6K => "native_gemm_warp_q6k_sk_ag",
+        Q8_0 => "native_gemm_warp_q8_0_sk_ag",
         _ => return None,
     })
 }
@@ -2371,34 +1873,13 @@ pub(crate) fn native_gemm_warp_sk_ag_build_spv(
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_warp_n128_ag_bm32_build_spv(
     dtype: infr_core::DType,
-) -> Option<(&'static str, &'static [u32])> {
+) -> Option<&'static str> {
     use infr_core::DType::*;
-    macro_rules! v {
-        ($name:literal) => {{
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            S.get_or_init(|| {
-                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
-            })
-            .as_slice()
-        }};
-    }
     Some(match dtype {
-        Q4K => (
-            "native_gemm_warp_q4k_n128_ag_bm32",
-            v!("native_gemm_warp_q4k_n128_ag_bm32"),
-        ),
-        Q5K => (
-            "native_gemm_warp_q5k_n128_ag_bm32",
-            v!("native_gemm_warp_q5k_n128_ag_bm32"),
-        ),
-        Q6K => (
-            "native_gemm_warp_q6k_n128_ag_bm32",
-            v!("native_gemm_warp_q6k_n128_ag_bm32"),
-        ),
-        Q8_0 => (
-            "native_gemm_warp_q8_0_n128_ag_bm32",
-            v!("native_gemm_warp_q8_0_n128_ag_bm32"),
-        ),
+        Q4K => "native_gemm_warp_q4k_n128_ag_bm32",
+        Q5K => "native_gemm_warp_q5k_n128_ag_bm32",
+        Q6K => "native_gemm_warp_q6k_n128_ag_bm32",
+        Q8_0 => "native_gemm_warp_q8_0_n128_ag_bm32",
         _ => return None,
     })
 }
@@ -2409,49 +1890,24 @@ pub(crate) fn native_gemm_warp_n128_ag_bm32_build_spv(
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_warp_n128_ag_bm16_build_spv(
     dtype: infr_core::DType,
-) -> Option<(&'static str, &'static [u32])> {
+) -> Option<&'static str> {
     use infr_core::DType::*;
-    macro_rules! v {
-        ($name:literal) => {{
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            S.get_or_init(|| {
-                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
-            })
-            .as_slice()
-        }};
-    }
     Some(match dtype {
-        Q4K => (
-            "native_gemm_warp_q4k_n128_ag_bm16",
-            v!("native_gemm_warp_q4k_n128_ag_bm16"),
-        ),
-        Q5K => (
-            "native_gemm_warp_q5k_n128_ag_bm16",
-            v!("native_gemm_warp_q5k_n128_ag_bm16"),
-        ),
-        Q6K => (
-            "native_gemm_warp_q6k_n128_ag_bm16",
-            v!("native_gemm_warp_q6k_n128_ag_bm16"),
-        ),
-        Q8_0 => (
-            "native_gemm_warp_q8_0_n128_ag_bm16",
-            v!("native_gemm_warp_q8_0_n128_ag_bm16"),
-        ),
+        Q4K => "native_gemm_warp_q4k_n128_ag_bm16",
+        Q5K => "native_gemm_warp_q5k_n128_ag_bm16",
+        Q6K => "native_gemm_warp_q6k_n128_ag_bm16",
+        Q8_0 => "native_gemm_warp_q8_0_n128_ag_bm16",
         _ => return None,
     })
 }
 
 /// SPIR-V for the SPLIT-K narrow warptile (NARROW_N + a k-split grid dimension writing partials).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_warp_sk_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
+pub(crate) fn native_gemm_warp_sk_build_spv(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
     macro_rules! v {
         ($name:literal) => {{
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            S.get_or_init(|| {
-                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
-            })
-            .as_slice()
+            $name
         }};
     }
     Some(match dtype {
@@ -2484,59 +1940,12 @@ pub(crate) fn splitk_reduce_spv() -> &'static [u32] {
     })
 }
 
-/// SPIR-V for the native-block prefill GEMM (`C=A·Wᵀ`, raw GGUF blocks dequantized in-shader via the
-/// coopmat tiled kernel). One specialization per quant format; `None` for unsupported dtypes.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
-    use infr_core::DType::*;
-    macro_rules! v {
-        ($name:literal) => {{
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            S.get_or_init(|| {
-                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
-            })
-            .as_slice()
-        }};
-    }
-    Some(match dtype {
-        Q8_0 => v!("native_gemm_q8_0"),
-        Bf16 => v!("native_gemm_bf16"),
-        Q4_0 => v!("native_gemm_q4_0"),
-        Q4_1 => v!("native_gemm_q4_1"),
-        Q5_0 => v!("native_gemm_q5_0"),
-        Q5_1 => v!("native_gemm_q5_1"),
-        Q2K => v!("native_gemm_q2k"),
-        Q3K => v!("native_gemm_q3k"),
-        Q4K => v!("native_gemm_q4k"),
-        Q5K => v!("native_gemm_q5k"),
-        Q6K => v!("native_gemm_q6k"),
-        Iq4Nl => v!("native_gemm_iq4nl"),
-        Iq4Xs => v!("native_gemm_iq4xs"),
-        Mxfp4 => v!("native_gemm_mxfp4"),
-        Nvfp4 => v!("native_gemm_nvfp4"),
-        Tq1_0 => v!("native_gemm_tq1_0"),
-        Tq2_0 => v!("native_gemm_tq2_0"),
-        Q2_0 => v!("native_gemm_q2_0"),
-        Iq2Xxs => v!("native_gemm_iq2xxs"),
-        Iq2Xs => v!("native_gemm_iq2xs"),
-        Iq2S => v!("native_gemm_iq2s"),
-        Iq3Xxs => v!("native_gemm_iq3xxs"),
-        Iq3S => v!("native_gemm_iq3s"),
-        Iq1S => v!("native_gemm_iq1s"),
-        Iq1M => v!("native_gemm_iq1m"),
-        _ => return None,
-    })
-}
-
 const GEMM_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coopmat.spv"));
 const GEMM_TILED_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coopmat_tiled.spv"));
 const GEMM_WARP_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_warp.spv"));
 const GEMM_DP4A_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_dp4a.spv"));
 const QUANT_Q8_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quant_q8.spv"));
-const GEMM_PROJ_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_proj.spv"));
-const GEMM_PROJ_WARP_SPV_BYTES: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/gemm_proj_warp.spv"));
 const ATTN_PARTIAL_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_partial.spv"));
 const ATTN_PARTIAL_DYNAC_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_partial_dynac.spv"));
@@ -2599,12 +2008,7 @@ const GELU_MUL_FUSED_SPV_BYTES: &[u8] =
 const STORE_F16_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/store_f16.spv"));
 const ROPE_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope.spv"));
 const LINEAR_F16_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f16.spv"));
-const LINEAR_F16_NOEXT_SPV_BYTES: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/linear_f16_noext.spv"));
-const LINEAR_F32_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f32.spv"));
-const LINEAR_F32R_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f32r.spv"));
 const LINEAR_BF16_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_bf16.spv"));
-const LINEAR_RES_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_res.spv"));
 const ATTENTION_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attention.spv"));
 const ATTN_COMBINE_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_combine.spv"));
 const ATTENTION_KV_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attention_kv.spv"));
@@ -2656,17 +2060,6 @@ fn gemm_dp4a_spv() -> &'static [u32] {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn quant_q8_spv() -> &'static [u32] {
     QUANT_Q8_SPV.get_or_init(|| spv_words(QUANT_Q8_SPV_BYTES))
-}
-/// SPIR-V for the prefill projection GEMM (`C=A·Wᵀ`, f16 W). Used by the recorder.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn gemm_proj_spv() -> &'static [u32] {
-    GEMM_PROJ_SPV.get_or_init(|| spv_words(GEMM_PROJ_SPV_BYTES))
-}
-/// Warp-tiled projection GEMM (BM=64,BN=128). Faster for large M (low/mid-ctx prefill); the recorder
-/// falls back to `gemm_proj_spv` for small M (high ctx) where its fewer workgroups lose occupancy.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn gemm_proj_warp_spv() -> &'static [u32] {
-    GEMM_PROJ_WARP_SPV.get_or_init(|| spv_words(GEMM_PROJ_WARP_SPV_BYTES))
 }
 /// `-DSTREAMED` twin SPIR-V of `gemm_proj` (the coopmat f16 projection GEMM, weight read through a
 /// typed 64-bit buffer_reference — see the shader's STREAMED doc). Parity-test entry.
@@ -2867,153 +2260,13 @@ pub(crate) fn softcap_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q4k_xp_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4k_xp.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
-
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q6k_xp_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q6k_xp.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
-
-/// SPIR-V for the tiled Q8_0 dp4a (mmq) GEMM, expert-grid variant (a diffusion-gemma MoE down
-/// projection quant option).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q8_0_xp_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q8_0_xp.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
-
-/// SPIR-V for the tiled Q5_0 dp4a (mmq) GEMM, expert-grid variant (the shipped
-/// diffusiongemma-26B-A4B-it-GGUF quantizes its MoE down projection as Q5_0).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q5_0_xp_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q5_0_xp.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
-
-/// SPIR-V for the tiled Q5_K dp4a (mmq) GEMM, expert-grid variant (unsloth-dynamic Qwen3.6-MoE
-/// quants mix Q5_K into the MoE down-projection banks; carries Q4_K's min term → binds `sact`).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q5k_xp_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q5k_xp.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
-
-/// SPIR-V for the tiled Q5_1 dp4a (mmq) GEMM, expert-grid variant (the shipped
-/// gemma-4-26B-A4B-it-GGUF quantizes its MoE down projection as Q5_1 on 29/30 layers; min-carrying
-/// like Q4_K/Q5_K → binds `sact`, but no superblock sub-scale — one d/m pair per 32-block).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q5_1_xp_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q5_1_xp.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
-
-/// SPIR-V for the tiled Q2_K dp4a (mmq) GEMM, expert-grid variant (Llama-4-Scout's shipped
-/// MoE gate/up banks; min-carrying like Q4_K/Q5_K → binds `sact`, 16-elem sub-block granularity).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q2_k_xp_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q2_k_xp.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
-
-/// SPIR-V for the tiled Q3_K dp4a (mmq) GEMM, expert-grid variant (Llama-4-Scout's shipped
-/// MoE down-projection bank; symmetric like Q6_K — no `sact`, no min term).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q3_k_xp_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q3_k_xp.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
 
 // BM=32 row-tile expert-grid variants — see build.rs's `_xp32` entries and
 // `matmul_mmq_experts`'s small-rows-per-expert doc.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q4k_xp32_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4k_xp32.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q6k_xp32_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q6k_xp32.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
 // BM=32 + BN=128 (wide-N) expert-grid variants — see build.rs's `_xp32w` entries and
 // `matmul_mmq_experts`'s wide-BN doc. Only the two dtypes real small-row MoE pools use.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q4k_xp32w_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4k_xp32w.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q6k_xp32w_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q6k_xp32w.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
 // BM=64 (default row tile) + BN=128 (wide-N) expert-grid variants — see build.rs's `_xp128`
 // entries and `matmul_mmq_experts`'s wide-BN doc. Same two dtypes as the `_xp32w` small-tile pair.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q4k_xp128_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4k_xp128.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q6k_xp128_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q6k_xp128.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q8_0_xp32_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q8_0_xp32.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q5_0_xp32_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q5_0_xp32.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q5k_xp32_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q5k_xp32.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q5_1_xp32_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q5_1_xp32.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q2_k_xp32_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q2_k_xp32.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q3_k_xp32_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q3_k_xp32.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
 
 // PAGED expert-grid variants — the batched-MoE mmq GEMM reading a GpuPager arena through the
 // word-base LUT (Scout's batched paged prefill; see the shaders' PAGED doc).
@@ -3044,20 +2297,6 @@ pub(crate) fn native_gemm_mmq_q3_k_xpg32_spv() -> &'static [u32] {
     S.get_or_init(|| spv_words(BYTES))
 }
 
-/// SPIR-V for the tiled Q4_0 dp4a (mmq) GEMM, expert-grid variant (symmetric, no shipped MoE GGUF
-/// in the audited cache uses it for expert banks — trivial family member, synthetic parity only).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q4_0_xp_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4_0_xp.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q4_0_xp32_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4_0_xp32.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_mmq_q4_0_xpg_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4_0_xpg.spv"));
@@ -3072,21 +2311,6 @@ pub(crate) fn native_gemm_mmq_q4_0_xpg32_spv() -> &'static [u32] {
     S.get_or_init(|| spv_words(BYTES))
 }
 
-/// SPIR-V for the tiled Q2_0 dp4a (mmq) GEMM, expert-grid variants (Bonsai ternary — symmetric
-/// trivial family member like Q4_0; no shipped MoE GGUF uses it for expert banks, synthetic
-/// parity only).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q2_0_xp_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q2_0_xp.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q2_0_xp32_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q2_0_xp32.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_mmq_q2_0_xpg_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q2_0_xpg.spv"));
@@ -3101,23 +2325,6 @@ pub(crate) fn native_gemm_mmq_q2_0_xpg32_spv() -> &'static [u32] {
     S.get_or_init(|| spv_words(BYTES))
 }
 
-/// SPIR-V for the tiled IQ2_S / IQ3_S dp4a (mmq) GEMMs, expert-grid variants (the grid-codebook
-/// pair Qwen3.6-35B-A3B-UD-IQ3_S ships for its expert banks: IQ2_S gate/up, IQ3_S down). Both
-/// symmetric (sign-flipped grid codes are the signed dp4a operand directly) — no `sact`. The
-/// grid LUT is staged into shared memory per workgroup (see the shaders' doc comments).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_iq2_s_xp_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq2_s_xp.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_iq2_s_xp32_spv() -> &'static [u32] {
-    const BYTES: &[u8] =
-        include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq2_s_xp32.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_mmq_iq2_s_xpg_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq2_s_xpg.spv"));
@@ -3128,19 +2335,6 @@ pub(crate) fn native_gemm_mmq_iq2_s_xpg_spv() -> &'static [u32] {
 pub(crate) fn native_gemm_mmq_iq2_s_xpg32_spv() -> &'static [u32] {
     const BYTES: &[u8] =
         include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq2_s_xpg32.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_iq3_s_xp_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq3_s_xp.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_iq3_s_xp32_spv() -> &'static [u32] {
-    const BYTES: &[u8] =
-        include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq3_s_xp32.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
@@ -3158,20 +2352,6 @@ pub(crate) fn native_gemm_mmq_iq3_s_xpg32_spv() -> &'static [u32] {
     S.get_or_init(|| spv_words(BYTES))
 }
 
-/// SPIR-V for the tiled Q4_1 dp4a (mmq) GEMM, expert-grid variant (min-carrying, Q5_1's pattern
-/// minus the highbit — binds `sact`).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q4_1_xp_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4_1_xp.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q4_1_xp32_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4_1_xp32.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_mmq_q4_1_xpg_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4_1_xpg.spv"));
@@ -3186,21 +2366,6 @@ pub(crate) fn native_gemm_mmq_q4_1_xpg32_spv() -> &'static [u32] {
     S.get_or_init(|| spv_words(BYTES))
 }
 
-/// SPIR-V for the tiled IQ4_NL dp4a (mmq) GEMM, expert-grid variant (codebook, symmetric — the
-/// LUT value itself is the signed dp4a operand, no `sact`).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_iq4_nl_xp_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq4_nl_xp.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_iq4_nl_xp32_spv() -> &'static [u32] {
-    const BYTES: &[u8] =
-        include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq4_nl_xp32.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_mmq_iq4_nl_xpg_spv() -> &'static [u32] {
     const BYTES: &[u8] =
@@ -3218,22 +2383,6 @@ pub(crate) fn native_gemm_mmq_iq4_nl_xpg32_spv() -> &'static [u32] {
     S.get_or_init(|| spv_words(BYTES))
 }
 
-/// SPIR-V for the tiled IQ4_XS dp4a (mmq) GEMM, expert-grid variant (codebook + Q4_K-shaped
-/// superblock, symmetric — no `sact`; unsloth's UD quants mix this into most of
-/// Qwen3.6-35B-A3B's gate/up expert banks).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_iq4_xs_xp_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq4_xs_xp.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_iq4_xs_xp32_spv() -> &'static [u32] {
-    const BYTES: &[u8] =
-        include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq4_xs_xp32.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_mmq_iq4_xs_xpg_spv() -> &'static [u32] {
     const BYTES: &[u8] =
@@ -3330,21 +2479,6 @@ pub(crate) fn native_gemm_mmq_q6k_xpg32_spv() -> &'static [u32] {
     S.get_or_init(|| spv_words(BYTES))
 }
 
-/// SPIR-V for the tiled MXFP4 dp4a (mmq) GEMM, expert-grid variant (the MXFP4_MOE quant family's
-/// expert banks — signed E2M1 codebook → dp4a, IQ4_NL's treatment; symmetric, no `sact`).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_mxfp4_xp_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_mxfp4_xp.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_mxfp4_xp32_spv() -> &'static [u32] {
-    const BYTES: &[u8] =
-        include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_mxfp4_xp32.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_mmq_mxfp4_xpg_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_mxfp4_xpg.spv"));
@@ -3359,21 +2493,6 @@ pub(crate) fn native_gemm_mmq_mxfp4_xpg32_spv() -> &'static [u32] {
     S.get_or_init(|| spv_words(BYTES))
 }
 
-/// SPIR-V for the tiled NVFP4 dp4a (mmq) GEMM, expert-grid variant (shares MXFP4's E2M1 codebook;
-/// per-16 UE4M3 sub-block scales split each 32-block into two dp4a halves — see the shader doc).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_nvfp4_xp_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_nvfp4_xp.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_nvfp4_xp32_spv() -> &'static [u32] {
-    const BYTES: &[u8] =
-        include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_nvfp4_xp32.spv"));
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(BYTES))
-}
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_mmq_nvfp4_xpg_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_nvfp4_xpg.spv"));
@@ -3900,61 +3019,6 @@ pub(crate) fn linear_f16_spv() -> &'static [u32] {
     static LINEAR_F16_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     LINEAR_F16_SPV.get_or_init(|| spv_words(LINEAR_F16_SPV_BYTES))
 }
-/// SPIR-V for the f16-weight GEMV, `!caps.f16` tier (no shaderFloat16 — `unpackHalf2x16` dequant).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn linear_f16_noext_spv() -> &'static [u32] {
-    static LINEAR_F16_NOEXT_SPV: OnceLock<Vec<u32>> = OnceLock::new();
-    LINEAR_F16_NOEXT_SPV.get_or_init(|| spv_words(LINEAR_F16_NOEXT_SPV_BYTES))
-}
-/// SPIR-V for the f32-weight GEMV (full-precision projection weights, e.g. gemma4 E2B per-layer).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn linear_f32_spv() -> &'static [u32] {
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(LINEAR_F32_SPV_BYTES))
-}
-/// SPIR-V for the reduction-shape f32 GEMV (workgroup per output — decode-hot narrow GEMVs).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn linear_f32r_spv() -> &'static [u32] {
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(LINEAR_F32R_SPV_BYTES))
-}
-/// SPIR-V for the ROW-TILED f32 GEMM (8 rows/workgroup — prefill weight reuse). Bit-identical to
-/// `linear_f32r_spv` per output (same K-accumulation order); grid = out_f·ceil(rows/8).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn linear_f32r_mrow8_spv() -> &'static [u32] {
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| {
-        spv_words(include_bytes!(concat!(
-            env!("OUT_DIR"),
-            "/linear_f32r_mrow8.spv"
-        )))
-    })
-}
-/// SPIR-V for the vec4 ROW-TILED f32 GEMM (4 rows/workgroup, vec4 K stream — the small-m
-/// prefill shape; requires in_f % 4 == 0). vec4-lane accumulation → NOT bit-identical to the
-/// scalar kernels (f32 tolerance-level shift).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn linear_f32r_mrow4_v4_spv() -> &'static [u32] {
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| {
-        spv_words(include_bytes!(concat!(
-            env!("OUT_DIR"),
-            "/linear_f32r_mrow4_v4.spv"
-        )))
-    })
-}
-/// SPIR-V for the vec4 ROW-TILED f32 GEMM, 8 rows/workgroup (chunked-prefill rows>4 shape;
-/// requires in_f % 4 == 0). Same vec4 accumulation caveat as the 4-row variant.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn linear_f32r_mrow8_v4_spv() -> &'static [u32] {
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| {
-        spv_words(include_bytes!(concat!(
-            env!("OUT_DIR"),
-            "/linear_f32r_mrow8_v4.spv"
-        )))
-    })
-}
 /// SPIR-V for E2B per-layer inp_gate fused GEMV+GELU+strided-multiply kernel.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn e2b_gate_spv() -> &'static [u32] {
@@ -4018,12 +3082,6 @@ pub(crate) fn qk_norm_rope_interleaved_dyn_spv() -> &'static [u32] {
 pub(crate) fn linear_bf16_spv() -> &'static [u32] {
     static LINEAR_BF16_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     LINEAR_BF16_SPV.get_or_init(|| spv_words(LINEAR_BF16_SPV_BYTES))
-}
-/// SPIR-V for the f16-weight GEMV with fused residual.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn linear_res_spv() -> &'static [u32] {
-    static LINEAR_RES_SPV: OnceLock<Vec<u32>> = OnceLock::new();
-    LINEAR_RES_SPV.get_or_init(|| spv_words(LINEAR_RES_SPV_BYTES))
 }
 /// SPIR-V for the online-softmax GQA attention (hd<=128).
 #[cfg_attr(infr_profile, infr_prof::instrument)]

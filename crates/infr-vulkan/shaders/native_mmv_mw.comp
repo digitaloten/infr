@@ -32,20 +32,12 @@
 #endif
 layout(local_size_x = WARPS * SG, local_size_y = 1, local_size_z = 1) in;
 
-// -DSTREAMED (see native_gemv.comp's header for the full rationale): the weight is read from the
+// Streamed (see native_gemv.comp's header for the full rationale): the weight is read from the
 // arena pool by 64-bit device address instead of a bound SSBO — arena_lo/arena_hi appended LAST,
-// w_base keeps its within-tensor element-offset meaning. Additive: the non-STREAMED build is
-// byte-identical.
-#ifdef STREAMED
+// w_base keeps its within-tensor element-offset meaning.
 layout(push_constant) uniform PC {
     uint rows; uint in_f; uint out_f; uint w_base; uint arena_lo; uint arena_hi;
 } pc;
-#else
-layout(push_constant) uniform PC { uint rows; uint in_f; uint out_f; uint w_base; } pc;
-#endif
-#ifndef STREAMED
-layout(binding = 0) readonly buffer WB { uint nw[]; };          // raw GGUF weight bytes (padded u32)
-#endif
 layout(binding = 1) readonly buffer QA { uint qa[]; };          // int8 activation, packed 4/u32 [nblk*8]
 layout(binding = 2) readonly buffer DA { float16_t dact[]; };   // per-block scale [nblk]
 layout(binding = 3) readonly buffer SA { float16_t sact[]; };   // per-block Σ dequant a [nblk]
@@ -58,14 +50,9 @@ layout(binding = 4) buffer YB { float y_buf[]; };
 
 // Weight-word read chokepoint — see native_mmv.comp for why this family declares its own `NW(i)`
 // instead of inheriting native_decode.glsl's.
-#ifdef STREAMED
 #include "native_arena_ref.glsl"
 #define NW(i) arena_word(i)
-#else
-#define NW(i) nw[i]
-#endif
-// Wide 4-word read: streamed builds get NW4 (b128, saddr) from native_arena_ref.glsl; non-streamed
-// reads the SSBO array directly (ACO already fuses to buffer_load_b128). Lets the dp4a weight
+// Wide 4-word read: NW4 (b128, saddr) comes from native_arena_ref.glsl, letting the dp4a weight
 // loads issue one b128 instead of four b32 — the streamed-vs-resident decode gap (see the arena ref
 // doc). Same words as NW(base+j) — bit-identical.
 #ifndef NW4
@@ -274,9 +261,7 @@ void main() {
     // early return below is safe before subgroupAdd (all SG lanes of a subgroup share it).
     uint o = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * uint(WARPS) + sg;
     if (o >= pc.out_f) { return; }
-#ifdef STREAMED
     nw_ptr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
-#endif
     uint nsub = pc.in_f / 32u;
     uint wb = pc.w_base + o * pc.in_f;
     float acc = 0.0;

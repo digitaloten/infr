@@ -1300,49 +1300,48 @@ impl<'a> Recorder<'a> {
         const WIDE_GRID_MIN: usize = 128;
         let wide_grid = m.div_ceil(64) * (n / 256).max(1);
         let use_wide = n.is_multiple_of(256) && wide_grid >= WIDE_GRID_MIN;
+        // `Some(bn)` selects a warptile (BN=256 wide or BN=128 narrow) for `dtype`; `None` falls
+        // back to the 64×64 kernel. The getters report tile availability only — weights are read by
+        // 64-bit address via the `_streamed` twin below, so no resident SPV is loaded here.
         let warp = if k.is_multiple_of(32) && std::env::var("INFR_NO_GEMM_WARP").is_err() {
             if use_wide {
-                crate::gemm::native_gemm_warp_build_spv(dtype).map(|s| (s, 256))
+                crate::gemm::native_gemm_warp_build_spv(dtype).map(|_| 256usize)
             } else if n.is_multiple_of(128) {
-                crate::gemm::native_gemm_warp_n128_build_spv(dtype).map(|s| (s, 128))
+                crate::gemm::native_gemm_warp_n128_build_spv(dtype).map(|_| 128usize)
             } else {
                 None
             }
         } else {
             None
         };
-        // `_spv` is the resident (bound-SSBO) tile's SPIR-V — no longer dispatched (weights are
-        // read by 64-bit address via the `_streamed` twin below), but the resident SPVs stay
-        // compiled and the name→streamed mapping keys off `name`, so the pick is kept intact.
-        let (name, _spv) = match (warp, dtype) {
-            (Some((spv, 256)), infr_core::DType::Bf16) => ("native_gemm_warp_bf16", spv),
-            (Some((spv, 256)), infr_core::DType::Q3K) => ("native_gemm_warp_q3k", spv),
-            (Some((spv, 256)), infr_core::DType::Q5_0) => ("native_gemm_warp_q5_0", spv),
-            (Some((spv, 256)), infr_core::DType::Q5_1) => ("native_gemm_warp_q5_1", spv),
-            (Some((spv, 256)), infr_core::DType::Iq4Nl) => ("native_gemm_warp_iq4nl", spv),
-            (Some((spv, 256)), infr_core::DType::Iq4Xs) => ("native_gemm_warp_iq4xs", spv),
-            (Some((spv, 256)), infr_core::DType::Q2K) => ("native_gemm_warp_q2k", spv),
-            (Some((spv, 256)), infr_core::DType::Q4_0) => ("native_gemm_warp_q4_0", spv),
-            (Some((spv, 256)), infr_core::DType::Q4K) => ("native_gemm_warp_q4k", spv),
-            (Some((spv, 256)), infr_core::DType::Q5K) => ("native_gemm_warp_q5k", spv),
-            (Some((spv, 256)), infr_core::DType::Q6K) => ("native_gemm_warp_q6k", spv),
-            (Some((spv, 256)), infr_core::DType::Q8_0) => ("native_gemm_warp_q8_0", spv),
-            (Some((spv, _)), infr_core::DType::Bf16) => ("native_gemm_warp_bf16_n128", spv),
-            (Some((spv, _)), infr_core::DType::Q3K) => ("native_gemm_warp_q3k_n128", spv),
-            (Some((spv, _)), infr_core::DType::Q5_0) => ("native_gemm_warp_q5_0_n128", spv),
-            (Some((spv, _)), infr_core::DType::Q5_1) => ("native_gemm_warp_q5_1_n128", spv),
-            (Some((spv, _)), infr_core::DType::Iq4Nl) => ("native_gemm_warp_iq4nl_n128", spv),
-            (Some((spv, _)), infr_core::DType::Iq4Xs) => ("native_gemm_warp_iq4xs_n128", spv),
-            (Some((spv, _)), infr_core::DType::Q2K) => ("native_gemm_warp_q2k_n128", spv),
-            (Some((spv, _)), infr_core::DType::Q4_0) => ("native_gemm_warp_q4_0_n128", spv),
-            (Some((spv, _)), infr_core::DType::Q4K) => ("native_gemm_warp_q4k_n128", spv),
-            (Some((spv, _)), infr_core::DType::Q5K) => ("native_gemm_warp_q5k_n128", spv),
-            (Some((spv, _)), infr_core::DType::Q6K) => ("native_gemm_warp_q6k_n128", spv),
-            (Some((spv, _)), infr_core::DType::Q8_0) => ("native_gemm_warp_q8_0_n128", spv),
-            _ => (
-                crate::linear::native_gemm_kernel_name(dtype),
-                crate::gemm::native_gemm_build_spv(dtype).expect("native GEMM spv"),
-            ),
+        // Resident tile NAME the arena-addressed `_streamed` twin keys off (`native_gemm_streamed_spv`
+        // below) — the pick stays 1:1 with the resident tables, but nothing binds a resident SSBO.
+        let name = match (warp, dtype) {
+            (Some(256), infr_core::DType::Bf16) => "native_gemm_warp_bf16",
+            (Some(256), infr_core::DType::Q3K) => "native_gemm_warp_q3k",
+            (Some(256), infr_core::DType::Q5_0) => "native_gemm_warp_q5_0",
+            (Some(256), infr_core::DType::Q5_1) => "native_gemm_warp_q5_1",
+            (Some(256), infr_core::DType::Iq4Nl) => "native_gemm_warp_iq4nl",
+            (Some(256), infr_core::DType::Iq4Xs) => "native_gemm_warp_iq4xs",
+            (Some(256), infr_core::DType::Q2K) => "native_gemm_warp_q2k",
+            (Some(256), infr_core::DType::Q4_0) => "native_gemm_warp_q4_0",
+            (Some(256), infr_core::DType::Q4K) => "native_gemm_warp_q4k",
+            (Some(256), infr_core::DType::Q5K) => "native_gemm_warp_q5k",
+            (Some(256), infr_core::DType::Q6K) => "native_gemm_warp_q6k",
+            (Some(256), infr_core::DType::Q8_0) => "native_gemm_warp_q8_0",
+            (Some(_), infr_core::DType::Bf16) => "native_gemm_warp_bf16_n128",
+            (Some(_), infr_core::DType::Q3K) => "native_gemm_warp_q3k_n128",
+            (Some(_), infr_core::DType::Q5_0) => "native_gemm_warp_q5_0_n128",
+            (Some(_), infr_core::DType::Q5_1) => "native_gemm_warp_q5_1_n128",
+            (Some(_), infr_core::DType::Iq4Nl) => "native_gemm_warp_iq4nl_n128",
+            (Some(_), infr_core::DType::Iq4Xs) => "native_gemm_warp_iq4xs_n128",
+            (Some(_), infr_core::DType::Q2K) => "native_gemm_warp_q2k_n128",
+            (Some(_), infr_core::DType::Q4_0) => "native_gemm_warp_q4_0_n128",
+            (Some(_), infr_core::DType::Q4K) => "native_gemm_warp_q4k_n128",
+            (Some(_), infr_core::DType::Q5K) => "native_gemm_warp_q5k_n128",
+            (Some(_), infr_core::DType::Q6K) => "native_gemm_warp_q6k_n128",
+            (Some(_), infr_core::DType::Q8_0) => "native_gemm_warp_q8_0_n128",
+            _ => crate::linear::native_gemm_kernel_name(dtype),
         };
         self.label_gemm(name, m, k, n);
         // The weight is read by its 64-bit address: an explicit streamed-block `arena` override, or
@@ -1357,7 +1356,7 @@ impl<'a> Recorder<'a> {
         let push_size: u32 = 24;
         let kern = self.be.kernel_sg(kname, kspv, 3, push_size, 32);
         let groups_n = match warp {
-            Some((_, bn)) => n / bn,
+            Some(bn) => n / bn,
             None => n / 64,
         };
         let mut push = [0u8; 24];
@@ -1480,20 +1479,24 @@ impl<'a> Recorder<'a> {
         let bm32 = small_bm
             .then(|| crate::gemm::native_gemm_warp_n128_ag_bm32_build_spv(dtype))
             .flatten();
-        // `_spv` is the resident (bound-SSBO) A_GLOBAL tile — no longer dispatched (the weight is
-        // read by 64-bit address via the `_streamed` twin), kept only so the `name` pick stays 1:1
-        // with the resident tables.
-        let (name, _spv, bn, bm): (_, _, usize, usize) = if use_wide {
-            let (name, spv) = crate::gemm::native_gemm_warp_ag_build_spv(dtype).expect("ag spv");
-            (name, spv, 256, 64)
-        } else if let Some((name, spv)) = bm16 {
-            (name, spv, 128, 16)
-        } else if let Some((name, spv)) = bm32 {
-            (name, spv, 128, 32)
+        // Resident A_GLOBAL tile NAME the `_streamed` twin keys off — the weight is read by 64-bit
+        // address, so nothing binds a resident SSBO; the getters report the tile name/availability.
+        let (name, bn, bm): (&str, usize, usize) = if use_wide {
+            (
+                crate::gemm::native_gemm_warp_ag_build_spv(dtype).expect("ag name"),
+                256,
+                64,
+            )
+        } else if let Some(name) = bm16 {
+            (name, 128, 16)
+        } else if let Some(name) = bm32 {
+            (name, 128, 32)
         } else {
-            let (name, spv) =
-                crate::gemm::native_gemm_warp_n128_ag_build_spv(dtype).expect("ag n128 spv");
-            (name, spv, 128, 64)
+            (
+                crate::gemm::native_gemm_warp_n128_ag_build_spv(dtype).expect("ag n128 name"),
+                128,
+                64,
+            )
         };
         self.label_gemm(name, m, k, n);
         // Weight read by 64-bit address (explicit streamed block, else the resident weight's own
@@ -1555,26 +1558,12 @@ impl<'a> Recorder<'a> {
         // the device, so a smaller row tile only adds fixed per-workgroup cost (barrier/staging)
         // without an occupancy win to pay for it. BM=64 stays unconditional here; the win lives
         // in `matmul_native_f16a` (the non-split-K n128_ag family), which had no such fill floor.
-        // `_spv` is the resident (bound-SSBO) split-K tile — no longer dispatched (the weight is
-        // read by 64-bit address via the `_streamed` twin), kept only so the `name` pick stays 1:1
-        // with the resident tables.
-        let (name, _spv) = if a_is_f16 {
-            crate::gemm::native_gemm_warp_sk_ag_build_spv(dtype).expect("split-k ag spv")
+        // Resident split-K tile NAME the `_streamed` twin keys off — the weight is read by 64-bit
+        // address, so nothing binds a resident SSBO; the getters report the tile name/availability.
+        let name = if a_is_f16 {
+            crate::gemm::native_gemm_warp_sk_ag_build_spv(dtype).expect("split-k ag name")
         } else {
-            let spv = crate::gemm::native_gemm_warp_sk_build_spv(dtype).expect("split-k spv");
-            let name = match dtype {
-                infr_core::DType::F16 => "native_gemm_warp_f16_sk",
-                infr_core::DType::Iq4Nl => "native_gemm_warp_iq4nl_sk",
-                infr_core::DType::Iq4Xs => "native_gemm_warp_iq4xs_sk",
-                infr_core::DType::Q2K => "native_gemm_warp_q2k_sk",
-                infr_core::DType::Q4_0 => "native_gemm_warp_q4_0_sk",
-                infr_core::DType::Q3K => "native_gemm_warp_q3k_sk",
-                infr_core::DType::Q4K => "native_gemm_warp_q4k_sk",
-                infr_core::DType::Q5K => "native_gemm_warp_q5k_sk",
-                infr_core::DType::Q6K => "native_gemm_warp_q6k_sk",
-                _ => "native_gemm_warp_q8_0_sk",
-            };
-            (name, spv)
+            crate::gemm::native_gemm_warp_sk_build_spv(dtype).expect("split-k name")
         };
         self.label_gemm(name, m, k, n);
         // Weight read by 64-bit address (explicit streamed block, else the resident weight's own
@@ -2125,7 +2114,7 @@ impl<'a> Recorder<'a> {
     /// (adapter.rs `nc_mmq`: no usable f16 coopmat, packed int8 dot present — Intel Arc/ANV).
     /// Same kernels/conventions as [`Self::matmul_mmq_q4k`]/[`Self::matmul_mmq_q6k`] (which it
     /// delegates to for those dtypes' names), extended to the full dense build set
-    /// (`native_gemm_mmq_dense_spv`): activations pre-quantized via `quant_q8`, `c` is
+    /// (`native_gemm_mmq_dense_streamed_spv`): activations pre-quantized via `quant_q8`, `c` is
     /// `ceil(m/64)*64` rows, requires `n%64`, `k%32`. `sact` (the per-32-block Σx term) is
     /// always passed but bound ONLY for the min-carrying dtypes
     /// (`infr_core::tensor::moe_mmq_needs_sact` — the same SSOT the `_xp` expert dispatch uses;

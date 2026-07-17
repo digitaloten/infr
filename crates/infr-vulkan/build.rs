@@ -2610,11 +2610,13 @@ fn main() {
             }
         })
         .collect();
-    // STREAMED twins for dense weight layer-streaming (see src/pager.rs `DensePagerSession`): the
-    // `-DSTREAMED` build reads the weight from a `bufferDeviceAddress` arena pool (native_arena_ref
-    // .glsl) instead of a bound SSBO, lifting the ~4 GiB `maxStorageBufferRange` cap one SSBO
-    // binding imposes. Additive: the default (non-STREAMED) build is byte-identical (the define
-    // only activates #ifdef arms that expand to nothing when off).
+    // STREAMED weight builds (resident-BDA): the `-DSTREAMED` build reads the weight from a
+    // `bufferDeviceAddress` arena pool (native_arena_ref.glsl) instead of a bound SSBO, lifting the
+    // ~4 GiB `maxStorageBufferRange` cap one SSBO binding imposes. `wants_streamed_twin` marks the
+    // families that get a STREAMED build; `keep_resident` (below) marks the few whose bound-SSBO
+    // build is STILL dispatched (eager ops, parity recorders, production conv1d/e2b, mechanism-(b)).
+    // For every other family STREAMED is now the SOLE weight build — the bound-SSBO "resident" build
+    // is no longer emitted (slice U4b2). The list below still enumerates which families qualify:
     //   * native_gemv — decode/small-m GEMV (any-m rows loop). Both plain and -DUSE_RES builds get
     //     a twin: production DOES dispatch fused-residual GEMVs on resident weights (the decode
     //     Linear+Add fusion — recorder.rs `linear_add_native`), and the resident-BDA endgame needs
@@ -2697,16 +2699,49 @@ fn main() {
             _ => false,
         }
     };
+    // Resident-BDA endgame (slice U4b2): for every twin family the recorder now dispatches
+    // STREAMED-only (weights read by 64-bit device address), the resident (non-`-DSTREAMED`) build
+    // is dead — the `_streamed` twin is the SOLE weight build. `keep_resident` is the whitelist of
+    // twin-family builds whose RESIDENT SPV is still genuinely dispatched (bound-descriptor read),
+    // so it must keep compiling alongside the streamed twin:
+    //   * native_gemv / native_gemv_sg / native_gemv_rm / native_gemv_rm_v2 — the eager
+    //     `VulkanBackend::linear_native` (ops.rs) and the `linear_native_{sg,rm,rm_v2}` parity
+    //     recorders bind the weight as an SSBO and dispatch the resident kernel.
+    //   * conv1d_silu / conv1d_silu_par / e2b_gate / e2b_proj — production dispatches the RESIDENT
+    //     kernel (their `_streamed` twin is the parity-test entry, not the production path).
+    //   * linear_f16 / linear_bf16 — the eager `VulkanBackend::linear_{f16,bf16}` GEMVs.
+    //   * mechanism-(b): the standalone mmq Q4_K/Q6_K, the int8/fp8-coopmat GEMMs, the Q8_0→E4M3
+    //     repack, and native_gemm_warp's `_cm8`/`_bf16cm` coopmat tiles all bind a `BdaSub`
+    //     sub-range via vkb and read through the bound descriptor — their resident build IS live.
+    // Everything else in a twin family (the dense/expert coopmat GEMM tiles, the mmv/mrow/id float
+    // and dequant GEMVs, embed_gather, gemm_proj, native_gemm_fma) is STREAMED-only now.
+    let keep_resident = |src: &str, defines: &[String]| -> bool {
+        match src {
+            "native_gemv" | "native_gemv_sg" | "native_gemv_rm" | "native_gemv_rm_v2" => true,
+            "conv1d_silu" | "conv1d_silu_par" | "e2b_gate" | "e2b_proj" => true,
+            "linear_f16" | "linear_bf16" => true,
+            // The eager f32 dense linear (`linear.rs` LinearKernel / `linear_spv()`) binds its
+            // weight SSBO and dispatches the resident build.
+            "linear_f32" => true,
+            "native_gemm_i8cm_q8_0" | "repack_q8_to_f8" => true,
+            "native_gemm_warp" => defines.iter().any(|d| d == "-DCM_M=8" || d == "-DBF16CM"),
+            "native_gemm_mmq_q4k" | "native_gemm_mmq_q6k" => defines.is_empty(),
+            _ => false,
+        }
+    };
     let builds: Vec<(String, String, Vec<String>)> = builds
         .into_iter()
         .flat_map(|(src_stem, dst_stem, defines)| {
             if wants_streamed_twin(&src_stem, &defines) {
                 let mut sd = defines.clone();
                 sd.push("-DSTREAMED".to_string());
-                vec![
-                    (src_stem.clone(), dst_stem.clone(), defines),
-                    (src_stem, format!("{dst_stem}_streamed"), sd),
-                ]
+                let streamed = (src_stem.clone(), format!("{dst_stem}_streamed"), sd);
+                if keep_resident(&src_stem, &defines) {
+                    vec![(src_stem, dst_stem, defines), streamed]
+                } else {
+                    // STREAMED is the only weight build for this family.
+                    vec![streamed]
+                }
             } else {
                 vec![(src_stem, dst_stem, defines)]
             }
