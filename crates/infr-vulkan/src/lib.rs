@@ -321,6 +321,14 @@ struct VkBuffer {
     /// them apart. Every upload/download/fill site that touches `buffer` at a byte offset must add
     /// this in, and [`Buffer::device_addr`] is `block_base_addr + sub_offset`.
     sub_offset: usize,
+    /// `vkGetBufferDeviceAddress(buffer)` for a buffer that owns ITS OWN `SHADER_DEVICE_ADDRESS`
+    /// buffer object (unlike `Backing::BdaSub`, which shares an arena block's handle and derives
+    /// its address from the block's `base_addr + sub_offset` instead). Populated by `make_buf_ex`/
+    /// `alloc_vram_mapped` whenever they were asked for a device address — today that's the
+    /// resident-BDA/paged-MoE arena blocks themselves (`Backing::Pooled`/`Backing::Vram`) and
+    /// `BufferUsage::KvCache` allocations (see [`Buffer::device_addr`]). `None` for every buffer
+    /// that never requested one.
+    own_addr: Option<u64>,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -406,6 +414,9 @@ impl Buffer for VkBuffer {
         self
     }
     fn device_addr(&self) -> Option<u64> {
+        if let Some(addr) = self.own_addr {
+            return Some(addr);
+        }
         match &self.backing {
             Backing::BdaSub(block) => Some(block.base_addr + self.sub_offset as u64),
             _ => None,
@@ -1972,6 +1983,15 @@ impl VulkanBackend {
         }
         .fetch_add(requirements.size, Ordering::Relaxed);
 
+        // Mirror `make_buf_ex`'s own-address computation: `device_address` here means the caller
+        // already added `SHADER_DEVICE_ADDRESS` to the buffer's usage AND (just above) chained the
+        // matching `DEVICE_ADDRESS` memory-allocate flag, so the query is valid.
+        let own_addr = device_address.then(|| unsafe {
+            self.shared
+                .device
+                .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
+        });
+
         Ok(VkBuffer {
             shared: Arc::clone(&self.shared),
             buffer,
@@ -1986,6 +2006,7 @@ impl VulkanBackend {
             mem_size: requirements.size,
             location: MemoryLocation::GpuOnly,
             sub_offset: 0,
+            own_addr,
         })
     }
 
@@ -2054,6 +2075,9 @@ impl VulkanBackend {
                     mem_size: 0,
                     location: MemoryLocation::GpuOnly,
                     sub_offset: off as usize,
+                    // `device_addr()` derives a `BdaSub`'s address from the block's `base_addr` +
+                    // `sub_offset` — no own address needed here.
+                    own_addr: None,
                 });
             }
         }
@@ -2101,6 +2125,7 @@ impl VulkanBackend {
             mem_size: 0,
             location: MemoryLocation::GpuOnly,
             sub_offset: 0,
+            own_addr: None,
         })
     }
 
@@ -2255,6 +2280,16 @@ impl VulkanBackend {
                 .fetch_add(allocation.size(), Ordering::Relaxed);
         }
 
+        // `device_address` callers added `SHADER_DEVICE_ADDRESS` to the buffer's usage above; the
+        // allocator itself was built with `buffer_device_address: true` (see `VulkanShared::new`),
+        // so every block it hands back — pooled sub-allocation or dedicated alike — already carries
+        // the matching memory-allocate flag and the query below is valid without any extra plumbing.
+        let own_addr = device_address.then(|| unsafe {
+            self.shared
+                .device
+                .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
+        });
+
         Ok(VkBuffer {
             shared: Arc::clone(&self.shared),
             buffer,
@@ -2263,6 +2298,7 @@ impl VulkanBackend {
             mem_size: requirements.size,
             location,
             sub_offset: 0,
+            own_addr,
         })
     }
 
@@ -2344,8 +2380,20 @@ impl VulkanBackend {
             }
             return Ok(buf);
         }
+        // KV cache: slice 0 of the u64/BDA migration (issue #74) — allocation-only enablement, NO
+        // kernel reads this address yet (every attention/store/dequant dispatch still binds these
+        // buffers exactly as before `vkb`). Unlike `Weights`, this is deliberately NOT an arena
+        // sub-allocation: each `kbufs[l]`/`vbufs[l]` (and its fork/checkpoint/MTP-draft twins)
+        // stays its OWN dedicated-or-pooled buffer object via the ordinary `make_buf_ex` path — the
+        // per-layer/per-side structure is unchanged, it just gains `SHADER_DEVICE_ADDRESS` usage +
+        // an `own_addr`. Smallest blast radius: only KV buffers get an address, not every
+        // `Activations` scratch/partial/logits allocation in the engine.
+        if usage == BufferUsage::KvCache {
+            return self.make_buf_ex(bytes, MemoryLocation::GpuOnly, "kv-cache", false, true);
+        }
         let (location, label) = match usage {
             BufferUsage::Weights => unreachable!("Weights routed to bda_weight_alloc above"),
+            BufferUsage::KvCache => unreachable!("KvCache routed to make_buf_ex above"),
             BufferUsage::Activations => (MemoryLocation::GpuOnly, "activations"),
             BufferUsage::Staging => (MemoryLocation::CpuToGpu, "staging"),
             BufferUsage::Readback => (MemoryLocation::GpuToCpu, "readback"),
@@ -2914,6 +2962,71 @@ mod tests {
 
         // A plain Activations alloc is unaffected by any of this — never routed through
         // `bda_weight_alloc`, so it must report no device address.
+        let act = be
+            .alloc(64, BufferUsage::Activations)
+            .expect("Activations alloc");
+        assert!(
+            act.device_addr().is_none(),
+            "an ordinary Activations buffer must not report a device_addr"
+        );
+    }
+
+    /// Slice 0 of the KV-cache u64/BDA migration (issue #74): pure allocator-seam enablement — a
+    /// `BufferUsage::KvCache` allocation (the exact usage class `infr-llama`'s `kbufs[l]`/
+    /// `vbufs[l]`, their `fork()`/MTP-checkpoint/MTP-draft twins all route through as of this
+    /// slice) must report `Some(device_addr)`. `kbufs` itself is `pub(super)` inside
+    /// `infr_llama::seam` (invisible to any integration test), so this exercises the mechanism
+    /// those call sites share rather than a live model session — exactly the "allocator seam
+    /// only, zero behavioral change" scope of this slice (no kernel reads this address yet).
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn kv_cache_buffer_reports_device_addr() {
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan GPU");
+                return;
+            }
+        };
+        // Two independent buffers, mirroring a K/V pair for one layer. UNLIKE the resident-weight
+        // BDA arena, KV buffers are deliberately NOT consolidated into one shared block in this
+        // slice (see `make_alloc`'s `KvCache` arm) — each stays its own dedicated-or-pooled
+        // object, so their addresses must be distinct, non-null VkDeviceAddress values.
+        let kbuf = be.alloc(4096, BufferUsage::KvCache).expect("KvCache alloc");
+        let vbuf = be.alloc(4096, BufferUsage::KvCache).expect("KvCache alloc");
+        let kaddr = kbuf
+            .device_addr()
+            .expect("kbuf must report Some(device_addr)");
+        let vaddr = vbuf
+            .device_addr()
+            .expect("vbuf must report Some(device_addr)");
+        assert_ne!(
+            kaddr, 0,
+            "device_addr must be a real (non-null) VkDeviceAddress"
+        );
+        assert_ne!(
+            vaddr, 0,
+            "device_addr must be a real (non-null) VkDeviceAddress"
+        );
+        assert_ne!(
+            kaddr, vaddr,
+            "K and V buffers must be independent objects, not shared/aliased"
+        );
+
+        // The buffer is still an ordinary bound-descriptor-usable SSBO — upload/download work
+        // exactly as before (zero behavioral change to the actual KV read/write path; this slice
+        // only adds the address, no kernel forks on it yet).
+        let data: Vec<u8> = (0..4096u32).map(|i| i as u8).collect();
+        be.upload(kbuf.as_ref(), &data).expect("upload");
+        let mut back = vec![0u8; 4096];
+        be.download(kbuf.as_ref(), &mut back).expect("download");
+        assert_eq!(
+            back, data,
+            "KvCache buffer upload/download round-trip mismatch"
+        );
+
+        // A plain Activations alloc must still report no address — smallest blast radius: only
+        // KvCache buffers gain one, not every scratch/partial/logits allocation in the engine.
         let act = be
             .alloc(64, BufferUsage::Activations)
             .expect("Activations alloc");

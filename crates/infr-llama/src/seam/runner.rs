@@ -703,11 +703,11 @@ pub(crate) fn generate_dense_backend(
                 let conv_elems = (c.ssm_d_conv - 1) * c.q35_conv_channels();
                 let s_elems = c.q35_num_v_heads() * c.q35_head_k_dim() * c.q35_head_v_dim();
                 kbufs.push(
-                    be.alloc(conv_elems * 4, BufferUsage::Activations)
+                    be.alloc(conv_elems * 4, BufferUsage::KvCache)
                         .map_err(|e| anyhow!("{e}"))?,
                 );
                 vbufs.push(
-                    be.alloc(s_elems * 4, BufferUsage::Activations)
+                    be.alloc(s_elems * 4, BufferUsage::KvCache)
                         .map_err(|e| anyhow!("{e}"))?,
                 );
                 continue;
@@ -717,18 +717,12 @@ pub(crate) fn generate_dense_backend(
             // the window mask already excludes — `crate::seam::kv_rows` has the argument).
             let rows_l = crate::seam::kv_rows(c, l, want_ctx, kv_ring);
             kbufs.push(
-                be.alloc(
-                    kv_fmt_bytes(k_fmt, rows_l * kvrow_l),
-                    BufferUsage::Activations,
-                )
-                .map_err(|e| anyhow!("{e}"))?,
+                be.alloc(kv_fmt_bytes(k_fmt, rows_l * kvrow_l), BufferUsage::KvCache)
+                    .map_err(|e| anyhow!("{e}"))?,
             );
             vbufs.push(
-                be.alloc(
-                    kv_fmt_bytes(v_fmt, rows_l * kvrow_l),
-                    BufferUsage::Activations,
-                )
-                .map_err(|e| anyhow!("{e}"))?,
+                be.alloc(kv_fmt_bytes(v_fmt, rows_l * kvrow_l), BufferUsage::KvCache)
+                    .map_err(|e| anyhow!("{e}"))?,
             );
         }
 

@@ -1426,10 +1426,10 @@ impl<'a> MtpHeadSession<'a> {
         let (wbufs, wspecs) = upload_mtp_head_bufs(be, bind_weight, g, cfg, head)?;
         let kvrow = cfg.n_kv * cfg.head_dim;
         let k_cache = be
-            .alloc(max_ctx * kvrow * 2, BufferUsage::Activations) // f16 KV — 2 bytes/elem
+            .alloc(max_ctx * kvrow * 2, BufferUsage::KvCache) // f16 KV — 2 bytes/elem
             .map_err(|e| anyhow!("{e}"))?;
         let v_cache = be
-            .alloc(max_ctx * kvrow * 2, BufferUsage::Activations)
+            .alloc(max_ctx * kvrow * 2, BufferUsage::KvCache)
             .map_err(|e| anyhow!("{e}"))?;
         let (embed_buf, embed_dtype) = build_embed_chain_buf(be, bind_weight, g, cfg, head)?;
         Ok(Self {

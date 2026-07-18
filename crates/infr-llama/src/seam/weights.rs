@@ -265,11 +265,11 @@ impl SeamKv {
             let mut vbufs = Vec::with_capacity(layers.len());
             for &l in &layers {
                 kbufs.push(
-                    be.alloc(self.kbufs[l].len_bytes().max(1), BufferUsage::Activations)
+                    be.alloc(self.kbufs[l].len_bytes().max(1), BufferUsage::KvCache)
                         .map_err(|e| anyhow!("{e}"))?,
                 );
                 vbufs.push(
-                    be.alloc(self.vbufs[l].len_bytes().max(1), BufferUsage::Activations)
+                    be.alloc(self.vbufs[l].len_bytes().max(1), BufferUsage::KvCache)
                         .map_err(|e| anyhow!("{e}"))?,
                 );
             }
@@ -341,11 +341,11 @@ impl SeamKv {
                 let conv_elems = (cfg.ssm_d_conv - 1) * cfg.q35_conv_channels();
                 let s_elems = cfg.q35_num_v_heads() * cfg.q35_head_k_dim() * cfg.q35_head_v_dim();
                 kbufs.push(
-                    be.alloc(conv_elems * 4, BufferUsage::Activations)
+                    be.alloc(conv_elems * 4, BufferUsage::KvCache)
                         .map_err(|e| anyhow!("{e}"))?,
                 );
                 vbufs.push(
-                    be.alloc(s_elems * 4, BufferUsage::Activations)
+                    be.alloc(s_elems * 4, BufferUsage::KvCache)
                         .map_err(|e| anyhow!("{e}"))?,
                 );
                 continue;
@@ -357,14 +357,14 @@ impl SeamKv {
             kbufs.push(
                 be.alloc(
                     kv_fmt_bytes(self.k_fmt, rows_l * kvrow_l),
-                    BufferUsage::Activations,
+                    BufferUsage::KvCache,
                 )
                 .map_err(|e| anyhow!("{e}"))?,
             );
             vbufs.push(
                 be.alloc(
                     kv_fmt_bytes(self.v_fmt, rows_l * kvrow_l),
-                    BufferUsage::Activations,
+                    BufferUsage::KvCache,
                 )
                 .map_err(|e| anyhow!("{e}"))?,
             );

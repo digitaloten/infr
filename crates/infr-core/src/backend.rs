@@ -334,6 +334,15 @@ impl Capabilities {
 pub enum BufferUsage {
     Weights,
     Activations,
+    /// Persistent per-layer, per-side KV cache buffers (`kbufs`/`vbufs` and their forks/
+    /// checkpoints/MTP-draft twins) — and, on qwen35, the DeltaNet conv/S recurrent-state buffers
+    /// that repurpose the same slots. Distinct from `Activations` ONLY so a backend can opt these
+    /// specific long-lived buffers into a 64-bit device address (see `Buffer::device_addr`)
+    /// without handing one to every scratch/partial/logits `Activations` allocation too. Slice 0
+    /// of the KV/u64 migration (issue #74): allocation-only, no kernel reads this address yet — a
+    /// backend that doesn't distinguish it (CPU, Metal today) may simply treat it like
+    /// `Activations`.
+    KvCache,
     /// Host→device staging (host-visible, mapped): `upload` is a direct memcpy.
     Staging,
     /// Device→host readback (host-visible, mapped): `download` is a direct memcpy.
