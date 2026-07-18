@@ -2832,14 +2832,6 @@ dyn_spv!(attention_kv_q8_bda_spv, "attention_kv_q8_bda");
 dyn_spv!(attention_kv_kq8_bda_spv, "attention_kv_kq8_bda");
 dyn_spv!(attention_kv_vq8_bda_spv, "attention_kv_vq8_bda");
 dyn_spv!(attention_kv_dyn_q8_bda_spv, "attention_kv_dyn_q8_bda");
-/// `INFR_NO_KV_BDA=1` — force the bound-SSBO KV read path (bindings 1/2) instead of the `-DKV_BDA`
-/// 64-bit device-address twin. Escape hatch + the profile-ruler A/B knob for the #74 slice-1
-/// migration; the default (unset) routes production KV reads through the pointer twin.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn kv_bda_disabled() -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("INFR_NO_KV_BDA").is_ok())
-}
 dyn_spv!(store_q8_spv, "store_q8");
 dyn_spv!(store_q8_dyn_spv, "store_q8_dyn");
 dyn_spv!(store_q8_f16_spv, "store_q8_f16");
@@ -2869,35 +2861,13 @@ dyn_spv!(store_kv_bf16_from_f16_spv, "store_kv_bf16_from_f16");
 
 // ── KV-cache u64/BDA store + dequant-read twins (#74 slice 3) ────────────────────────────────────
 // The `-DKV_BDA` builds: store kernels write the DEST cache / dequant kernels read the SOURCE cache by
-// 64-bit device address (kv_addr.glsl) instead of the bound KV SSBO. Bound builds above stay for
-// kv_addr_parity.rs; production forks here via the Recorder `*_at` methods unless INFR_NO_KV_BDA.
+// 64-bit device address (kv_addr.glsl) instead of the bound KV SSBO. The store_f16 twin keeps its
+// bound build (it ALSO writes a non-KV f16 scratch, the f32-cast dequant read); the qk_norm_rope*/
+// rope_f16* twins keep theirs (un-fused Q-scratch write). The store_q8/quant_kv/store_kv_dense/
+// dequant_q8_f16/dequant_kv_f16 kernels went BDA-only (slice 5): their base getters below now yield
+// the (unconditional) BDA build and their bound twins/`*_bda` getters were deleted.
 dyn_spv!(store_f16_bda_spv, "store_f16_bda");
 dyn_spv!(store_f16_dyn_bda_spv, "store_f16_dyn_bda");
-dyn_spv!(store_q8_bda_spv, "store_q8_bda");
-dyn_spv!(store_q8_dyn_bda_spv, "store_q8_dyn_bda");
-dyn_spv!(store_q8_f16_bda_spv, "store_q8_f16_bda");
-dyn_spv!(store_q8_f16_dyn_bda_spv, "store_q8_f16_dyn_bda");
-dyn_spv!(dequant_q8_f16_bda_spv, "dequant_q8_f16_bda");
-dyn_spv!(quant_kv_q4_0_bda_spv, "quant_kv_q4_0_bda");
-dyn_spv!(quant_kv_q4_0_f16_bda_spv, "quant_kv_q4_0_f16_bda");
-dyn_spv!(quant_kv_q4_1_bda_spv, "quant_kv_q4_1_bda");
-dyn_spv!(quant_kv_q4_1_f16_bda_spv, "quant_kv_q4_1_f16_bda");
-dyn_spv!(quant_kv_q5_0_bda_spv, "quant_kv_q5_0_bda");
-dyn_spv!(quant_kv_q5_0_f16_bda_spv, "quant_kv_q5_0_f16_bda");
-dyn_spv!(quant_kv_q5_1_bda_spv, "quant_kv_q5_1_bda");
-dyn_spv!(quant_kv_q5_1_f16_bda_spv, "quant_kv_q5_1_f16_bda");
-dyn_spv!(quant_kv_iq4_nl_bda_spv, "quant_kv_iq4_nl_bda");
-dyn_spv!(quant_kv_iq4_nl_f16_bda_spv, "quant_kv_iq4_nl_f16_bda");
-dyn_spv!(dequant_kv_q4_0_bda_spv, "dequant_kv_q4_0_bda");
-dyn_spv!(dequant_kv_q4_1_bda_spv, "dequant_kv_q4_1_bda");
-dyn_spv!(dequant_kv_q5_0_bda_spv, "dequant_kv_q5_0_bda");
-dyn_spv!(dequant_kv_q5_1_bda_spv, "dequant_kv_q5_1_bda");
-dyn_spv!(dequant_kv_iq4_nl_bda_spv, "dequant_kv_iq4_nl_bda");
-dyn_spv!(dequant_kv_bf16_bda_spv, "dequant_kv_bf16_bda");
-dyn_spv!(store_kv_f32_bda_spv, "store_kv_f32_bda");
-dyn_spv!(store_kv_f32_from_f16_bda_spv, "store_kv_f32_from_f16_bda");
-dyn_spv!(store_kv_bf16_bda_spv, "store_kv_bf16_bda");
-dyn_spv!(store_kv_bf16_from_f16_bda_spv, "store_kv_bf16_from_f16_bda");
 dyn_spv!(rope_f16_bda_spv, "rope_f16_bda");
 dyn_spv!(rope_f16_dyn_bda_spv, "rope_f16_dyn_bda");
 dyn_spv!(qk_norm_rope_bda_spv, "qk_norm_rope_bda");
@@ -2912,62 +2882,6 @@ dyn_spv!(
     qk_norm_rope_interleaved_dyn_bda_spv,
     "qk_norm_rope_interleaved_dyn_bda"
 );
-
-/// (kernel name, SPIR-V) for the `-DKV_BDA` KV quantize kernel of `dt` (`src_f16` = f16 K, else f32 V).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn quant_kv_bda_kernel(
-    dt: infr_core::DType,
-    src_f16: bool,
-) -> (&'static str, &'static [u32]) {
-    use infr_core::DType::*;
-    match (dt, src_f16) {
-        (Q4_0, false) => ("quant_kv_q4_0_bda", quant_kv_q4_0_bda_spv()),
-        (Q4_0, true) => ("quant_kv_q4_0_f16_bda", quant_kv_q4_0_f16_bda_spv()),
-        (Q4_1, false) => ("quant_kv_q4_1_bda", quant_kv_q4_1_bda_spv()),
-        (Q4_1, true) => ("quant_kv_q4_1_f16_bda", quant_kv_q4_1_f16_bda_spv()),
-        (Q5_0, false) => ("quant_kv_q5_0_bda", quant_kv_q5_0_bda_spv()),
-        (Q5_0, true) => ("quant_kv_q5_0_f16_bda", quant_kv_q5_0_f16_bda_spv()),
-        (Q5_1, false) => ("quant_kv_q5_1_bda", quant_kv_q5_1_bda_spv()),
-        (Q5_1, true) => ("quant_kv_q5_1_f16_bda", quant_kv_q5_1_f16_bda_spv()),
-        (Iq4Nl, false) => ("quant_kv_iq4_nl_bda", quant_kv_iq4_nl_bda_spv()),
-        (Iq4Nl, true) => ("quant_kv_iq4_nl_f16_bda", quant_kv_iq4_nl_f16_bda_spv()),
-        _ => unreachable!("quant_kv_bda_kernel for non-KV-quant dtype {dt:?}"),
-    }
-}
-
-/// (kernel name, SPIR-V) for the `-DKV_BDA` KV dequant→f16 prefix expander of `dt`.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn dequant_kv_bda_kernel(dt: infr_core::DType) -> (&'static str, &'static [u32]) {
-    use infr_core::DType::*;
-    match dt {
-        Q4_0 => ("dequant_kv_q4_0_bda", dequant_kv_q4_0_bda_spv()),
-        Q4_1 => ("dequant_kv_q4_1_bda", dequant_kv_q4_1_bda_spv()),
-        Q5_0 => ("dequant_kv_q5_0_bda", dequant_kv_q5_0_bda_spv()),
-        Q5_1 => ("dequant_kv_q5_1_bda", dequant_kv_q5_1_bda_spv()),
-        Iq4Nl => ("dequant_kv_iq4_nl_bda", dequant_kv_iq4_nl_bda_spv()),
-        Bf16 => ("dequant_kv_bf16_bda", dequant_kv_bf16_bda_spv()),
-        _ => unreachable!("dequant_kv_bda_kernel for non-prepass KV dtype {dt:?}"),
-    }
-}
-
-/// (kernel name, SPIR-V) for the `-DKV_BDA` dense KV cast-store into `dst_dt` (F32/Bf16).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn store_kv_dense_bda_kernel(
-    dst_dt: infr_core::DType,
-    src_f16: bool,
-) -> (&'static str, &'static [u32]) {
-    use infr_core::DType::*;
-    match (dst_dt, src_f16) {
-        (F32, false) => ("store_kv_f32_bda", store_kv_f32_bda_spv()),
-        (F32, true) => ("store_kv_f32_from_f16_bda", store_kv_f32_from_f16_bda_spv()),
-        (Bf16, false) => ("store_kv_bf16_bda", store_kv_bf16_bda_spv()),
-        (Bf16, true) => (
-            "store_kv_bf16_from_f16_bda",
-            store_kv_bf16_from_f16_bda_spv(),
-        ),
-        _ => unreachable!("store_kv_dense_bda_kernel for non-dense KV dtype {dst_dt:?}"),
-    }
-}
 
 dyn_spv!(quant_turbo_t2_spv, "quant_turbo_t2");
 dyn_spv!(quant_turbo_t2_f16_spv, "quant_turbo_t2_f16");

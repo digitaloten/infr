@@ -698,7 +698,11 @@ fn store_legs(
         let d = be.alloc(prefix + dst_len, BufferUsage::KvCache).unwrap();
         be.upload(d.as_ref(), &vec![0u8; prefix + dst_len]).unwrap();
         let addr = if bda {
-            Some(d.device_addr().expect("KvCache must expose a device address") + prefix as u64)
+            Some(
+                d.device_addr()
+                    .expect("KvCache must expose a device address")
+                    + prefix as u64,
+            )
         } else {
             None
         };
@@ -712,35 +716,87 @@ fn store_legs(
     (leg(0, false), leg(0, true), leg(OFF, true))
 }
 
-/// Runs a DEQUANT READER 3 ways (bound / pointer@0 / pointer@nonzero-offset) reading `src_bytes`
-/// from a KvCache SOURCE, returns the f16 output bytes. `run(rec, src, dst, addr)`: `addr` None =
-/// bound, Some = the `_at` twin reading at that device address (src still bound for the barrier).
-fn dequant_legs(
+// ── Slice-5 BDA-only kernels ──────────────────────────────────────────────────────────────────
+// store_q8/quant_kv/store_kv_dense/dequant_q8_f16/dequant_kv_f16 went BDA-only in slice 5 (the bound
+// twin AND the explicit-address `_at` method were deleted; the base method now reads the KV cache's
+// own `device_addr()`). With no explicit-address entry point the parity test can't park data behind a
+// byte prefix and pass base+prefix; instead it proves BASE-INVARIANCE: the SAME store/read run into
+// two SIMULTANEOUSLY-LIVE KvCache buffers (distinct device-address bases — a throwaway buffer is held
+// between them so the second base is offset from the first) must be byte-identical. A twin that
+// mishandled its 64-bit base (e.g. dropped low bits of device_addr) would diverge across the two
+// bases. gpu_seam goldens (never re-blessed) remain the end-to-end byte-identity proof.
+
+/// Runs a STORE into two simultaneously-live zeroed KvCache dsts at DISTINCT device-address bases and
+/// returns both written caches. `store(rec, dst)` records the BDA store (dst read by `device_addr()`).
+fn store_offinv(
+    be: &VulkanBackend,
+    dst_len: usize,
+    store: impl Fn(&Recorder, &dyn Buffer),
+) -> (Vec<u8>, Vec<u8>) {
+    // All three buffers stay alive → the allocator hands out distinct bases (no freed-then-reused
+    // address that would make the two legs share a base and the check vacuous).
+    let d0 = be.alloc(dst_len, BufferUsage::KvCache).unwrap();
+    let _gap = be.alloc(OFF, BufferUsage::KvCache).unwrap();
+    let d1 = be.alloc(dst_len, BufferUsage::KvCache).unwrap();
+    let run_one = |d: &dyn Buffer| -> Vec<u8> {
+        be.upload(d, &vec![0u8; dst_len]).unwrap();
+        let rec = be.recorder().unwrap();
+        store(&rec, d);
+        rec.finish().unwrap();
+        let mut out = vec![0u8; dst_len];
+        be.download(d, &mut out).unwrap();
+        out
+    };
+    assert_ne!(
+        d0.device_addr().unwrap(),
+        d1.device_addr().unwrap(),
+        "test setup: the two KvCache dsts must have distinct bases for base-invariance to mean anything"
+    );
+    (run_one(d0.as_ref()), run_one(d1.as_ref()))
+}
+
+/// Runs a DEQUANT READER from two simultaneously-live KvCache srcs at DISTINCT device-address bases,
+/// returns both f16 outputs. `run(rec, src, dst)` records the BDA read (src read by `device_addr()`).
+fn dequant_offinv(
     be: &VulkanBackend,
     src_bytes: &[u8],
     dst_len: usize,
-    run: impl Fn(&Recorder, &dyn Buffer, &dyn Buffer, Option<u64>),
-) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    let leg = |prefix: usize, bda: bool| -> Vec<u8> {
-        let mut sd = synth_bytes(prefix, 0xF00D);
-        sd.extend_from_slice(src_bytes);
-        let src = be.alloc(sd.len(), BufferUsage::KvCache).unwrap();
-        be.upload(src.as_ref(), &sd).unwrap();
+    run: impl Fn(&Recorder, &dyn Buffer, &dyn Buffer),
+) -> (Vec<u8>, Vec<u8>) {
+    let s0 = be.alloc(src_bytes.len(), BufferUsage::KvCache).unwrap();
+    let _gap = be.alloc(OFF, BufferUsage::KvCache).unwrap();
+    let s1 = be.alloc(src_bytes.len(), BufferUsage::KvCache).unwrap();
+    be.upload(s0.as_ref(), src_bytes).unwrap();
+    be.upload(s1.as_ref(), src_bytes).unwrap();
+    let run_one = |src: &dyn Buffer| -> Vec<u8> {
         let dst = be.alloc(dst_len, BufferUsage::Activations).unwrap();
         be.upload(dst.as_ref(), &vec![0u8; dst_len]).unwrap();
-        let addr = if bda {
-            Some(src.device_addr().unwrap() + prefix as u64)
-        } else {
-            None
-        };
         let rec = be.recorder().unwrap();
-        run(&rec, src.as_ref(), dst.as_ref(), addr);
+        run(&rec, src, dst.as_ref());
         rec.finish().unwrap();
         let mut out = vec![0u8; dst_len];
         be.download(dst.as_ref(), &mut out).unwrap();
         out
     };
-    (leg(0, false), leg(0, true), leg(OFF, true))
+    assert_ne!(
+        s0.device_addr().unwrap(),
+        s1.device_addr().unwrap(),
+        "test setup: the two KvCache srcs must have distinct bases for base-invariance to mean anything"
+    );
+    (run_one(s0.as_ref()), run_one(s1.as_ref()))
+}
+
+/// Asserts a BDA kernel is byte-identical across the two distinct-base legs (and non-vacuous).
+fn assert_offinv(name: &str, a: &[u8], b: &[u8]) {
+    assert!(
+        a.iter().any(|&x| x != 0),
+        "{name}: BDA leg produced all zeros — the case is not exercising the kernel"
+    );
+    assert_eq!(
+        a, b,
+        "{name}: BDA output differs across two KvCache allocations (distinct device-address bases) — \
+         the pointer twin is mishandling its 64-bit base"
+    );
 }
 
 #[test]
@@ -778,20 +834,18 @@ fn store_q8_bda_matches_bound() {
         let sb = synth_f32(n, 9);
         let src = be.alloc(sb.len(), BufferUsage::Activations).unwrap();
         be.upload(src.as_ref(), &sb).unwrap();
-        let (b, a0, ao) = store_legs(&be, dst_len, |rec, dst, addr| match addr {
-            Some(a) => rec.store_q8_at(src.as_ref(), dst, a, n, 0, cap, false, 0),
-            None => rec.store_q8(src.as_ref(), dst, n, 0, cap, false, 0),
+        let (a, b) = store_offinv(&be, dst_len, |rec, dst| {
+            rec.store_q8(src.as_ref(), dst, n, 0, cap, false, 0)
         });
-        assert_bytes(&format!("store_q8(f32) n={n}"), &b, &a0, &ao);
+        assert_offinv(&format!("store_q8(f32) n={n}"), &a, &b);
         // f16 source.
         let sf = synth_f16(n, 21);
         let srcf = be.alloc(sf.len(), BufferUsage::Activations).unwrap();
         be.upload(srcf.as_ref(), &sf).unwrap();
-        let (b, a0, ao) = store_legs(&be, dst_len, |rec, dst, addr| match addr {
-            Some(a) => rec.store_q8_at(srcf.as_ref(), dst, a, n, 0, cap, true, 0),
-            None => rec.store_q8(srcf.as_ref(), dst, n, 0, cap, true, 0),
+        let (a, b) = store_offinv(&be, dst_len, |rec, dst| {
+            rec.store_q8(srcf.as_ref(), dst, n, 0, cap, true, 0)
         });
-        assert_bytes(&format!("store_q8(f16) n={n}"), &b, &a0, &ao);
+        assert_offinv(&format!("store_q8(f16) n={n}"), &a, &b);
         println!("ok: store_q8 n={n}");
     }
 }
@@ -805,17 +859,22 @@ fn quant_kv_bda_matches_bound() {
     };
     use infr_core::DType::*;
     // (dtype, bytes-per-32-block) for the mainline low-bit KV quants.
-    for (dt, blk) in [(Q4_0, 18usize), (Q4_1, 20), (Q5_0, 22), (Q5_1, 24), (Iq4Nl, 18)] {
+    for (dt, blk) in [
+        (Q4_0, 18usize),
+        (Q4_1, 20),
+        (Q5_0, 22),
+        (Q5_1, 24),
+        (Iq4Nl, 18),
+    ] {
         for n in [64usize, 256] {
             let dst_len = (n / 32) * blk;
             let sb = synth_f32(n, 33);
             let src = be.alloc(sb.len(), BufferUsage::Activations).unwrap();
             be.upload(src.as_ref(), &sb).unwrap();
-            let (b, a0, ao) = store_legs(&be, dst_len, |rec, dst, addr| match addr {
-                Some(a) => rec.quant_kv_at(dt, src.as_ref(), dst, a, n, 0, false),
-                None => rec.quant_kv(dt, src.as_ref(), dst, n, 0, false),
+            let (a, b) = store_offinv(&be, dst_len, |rec, dst| {
+                rec.quant_kv(dt, src.as_ref(), dst, n, 0, false)
             });
-            assert_bytes(&format!("quant_kv {dt:?} n={n}"), &b, &a0, &ao);
+            assert_offinv(&format!("quant_kv {dt:?} n={n}"), &a, &b);
         }
         println!("ok: quant_kv {dt:?}");
     }
@@ -835,11 +894,10 @@ fn store_kv_dense_bda_matches_bound() {
             let sb = synth_f32(n, 41);
             let src = be.alloc(sb.len(), BufferUsage::Activations).unwrap();
             be.upload(src.as_ref(), &sb).unwrap();
-            let (b, a0, ao) = store_legs(&be, dst_len, |rec, dst, addr| match addr {
-                Some(a) => rec.store_kv_dense_at(dt, src.as_ref(), dst, a, n, 0, false),
-                None => rec.store_kv_dense(dt, src.as_ref(), dst, n, 0, false),
+            let (a, b) = store_offinv(&be, dst_len, |rec, dst| {
+                rec.store_kv_dense(dt, src.as_ref(), dst, n, 0, false)
             });
-            assert_bytes(&format!("store_kv_dense {dt:?} n={n}"), &b, &a0, &ao);
+            assert_offinv(&format!("store_kv_dense {dt:?} n={n}"), &a, &b);
         }
         println!("ok: store_kv_dense {dt:?}");
     }
@@ -855,11 +913,10 @@ fn dequant_q8_f16_bda_matches_bound() {
     for n in [64usize, 256] {
         let cap = n;
         let src_bytes = synth_bytes(cap + (cap / 32) * 2, 13); // planar Q8 codes + scales
-        let (b, a0, ao) = dequant_legs(&be, &src_bytes, n * 2, |rec, src, dst, addr| match addr {
-            Some(a) => rec.dequant_q8_f16_at(src, dst, a, n, cap),
-            None => rec.dequant_q8_f16(src, dst, n, cap),
+        let (a, b) = dequant_offinv(&be, &src_bytes, n * 2, |rec, src, dst| {
+            rec.dequant_q8_f16(src, dst, n, cap)
         });
-        assert_bytes(&format!("dequant_q8_f16 n={n}"), &b, &a0, &ao);
+        assert_offinv(&format!("dequant_q8_f16 n={n}"), &a, &b);
         println!("ok: dequant_q8_f16 n={n}");
     }
 }
@@ -872,15 +929,19 @@ fn dequant_kv_f16_bda_matches_bound() {
         return;
     };
     use infr_core::DType::*;
-    for (dt, blk) in [(Q4_0, 18usize), (Q4_1, 20), (Q5_0, 22), (Q5_1, 24), (Iq4Nl, 18)] {
+    for (dt, blk) in [
+        (Q4_0, 18usize),
+        (Q4_1, 20),
+        (Q5_0, 22),
+        (Q5_1, 24),
+        (Iq4Nl, 18),
+    ] {
         for n in [64usize, 256] {
             let src_bytes = synth_bytes((n / 32) * blk, 17); // GGUF blocks
-            let (b, a0, ao) =
-                dequant_legs(&be, &src_bytes, n * 2, |rec, src, dst, addr| match addr {
-                    Some(a) => rec.dequant_kv_f16_at(dt, src, dst, a, n),
-                    None => rec.dequant_kv_f16(dt, src, dst, n),
-                });
-            assert_bytes(&format!("dequant_kv_f16 {dt:?} n={n}"), &b, &a0, &ao);
+            let (a, b) = dequant_offinv(&be, &src_bytes, n * 2, |rec, src, dst| {
+                rec.dequant_kv_f16(dt, src, dst, n)
+            });
+            assert_offinv(&format!("dequant_kv_f16 {dt:?} n={n}"), &a, &b);
         }
         println!("ok: dequant_kv_f16 {dt:?}");
     }

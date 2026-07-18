@@ -3709,7 +3709,8 @@ impl<'a> Recorder<'a> {
     /// `-DKV_BDA` twin of [`Self::attention_kv`] (#74 slice 1): reads the K/V cache by 64-bit device
     /// address (`k_addr`/`v_addr`, kv_addr.glsl) instead of the bound SSBOs at slots 1/2. Bit-
     /// identical to the bound build (proven by kv_addr_parity.rs); production forks here from
-    /// adapter.rs when both KV buffers report a `device_addr` and `INFR_NO_KV_BDA` is unset. Push
+    /// adapter.rs when both KV buffers report a `device_addr` (attention_kv stays dual-arm: the
+    /// quantized-KV-prefill scalar read off the Activations dequant scratch has none → bound). Push
     /// grows by k_lo/k_hi/v_lo/v_hi (uvec2 splits, avoiding 8-byte push alignment).
     ///
     /// `kc`/`vc` are still bound at slots 1/2 as INERT descriptors the shader never reads — solely so
@@ -4266,7 +4267,8 @@ impl<'a> Recorder<'a> {
     // read barrier — the write-side analog of the slice-1 inert read bind. `n_buf`/`n_out` are
     // UNCHANGED from the bound sibling (the KV binding stays in the reads|writes split); only the push
     // grows by the addr uvec2 (lo/hi). Production forks here from adapter.rs when the KV buffer exposes
-    // a device address and INFR_NO_KV_BDA is unset; bit-identical to the bound dispatch.
+    // a device address; bit-identical to the bound dispatch (store_f16 stays dual-arm — its f32-cast
+    // dequant read writes a non-KV Activations scratch that has none → bound).
 
     /// `-DKV_BDA` twin of [`Self::store_f16_off`]: writes the f16 cache at `dst_addr`. `dst` stays
     /// bound at slot 1 as the inert write descriptor keeping the store→read barrier.
@@ -4324,191 +4326,6 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             k,
             &[Self::vkb(src), Self::vkb(params), Self::vkb(dst)],
-            1,
-            &push,
-            (n as u32).div_ceil(64),
-        );
-    }
-
-    /// `-DKV_BDA` twin of [`Self::store_q8`]: writes the planar-Q8 cache at `dst_addr`. `dst` stays
-    /// bound at slot 1 (inert) for the store→read barrier.
-    #[allow(clippy::too_many_arguments)]
-    pub fn store_q8_at(
-        &self,
-        src: &dyn Buffer,
-        dst: &dyn Buffer,
-        dst_addr: u64,
-        n: usize,
-        off: usize,
-        cap: usize,
-        src_f16: bool,
-        src_off: usize,
-    ) {
-        let (name, spv) = if src_f16 {
-            ("store_q8_f16_bda", crate::gemm::store_q8_f16_bda_spv())
-        } else {
-            ("store_q8_bda", crate::gemm::store_q8_bda_spv())
-        };
-        let k = self.be.kernel(name, spv, 2, 24);
-        let mut push = [0u8; 24];
-        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(cap as u32).to_ne_bytes());
-        push[12..16].copy_from_slice(&(src_off as u32).to_ne_bytes());
-        push[16..20].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
-        push[20..24].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
-            k,
-            &[Self::vkb(src), Self::vkb(dst)],
-            1,
-            &push,
-            (n as u32) / 32,
-        );
-    }
-
-    /// `-DKV_BDA` twin of [`Self::store_q8_dyn`]: writes the planar-Q8 cache at `dst_addr`. `dst`
-    /// stays bound at slot 2 (inert) for the store→read barrier.
-    #[allow(clippy::too_many_arguments)]
-    pub fn store_q8_dyn_at(
-        &self,
-        src: &dyn Buffer,
-        params: &dyn Buffer,
-        dst: &dyn Buffer,
-        dst_addr: u64,
-        n: usize,
-        cap: usize,
-        src_f16: bool,
-    ) {
-        let (name, spv) = if src_f16 {
-            (
-                "store_q8_f16_dyn_bda",
-                crate::gemm::store_q8_f16_dyn_bda_spv(),
-            )
-        } else {
-            ("store_q8_dyn_bda", crate::gemm::store_q8_dyn_bda_spv())
-        };
-        let k = self.be.kernel(name, spv, 3, 24);
-        let mut push = [0u8; 24];
-        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(cap as u32).to_ne_bytes());
-        push[16..20].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
-        push[20..24].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
-            k,
-            &[Self::vkb(src), Self::vkb(params), Self::vkb(dst)],
-            1,
-            &push,
-            (n as u32) / 32,
-        );
-    }
-
-    /// `-DKV_BDA` twin of [`Self::dequant_q8_f16`]: reads the planar-Q8 cache at `src_addr`. `src`
-    /// stays bound at slot 0 (inert READ) so the store→dequant-read barrier survives.
-    pub fn dequant_q8_f16_at(
-        &self,
-        src: &dyn Buffer,
-        dst: &dyn Buffer,
-        src_addr: u64,
-        n: usize,
-        cap: usize,
-    ) {
-        let k = self.be.kernel(
-            "dequant_q8_f16_bda",
-            crate::gemm::dequant_q8_f16_bda_spv(),
-            2,
-            16,
-        );
-        let mut push = [0u8; 16];
-        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(cap as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(src_addr as u32).to_ne_bytes());
-        push[12..16].copy_from_slice(&((src_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
-            k,
-            &[Self::vkb(src), Self::vkb(dst)],
-            1,
-            &push,
-            (n as u32).div_ceil(64),
-        );
-    }
-
-    /// `-DKV_BDA` twin of [`Self::quant_kv`]: writes the GGUF-block cache at `dst_addr`. `dst`
-    /// stays bound at slot 1 (inert) for the store→read barrier.
-    #[allow(clippy::too_many_arguments)]
-    pub fn quant_kv_at(
-        &self,
-        dt: infr_core::DType,
-        src: &dyn Buffer,
-        dst: &dyn Buffer,
-        dst_addr: u64,
-        n: usize,
-        off: usize,
-        src_f16: bool,
-    ) {
-        let (name, spv) = crate::gemm::quant_kv_bda_kernel(dt, src_f16);
-        let k = self.be.kernel(name, spv, 2, 16);
-        let mut push = [0u8; 16];
-        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
-        push[12..16].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
-            k,
-            &[Self::vkb(src), Self::vkb(dst)],
-            1,
-            &push,
-            ((n / 32) as u32).div_ceil(64),
-        );
-    }
-
-    /// `-DKV_BDA` twin of [`Self::dequant_kv_f16`]: reads the GGUF-block cache at `src_addr`. `src`
-    /// stays bound at slot 0 (inert READ) so the store→dequant-read barrier survives.
-    pub fn dequant_kv_f16_at(
-        &self,
-        dt: infr_core::DType,
-        src: &dyn Buffer,
-        dst: &dyn Buffer,
-        src_addr: u64,
-        n: usize,
-    ) {
-        let (name, spv) = crate::gemm::dequant_kv_bda_kernel(dt);
-        let k = self.be.kernel(name, spv, 2, 12);
-        let mut push = [0u8; 12];
-        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(src_addr as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&((src_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
-            k,
-            &[Self::vkb(src), Self::vkb(dst)],
-            1,
-            &push,
-            (n as u32).div_ceil(64),
-        );
-    }
-
-    /// `-DKV_BDA` twin of [`Self::store_kv_dense`]: writes the dense (f32/bf16) cache at `dst_addr`.
-    /// `dst` stays bound at slot 1 (inert) for the store→read barrier.
-    #[allow(clippy::too_many_arguments)]
-    pub fn store_kv_dense_at(
-        &self,
-        dst_dt: infr_core::DType,
-        src: &dyn Buffer,
-        dst: &dyn Buffer,
-        dst_addr: u64,
-        n: usize,
-        off: usize,
-        src_f16: bool,
-    ) {
-        let (name, spv) = crate::gemm::store_kv_dense_bda_kernel(dst_dt, src_f16);
-        let k = self.be.kernel(name, spv, 2, 16);
-        let mut push = [0u8; 16];
-        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
-        push[12..16].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
-            k,
-            &[Self::vkb(src), Self::vkb(dst)],
             1,
             &push,
             (n as u32).div_ceil(64),
@@ -4842,17 +4659,24 @@ impl<'a> Recorder<'a> {
         src_f16: bool,
         src_off: usize,
     ) {
+        // #74 (slice 5): BDA-only. `dst` (the planar-Q8 KV cache) is written by device address; it
+        // stays bound at slot 1 as an inert descriptor so Recorder::sync keeps the store→read barrier.
+        let dst_addr = dst
+            .device_addr()
+            .expect("store_q8: KV cache dst must have a device address (BufferUsage::KvCache)");
         let (name, spv) = if src_f16 {
             ("store_q8_f16", crate::gemm::store_q8_f16_spv())
         } else {
             ("store_q8", crate::gemm::store_q8_spv())
         };
-        let k = self.be.kernel(name, spv, 2, 16);
-        let mut push = [0u8; 16];
+        let k = self.be.kernel(name, spv, 2, 24);
+        let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(cap as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(src_off as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
         // One workgroup (32 lanes) per 32-element block.
         self.dispatch(
             k,
@@ -4874,17 +4698,24 @@ impl<'a> Recorder<'a> {
         cap: usize,
         src_f16: bool,
     ) {
+        // #74 (slice 5): BDA-only. `dst` (the planar-Q8 KV cache) is written by device address; it
+        // stays bound at slot 2 as an inert descriptor so Recorder::sync keeps the store→read barrier.
+        let dst_addr = dst
+            .device_addr()
+            .expect("store_q8_dyn: KV cache dst must have a device address (BufferUsage::KvCache)");
         let (name, spv) = if src_f16 {
             ("store_q8_f16_dyn", crate::gemm::store_q8_f16_dyn_spv())
         } else {
             ("store_q8_dyn", crate::gemm::store_q8_dyn_spv())
         };
-        let k = self.be.kernel(name, spv, 3, 16);
-        let mut push = [0u8; 16];
+        let k = self.be.kernel(name, spv, 3, 24);
+        let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         // [4..8] off: unused (from params). [12..16] src_off: always 0 here (a single decode row
         // never crosses the ring wrap). The kernel derives the ring row capacity from cap/n.
         push[8..12].copy_from_slice(&(cap as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
         self.dispatch(
             k,
             &[Self::vkb(src), Self::vkb(params), Self::vkb(dst)],
@@ -4898,12 +4729,19 @@ impl<'a> Recorder<'a> {
     /// f16 flash / non-FA prefill kernels can read it; the persistent cache stays Q8). `cap` = total
     /// cache elements (the planar scales region base).
     pub fn dequant_q8_f16(&self, src: &dyn Buffer, dst: &dyn Buffer, n: usize, cap: usize) {
+        // #74 (slice 5): BDA-only. `src` (the planar-Q8 KV cache) is read by device address; it stays
+        // bound at slot 0 as an inert descriptor so Recorder::sync keeps the store→dequant-read barrier.
+        let src_addr = src.device_addr().expect(
+            "dequant_q8_f16: KV cache src must have a device address (BufferUsage::KvCache)",
+        );
         let k = self
             .be
-            .kernel("dequant_q8_f16", crate::gemm::dequant_q8_f16_spv(), 2, 8);
-        let mut push = [0u8; 8];
+            .kernel("dequant_q8_f16", crate::gemm::dequant_q8_f16_spv(), 2, 16);
+        let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(cap as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(src_addr as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&((src_addr >> 32) as u32).to_ne_bytes());
         self.dispatch(
             k,
             &[Self::vkb(src), Self::vkb(dst)],
@@ -4924,11 +4762,18 @@ impl<'a> Recorder<'a> {
         off: usize,
         src_f16: bool,
     ) {
+        // #74 (slice 5): BDA-only. `dst` (the GGUF-block KV cache) is written by device address; it
+        // stays bound at slot 1 as an inert descriptor so Recorder::sync keeps the store→read barrier.
+        let dst_addr = dst
+            .device_addr()
+            .expect("quant_kv: KV cache dst must have a device address (BufferUsage::KvCache)");
         let (name, spv) = crate::gemm::quant_kv_kernel(dt, src_f16);
-        let k = self.be.kernel(name, spv, 2, 8);
-        let mut push = [0u8; 8];
+        let k = self.be.kernel(name, spv, 2, 16);
+        let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
         self.dispatch(
             k,
             &[Self::vkb(src), Self::vkb(dst)],
@@ -4996,11 +4841,18 @@ impl<'a> Recorder<'a> {
         off: usize,
         src_f16: bool,
     ) {
+        // #74 (slice 5): BDA-only. `dst` (the dense KV cache) is written by device address; it stays
+        // bound at slot 1 as an inert descriptor so Recorder::sync keeps the store→read barrier.
+        let dst_addr = dst.device_addr().expect(
+            "store_kv_dense: KV cache dst must have a device address (BufferUsage::KvCache)",
+        );
         let (name, spv) = crate::gemm::store_kv_dense_kernel(dst_dt, src_f16);
-        let k = self.be.kernel(name, spv, 2, 8);
-        let mut push = [0u8; 8];
+        let k = self.be.kernel(name, spv, 2, 16);
+        let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
         self.dispatch(
             k,
             &[Self::vkb(src), Self::vkb(dst)],
@@ -5019,10 +4871,17 @@ impl<'a> Recorder<'a> {
         dst: &dyn Buffer,
         n: usize,
     ) {
+        // #74 (slice 5): BDA-only. `src` (the GGUF-block KV cache) is read by device address; it stays
+        // bound at slot 0 as an inert descriptor so Recorder::sync keeps the store→dequant-read barrier.
+        let src_addr = src.device_addr().expect(
+            "dequant_kv_f16: KV cache src must have a device address (BufferUsage::KvCache)",
+        );
         let (name, spv) = crate::gemm::dequant_kv_kernel(dt);
-        let k = self.be.kernel(name, spv, 2, 4);
-        let mut push = [0u8; 4];
+        let k = self.be.kernel(name, spv, 2, 12);
+        let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(src_addr as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&((src_addr >> 32) as u32).to_ne_bytes());
         self.dispatch(
             k,
             &[Self::vkb(src), Self::vkb(dst)],

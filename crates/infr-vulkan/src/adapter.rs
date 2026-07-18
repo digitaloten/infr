@@ -2100,41 +2100,30 @@ fn lower_op(
             } else {
                 [(0, pos_r, rows), (0, 0, 0)]
             };
-            // #74 slice 3: fork each store to its -DKV_BDA twin when the DEST cache `c` exposes a
-            // device address (KvCache always does) and INFR_NO_KV_BDA is unset — the store writes the
-            // cache by pointer, but `c` stays bound at its write slot inside the `_at` method so the
-            // store→(later attention)read barrier survives. Bit-identical to the bound store.
-            let c_addr = if crate::gemm::kv_bda_disabled() {
-                None
-            } else {
-                c.device_addr()
-            };
+            // #74: the store kernels write the DEST cache `c` (always a KvCache, so it always exposes
+            // a device address) by pointer. store_q8/quant_kv/store_kv_dense are BDA-only (slice 5) —
+            // they read `c.device_addr()` internally; `c` still stays bound at its write slot so the
+            // store→(later attention)read barrier survives. store_f16 keeps its bound/BDA fork below
+            // (it also has a non-KV scratch caller), so `c_addr` is still computed for it.
+            let c_addr = c.device_addr();
             match mode {
                 RopeMode::Static(_) if cache_q8 => {
                     for &(sr, dr, nr) in segs.iter().filter(|&&(_, _, nr)| nr > 0) {
-                        match c_addr {
-                            Some(a) => {
-                                rec.store_q8_at(s, c, a, nr * rs, dr * rs, cap, src_f16, sr * rs)
-                            }
-                            None => rec.store_q8(s, c, nr * rs, dr * rs, cap, src_f16, sr * rs),
-                        }
+                        rec.store_q8(s, c, nr * rs, dr * rs, cap, src_f16, sr * rs);
                     }
                 }
-                RopeMode::Dynamic(params) if cache_q8 => match c_addr {
-                    Some(a) => rec.store_q8_dyn_at(s, *params, c, a, n, cap, src_f16),
-                    None => rec.store_q8_dyn(s, *params, c, n, cap, src_f16),
-                },
+                RopeMode::Dynamic(params) if cache_q8 => {
+                    rec.store_q8_dyn(s, *params, c, n, cap, src_f16)
+                }
                 // Mainline low-bit KV quants: quantize into standard GGUF blocks (static only — a
                 // quantized KV cache forces static decode, so a Dynamic WriteKv never reaches here).
-                RopeMode::Static(_) if is_kv_quant(cache_dt) => match c_addr {
-                    Some(a) => rec.quant_kv_at(cache_dt, s, c, a, n, pos * rs, src_f16),
-                    None => rec.quant_kv(cache_dt, s, c, n, pos * rs, src_f16),
-                },
+                RopeMode::Static(_) if is_kv_quant(cache_dt) => {
+                    rec.quant_kv(cache_dt, s, c, n, pos * rs, src_f16)
+                }
                 // Dense f32/bf16 cache: cast-store the row (also static-only).
-                RopeMode::Static(_) if is_kv_dense_alt(cache_dt) => match c_addr {
-                    Some(a) => rec.store_kv_dense_at(cache_dt, s, c, a, n, pos * rs, src_f16),
-                    None => rec.store_kv_dense(cache_dt, s, c, n, pos * rs, src_f16),
-                },
+                RopeMode::Static(_) if is_kv_dense_alt(cache_dt) => {
+                    rec.store_kv_dense(cache_dt, s, c, n, pos * rs, src_f16)
+                }
                 // TurboQuant cache: WHT-quantize the row (static-only). NOT BDA-migrated (#74 slice 3
                 // deferred turbo — its dequant read is byte-granular, outside the u32-word/f16 read
                 // family; experimental, not in the gate suite).
@@ -2196,15 +2185,11 @@ fn lower_op(
             } else {
                 (r(*dst)?, None, 0)
             };
-            // #74 slice 3: fork to the -DKV_BDA twin ONLY when the fused K write lands in the KV cache
-            // (which exposes a device address); the un-fused Q-scratch write (Activations, no address)
-            // always stays on the bound build. `out_buf` stays bound at its write slot in the `_at`
-            // method for the store→read barrier. Bit-identical to the bound dispatch.
-            let y_addr = if crate::gemm::kv_bda_disabled() {
-                None
-            } else {
-                out_buf.device_addr()
-            };
+            // #74: fork to the BDA path ONLY when the fused K write lands in the KV cache (which
+            // exposes a device address); the un-fused Q-scratch write (Activations, no address) stays
+            // on the bound build. `out_buf` stays bound at its write slot in the `_at` method for the
+            // store→read barrier. Bit-identical to the bound dispatch.
+            let y_addr = out_buf.device_addr();
             match mode {
                 RopeMode::Static(rope_pos) => {
                     let ff = match freq_factors {
@@ -2386,14 +2371,10 @@ fn lower_op(
             } else {
                 (r(*dst)?, None)
             };
-            // #74 slice 3: fork to the -DKV_BDA twin when the fused K write lands in the KV cache
-            // (device address present); the un-fused Q-scratch write stays bound. `out_buf` stays
-            // bound at its write slot in the `_at` method for the store→read barrier.
-            let y_addr = if crate::gemm::kv_bda_disabled() {
-                None
-            } else {
-                out_buf.device_addr()
-            };
+            // #74: fork to the BDA path when the fused K write lands in the KV cache (device address
+            // present); the un-fused Q-scratch write stays bound. `out_buf` stays bound at its write
+            // slot in the `_at` method for the store→read barrier.
+            let y_addr = out_buf.device_addr();
             match mode {
                 RopeMode::Static(rope_pos) => {
                     if f16_out {
@@ -2573,19 +2554,15 @@ fn lower_op(
                         });
                     }
                     let ctx = dyn_args.iter().find(|c| key(c)).unwrap();
-                    // KV u64/BDA (#74 slice 2): fork the HOT record-once decode split-K read to the
-                    // pointer twin when both KV caches expose a device address (they always do — this
-                    // is the resident decode path, KV is never the dequant scratch here) and
-                    // INFR_NO_KV_BDA is unset. The caches persist across replay, so their addresses
-                    // are stable in the baked push. Bit-identical to the bound dispatch.
+                    // KV u64/BDA (#74): fork the HOT record-once decode split-K read to the pointer
+                    // twin when both KV caches expose a device address (they always do — this is the
+                    // resident decode path, KV is never the dequant scratch here). The caches persist
+                    // across replay, so their addresses are stable in the baked push. Bit-identical to
+                    // the bound dispatch (kept dual-arm: attn_partial's .comp also serves prefill).
                     let kb = r(*k_cache)?;
                     let vb = r(*v_cache)?;
-                    match (
-                        crate::gemm::kv_bda_disabled(),
-                        kb.device_addr(),
-                        vb.device_addr(),
-                    ) {
-                        (false, Some(ka), Some(va)) => rec.attention_kv_split_dynac_at(
+                    match (kb.device_addr(), vb.device_addr()) {
+                        (Some(ka), Some(va)) => rec.attention_kv_split_dynac_at(
                             r(*q)?,
                             kb,
                             vb,
@@ -2629,17 +2606,13 @@ fn lower_op(
                         ),
                     }
                 } else {
-                    // KV u64/BDA (#74 slice 1): fork the record-once decode read to the pointer twin
-                    // when both KV buffers expose a device address and INFR_NO_KV_BDA is unset. The
-                    // caches persist across the replay, so their addresses are stable in the push.
+                    // KV u64/BDA (#74): fork the record-once decode read to the pointer twin when both
+                    // KV buffers expose a device address (they always do on decode). The caches persist
+                    // across the replay, so their addresses are stable in the push. Kept dual-arm.
                     let kb = r(*k_cache)?;
                     let vb = r(*v_cache)?;
-                    match (
-                        crate::gemm::kv_bda_disabled(),
-                        kb.device_addr(),
-                        vb.device_addr(),
-                    ) {
-                        (false, Some(ka), Some(va)) => rec.attention_kv_dyn_at(
+                    match (kb.device_addr(), vb.device_addr()) {
+                        (Some(ka), Some(va)) => rec.attention_kv_dyn_at(
                             r(*q)?,
                             kb,
                             vb,
@@ -2689,36 +2662,23 @@ fn lower_op(
                 let ne = kv_len.min(att_cap_rows) * nkv * hd;
                 // Expand a KV side into the f16 scratch: native Q8 (planar), f32 cast (store_f16),
                 // else the shared quant/bf16 dequant (dequant_kv_f16).
-                // #74 slice 3: the dequant READERS fork to their -DKV_BDA twin when the SOURCE cache
-                // exposes a device address and INFR_NO_KV_BDA is unset — the cache is read by pointer
-                // but stays BOUND at the reader's read slot (in the `_at` method) so the store→dequant-
-                // read barrier survives. The f32 cast (store_f16) and turbo dequant read paths are NOT
-                // migrated (store_f16's BDA arm moves its WRITE, not this source read; turbo deferred).
-                let src_addr = |b: &dyn infr_core::backend::Buffer| -> Option<u64> {
-                    if crate::gemm::kv_bda_disabled() {
-                        None
-                    } else {
-                        b.device_addr()
-                    }
-                };
+                // #74: the dequant READERS read the SOURCE cache (`r(*k_cache)?`/`r(*v_cache)?`, always
+                // a KvCache with a device address) by pointer. dequant_q8_f16/dequant_kv_f16 are BDA-only
+                // (slice 5) — they read `src.device_addr()` internally; `src` still stays bound at the
+                // read slot so the store→dequant-read barrier survives. The f32 cast (store_f16) writes
+                // the f16 SCRATCH `sc` (Activations, no address) → bound; turbo dequant is deferred/bound.
                 let kc_key = if deq_k {
                     let k = pooled(pool, be_, "kvdeq_k", ne * 2)?;
                     let sc = pool[&k].as_ref();
                     let src = r(*k_cache)?;
                     if k_q8 {
-                        match src_addr(src) {
-                            Some(a) => rec.dequant_q8_f16_at(src, sc, a, ne, cap),
-                            None => rec.dequant_q8_f16(src, sc, ne, cap),
-                        }
+                        rec.dequant_q8_f16(src, sc, ne, cap);
                     } else if matches!(kdt, infr_core::DType::F32) {
                         rec.store_f16(src, sc, ne, 0);
                     } else if is_turbo(kdt) {
                         rec.dequant_turbo_f16(kdt, src, sc, ne);
                     } else {
-                        match src_addr(src) {
-                            Some(a) => rec.dequant_kv_f16_at(kdt, src, sc, a, ne),
-                            None => rec.dequant_kv_f16(kdt, src, sc, ne),
-                        }
+                        rec.dequant_kv_f16(kdt, src, sc, ne);
                     }
                     Some(k)
                 } else {
@@ -2729,19 +2689,13 @@ fn lower_op(
                     let sc = pool[&k].as_ref();
                     let src = r(*v_cache)?;
                     if v_q8 {
-                        match src_addr(src) {
-                            Some(a) => rec.dequant_q8_f16_at(src, sc, a, ne, cap),
-                            None => rec.dequant_q8_f16(src, sc, ne, cap),
-                        }
+                        rec.dequant_q8_f16(src, sc, ne, cap);
                     } else if matches!(vdt, infr_core::DType::F32) {
                         rec.store_f16(src, sc, ne, 0);
                     } else if is_turbo(vdt) {
                         rec.dequant_turbo_f16(vdt, src, sc, ne);
                     } else {
-                        match src_addr(src) {
-                            Some(a) => rec.dequant_kv_f16_at(vdt, src, sc, a, ne),
-                            None => rec.dequant_kv_f16(vdt, src, sc, ne),
-                        }
+                        rec.dequant_kv_f16(vdt, src, sc, ne);
                     }
                     Some(k)
                 } else {
@@ -3063,16 +3017,12 @@ fn lower_op(
                         Some(k) => pool[k].as_ref(),
                         None => r(*v_cache)?,
                     };
-                    // KV u64/BDA (#74 slice 2): fork the split-K partial read to the pointer twin when
-                    // both KV buffers expose a device address and INFR_NO_KV_BDA is unset. `kcb`/`vcb`
-                    // may be the dequant scratch (rows>1 quantized KV) — those lack an address and fall
-                    // through to the bound arm. Bit-identical to the bound dispatch.
-                    match (
-                        crate::gemm::kv_bda_disabled(),
-                        kcb.device_addr(),
-                        vcb.device_addr(),
-                    ) {
-                        (false, Some(ka), Some(va)) => rec.attention_kv_split_at(
+                    // KV u64/BDA (#74): fork the split-K partial read to the pointer twin when both KV
+                    // buffers expose a device address. `kcb`/`vcb` MAY be the dequant scratch (rows>1
+                    // quantized KV prefill) — those are Activations with no address and fall through to
+                    // the bound arm, which is why this kernel stays dual-arm. Bit-identical either way.
+                    match (kcb.device_addr(), vcb.device_addr()) {
+                        (Some(ka), Some(va)) => rec.attention_kv_split_at(
                             r(*q)?,
                             kcb,
                             vcb,
@@ -3143,15 +3093,11 @@ fn lower_op(
                         Some(k) => pool[k].as_ref(),
                         None => r(*v_cache)?,
                     };
-                    // KV u64/BDA (#74 slice 1): fork to the pointer-read twin when both KV buffers
-                    // expose a device address (KvCache always does; the dequant scratch may not) and
-                    // INFR_NO_KV_BDA is unset. Bit-identical to the bound dispatch below.
-                    match (
-                        crate::gemm::kv_bda_disabled(),
-                        kcb.device_addr(),
-                        vcb.device_addr(),
-                    ) {
-                        (false, Some(ka), Some(va)) => rec.attention_kv_at(
+                    // KV u64/BDA (#74): fork to the pointer-read twin when both KV buffers expose a
+                    // device address (KvCache always does; the dequant scratch may not). Bit-identical
+                    // to the bound dispatch below, which is why this kernel stays dual-arm.
+                    match (kcb.device_addr(), vcb.device_addr()) {
+                        (Some(ka), Some(va)) => rec.attention_kv_at(
                             r(*q)?,
                             kcb,
                             vcb,

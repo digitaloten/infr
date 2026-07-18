@@ -19,7 +19,7 @@ fn planar_q8_store_dequant_roundtrip() {
     be.upload(sbuf.as_ref(), bytemuck::cast_slice(&src))
         .unwrap();
 
-    let cache = be.alloc(cache_bytes, BufferUsage::Activations).unwrap();
+    let cache = be.alloc(cache_bytes, BufferUsage::KvCache).unwrap();
     let dst = be.alloc(n * 2, BufferUsage::Activations).unwrap(); // f16 out
 
     let rec = be.recorder().unwrap();
@@ -72,7 +72,7 @@ fn planar_q8_store_dyn_roundtrip() {
         bytemuck::cast_slice(&[pos as u32, (pos + 1) as u32]),
     )
     .unwrap();
-    let cache = be.alloc(cache_bytes, BufferUsage::Activations).unwrap();
+    let cache = be.alloc(cache_bytes, BufferUsage::KvCache).unwrap();
     let ne = (pos + 1) * rs;
     let dst = be.alloc(ne * 2, BufferUsage::Activations).unwrap();
 
@@ -188,8 +188,8 @@ fn planar_q8_attn_partial_matches_f16() {
     // the scales region base = full cap, not the written length.
     let cap = 200 * nkv * hd;
     let cbytes = (cap / 32 * 34).next_multiple_of(4);
-    let kq = be.alloc(cbytes, BufferUsage::Activations).unwrap();
-    let vq = be.alloc(cbytes, BufferUsage::Activations).unwrap();
+    let kq = be.alloc(cbytes, BufferUsage::KvCache).unwrap();
+    let vq = be.alloc(cbytes, BufferUsage::KvCache).unwrap();
     let oq = be.alloc(nh * hd * 4, BufferUsage::Activations).unwrap();
     let (pm2, pl2, pacc2) = mk();
     let rec = be.recorder().unwrap();
@@ -258,8 +258,8 @@ fn planar_q8_attn_partial_mixed_kv() {
     be.upload(vf.as_ref(), &to_f16_bytes(&kv)).unwrap();
     let cap = 200 * nkv * hd;
     let cbytes = (cap / 32 * 34).next_multiple_of(4);
-    let kq = be.alloc(cbytes, BufferUsage::Activations).unwrap();
-    let vq = be.alloc(cbytes, BufferUsage::Activations).unwrap();
+    let kq = be.alloc(cbytes, BufferUsage::KvCache).unwrap();
+    let vq = be.alloc(cbytes, BufferUsage::KvCache).unwrap();
     let chunk = (kv_len / 32).clamp(64, 512);
     let n_chunks = kv_len.div_ceil(chunk);
     let split = |k: &dyn infr_core::backend::Buffer,
@@ -403,8 +403,8 @@ fn planar_q8_dynac_matches_f16() {
 
     let cap = 200 * nkv * hd;
     let cbytes = (cap / 32 * 34).next_multiple_of(4);
-    let kq = be.alloc(cbytes, BufferUsage::Activations).unwrap();
-    let vq = be.alloc(cbytes, BufferUsage::Activations).unwrap();
+    let kq = be.alloc(cbytes, BufferUsage::KvCache).unwrap();
+    let vq = be.alloc(cbytes, BufferUsage::KvCache).unwrap();
     let oq = be.alloc(nh * hd * 4, BufferUsage::Activations).unwrap();
     let (pm2, pl2, pacc2, args2) = mk();
     let rec = be.recorder().unwrap();
@@ -479,8 +479,8 @@ fn planar_q8_store_replay_tape_matches_static() {
     let params = be.alloc(8, BufferUsage::Activations).unwrap();
     be.upload(params.as_ref(), bytemuck::cast_slice(&[u32::MAX, 0u32]))
         .unwrap();
-    let kq_dyn = be.alloc(cbytes, BufferUsage::Activations).unwrap();
-    let vq_dyn = be.alloc(cbytes, BufferUsage::Activations).unwrap();
+    let kq_dyn = be.alloc(cbytes, BufferUsage::KvCache).unwrap();
+    let vq_dyn = be.alloc(cbytes, BufferUsage::KvCache).unwrap();
     let rec = be.recorder_persistent().unwrap();
     rec.global_barrier();
     rec.params_advance(params.as_ref());
@@ -508,8 +508,8 @@ fn planar_q8_store_replay_tape_matches_static() {
     tape.replay_n(t_chain).unwrap();
 
     // ── static reference: per-token store_q8 at baked offsets ──
-    let kq_st = be.alloc(cbytes, BufferUsage::Activations).unwrap();
-    let vq_st = be.alloc(cbytes, BufferUsage::Activations).unwrap();
+    let kq_st = be.alloc(cbytes, BufferUsage::KvCache).unwrap();
+    let vq_st = be.alloc(cbytes, BufferUsage::KvCache).unwrap();
     for t in 0..t_single + t_chain {
         let row = row_at(t.min(t_single));
         be.upload(kf.as_ref(), &to_f16_bytes(&row)).unwrap();

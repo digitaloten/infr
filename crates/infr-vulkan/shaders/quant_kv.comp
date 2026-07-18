@@ -11,14 +11,12 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-// -DKV_BDA (#74 slice 3): write the GGUF-block KV cache by 64-bit device address (kv_addr.glsl
-// `k_addr`, d_lo/d_hi) instead of the bound `cb` SSBO — the `cb` binding disappears, cache stays bound
-// at the write slot as an inert descriptor for the store→read barrier (see Recorder::quant_kv_at).
-// Byte stores don't vectorize (cold path).
+// #74: write the GGUF-block KV cache by 64-bit device address (kv_addr.glsl `k_addr`, d_lo/d_hi) —
+// this kernel is BDA-only (slice 5 deleted the bound-`cb` twin). The cache stays bound at the write
+// slot as an inert descriptor for the store→read barrier (see Recorder::quant_kv). Byte stores don't
+// vectorize (cold path).
 layout(push_constant) uniform PC { uint n; uint off;
-#ifdef KV_BDA
     uint d_lo; uint d_hi;
-#endif
 } pc;
 #ifdef SRC_F16
 layout(binding = 0) readonly buffer SB { float16_t src[]; };
@@ -27,19 +25,10 @@ layout(binding = 0) readonly buffer SB { float src[]; };
 #endif
 #ifdef USE_PARAMS
 layout(binding = 1) readonly buffer PB { uint p_pos; uint p_kvlen; };
-#ifndef KV_BDA
-layout(binding = 2) writeonly buffer CB { uint8_t cb[]; };
 #endif
-#elif !defined(KV_BDA)
-layout(binding = 1) writeonly buffer CB { uint8_t cb[]; };
-#endif
-#ifdef KV_BDA
 #define KV_STORE_BYTE
 #include "kv_addr.glsl"
 #define STB(bo, v) kv_store_byte(k_addr, (bo), uint(v))
-#else
-#define STB(bo, v) cb[bo] = uint8_t(v)
-#endif
 
 // Write an f16 value as 2 little-endian bytes at byte offset `bo`.
 void wf16(uint bo, float x) {
@@ -63,9 +52,7 @@ int best_index(float x) {
 #endif
 
 void main() {
-#ifdef KV_BDA
     k_addr = kv_base(pc.d_lo, pc.d_hi);
-#endif
     uint blk = gl_GlobalInvocationID.x; // block index over the local src rows
     if (blk * 32u >= pc.n) { return; }
 #ifdef USE_PARAMS

@@ -70,9 +70,10 @@ fn main() {
         // KV-cache u64/BDA twins (#74, slice 2): `-DKV_BDA` reads the K/V cache by 64-bit device
         // address (kv_addr.glsl, wide KV2 b64 for the f16 vec4 loads / scalar kv_word for Q8) instead
         // of bound SSBOs at bindings 1/2 — the flash-decoding mirror of slice 1's scalar attention_kv.
-        // The bound builds above stay compiled so kv_addr_parity.rs can compare bound-vs-pointer bit-
-        // for-bit; production forks to these when the KV buffers report a device address (see
-        // Recorder::attention_kv_split_at / _dynac_at and adapter.rs) unless INFR_NO_KV_BDA.
+        // The bound builds above stay compiled — attn_partial stays DUAL-ARM (its .comp also serves
+        // the quantized-KV-prefill split read off the dequant f16 scratch, which is Activations with no
+        // device address → bound). Production forks to these when the KV buffers report a device address
+        // (see Recorder::attention_kv_split_at / _dynac_at and adapter.rs's `device_addr()` fork).
         ("attn_partial", "attn_partial_bda", &["-DKV_BDA"]),
         (
             "attn_partial",
@@ -331,9 +332,10 @@ fn main() {
         ),
         // KV-cache u64/BDA twins (#74, slice 1): `-DKV_BDA` reads the K/V cache by 64-bit device
         // address (kv_addr.glsl) instead of bound SSBOs at bindings 1/2 — the mirror of the weight
-        // side's `-DSTREAMED`. The bound builds above stay compiled so kv_addr_parity.rs can compare
-        // bound-vs-pointer bit-for-bit; production forks to these when the KV buffers report a
-        // device address (see Recorder::attention_kv_at / adapter.rs) unless INFR_NO_KV_BDA.
+        // side's `-DSTREAMED`. The bound builds above stay compiled — attention_kv stays DUAL-ARM (its
+        // .comp also serves the quantized-KV-prefill scalar read off the dequant f16 scratch, which is
+        // Activations with no device address → bound). Production forks to these when the KV buffers
+        // report a device address (see Recorder::attention_kv_at / adapter.rs's `device_addr()` fork).
         ("attention_kv", "attention_kv_bda", &["-DKV_BDA"]),
         (
             "attention_kv",
@@ -381,110 +383,17 @@ fn main() {
         // writable KvHalfW/KvF32W/KvU16W/KvByteW stores + the kv_word* reads) instead of the bound KV
         // SSBO — the KV descriptor slot disappears from the shader but stays BOUND at the recorder (the
         // dst at its write slot / the src at its read slot) purely so Recorder::sync's descriptor hazard
-        // tracker keeps the store→read barrier a BDA access is invisible to. The bound builds above stay
-        // compiled for kv_addr_parity.rs bound-vs-pointer; production forks here unless INFR_NO_KV_BDA.
+        // tracker keeps the store→read barrier a BDA access is invisible to. The store_f16 twin below
+        // keeps its bound build because it ALSO writes a non-KV f16 scratch (the f32-cast dequant read,
+        // Activations, no device address → bound); the store_q8/quant_kv/store_kv_dense/dequant_q8_f16/
+        // dequant_kv_f16 kernels went BDA-only (slice 5): their base builds compile the (now
+        // unconditional) BDA shader and their bound twins were deleted — always-KV-cache, no scratch
+        // caller. See adapter.rs (the `device_addr()`-driven fork) and tests/kv_addr_parity.rs.
         ("store_f16", "store_f16_bda", &["-DKV_BDA"]),
         (
             "store_f16",
             "store_f16_dyn_bda",
             &["-DUSE_PARAMS", "-DKV_BDA"],
-        ),
-        ("store_q8", "store_q8_bda", &["-DKV_BDA"]),
-        (
-            "store_q8",
-            "store_q8_dyn_bda",
-            &["-DUSE_PARAMS", "-DKV_BDA"],
-        ),
-        ("store_q8", "store_q8_f16_bda", &["-DSRC_F16", "-DKV_BDA"]),
-        (
-            "store_q8",
-            "store_q8_f16_dyn_bda",
-            &["-DSRC_F16", "-DUSE_PARAMS", "-DKV_BDA"],
-        ),
-        ("dequant_q8_f16", "dequant_q8_f16_bda", &["-DKV_BDA"]),
-        ("quant_kv", "quant_kv_q4_0_bda", &["-DFMT_Q4_0", "-DKV_BDA"]),
-        (
-            "quant_kv",
-            "quant_kv_q4_0_f16_bda",
-            &["-DFMT_Q4_0", "-DSRC_F16", "-DKV_BDA"],
-        ),
-        ("quant_kv", "quant_kv_q4_1_bda", &["-DFMT_Q4_1", "-DKV_BDA"]),
-        (
-            "quant_kv",
-            "quant_kv_q4_1_f16_bda",
-            &["-DFMT_Q4_1", "-DSRC_F16", "-DKV_BDA"],
-        ),
-        ("quant_kv", "quant_kv_q5_0_bda", &["-DFMT_Q5_0", "-DKV_BDA"]),
-        (
-            "quant_kv",
-            "quant_kv_q5_0_f16_bda",
-            &["-DFMT_Q5_0", "-DSRC_F16", "-DKV_BDA"],
-        ),
-        ("quant_kv", "quant_kv_q5_1_bda", &["-DFMT_Q5_1", "-DKV_BDA"]),
-        (
-            "quant_kv",
-            "quant_kv_q5_1_f16_bda",
-            &["-DFMT_Q5_1", "-DSRC_F16", "-DKV_BDA"],
-        ),
-        (
-            "quant_kv",
-            "quant_kv_iq4_nl_bda",
-            &["-DFMT_IQ4NL", "-DKV_BDA"],
-        ),
-        (
-            "quant_kv",
-            "quant_kv_iq4_nl_f16_bda",
-            &["-DFMT_IQ4NL", "-DSRC_F16", "-DKV_BDA"],
-        ),
-        (
-            "dequant_kv_f16",
-            "dequant_kv_q4_0_bda",
-            &["-DFMT_Q4_0", "-DKV_BDA"],
-        ),
-        (
-            "dequant_kv_f16",
-            "dequant_kv_q4_1_bda",
-            &["-DFMT_Q4_1", "-DKV_BDA"],
-        ),
-        (
-            "dequant_kv_f16",
-            "dequant_kv_q5_0_bda",
-            &["-DFMT_Q5_0", "-DKV_BDA"],
-        ),
-        (
-            "dequant_kv_f16",
-            "dequant_kv_q5_1_bda",
-            &["-DFMT_Q5_1", "-DKV_BDA"],
-        ),
-        (
-            "dequant_kv_f16",
-            "dequant_kv_iq4_nl_bda",
-            &["-DFMT_IQ4NL", "-DKV_BDA"],
-        ),
-        (
-            "dequant_kv_f16",
-            "dequant_kv_bf16_bda",
-            &["-DFMT_BF16", "-DKV_BDA"],
-        ),
-        (
-            "store_kv_dense",
-            "store_kv_f32_bda",
-            &["-DDST_F32", "-DKV_BDA"],
-        ),
-        (
-            "store_kv_dense",
-            "store_kv_f32_from_f16_bda",
-            &["-DDST_F32", "-DSRC_F16", "-DKV_BDA"],
-        ),
-        (
-            "store_kv_dense",
-            "store_kv_bf16_bda",
-            &["-DDST_BF16", "-DKV_BDA"],
-        ),
-        (
-            "store_kv_dense",
-            "store_kv_bf16_from_f16_bda",
-            &["-DDST_BF16", "-DSRC_F16", "-DKV_BDA"],
         ),
         ("rope", "rope_f16_bda", &["-DOUT_F16", "-DKV_BDA"]),
         (
