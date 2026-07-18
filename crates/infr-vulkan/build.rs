@@ -272,6 +272,37 @@ fn main() {
             "attention_kv_dyn_q8",
             &["-DKQ8", "-DVQ8", "-DUSE_PARAMS"],
         ),
+        // KV-cache u64/BDA twins (#74, slice 1): `-DKV_BDA` reads the K/V cache by 64-bit device
+        // address (kv_addr.glsl) instead of bound SSBOs at bindings 1/2 — the mirror of the weight
+        // side's `-DSTREAMED`. The bound builds above stay compiled so kv_addr_parity.rs can compare
+        // bound-vs-pointer bit-for-bit; production forks to these when the KV buffers report a
+        // device address (see Recorder::attention_kv_at / adapter.rs) unless INFR_NO_KV_BDA.
+        ("attention_kv", "attention_kv_bda", &["-DKV_BDA"]),
+        (
+            "attention_kv",
+            "attention_kv_dyn_bda",
+            &["-DUSE_PARAMS", "-DKV_BDA"],
+        ),
+        (
+            "attention_kv",
+            "attention_kv_q8_bda",
+            &["-DKQ8", "-DVQ8", "-DKV_BDA"],
+        ),
+        (
+            "attention_kv",
+            "attention_kv_kq8_bda",
+            &["-DKQ8", "-DKV_BDA"],
+        ),
+        (
+            "attention_kv",
+            "attention_kv_vq8_bda",
+            &["-DVQ8", "-DKV_BDA"],
+        ),
+        (
+            "attention_kv",
+            "attention_kv_dyn_q8_bda",
+            &["-DKQ8", "-DVQ8", "-DUSE_PARAMS", "-DKV_BDA"],
+        ),
         ("qk_norm_rope", "qk_norm_rope", &[]),
         ("qk_norm_rope", "qk_norm_rope_dyn", &["-DUSE_PARAMS"]),
         ("qk_norm_rope", "qk_norm_rope_ff", &["-DFREQ_FACTORS"]),

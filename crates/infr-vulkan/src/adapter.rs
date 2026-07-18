@@ -2454,21 +2454,49 @@ fn lower_op(
                         cap,
                     );
                 } else {
-                    rec.attention_kv_dyn(
-                        r(*q)?,
-                        r(*k_cache)?,
-                        r(*v_cache)?,
-                        *params,
-                        r(*dst)?,
-                        1,
-                        nh,
-                        nkv,
-                        hd,
-                        pscale,
-                        window,
-                        kv_q8,
-                        cap,
-                    );
+                    // KV u64/BDA (#74 slice 1): fork the record-once decode read to the pointer twin
+                    // when both KV buffers expose a device address and INFR_NO_KV_BDA is unset. The
+                    // caches persist across the replay, so their addresses are stable in the push.
+                    let kb = r(*k_cache)?;
+                    let vb = r(*v_cache)?;
+                    match (
+                        crate::gemm::kv_bda_disabled(),
+                        kb.device_addr(),
+                        vb.device_addr(),
+                    ) {
+                        (false, Some(ka), Some(va)) => rec.attention_kv_dyn_at(
+                            r(*q)?,
+                            kb,
+                            vb,
+                            ka,
+                            va,
+                            *params,
+                            r(*dst)?,
+                            1,
+                            nh,
+                            nkv,
+                            hd,
+                            pscale,
+                            window,
+                            kv_q8,
+                            cap,
+                        ),
+                        _ => rec.attention_kv_dyn(
+                            r(*q)?,
+                            kb,
+                            vb,
+                            *params,
+                            r(*dst)?,
+                            1,
+                            nh,
+                            nkv,
+                            hd,
+                            pscale,
+                            window,
+                            kv_q8,
+                            cap,
+                        ),
+                    }
                 }
             } else {
                 // Dequant a quantized KV side → a transient f16 scratch, then run the f16 attention on
@@ -2878,23 +2906,51 @@ fn lower_op(
                         Some(k) => pool[k].as_ref(),
                         None => r(*v_cache)?,
                     };
-                    rec.attention_kv(
-                        r(*q)?,
-                        kcb,
-                        vcb,
-                        r(*dst)?,
-                        rows,
-                        kv_len,
-                        nh,
-                        nkv,
-                        hd,
-                        pos,
-                        window,
-                        *scale,
-                        k_q8_eff,
-                        v_q8_eff,
-                        cap,
-                    );
+                    // KV u64/BDA (#74 slice 1): fork to the pointer-read twin when both KV buffers
+                    // expose a device address (KvCache always does; the dequant scratch may not) and
+                    // INFR_NO_KV_BDA is unset. Bit-identical to the bound dispatch below.
+                    match (
+                        crate::gemm::kv_bda_disabled(),
+                        kcb.device_addr(),
+                        vcb.device_addr(),
+                    ) {
+                        (false, Some(ka), Some(va)) => rec.attention_kv_at(
+                            r(*q)?,
+                            kcb,
+                            vcb,
+                            ka,
+                            va,
+                            r(*dst)?,
+                            rows,
+                            kv_len,
+                            nh,
+                            nkv,
+                            hd,
+                            pos,
+                            window,
+                            *scale,
+                            k_q8_eff,
+                            v_q8_eff,
+                            cap,
+                        ),
+                        _ => rec.attention_kv(
+                            r(*q)?,
+                            kcb,
+                            vcb,
+                            r(*dst)?,
+                            rows,
+                            kv_len,
+                            nh,
+                            nkv,
+                            hd,
+                            pos,
+                            window,
+                            *scale,
+                            k_q8_eff,
+                            v_q8_eff,
+                            cap,
+                        ),
+                    }
                 }
             }
         }

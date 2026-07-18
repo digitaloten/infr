@@ -3706,6 +3706,80 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// `-DKV_BDA` twin of [`Self::attention_kv`] (#74 slice 1): reads the K/V cache by 64-bit device
+    /// address (`k_addr`/`v_addr`, kv_addr.glsl) instead of the bound SSBOs at slots 1/2. Bit-
+    /// identical to the bound build (proven by kv_addr_parity.rs); production forks here from
+    /// adapter.rs when both KV buffers report a `device_addr` and `INFR_NO_KV_BDA` is unset. Push
+    /// grows by k_lo/k_hi/v_lo/v_hi (uvec2 splits, avoiding 8-byte push alignment).
+    ///
+    /// `kc`/`vc` are still bound at slots 1/2 as INERT descriptors the shader never reads — solely so
+    /// `Recorder::sync`'s hazard tracker still sees the KV read and orders it after the store kernel's
+    /// write (a BDA pointer read is invisible to that descriptor-based tracker — the dropped-barrier
+    /// class fixed for the MoE pager in 843a759). `k_addr`/`v_addr` need not equal
+    /// `kc`/`vc`.device_addr(): the parity test parks the SAME cache behind a non-zero prefix and
+    /// passes base+prefix, while binding the prefixed buffer for the hazard edge.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_kv_at(
+        &self,
+        q: &dyn Buffer,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        k_addr: u64,
+        v_addr: u64,
+        o: &dyn Buffer,
+        q_len: usize,
+        kv_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        pos_offset: usize,
+        window: usize,
+        scale: f32,
+        k_q8: bool,
+        v_q8: bool,
+        cap: usize,
+    ) {
+        let (name, spv) = match (k_q8, v_q8) {
+            (false, false) => ("attention_kv_bda", crate::gemm::attention_kv_bda_spv()),
+            (true, false) => (
+                "attention_kv_kq8_bda",
+                crate::gemm::attention_kv_kq8_bda_spv(),
+            ),
+            (false, true) => (
+                "attention_kv_vq8_bda",
+                crate::gemm::attention_kv_vq8_bda_spv(),
+            ),
+            (true, true) => (
+                "attention_kv_q8_bda",
+                crate::gemm::attention_kv_q8_bda_spv(),
+            ),
+        };
+        // n_buf stays 4 (q, K, V, o): slots 1/2 keep the KV binds the -DKV_BDA shader ignores — see
+        // the doc above (hazard-tracking only), mirroring the weight side's linear_f16 filler bind.
+        let kern = self.be.kernel(name, spv, 4, 52);
+        let mut push = [0u8; 52];
+        push[0..4].copy_from_slice(&(q_len as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(nh as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(nkv as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(hd as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&(pos_offset as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&scale.to_ne_bytes());
+        push[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
+        push[36..40].copy_from_slice(&(k_addr as u32).to_ne_bytes());
+        push[40..44].copy_from_slice(&((k_addr >> 32) as u32).to_ne_bytes());
+        push[44..48].copy_from_slice(&(v_addr as u32).to_ne_bytes());
+        push[48..52].copy_from_slice(&((v_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch(
+            kern,
+            &[Self::vkb(q), Self::vkb(kc), Self::vkb(vc), Self::vkb(o)],
+            1,
+            &push,
+            (q_len * nh) as u32,
+        );
+    }
+
     /// Non-FA prefill attention: clean coopmat QK → row softmax → coopmat PV (ollama's approach).
     /// `q`=[mpad,nh,hd] f16, `kc`/`vc`=[kv_len,nkv,hd] f16, `attn`=[mpad,nh*hd] f32 out, `s`=
     /// [nh,mpad,kv_pad] f16 scratch (mpad=ceil(n/64)*64, kv_pad=ceil(kv_len/64)*64). `pos_offset` is
@@ -4823,6 +4897,71 @@ impl<'a> Recorder<'a> {
         push[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&scale.to_ne_bytes());
         push[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
+        self.dispatch(
+            kern,
+            &[
+                Self::vkb(q),
+                Self::vkb(kc),
+                Self::vkb(vc),
+                Self::vkb(params),
+                Self::vkb(o),
+            ],
+            1,
+            &push,
+            (q_len * nh) as u32,
+        );
+    }
+
+    /// `-DKV_BDA` twin of [`Self::attention_kv_dyn`] (#74 slice 1): record-once decode attention that
+    /// reads the K/V cache by 64-bit device address (`k_addr`/`v_addr`). The KV cache buffers are
+    /// persistent across the replay, so their addresses are stable — baked into the recorded push
+    /// constants, replay-safe. `kc`/`vc` stay bound at slots 1/2 as inert descriptors purely for the
+    /// hazard edge (see [`Self::attention_kv_at`]). Push grows by k_lo/k_hi/v_lo/v_hi.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_kv_dyn_at(
+        &self,
+        q: &dyn Buffer,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        k_addr: u64,
+        v_addr: u64,
+        params: &dyn Buffer,
+        o: &dyn Buffer,
+        q_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        scale: f32,
+        window: usize,
+        q8: bool,
+        cap: usize,
+    ) {
+        let (name, spv) = if q8 {
+            (
+                "attention_kv_dyn_q8_bda",
+                crate::gemm::attention_kv_dyn_q8_bda_spv(),
+            )
+        } else {
+            (
+                "attention_kv_dyn_bda",
+                crate::gemm::attention_kv_dyn_bda_spv(),
+            )
+        };
+        let kern = self.be.kernel(name, spv, 5, 52);
+        let mut push = [0u8; 52];
+        push[0..4].copy_from_slice(&(q_len as u32).to_ne_bytes());
+        // [4..8] kv_len: unused (from params)
+        push[8..12].copy_from_slice(&(nh as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(nkv as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(hd as u32).to_ne_bytes());
+        // [20..24] pos_offset: unused (from params)
+        push[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&scale.to_ne_bytes());
+        push[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
+        push[36..40].copy_from_slice(&(k_addr as u32).to_ne_bytes());
+        push[40..44].copy_from_slice(&((k_addr >> 32) as u32).to_ne_bytes());
+        push[44..48].copy_from_slice(&(v_addr as u32).to_ne_bytes());
+        push[48..52].copy_from_slice(&((v_addr >> 32) as u32).to_ne_bytes());
         self.dispatch(
             kern,
             &[

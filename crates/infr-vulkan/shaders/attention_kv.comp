@@ -5,36 +5,71 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-layout(push_constant) uniform PC { uint q_len; uint kv_len; uint nh; uint nkv; uint hd; uint pos_offset; uint window; float scale; uint cap; } pc;
+layout(push_constant) uniform PC {
+    uint q_len; uint kv_len; uint nh; uint nkv; uint hd; uint pos_offset; uint window; float scale; uint cap;
+#ifdef KV_BDA
+    // -DKV_BDA build: K/V cache base device addresses, uvec2-split (avoids 8-byte push align) — see
+    // kv_addr.glsl. K binding 1 / V binding 2 disappear; those descriptor slots go unused (filler).
+    uint k_lo; uint k_hi; uint v_lo; uint v_hi;
+#endif
+} pc;
+#ifdef KV_BDA
+#include "kv_addr.glsl"
+#endif
 layout(binding = 0) readonly buffer QB { float16_t q[]; };
 // PLANAR Q8_0 KV cache (per-side, -DKQ8 / -DVQ8): codes int8[cap] then scales f16[cap/32] (see
 // store_q8). Read as `uint` words; per element = one byte code (from a u32 word) + the block's f16
 // scale (scales region at word cap/4). K and V pick their dtype independently → four variants.
 // Dequant element `idx`: code byte = word idx/4, lane idx%4 (sign-extended); block = idx/32, scale at
 // scale-word cap/4 + block/2, half block&1.
+// -DKV_BDA overlays each read onto a 64-bit device-address load (kv_word/kv_half) with NO bound SSBO.
 #ifdef KQ8
+#ifdef KV_BDA
+float dq8k(uint idx) {
+    int c = bitfieldExtract(int(kv_word(k_addr, idx >> 2u)), int((idx & 3u) * 8u), 8);
+    uint bk = idx >> 5u;
+    return unpackHalf2x16(kv_word(k_addr, (pc.cap >> 2u) + (bk >> 1u)))[bk & 1u] * float(c);
+}
+#else
 layout(binding = 1) readonly buffer KB { uint ku[]; };
 float dq8k(uint idx) {
     int c = bitfieldExtract(int(ku[idx >> 2u]), int((idx & 3u) * 8u), 8);
     uint bk = idx >> 5u;
     return unpackHalf2x16(ku[(pc.cap >> 2u) + (bk >> 1u)])[bk & 1u] * float(c);
 }
+#endif
 #define KREAD(i) dq8k(i)
+#else
+#ifdef KV_BDA
+#define KREAD(i) kv_half(k_addr, i)
 #else
 layout(binding = 1) readonly buffer KB { float16_t k[]; };
 #define KREAD(i) float(k[i])
 #endif
+#endif
 #ifdef VQ8
+#ifdef KV_BDA
+float dq8v(uint idx) {
+    int c = bitfieldExtract(int(kv_word(v_addr, idx >> 2u)), int((idx & 3u) * 8u), 8);
+    uint bk = idx >> 5u;
+    return unpackHalf2x16(kv_word(v_addr, (pc.cap >> 2u) + (bk >> 1u)))[bk & 1u] * float(c);
+}
+#else
 layout(binding = 2) readonly buffer VB { uint vu[]; };
 float dq8v(uint idx) {
     int c = bitfieldExtract(int(vu[idx >> 2u]), int((idx & 3u) * 8u), 8);
     uint bk = idx >> 5u;
     return unpackHalf2x16(vu[(pc.cap >> 2u) + (bk >> 1u)])[bk & 1u] * float(c);
 }
+#endif
 #define VREAD(i) dq8v(i)
+#else
+#ifdef KV_BDA
+#define VREAD(i) kv_half(v_addr, i)
 #else
 layout(binding = 2) readonly buffer VB { float16_t v[]; };
 #define VREAD(i) float(v[i])
+#endif
 #endif
 #ifdef USE_PARAMS
 // Record-once decode: pos_offset comes from a host-updated params SSBO so the buffer can be replayed.
@@ -52,6 +87,12 @@ shared float red[64];
 
 void main() {
     uint t = gl_LocalInvocationID.x;
+#ifdef KV_BDA
+    // Wave-uniform K/V cache base pointers, set ONCE (see kv_addr.glsl). Every KREAD/VREAD below
+    // adds a u32 element offset to these before the uint64_t cast → saddr scalar-base loads.
+    k_addr = kv_base(pc.k_lo, pc.k_hi);
+    v_addr = kv_base(pc.v_lo, pc.v_hi);
+#endif
     uint unit = gl_WorkGroupID.x;
     if (unit >= pc.q_len * pc.nh) { return; }
     uint ti = unit / pc.nh;

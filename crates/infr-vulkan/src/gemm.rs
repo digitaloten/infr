@@ -2823,6 +2823,23 @@ dyn_spv!(attention_kv_q8_spv, "attention_kv_q8");
 dyn_spv!(attention_kv_kq8_spv, "attention_kv_kq8");
 dyn_spv!(attention_kv_vq8_spv, "attention_kv_vq8");
 dyn_spv!(attention_kv_dyn_q8_spv, "attention_kv_dyn_q8");
+// KV-cache u64/BDA twins (#74, slice 1): the `-DKV_BDA` builds of the scalar attention_kv family —
+// K/V read by 64-bit device address (kv_addr.glsl) instead of bound SSBOs. Bound twins above stay
+// for kv_addr_parity.rs; production forks here via Recorder::attention_kv_at / attention_kv_dyn_at.
+dyn_spv!(attention_kv_bda_spv, "attention_kv_bda");
+dyn_spv!(attention_kv_dyn_bda_spv, "attention_kv_dyn_bda");
+dyn_spv!(attention_kv_q8_bda_spv, "attention_kv_q8_bda");
+dyn_spv!(attention_kv_kq8_bda_spv, "attention_kv_kq8_bda");
+dyn_spv!(attention_kv_vq8_bda_spv, "attention_kv_vq8_bda");
+dyn_spv!(attention_kv_dyn_q8_bda_spv, "attention_kv_dyn_q8_bda");
+/// `INFR_NO_KV_BDA=1` — force the bound-SSBO KV read path (bindings 1/2) instead of the `-DKV_BDA`
+/// 64-bit device-address twin. Escape hatch + the profile-ruler A/B knob for the #74 slice-1
+/// migration; the default (unset) routes production KV reads through the pointer twin.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn kv_bda_disabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("INFR_NO_KV_BDA").is_ok())
+}
 dyn_spv!(store_q8_spv, "store_q8");
 dyn_spv!(store_q8_dyn_spv, "store_q8_dyn");
 dyn_spv!(store_q8_f16_spv, "store_q8_f16");
