@@ -22,8 +22,8 @@
 //! ISA probe: `RADV_DEBUG=shaders MESA_SHADER_CACHE_DISABLE=true cargo test -p infr-vulkan \
 //!   --test kv_addr_parity kv_isa_probe -- --ignored --nocapture 2> isa.txt` (move the pipeline
 //!   cache aside first).
-use infr_core::backend::{Backend, BufferUsage};
-use infr_vulkan::VulkanBackend;
+use infr_core::backend::{Backend, Buffer, BufferUsage};
+use infr_vulkan::{Recorder, VulkanBackend};
 
 /// Pseudo-random bytes in `0x00..=0x3F` — Q8 codes (small +ints) and scales (finite +f16).
 fn synth_bytes(n: usize, seed: usize) -> Vec<u8> {
@@ -644,4 +644,296 @@ fn attn_partial_isa_probe() {
     let l = run_split(&be, &c, false, false);
     assert_legs("isa-probe attn_partial f16", &l);
     println!("ok: attn_partial_isa_probe (dispatched attn_partial_bda)");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// #74 slice 3 — KV STORE kernels (write the DEST cache by device address) and DEQUANT READERS
+// (read the SOURCE cache by device address) bound-vs-pointer + offset-invariance.
+//
+// The store/dequant `-DKV_BDA` twins must produce BYTE-IDENTICAL cache/output bytes to the bound
+// builds — they differ ONLY in where the KV bytes are written/read (a bound binding vs a k_addr
+// pointer). Three legs each, exactly like the read tests:
+//   * BOUND-VS-POINTER: bound store/dequant vs the `_at` twin at arena offset 0.
+//   * OFFSET-INVARIANCE (load-bearing): the SAME store/read parked behind a 256-byte garbage prefix
+//     in a KvCache buffer, base+prefix passed as the address. A twin that dropped its base offset
+//     would clobber/read the garbage prefix and diverge.
+
+/// `n` f32 elements as small finite values in [-1, 1) (never NaN/Inf → a byte compare is never
+/// vacuous). Distinct per `seed`.
+fn synth_f32(n: usize, seed: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(n * 4);
+    for i in 0..n {
+        let h = (i.wrapping_mul(2654435761) ^ seed.wrapping_mul(40503)) >> 9;
+        let v = ((h % 2048) as f32) / 1024.0 - 1.0;
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
+fn assert_bytes(name: &str, bound: &[u8], at0: &[u8], atoff: &[u8]) {
+    assert!(
+        bound.iter().any(|&b| b != 0),
+        "{name}: bound leg wrote all zeros — the case is not exercising the kernel"
+    );
+    assert_eq!(
+        bound, at0,
+        "{name}: BDA@0 bytes differ from bound — a mis-addressing bug in the pointer twin"
+    );
+    assert_eq!(
+        bound, atoff,
+        "{name}: BDA@nonzero-offset bytes differ from bound — the twin is ignoring its KV base \
+         offset, which breaks every KV tensor but one at a shared base"
+    );
+}
+
+/// Runs a STORE 3 ways into a fresh zeroed KvCache dst (bound, pointer@0, pointer@nonzero-offset)
+/// and returns the written cache bytes for each. `store(rec, dst, addr)`: `addr` None = bound build,
+/// Some = the `-DKV_BDA` `_at` twin writing at that device address (dst still bound for the barrier).
+fn store_legs(
+    be: &VulkanBackend,
+    dst_len: usize,
+    store: impl Fn(&Recorder, &dyn Buffer, Option<u64>),
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let leg = |prefix: usize, bda: bool| -> Vec<u8> {
+        let d = be.alloc(prefix + dst_len, BufferUsage::KvCache).unwrap();
+        be.upload(d.as_ref(), &vec![0u8; prefix + dst_len]).unwrap();
+        let addr = if bda {
+            Some(d.device_addr().expect("KvCache must expose a device address") + prefix as u64)
+        } else {
+            None
+        };
+        let rec = be.recorder().unwrap();
+        store(&rec, d.as_ref(), addr);
+        rec.finish().unwrap();
+        let mut out = vec![0u8; prefix + dst_len];
+        be.download(d.as_ref(), &mut out).unwrap();
+        out[prefix..].to_vec()
+    };
+    (leg(0, false), leg(0, true), leg(OFF, true))
+}
+
+/// Runs a DEQUANT READER 3 ways (bound / pointer@0 / pointer@nonzero-offset) reading `src_bytes`
+/// from a KvCache SOURCE, returns the f16 output bytes. `run(rec, src, dst, addr)`: `addr` None =
+/// bound, Some = the `_at` twin reading at that device address (src still bound for the barrier).
+fn dequant_legs(
+    be: &VulkanBackend,
+    src_bytes: &[u8],
+    dst_len: usize,
+    run: impl Fn(&Recorder, &dyn Buffer, &dyn Buffer, Option<u64>),
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let leg = |prefix: usize, bda: bool| -> Vec<u8> {
+        let mut sd = synth_bytes(prefix, 0xF00D);
+        sd.extend_from_slice(src_bytes);
+        let src = be.alloc(sd.len(), BufferUsage::KvCache).unwrap();
+        be.upload(src.as_ref(), &sd).unwrap();
+        let dst = be.alloc(dst_len, BufferUsage::Activations).unwrap();
+        be.upload(dst.as_ref(), &vec![0u8; dst_len]).unwrap();
+        let addr = if bda {
+            Some(src.device_addr().unwrap() + prefix as u64)
+        } else {
+            None
+        };
+        let rec = be.recorder().unwrap();
+        run(&rec, src.as_ref(), dst.as_ref(), addr);
+        rec.finish().unwrap();
+        let mut out = vec![0u8; dst_len];
+        be.download(dst.as_ref(), &mut out).unwrap();
+        out
+    };
+    (leg(0, false), leg(0, true), leg(OFF, true))
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn store_f16_bda_matches_bound() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    for n in [64usize, 256, 512] {
+        let sb = synth_f32(n, 7);
+        let src = be.alloc(sb.len(), BufferUsage::Activations).unwrap();
+        be.upload(src.as_ref(), &sb).unwrap();
+        let (b, a0, ao) = store_legs(&be, n * 2, |rec, dst, addr| match addr {
+            Some(a) => rec.store_f16_off_at(src.as_ref(), dst, a, n, 0, 0),
+            None => rec.store_f16_off(src.as_ref(), dst, n, 0, 0),
+        });
+        assert_bytes(&format!("store_f16 n={n}"), &b, &a0, &ao);
+        println!("ok: store_f16 n={n}");
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn store_q8_bda_matches_bound() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    // f32 V source and f16 K source; planar Q8 dst = codes[cap] + scales[cap/32]·2, cap = n.
+    for n in [64usize, 256] {
+        let cap = n;
+        let dst_len = cap + (cap / 32) * 2;
+        // f32 source.
+        let sb = synth_f32(n, 9);
+        let src = be.alloc(sb.len(), BufferUsage::Activations).unwrap();
+        be.upload(src.as_ref(), &sb).unwrap();
+        let (b, a0, ao) = store_legs(&be, dst_len, |rec, dst, addr| match addr {
+            Some(a) => rec.store_q8_at(src.as_ref(), dst, a, n, 0, cap, false, 0),
+            None => rec.store_q8(src.as_ref(), dst, n, 0, cap, false, 0),
+        });
+        assert_bytes(&format!("store_q8(f32) n={n}"), &b, &a0, &ao);
+        // f16 source.
+        let sf = synth_f16(n, 21);
+        let srcf = be.alloc(sf.len(), BufferUsage::Activations).unwrap();
+        be.upload(srcf.as_ref(), &sf).unwrap();
+        let (b, a0, ao) = store_legs(&be, dst_len, |rec, dst, addr| match addr {
+            Some(a) => rec.store_q8_at(srcf.as_ref(), dst, a, n, 0, cap, true, 0),
+            None => rec.store_q8(srcf.as_ref(), dst, n, 0, cap, true, 0),
+        });
+        assert_bytes(&format!("store_q8(f16) n={n}"), &b, &a0, &ao);
+        println!("ok: store_q8 n={n}");
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn quant_kv_bda_matches_bound() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    use infr_core::DType::*;
+    // (dtype, bytes-per-32-block) for the mainline low-bit KV quants.
+    for (dt, blk) in [(Q4_0, 18usize), (Q4_1, 20), (Q5_0, 22), (Q5_1, 24), (Iq4Nl, 18)] {
+        for n in [64usize, 256] {
+            let dst_len = (n / 32) * blk;
+            let sb = synth_f32(n, 33);
+            let src = be.alloc(sb.len(), BufferUsage::Activations).unwrap();
+            be.upload(src.as_ref(), &sb).unwrap();
+            let (b, a0, ao) = store_legs(&be, dst_len, |rec, dst, addr| match addr {
+                Some(a) => rec.quant_kv_at(dt, src.as_ref(), dst, a, n, 0, false),
+                None => rec.quant_kv(dt, src.as_ref(), dst, n, 0, false),
+            });
+            assert_bytes(&format!("quant_kv {dt:?} n={n}"), &b, &a0, &ao);
+        }
+        println!("ok: quant_kv {dt:?}");
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn store_kv_dense_bda_matches_bound() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    use infr_core::DType::*;
+    for (dt, bytes) in [(F32, 4usize), (Bf16, 2)] {
+        for n in [64usize, 256] {
+            let dst_len = n * bytes;
+            let sb = synth_f32(n, 41);
+            let src = be.alloc(sb.len(), BufferUsage::Activations).unwrap();
+            be.upload(src.as_ref(), &sb).unwrap();
+            let (b, a0, ao) = store_legs(&be, dst_len, |rec, dst, addr| match addr {
+                Some(a) => rec.store_kv_dense_at(dt, src.as_ref(), dst, a, n, 0, false),
+                None => rec.store_kv_dense(dt, src.as_ref(), dst, n, 0, false),
+            });
+            assert_bytes(&format!("store_kv_dense {dt:?} n={n}"), &b, &a0, &ao);
+        }
+        println!("ok: store_kv_dense {dt:?}");
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn dequant_q8_f16_bda_matches_bound() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    for n in [64usize, 256] {
+        let cap = n;
+        let src_bytes = synth_bytes(cap + (cap / 32) * 2, 13); // planar Q8 codes + scales
+        let (b, a0, ao) = dequant_legs(&be, &src_bytes, n * 2, |rec, src, dst, addr| match addr {
+            Some(a) => rec.dequant_q8_f16_at(src, dst, a, n, cap),
+            None => rec.dequant_q8_f16(src, dst, n, cap),
+        });
+        assert_bytes(&format!("dequant_q8_f16 n={n}"), &b, &a0, &ao);
+        println!("ok: dequant_q8_f16 n={n}");
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn dequant_kv_f16_bda_matches_bound() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    use infr_core::DType::*;
+    for (dt, blk) in [(Q4_0, 18usize), (Q4_1, 20), (Q5_0, 22), (Q5_1, 24), (Iq4Nl, 18)] {
+        for n in [64usize, 256] {
+            let src_bytes = synth_bytes((n / 32) * blk, 17); // GGUF blocks
+            let (b, a0, ao) =
+                dequant_legs(&be, &src_bytes, n * 2, |rec, src, dst, addr| match addr {
+                    Some(a) => rec.dequant_kv_f16_at(dt, src, dst, a, n),
+                    None => rec.dequant_kv_f16(dt, src, dst, n),
+                });
+            assert_bytes(&format!("dequant_kv_f16 {dt:?} n={n}"), &b, &a0, &ao);
+        }
+        println!("ok: dequant_kv_f16 {dt:?}");
+    }
+}
+
+/// qk_norm_rope — the HOT fused-K cache write. Bound `qk_norm_rope` vs `qk_norm_rope_at` writing the
+/// same f16 cache by device address, plus offset-invariance. out_base=0 (write cache rows [0,rows)).
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn qk_norm_rope_bda_matches_bound() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let (rows, nh, hd, rope_dim) = (3usize, 8usize, 64usize, 64usize);
+    let n = rows * nh * hd;
+    let xb = synth_f32(n, 5);
+    let x = be.alloc(xb.len(), BufferUsage::Activations).unwrap();
+    be.upload(x.as_ref(), &xb).unwrap();
+    let nwb = synth_f32(hd, 55);
+    let nw = be.alloc(nwb.len(), BufferUsage::Activations).unwrap();
+    be.upload(nw.as_ref(), &nwb).unwrap();
+    let (b, a0, ao) = store_legs(&be, n * 2, |rec, dst, addr| match addr {
+        Some(a) => rec.qk_norm_rope_at(
+            x.as_ref(),
+            nw.as_ref(),
+            dst,
+            a,
+            rows,
+            nh,
+            hd,
+            rope_dim,
+            10000.0,
+            0,
+            0,
+            1e-6,
+            None,
+        ),
+        None => rec.qk_norm_rope(
+            x.as_ref(),
+            nw.as_ref(),
+            dst,
+            rows,
+            nh,
+            hd,
+            rope_dim,
+            10000.0,
+            0,
+            0,
+            1e-6,
+            None,
+        ),
+    });
+    assert_bytes("qk_norm_rope", &b, &a0, &ao);
+    println!("ok: qk_norm_rope");
 }

@@ -2100,25 +2100,44 @@ fn lower_op(
             } else {
                 [(0, pos_r, rows), (0, 0, 0)]
             };
+            // #74 slice 3: fork each store to its -DKV_BDA twin when the DEST cache `c` exposes a
+            // device address (KvCache always does) and INFR_NO_KV_BDA is unset — the store writes the
+            // cache by pointer, but `c` stays bound at its write slot inside the `_at` method so the
+            // store→(later attention)read barrier survives. Bit-identical to the bound store.
+            let c_addr = if crate::gemm::kv_bda_disabled() {
+                None
+            } else {
+                c.device_addr()
+            };
             match mode {
                 RopeMode::Static(_) if cache_q8 => {
                     for &(sr, dr, nr) in segs.iter().filter(|&&(_, _, nr)| nr > 0) {
-                        rec.store_q8(s, c, nr * rs, dr * rs, cap, src_f16, sr * rs);
+                        match c_addr {
+                            Some(a) => {
+                                rec.store_q8_at(s, c, a, nr * rs, dr * rs, cap, src_f16, sr * rs)
+                            }
+                            None => rec.store_q8(s, c, nr * rs, dr * rs, cap, src_f16, sr * rs),
+                        }
                     }
                 }
-                RopeMode::Dynamic(params) if cache_q8 => {
-                    rec.store_q8_dyn(s, *params, c, n, cap, src_f16)
-                }
+                RopeMode::Dynamic(params) if cache_q8 => match c_addr {
+                    Some(a) => rec.store_q8_dyn_at(s, *params, c, a, n, cap, src_f16),
+                    None => rec.store_q8_dyn(s, *params, c, n, cap, src_f16),
+                },
                 // Mainline low-bit KV quants: quantize into standard GGUF blocks (static only — a
                 // quantized KV cache forces static decode, so a Dynamic WriteKv never reaches here).
-                RopeMode::Static(_) if is_kv_quant(cache_dt) => {
-                    rec.quant_kv(cache_dt, s, c, n, pos * rs, src_f16)
-                }
+                RopeMode::Static(_) if is_kv_quant(cache_dt) => match c_addr {
+                    Some(a) => rec.quant_kv_at(cache_dt, s, c, a, n, pos * rs, src_f16),
+                    None => rec.quant_kv(cache_dt, s, c, n, pos * rs, src_f16),
+                },
                 // Dense f32/bf16 cache: cast-store the row (also static-only).
-                RopeMode::Static(_) if is_kv_dense_alt(cache_dt) => {
-                    rec.store_kv_dense(cache_dt, s, c, n, pos * rs, src_f16)
-                }
-                // TurboQuant cache: WHT-quantize the row (static-only).
+                RopeMode::Static(_) if is_kv_dense_alt(cache_dt) => match c_addr {
+                    Some(a) => rec.store_kv_dense_at(cache_dt, s, c, a, n, pos * rs, src_f16),
+                    None => rec.store_kv_dense(cache_dt, s, c, n, pos * rs, src_f16),
+                },
+                // TurboQuant cache: WHT-quantize the row (static-only). NOT BDA-migrated (#74 slice 3
+                // deferred turbo — its dequant read is byte-granular, outside the u32-word/f16 read
+                // family; experimental, not in the gate suite).
                 RopeMode::Static(_) if is_turbo(cache_dt) => {
                     rec.quant_turbo(cache_dt, s, c, n, pos * rs, src_f16)
                 }
@@ -2128,7 +2147,10 @@ fn lower_op(
                             infr_core::DType::F16 => {
                                 rec.copy(s, sr * rs * 2, c, dr * rs * 2, nr * rs * 2)
                             }
-                            _ => rec.store_f16_off(s, c, nr * rs, dr * rs, sr * rs),
+                            _ => match c_addr {
+                                Some(a) => rec.store_f16_off_at(s, c, a, nr * rs, dr * rs, sr * rs),
+                                None => rec.store_f16_off(s, c, nr * rs, dr * rs, sr * rs),
+                            },
                         }
                     }
                 }
@@ -2138,7 +2160,10 @@ fn lower_op(
                     infr_core::DType::F16 => {
                         return Err(be("vulkan adapter: dynamic decode f16 WriteKv unexpected"))
                     }
-                    _ => rec.store_f16_dyn(s, *params, c, n, cap_rows),
+                    _ => match c_addr {
+                        Some(a) => rec.store_f16_dyn_at(s, *params, c, a, n, cap_rows),
+                        None => rec.store_f16_dyn(s, *params, c, n, cap_rows),
+                    },
                 },
             }
         }
@@ -2171,6 +2196,15 @@ fn lower_op(
             } else {
                 (r(*dst)?, None, 0)
             };
+            // #74 slice 3: fork to the -DKV_BDA twin ONLY when the fused K write lands in the KV cache
+            // (which exposes a device address); the un-fused Q-scratch write (Activations, no address)
+            // always stays on the bound build. `out_buf` stays bound at its write slot in the `_at`
+            // method for the store→read barrier. Bit-identical to the bound dispatch.
+            let y_addr = if crate::gemm::kv_bda_disabled() {
+                None
+            } else {
+                out_buf.device_addr()
+            };
             match mode {
                 RopeMode::Static(rope_pos) => {
                     let ff = match freq_factors {
@@ -2179,35 +2213,69 @@ fn lower_op(
                     };
                     if *x_stride > 0 && ff.is_none() {
                         // Interleaved q+g buffer: read query with stride, skip CopyStrided per head.
-                        rec.qk_norm_rope_interleaved(
-                            r(*x)?,
-                            r(*weight)?,
-                            out_buf,
-                            *rows as usize,
-                            *n_head as usize,
-                            *head_dim as usize,
-                            *rope_dim as usize,
-                            *theta,
-                            rope_pos[&positions.0],
-                            fused.unwrap_or(0),
-                            *eps,
-                            *x_stride as usize,
-                        );
+                        match y_addr {
+                            Some(a) => rec.qk_norm_rope_interleaved_at(
+                                r(*x)?,
+                                r(*weight)?,
+                                out_buf,
+                                a,
+                                *rows as usize,
+                                *n_head as usize,
+                                *head_dim as usize,
+                                *rope_dim as usize,
+                                *theta,
+                                rope_pos[&positions.0],
+                                fused.unwrap_or(0),
+                                *eps,
+                                *x_stride as usize,
+                            ),
+                            None => rec.qk_norm_rope_interleaved(
+                                r(*x)?,
+                                r(*weight)?,
+                                out_buf,
+                                *rows as usize,
+                                *n_head as usize,
+                                *head_dim as usize,
+                                *rope_dim as usize,
+                                *theta,
+                                rope_pos[&positions.0],
+                                fused.unwrap_or(0),
+                                *eps,
+                                *x_stride as usize,
+                            ),
+                        }
                     } else {
-                        rec.qk_norm_rope(
-                            r(*x)?,
-                            r(*weight)?,
-                            out_buf,
-                            *rows as usize,
-                            *n_head as usize,
-                            *head_dim as usize,
-                            *rope_dim as usize,
-                            *theta,
-                            rope_pos[&positions.0],
-                            fused.unwrap_or(0),
-                            *eps,
-                            ff,
-                        );
+                        match y_addr {
+                            Some(a) => rec.qk_norm_rope_at(
+                                r(*x)?,
+                                r(*weight)?,
+                                out_buf,
+                                a,
+                                *rows as usize,
+                                *n_head as usize,
+                                *head_dim as usize,
+                                *rope_dim as usize,
+                                *theta,
+                                rope_pos[&positions.0],
+                                fused.unwrap_or(0),
+                                *eps,
+                                ff,
+                            ),
+                            None => rec.qk_norm_rope(
+                                r(*x)?,
+                                r(*weight)?,
+                                out_buf,
+                                *rows as usize,
+                                *n_head as usize,
+                                *head_dim as usize,
+                                *rope_dim as usize,
+                                *theta,
+                                rope_pos[&positions.0],
+                                fused.unwrap_or(0),
+                                *eps,
+                                ff,
+                            ),
+                        }
                     } // x_stride > 0
                 }
                 RopeMode::Dynamic(params) => {
@@ -2221,36 +2289,72 @@ fn lower_op(
                     // by nheads*hd): 1 → write cache row pos, 0 → write row 0 of the Q scratch.
                     let out_base_mul = usize::from(fused.is_some());
                     if *x_stride > 0 && ff.is_none() {
-                        rec.qk_norm_rope_interleaved_dyn(
-                            r(*x)?,
-                            r(*weight)?,
-                            *params,
-                            out_buf,
-                            *rows as usize,
-                            *n_head as usize,
-                            *head_dim as usize,
-                            *rope_dim as usize,
-                            *theta,
-                            out_base_mul,
-                            *eps,
-                            *x_stride as usize,
-                        );
+                        match y_addr {
+                            Some(a) => rec.qk_norm_rope_interleaved_dyn_at(
+                                r(*x)?,
+                                r(*weight)?,
+                                *params,
+                                out_buf,
+                                a,
+                                *rows as usize,
+                                *n_head as usize,
+                                *head_dim as usize,
+                                *rope_dim as usize,
+                                *theta,
+                                out_base_mul,
+                                *eps,
+                                *x_stride as usize,
+                            ),
+                            None => rec.qk_norm_rope_interleaved_dyn(
+                                r(*x)?,
+                                r(*weight)?,
+                                *params,
+                                out_buf,
+                                *rows as usize,
+                                *n_head as usize,
+                                *head_dim as usize,
+                                *rope_dim as usize,
+                                *theta,
+                                out_base_mul,
+                                *eps,
+                                *x_stride as usize,
+                            ),
+                        }
                     } else {
-                        rec.qk_norm_rope_dyn(
-                            r(*x)?,
-                            r(*weight)?,
-                            *params,
-                            ff,
-                            out_buf,
-                            *rows as usize,
-                            *n_head as usize,
-                            *head_dim as usize,
-                            *rope_dim as usize,
-                            *theta,
-                            out_base_mul,
-                            *eps,
-                            if out_base_mul > 0 { kcap } else { 0 },
-                        );
+                        let kc = if out_base_mul > 0 { kcap } else { 0 };
+                        match y_addr {
+                            Some(a) => rec.qk_norm_rope_dyn_at(
+                                r(*x)?,
+                                r(*weight)?,
+                                *params,
+                                ff,
+                                out_buf,
+                                a,
+                                *rows as usize,
+                                *n_head as usize,
+                                *head_dim as usize,
+                                *rope_dim as usize,
+                                *theta,
+                                out_base_mul,
+                                *eps,
+                                kc,
+                            ),
+                            None => rec.qk_norm_rope_dyn(
+                                r(*x)?,
+                                r(*weight)?,
+                                *params,
+                                ff,
+                                out_buf,
+                                *rows as usize,
+                                *n_head as usize,
+                                *head_dim as usize,
+                                *rope_dim as usize,
+                                *theta,
+                                out_base_mul,
+                                *eps,
+                                kc,
+                            ),
+                        }
                     } // x_stride > 0
                 }
             }
@@ -2282,20 +2386,42 @@ fn lower_op(
             } else {
                 (r(*dst)?, None)
             };
+            // #74 slice 3: fork to the -DKV_BDA twin when the fused K write lands in the KV cache
+            // (device address present); the un-fused Q-scratch write stays bound. `out_buf` stays
+            // bound at its write slot in the `_at` method for the store→read barrier.
+            let y_addr = if crate::gemm::kv_bda_disabled() {
+                None
+            } else {
+                out_buf.device_addr()
+            };
             match mode {
                 RopeMode::Static(rope_pos) => {
                     if f16_out {
-                        rec.rope_f16(
-                            r(*x)?,
-                            out_buf,
-                            *rows as usize,
-                            *n_head as usize,
-                            *head_dim as usize,
-                            *rope_dim as usize,
-                            *theta,
-                            rope_pos[&positions.0],
-                            fused.unwrap_or(0),
-                        );
+                        match y_addr {
+                            Some(a) => rec.rope_f16_at(
+                                r(*x)?,
+                                out_buf,
+                                a,
+                                *rows as usize,
+                                *n_head as usize,
+                                *head_dim as usize,
+                                *rope_dim as usize,
+                                *theta,
+                                rope_pos[&positions.0],
+                                fused.unwrap_or(0),
+                            ),
+                            None => rec.rope_f16(
+                                r(*x)?,
+                                out_buf,
+                                *rows as usize,
+                                *n_head as usize,
+                                *head_dim as usize,
+                                *rope_dim as usize,
+                                *theta,
+                                rope_pos[&positions.0],
+                                fused.unwrap_or(0),
+                            ),
+                        }
                     } else {
                         rec.rope(
                             r(*x)?,
@@ -2315,17 +2441,31 @@ fn lower_op(
                             "vulkan adapter: dynamic decode f32 in-place Rope unsupported",
                         ));
                     }
-                    rec.rope_f16_dyn(
-                        r(*x)?,
-                        *params,
-                        out_buf,
-                        *rows as usize,
-                        *n_head as usize,
-                        *head_dim as usize,
-                        *rope_dim as usize,
-                        *theta,
-                        usize::from(fused.is_some()),
-                    );
+                    match y_addr {
+                        Some(a) => rec.rope_f16_dyn_at(
+                            r(*x)?,
+                            *params,
+                            out_buf,
+                            a,
+                            *rows as usize,
+                            *n_head as usize,
+                            *head_dim as usize,
+                            *rope_dim as usize,
+                            *theta,
+                            usize::from(fused.is_some()),
+                        ),
+                        None => rec.rope_f16_dyn(
+                            r(*x)?,
+                            *params,
+                            out_buf,
+                            *rows as usize,
+                            *n_head as usize,
+                            *head_dim as usize,
+                            *rope_dim as usize,
+                            *theta,
+                            usize::from(fused.is_some()),
+                        ),
+                    }
                 }
             }
         }
@@ -2549,17 +2689,36 @@ fn lower_op(
                 let ne = kv_len.min(att_cap_rows) * nkv * hd;
                 // Expand a KV side into the f16 scratch: native Q8 (planar), f32 cast (store_f16),
                 // else the shared quant/bf16 dequant (dequant_kv_f16).
+                // #74 slice 3: the dequant READERS fork to their -DKV_BDA twin when the SOURCE cache
+                // exposes a device address and INFR_NO_KV_BDA is unset — the cache is read by pointer
+                // but stays BOUND at the reader's read slot (in the `_at` method) so the store→dequant-
+                // read barrier survives. The f32 cast (store_f16) and turbo dequant read paths are NOT
+                // migrated (store_f16's BDA arm moves its WRITE, not this source read; turbo deferred).
+                let src_addr = |b: &dyn infr_core::backend::Buffer| -> Option<u64> {
+                    if crate::gemm::kv_bda_disabled() {
+                        None
+                    } else {
+                        b.device_addr()
+                    }
+                };
                 let kc_key = if deq_k {
                     let k = pooled(pool, be_, "kvdeq_k", ne * 2)?;
                     let sc = pool[&k].as_ref();
+                    let src = r(*k_cache)?;
                     if k_q8 {
-                        rec.dequant_q8_f16(r(*k_cache)?, sc, ne, cap);
+                        match src_addr(src) {
+                            Some(a) => rec.dequant_q8_f16_at(src, sc, a, ne, cap),
+                            None => rec.dequant_q8_f16(src, sc, ne, cap),
+                        }
                     } else if matches!(kdt, infr_core::DType::F32) {
-                        rec.store_f16(r(*k_cache)?, sc, ne, 0);
+                        rec.store_f16(src, sc, ne, 0);
                     } else if is_turbo(kdt) {
-                        rec.dequant_turbo_f16(kdt, r(*k_cache)?, sc, ne);
+                        rec.dequant_turbo_f16(kdt, src, sc, ne);
                     } else {
-                        rec.dequant_kv_f16(kdt, r(*k_cache)?, sc, ne);
+                        match src_addr(src) {
+                            Some(a) => rec.dequant_kv_f16_at(kdt, src, sc, a, ne),
+                            None => rec.dequant_kv_f16(kdt, src, sc, ne),
+                        }
                     }
                     Some(k)
                 } else {
@@ -2568,14 +2727,21 @@ fn lower_op(
                 let vc_key = if deq_v {
                     let k = pooled(pool, be_, "kvdeq_v", ne * 2)?;
                     let sc = pool[&k].as_ref();
+                    let src = r(*v_cache)?;
                     if v_q8 {
-                        rec.dequant_q8_f16(r(*v_cache)?, sc, ne, cap);
+                        match src_addr(src) {
+                            Some(a) => rec.dequant_q8_f16_at(src, sc, a, ne, cap),
+                            None => rec.dequant_q8_f16(src, sc, ne, cap),
+                        }
                     } else if matches!(vdt, infr_core::DType::F32) {
-                        rec.store_f16(r(*v_cache)?, sc, ne, 0);
+                        rec.store_f16(src, sc, ne, 0);
                     } else if is_turbo(vdt) {
-                        rec.dequant_turbo_f16(vdt, r(*v_cache)?, sc, ne);
+                        rec.dequant_turbo_f16(vdt, src, sc, ne);
                     } else {
-                        rec.dequant_kv_f16(vdt, r(*v_cache)?, sc, ne);
+                        match src_addr(src) {
+                            Some(a) => rec.dequant_kv_f16_at(vdt, src, sc, a, ne),
+                            None => rec.dequant_kv_f16(vdt, src, sc, ne),
+                        }
                     }
                     Some(k)
                 } else {

@@ -7,16 +7,35 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-layout(push_constant) uniform PC { uint n; uint cap; } pc;
+// -DKV_BDA (#74 slice 3): read the planar-Q8 cache by 64-bit device address (kv_addr.glsl `k_addr`,
+// s_lo/s_hi) instead of the bound `su` SSBO — the `su` binding disappears here, and the recorder keeps
+// the cache BOUND at that read slot as an inert descriptor so the store→dequant-read barrier survives
+// (a BDA read is invisible to the descriptor hazard tracker). See Recorder::dequant_q8_f16_at.
+layout(push_constant) uniform PC { uint n; uint cap;
+#ifdef KV_BDA
+    uint s_lo; uint s_hi;
+#endif
+} pc;
+#ifndef KV_BDA
 layout(binding = 0) readonly buffer SB { uint su[]; };        // planar Q8 as u32 words
+#endif
 layout(binding = 1) writeonly buffer DB { float16_t dst[]; };
+#ifdef KV_BDA
+#include "kv_addr.glsl"
+#define SU(wi) kv_word(k_addr, (wi))
+#else
+#define SU(wi) su[wi]
+#endif
 
 void main() {
+#ifdef KV_BDA
+    k_addr = kv_base(pc.s_lo, pc.s_hi);
+#endif
     uint i = gl_GlobalInvocationID.x;
     if (i >= pc.n) { return; }
-    int cw = int(su[i >> 2u]);
+    int cw = int(SU(i >> 2u));
     int c = bitfieldExtract(cw, int((i & 3u) * 8u), 8);
     uint bk = i >> 5u;
-    float d = unpackHalf2x16(su[(pc.cap >> 2u) + (bk >> 1u)])[bk & 1u];
+    float d = unpackHalf2x16(SU((pc.cap >> 2u) + (bk >> 1u)))[bk & 1u];
     dst[i] = float16_t(d * float(c));
 }

@@ -12,6 +12,14 @@ layout(push_constant) uniform PC {
     // full-context cache where pos < kcap always). 0 = no modulo. Static mode ignores it (the
     // adapter pre-mods the baked out_base row instead).
     uint kcap;
+#ifdef KV_BDA
+    // -DKV_BDA (#74 slice 3): the fused-K cache write `y` goes to a 64-bit device address (kv_addr.glsl
+    // `k_addr`, from d_lo/d_hi) instead of the bound `y` SSBO — the `y` binding disappears, and the
+    // recorder keeps the cache bound at that write slot as an inert descriptor for the store→read
+    // barrier (see Recorder::qk_norm_rope_at). Only used when `y` is the KV cache (adapter gate);
+    // the Q-scratch write (no device_addr) stays on the bound build.
+    uint d_lo; uint d_hi;
+#endif
 } pc;
 layout(binding = 0) readonly buffer XB { float x[]; };
 layout(binding = 1) readonly buffer NB { float nw[]; };
@@ -24,23 +32,36 @@ layout(binding = 1) readonly buffer NB { float nw[]; };
 layout(binding = 2) readonly buffer PB { uint p_pos; uint p_kvlen; };
 #ifdef FREQ_FACTORS
 layout(binding = 3) readonly buffer FF { float ff[]; };
+#ifndef KV_BDA
 layout(binding = 4) buffer YB { float16_t y[]; };
-#else
+#endif
+#elif !defined(KV_BDA)
 layout(binding = 3) buffer YB { float16_t y[]; };
 #endif
 #elif defined(FREQ_FACTORS)
 // gemma4 full-attention layers use proportional RoPE: per-pair frequency divisors (most are huge →
 // those dims are left unrotated). `ff` takes binding 2 (read), `y` shifts to binding 3 (write).
 layout(binding = 2) readonly buffer FF { float ff[]; };
+#ifndef KV_BDA
 layout(binding = 3) buffer YB { float16_t y[]; };
-#else
+#endif
+#elif !defined(KV_BDA)
 layout(binding = 2) buffer YB { float16_t y[]; };
+#endif
+#ifdef KV_BDA
+#include "kv_addr.glsl"
+#define KVW(idx, val) kv_store_half(k_addr, (idx), (val))
+#else
+#define KVW(idx, val) y[idx] = float16_t(val)
 #endif
 
 shared float xs[512]; // hd up to 512 (gemma4 full layers); 64 threads each handle hd/64 elements
 shared float red[64];
 
 void main() {
+#ifdef KV_BDA
+    k_addr = kv_base(pc.d_lo, pc.d_hi);
+#endif
     uint t = gl_LocalInvocationID.x;
     uint unit = gl_WorkGroupID.x;
     uint h = unit % pc.nheads;
@@ -81,12 +102,12 @@ void main() {
 #endif
         float s = sin(ang);
         float co = cos(ang);
-        y[out_base_idx + i0] = float16_t(a * co - b * s);
-        y[out_base_idx + i1] = float16_t(a * s + b * co);
+        KVW(out_base_idx + i0, a * co - b * s);
+        KVW(out_base_idx + i1, a * s + b * co);
     }
     // Partial RoPE (qwen35: rope_dim=64 < hd=256): dims [rope_dim, hd) are rmsnormed but NOT rotated;
     // they must still be written through. Empty when rope_dim==hd (qwen3/gemma), so no effect there.
     for (uint i = pc.rope_dim + t; i < pc.hd; i += 64u) {
-        y[out_base_idx + i] = float16_t(xs[i] * scale * nw[i]);
+        KVW(out_base_idx + i, xs[i] * scale * nw[i]);
     }
 }

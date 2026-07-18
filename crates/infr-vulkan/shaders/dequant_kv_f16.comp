@@ -7,12 +7,32 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-layout(push_constant) uniform PC { uint n; } pc;
+// -DKV_BDA (#74 slice 3): read the GGUF-block KV cache by 64-bit device address instead of the bound
+// `nw` SSBO, via native_decode's NW/NW2/NW4 chokepoint redefined to kv_addr.glsl's kv_word*(k_addr,·)
+// (same saddr shape the paged-expert -DPAGED build uses). The `nw` binding disappears here; the
+// recorder keeps the cache BOUND at that read slot as an inert descriptor so the store→dequant-read
+// barrier survives (a BDA read is invisible to the descriptor hazard tracker). See
+// Recorder::dequant_kv_f16_at.
+layout(push_constant) uniform PC { uint n;
+#ifdef KV_BDA
+    uint s_lo; uint s_hi;
+#endif
+} pc;
+#ifndef KV_BDA
 layout(binding = 0) readonly buffer NB { uint nw[]; }; // KV cache (GGUF blocks as u32 words)
+#else
+#include "kv_addr.glsl"
+#define NW(i) kv_word(k_addr, (i))
+#define NW2(wbase) kv_word2(k_addr, (wbase))
+#define NW4(wbase) kv_word4(k_addr, (wbase))
+#endif
 #include "native_decode.glsl"
 layout(binding = 1) writeonly buffer DB { float16_t dst[]; };
 
 void main() {
+#ifdef KV_BDA
+    k_addr = kv_base(pc.s_lo, pc.s_hi);
+#endif
     uint i = gl_GlobalInvocationID.x;
     if (i >= pc.n) { return; }
     dst[i] = float16_t(dq(i));

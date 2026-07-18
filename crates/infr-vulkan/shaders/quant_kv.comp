@@ -11,7 +11,15 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-layout(push_constant) uniform PC { uint n; uint off; } pc;
+// -DKV_BDA (#74 slice 3): write the GGUF-block KV cache by 64-bit device address (kv_addr.glsl
+// `k_addr`, d_lo/d_hi) instead of the bound `cb` SSBO — the `cb` binding disappears, cache stays bound
+// at the write slot as an inert descriptor for the store→read barrier (see Recorder::quant_kv_at).
+// Byte stores don't vectorize (cold path).
+layout(push_constant) uniform PC { uint n; uint off;
+#ifdef KV_BDA
+    uint d_lo; uint d_hi;
+#endif
+} pc;
 #ifdef SRC_F16
 layout(binding = 0) readonly buffer SB { float16_t src[]; };
 #else
@@ -19,16 +27,25 @@ layout(binding = 0) readonly buffer SB { float src[]; };
 #endif
 #ifdef USE_PARAMS
 layout(binding = 1) readonly buffer PB { uint p_pos; uint p_kvlen; };
+#ifndef KV_BDA
 layout(binding = 2) writeonly buffer CB { uint8_t cb[]; };
-#else
+#endif
+#elif !defined(KV_BDA)
 layout(binding = 1) writeonly buffer CB { uint8_t cb[]; };
+#endif
+#ifdef KV_BDA
+#define KV_STORE_BYTE
+#include "kv_addr.glsl"
+#define STB(bo, v) kv_store_byte(k_addr, (bo), uint(v))
+#else
+#define STB(bo, v) cb[bo] = uint8_t(v)
 #endif
 
 // Write an f16 value as 2 little-endian bytes at byte offset `bo`.
 void wf16(uint bo, float x) {
     uint16_t hbits = float16BitsToUint16(float16_t(x));
-    cb[bo] = uint8_t(hbits & uint16_t(0xFFu));
-    cb[bo + 1u] = uint8_t(hbits >> 8);
+    STB(bo, hbits & uint16_t(0xFFu));
+    STB(bo + 1u, hbits >> 8);
 }
 
 #ifdef FMT_IQ4NL
@@ -46,6 +63,9 @@ int best_index(float x) {
 #endif
 
 void main() {
+#ifdef KV_BDA
+    k_addr = kv_base(pc.d_lo, pc.d_hi);
+#endif
     uint blk = gl_GlobalInvocationID.x; // block index over the local src rows
     if (blk * 32u >= pc.n) { return; }
 #ifdef USE_PARAMS
@@ -70,7 +90,7 @@ void main() {
     for (uint j = 0u; j < 16u; j++) {
         int xi0 = clamp(int(x[j] * id + 8.5), 0, 15);
         int xi1 = clamp(int(x[j + 16u] * id + 8.5), 0, 15);
-        cb[bo + 2u + j] = uint8_t(xi0 | (xi1 << 4));
+        STB(bo + 2u + j, xi0 | (xi1 << 4));
     }
 
 #elif defined(FMT_Q4_1)
@@ -84,7 +104,7 @@ void main() {
     for (uint j = 0u; j < 16u; j++) {
         int xi0 = clamp(int((x[j] - vmin) * id + 0.5), 0, 15);
         int xi1 = clamp(int((x[j + 16u] - vmin) * id + 0.5), 0, 15);
-        cb[bo + 4u + j] = uint8_t(xi0 | (xi1 << 4));
+        STB(bo + 4u + j, xi0 | (xi1 << 4));
     }
 
 #elif defined(FMT_Q5_0)
@@ -99,14 +119,14 @@ void main() {
     for (uint j = 0u; j < 16u; j++) {
         int xi0 = clamp(int(x[j] * id + 16.5), 0, 31);
         int xi1 = clamp(int(x[j + 16u] * id + 16.5), 0, 31);
-        cb[bo + 6u + j] = uint8_t((xi0 & 0xF) | ((xi1 & 0xF) << 4));
+        STB(bo + 6u + j, (xi0 & 0xF) | ((xi1 & 0xF) << 4));
         qh |= (uint(xi0 & 0x10) >> 4) << j;
         qh |= (uint(xi1 & 0x10) >> 4) << (j + 16u);
     }
-    cb[bo + 2u] = uint8_t(qh & 0xFFu);
-    cb[bo + 3u] = uint8_t((qh >> 8) & 0xFFu);
-    cb[bo + 4u] = uint8_t((qh >> 16) & 0xFFu);
-    cb[bo + 5u] = uint8_t((qh >> 24) & 0xFFu);
+    STB(bo + 2u, qh & 0xFFu);
+    STB(bo + 3u, (qh >> 8) & 0xFFu);
+    STB(bo + 4u, (qh >> 16) & 0xFFu);
+    STB(bo + 5u, (qh >> 24) & 0xFFu);
 
 #elif defined(FMT_Q5_1)
     uint bo = dblk * 24u;
@@ -120,14 +140,14 @@ void main() {
     for (uint j = 0u; j < 16u; j++) {
         int xi0 = int((x[j] - vmin) * id + 0.5);
         int xi1 = int((x[j + 16u] - vmin) * id + 0.5);
-        cb[bo + 8u + j] = uint8_t((xi0 & 0xF) | ((xi1 & 0xF) << 4));
+        STB(bo + 8u + j, (xi0 & 0xF) | ((xi1 & 0xF) << 4));
         qh |= (uint(xi0 & 0x10) >> 4) << j;
         qh |= (uint(xi1 & 0x10) >> 4) << (j + 16u);
     }
-    cb[bo + 4u] = uint8_t(qh & 0xFFu);
-    cb[bo + 5u] = uint8_t((qh >> 8) & 0xFFu);
-    cb[bo + 6u] = uint8_t((qh >> 16) & 0xFFu);
-    cb[bo + 7u] = uint8_t((qh >> 24) & 0xFFu);
+    STB(bo + 4u, qh & 0xFFu);
+    STB(bo + 5u, (qh >> 8) & 0xFFu);
+    STB(bo + 6u, (qh >> 16) & 0xFFu);
+    STB(bo + 7u, (qh >> 24) & 0xFFu);
 
 #elif defined(FMT_IQ4NL)
     uint bo = dblk * 18u;
@@ -156,7 +176,7 @@ void main() {
     }
     wf16(bo, d);
     for (uint j = 0u; j < 16u; j++) {
-        cb[bo + 2u + j] = uint8_t(L[j] | (L[j + 16u] << 4));
+        STB(bo + 2u + j, L[j] | (L[j + 16u] << 4));
     }
 #endif
 }

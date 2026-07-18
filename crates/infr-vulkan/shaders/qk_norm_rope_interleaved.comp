@@ -10,6 +10,12 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 layout(push_constant) uniform PC {
     uint rows; uint nheads; uint hd; uint rope_dim; float theta; uint rope_pos; uint out_base; float eps;
     uint src_stride;
+#ifdef KV_BDA
+    // -DKV_BDA (#74 slice 3): fused-K cache write by device address (kv_addr.glsl `k_addr`, d_lo/d_hi);
+    // `y` binding disappears, cache stays bound inert for the barrier — see Recorder::
+    // qk_norm_rope_interleaved_at.
+    uint d_lo; uint d_hi;
+#endif
 } pc;
 layout(binding = 0) readonly buffer XB { float x[]; };
 layout(binding = 1) readonly buffer NB { float nw[]; };
@@ -17,21 +23,34 @@ layout(binding = 1) readonly buffer NB { float nw[]; };
 layout(binding = 2) readonly buffer PB { uint p_pos; uint p_kvlen; };
 #ifdef FREQ_FACTORS
 layout(binding = 3) readonly buffer FF { float ff[]; };
+#ifndef KV_BDA
 layout(binding = 4) buffer YB { float16_t y[]; };
-#else
+#endif
+#elif !defined(KV_BDA)
 layout(binding = 3) buffer YB { float16_t y[]; };
 #endif
 #elif defined(FREQ_FACTORS)
 layout(binding = 2) readonly buffer FF { float ff[]; };
+#ifndef KV_BDA
 layout(binding = 3) buffer YB { float16_t y[]; };
-#else
+#endif
+#elif !defined(KV_BDA)
 layout(binding = 2) buffer YB { float16_t y[]; };
+#endif
+#ifdef KV_BDA
+#include "kv_addr.glsl"
+#define KVW(idx, val) kv_store_half(k_addr, (idx), (val))
+#else
+#define KVW(idx, val) y[idx] = float16_t(val)
 #endif
 
 shared float xs[512];
 shared float red[64];
 
 void main() {
+#ifdef KV_BDA
+    k_addr = kv_base(pc.d_lo, pc.d_hi);
+#endif
     uint t = gl_LocalInvocationID.x;
     uint unit = gl_WorkGroupID.x;
     uint h = unit % pc.nheads;
@@ -71,10 +90,10 @@ void main() {
 #endif
         float s = sin(ang);
         float co = cos(ang);
-        y[out_base_idx + i0] = float16_t(a * co - b * s);
-        y[out_base_idx + i1] = float16_t(a * s + b * co);
+        KVW(out_base_idx + i0, a * co - b * s);
+        KVW(out_base_idx + i1, a * s + b * co);
     }
     for (uint i = pc.rope_dim + t; i < pc.hd; i += 64u) {
-        y[out_base_idx + i] = float16_t(xs[i] * scale * nw[i]);
+        KVW(out_base_idx + i, xs[i] * scale * nw[i]);
     }
 }

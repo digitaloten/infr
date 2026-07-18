@@ -20,8 +20,10 @@
 // GEMM). The `base` args below are always fed a wave-uniform pointer (k_addr/v_addr, from push
 // constants), so no explicit uniformity hint is needed — the iadd shape alone gets saddr selected.
 //
-// READ-ONLY: every buffer_reference here is `readonly`. The KV STORE kernels (store_f16/store_q8)
-// are a LATER slice; a writable KV buffer_reference is deliberately NOT provided yet.
+// READS use the `readonly buffer` blocks below; WRITES (the KV STORE kernels, #74 slice 3) use the
+// separate `writeonly buffer` blocks at the bottom. A single buffer_reference TYPE cannot be both
+// `readonly` and `writeonly`, so the two paths get distinct type names over (possibly) the same
+// bytes — the aliasing is fine, each access goes through its own typed reference.
 #extension GL_EXT_buffer_reference2 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
@@ -65,3 +67,51 @@ uvec2 kv_word2(uint64_t base, uint wbase) {
     return uvec2(p.v[0], p.v[1]);
 }
 #define KV2(base, wbase) kv_word2(base, wbase)
+
+// ── WRITABLE stores (KV STORE kernels, #74 slice 3) ─────────────────────────────────────────────
+// The store kernels write their DESTINATION KV cache by device address. A store touches exactly ONE
+// KV buffer, so it reuses the `k_addr` global above as that buffer's base (set once in main via
+// kv_base) — v_addr stays 0/unused. Same saddr shape as the reads: the element→byte offset is built
+// entirely in u32 and added to the base BEFORE the uint64_t cast, with a CONSTANT deref index, so
+// NIR sees `iadd(uniform64, u2u64(divergent32))` → ACO selects a scalar-base `global_store_*` (64-bit
+// base in SGPRs, one 32-bit VGPR offset) with NO per-store v_add_co/v_addc carry-add pair. These are
+// scalar single-element stores (no kernel here writes a vec4), so there is no wide-store analog.
+//
+// NOTE the store kernels keep their destination BOUND at its write slot as an INERT descriptor the
+// `-DKV_BDA` shader never touches — a BDA store is invisible to `Recorder::sync`'s descriptor hazard
+// tracker, so the bound-at-write-slot dst is what preserves the store→(later)read barrier (the
+// write-side analog of slice 1's inert read bind). See each Recorder `*_at` store method.
+
+// One f16 element `i` (byte offset `i<<1`): store_f16 / qk_norm_rope* / rope(-DOUT_F16). float16 is
+// enabled by every kv_addr includer (all read + write f16), so this block is unconditional.
+layout(buffer_reference, std430, buffer_reference_align = 2) writeonly buffer KvHalfW { float16_t v[]; };
+void kv_store_half(uint64_t base, uint i, float val) {
+    KvHalfW(base + uint64_t(i << 1u)).v[0] = float16_t(val);
+}
+
+// One f32 element `i` (byte offset `i<<2`): store_kv_dense -DDST_F32. Core `float` type, unconditional.
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer KvF32W { float v[]; };
+void kv_store_f32(uint64_t base, uint i, float val) {
+    KvF32W(base + uint64_t(i << 2u)).v[0] = val;
+}
+
+// One u16 element `i` (byte offset `i<<1`): store_kv_dense -DDST_BF16 writes raw bf16 bits. Needs the
+// int16 type — GUARDED so the f16-only readers (attention_kv / attn_partial, no int16 ext) still
+// compile the header. Includers that write bf16 KV define KV_STORE_U16 before the include.
+#ifdef KV_STORE_U16
+layout(buffer_reference, std430, buffer_reference_align = 2) writeonly buffer KvU16W { uint16_t v[]; };
+void kv_store_u16(uint64_t base, uint i, uint bits) {
+    KvU16W(base + uint64_t(i << 1u)).v[0] = uint16_t(bits);
+}
+#endif
+
+// One byte at BYTE offset `bo` (already in bytes → no shift): the low-bit quant packers
+// (store_q8 / quant_kv) write their blocks byte-by-byte. Needs int8 + 8bit_storage — GUARDED
+// (includers define KV_STORE_BYTE before the include). Byte stores don't vectorize; the quant
+// packers are cold, so this is fine — the hot f16 stores go through kv_store_half.
+#ifdef KV_STORE_BYTE
+layout(buffer_reference, std430, buffer_reference_align = 1) writeonly buffer KvByteW { uint8_t v[]; };
+void kv_store_byte(uint64_t base, uint bo, uint val) {
+    KvByteW(base + uint64_t(bo)).v[0] = uint8_t(val);
+}
+#endif

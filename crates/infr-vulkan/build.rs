@@ -376,6 +376,148 @@ fn main() {
             "qk_norm_rope_interleaved_dyn",
             &["-DUSE_PARAMS"],
         ),
+        // KV-cache u64/BDA store + dequant-read twins (#74, slice 3): `-DKV_BDA` writes the DEST cache
+        // (store kernels) or reads the SOURCE cache (dequant) by 64-bit device address (kv_addr.glsl's
+        // writable KvHalfW/KvF32W/KvU16W/KvByteW stores + the kv_word* reads) instead of the bound KV
+        // SSBO — the KV descriptor slot disappears from the shader but stays BOUND at the recorder (the
+        // dst at its write slot / the src at its read slot) purely so Recorder::sync's descriptor hazard
+        // tracker keeps the store→read barrier a BDA access is invisible to. The bound builds above stay
+        // compiled for kv_addr_parity.rs bound-vs-pointer; production forks here unless INFR_NO_KV_BDA.
+        ("store_f16", "store_f16_bda", &["-DKV_BDA"]),
+        (
+            "store_f16",
+            "store_f16_dyn_bda",
+            &["-DUSE_PARAMS", "-DKV_BDA"],
+        ),
+        ("store_q8", "store_q8_bda", &["-DKV_BDA"]),
+        (
+            "store_q8",
+            "store_q8_dyn_bda",
+            &["-DUSE_PARAMS", "-DKV_BDA"],
+        ),
+        ("store_q8", "store_q8_f16_bda", &["-DSRC_F16", "-DKV_BDA"]),
+        (
+            "store_q8",
+            "store_q8_f16_dyn_bda",
+            &["-DSRC_F16", "-DUSE_PARAMS", "-DKV_BDA"],
+        ),
+        ("dequant_q8_f16", "dequant_q8_f16_bda", &["-DKV_BDA"]),
+        ("quant_kv", "quant_kv_q4_0_bda", &["-DFMT_Q4_0", "-DKV_BDA"]),
+        (
+            "quant_kv",
+            "quant_kv_q4_0_f16_bda",
+            &["-DFMT_Q4_0", "-DSRC_F16", "-DKV_BDA"],
+        ),
+        ("quant_kv", "quant_kv_q4_1_bda", &["-DFMT_Q4_1", "-DKV_BDA"]),
+        (
+            "quant_kv",
+            "quant_kv_q4_1_f16_bda",
+            &["-DFMT_Q4_1", "-DSRC_F16", "-DKV_BDA"],
+        ),
+        ("quant_kv", "quant_kv_q5_0_bda", &["-DFMT_Q5_0", "-DKV_BDA"]),
+        (
+            "quant_kv",
+            "quant_kv_q5_0_f16_bda",
+            &["-DFMT_Q5_0", "-DSRC_F16", "-DKV_BDA"],
+        ),
+        ("quant_kv", "quant_kv_q5_1_bda", &["-DFMT_Q5_1", "-DKV_BDA"]),
+        (
+            "quant_kv",
+            "quant_kv_q5_1_f16_bda",
+            &["-DFMT_Q5_1", "-DSRC_F16", "-DKV_BDA"],
+        ),
+        (
+            "quant_kv",
+            "quant_kv_iq4_nl_bda",
+            &["-DFMT_IQ4NL", "-DKV_BDA"],
+        ),
+        (
+            "quant_kv",
+            "quant_kv_iq4_nl_f16_bda",
+            &["-DFMT_IQ4NL", "-DSRC_F16", "-DKV_BDA"],
+        ),
+        (
+            "dequant_kv_f16",
+            "dequant_kv_q4_0_bda",
+            &["-DFMT_Q4_0", "-DKV_BDA"],
+        ),
+        (
+            "dequant_kv_f16",
+            "dequant_kv_q4_1_bda",
+            &["-DFMT_Q4_1", "-DKV_BDA"],
+        ),
+        (
+            "dequant_kv_f16",
+            "dequant_kv_q5_0_bda",
+            &["-DFMT_Q5_0", "-DKV_BDA"],
+        ),
+        (
+            "dequant_kv_f16",
+            "dequant_kv_q5_1_bda",
+            &["-DFMT_Q5_1", "-DKV_BDA"],
+        ),
+        (
+            "dequant_kv_f16",
+            "dequant_kv_iq4_nl_bda",
+            &["-DFMT_IQ4NL", "-DKV_BDA"],
+        ),
+        (
+            "dequant_kv_f16",
+            "dequant_kv_bf16_bda",
+            &["-DFMT_BF16", "-DKV_BDA"],
+        ),
+        (
+            "store_kv_dense",
+            "store_kv_f32_bda",
+            &["-DDST_F32", "-DKV_BDA"],
+        ),
+        (
+            "store_kv_dense",
+            "store_kv_f32_from_f16_bda",
+            &["-DDST_F32", "-DSRC_F16", "-DKV_BDA"],
+        ),
+        (
+            "store_kv_dense",
+            "store_kv_bf16_bda",
+            &["-DDST_BF16", "-DKV_BDA"],
+        ),
+        (
+            "store_kv_dense",
+            "store_kv_bf16_from_f16_bda",
+            &["-DDST_BF16", "-DSRC_F16", "-DKV_BDA"],
+        ),
+        ("rope", "rope_f16_bda", &["-DOUT_F16", "-DKV_BDA"]),
+        (
+            "rope",
+            "rope_f16_dyn_bda",
+            &["-DOUT_F16", "-DUSE_PARAMS", "-DKV_BDA"],
+        ),
+        ("qk_norm_rope", "qk_norm_rope_bda", &["-DKV_BDA"]),
+        (
+            "qk_norm_rope",
+            "qk_norm_rope_dyn_bda",
+            &["-DUSE_PARAMS", "-DKV_BDA"],
+        ),
+        (
+            "qk_norm_rope",
+            "qk_norm_rope_ff_bda",
+            &["-DFREQ_FACTORS", "-DKV_BDA"],
+        ),
+        (
+            "qk_norm_rope",
+            "qk_norm_rope_dyn_ff_bda",
+            &["-DUSE_PARAMS", "-DFREQ_FACTORS", "-DKV_BDA"],
+        ),
+        (
+            "qk_norm_rope_interleaved",
+            "qk_norm_rope_interleaved_bda",
+            &["-DKV_BDA"],
+        ),
+        (
+            "qk_norm_rope_interleaved",
+            "qk_norm_rope_interleaved_dyn_bda",
+            &["-DUSE_PARAMS", "-DKV_BDA"],
+        ),
         // Native-block dequant GEMVs: one .spv per (quant format, residual) from one source.
         ("native_gemv", "native_q8_0", &["-DFMT_Q8_0"]),
         ("native_gemv", "native_bf16", &["-DFMT_BF16"]),

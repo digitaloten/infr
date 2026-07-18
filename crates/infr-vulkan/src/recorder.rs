@@ -4258,6 +4258,574 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    // ── #74 slice 3: KV-cache u64/BDA store + dequant-read `_at` twins ──────────────────────────
+    // Each `_at` forks to the `-DKV_BDA` build (writes the DEST cache / reads the SOURCE cache by the
+    // 64-bit `addr`) but keeps the KV buffer BOUND at its original slot as an INERT descriptor: a BDA
+    // access is invisible to `Recorder::sync`'s descriptor hazard tracker, so the bound-at-write-slot
+    // dst (store) / bound-at-read-slot src (dequant) is exactly what still orders the store→(later)
+    // read barrier — the write-side analog of the slice-1 inert read bind. `n_buf`/`n_out` are
+    // UNCHANGED from the bound sibling (the KV binding stays in the reads|writes split); only the push
+    // grows by the addr uvec2 (lo/hi). Production forks here from adapter.rs when the KV buffer exposes
+    // a device address and INFR_NO_KV_BDA is unset; bit-identical to the bound dispatch.
+
+    /// `-DKV_BDA` twin of [`Self::store_f16_off`]: writes the f16 cache at `dst_addr`. `dst` stays
+    /// bound at slot 1 as the inert write descriptor keeping the store→read barrier.
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_f16_off_at(
+        &self,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        dst_addr: u64,
+        n: usize,
+        off: usize,
+        src_off: usize,
+    ) {
+        let k = self
+            .be
+            .kernel("store_f16_bda", crate::gemm::store_f16_bda_spv(), 2, 24);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(src_off as u32).to_ne_bytes());
+        // [12..16] cap: dyn-only, zero here.
+        push[16..20].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(src), Self::vkb(dst)],
+            1,
+            &push,
+            (n as u32).div_ceil(64),
+        );
+    }
+
+    /// `-DKV_BDA` twin of [`Self::store_f16_dyn`]: writes the f16 cache at `dst_addr` (row from
+    /// `params`). `dst` stays bound at slot 2 (inert) for the store→read barrier.
+    pub fn store_f16_dyn_at(
+        &self,
+        src: &dyn Buffer,
+        params: &dyn Buffer,
+        dst: &dyn Buffer,
+        dst_addr: u64,
+        n: usize,
+        cap_rows: usize,
+    ) {
+        let k = self.be.kernel(
+            "store_f16_dyn_bda",
+            crate::gemm::store_f16_dyn_bda_spv(),
+            3,
+            24,
+        );
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(cap_rows as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(src), Self::vkb(params), Self::vkb(dst)],
+            1,
+            &push,
+            (n as u32).div_ceil(64),
+        );
+    }
+
+    /// `-DKV_BDA` twin of [`Self::store_q8`]: writes the planar-Q8 cache at `dst_addr`. `dst` stays
+    /// bound at slot 1 (inert) for the store→read barrier.
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_q8_at(
+        &self,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        dst_addr: u64,
+        n: usize,
+        off: usize,
+        cap: usize,
+        src_f16: bool,
+        src_off: usize,
+    ) {
+        let (name, spv) = if src_f16 {
+            ("store_q8_f16_bda", crate::gemm::store_q8_f16_bda_spv())
+        } else {
+            ("store_q8_bda", crate::gemm::store_q8_bda_spv())
+        };
+        let k = self.be.kernel(name, spv, 2, 24);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(cap as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(src_off as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(src), Self::vkb(dst)],
+            1,
+            &push,
+            (n as u32) / 32,
+        );
+    }
+
+    /// `-DKV_BDA` twin of [`Self::store_q8_dyn`]: writes the planar-Q8 cache at `dst_addr`. `dst`
+    /// stays bound at slot 2 (inert) for the store→read barrier.
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_q8_dyn_at(
+        &self,
+        src: &dyn Buffer,
+        params: &dyn Buffer,
+        dst: &dyn Buffer,
+        dst_addr: u64,
+        n: usize,
+        cap: usize,
+        src_f16: bool,
+    ) {
+        let (name, spv) = if src_f16 {
+            (
+                "store_q8_f16_dyn_bda",
+                crate::gemm::store_q8_f16_dyn_bda_spv(),
+            )
+        } else {
+            ("store_q8_dyn_bda", crate::gemm::store_q8_dyn_bda_spv())
+        };
+        let k = self.be.kernel(name, spv, 3, 24);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(cap as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(src), Self::vkb(params), Self::vkb(dst)],
+            1,
+            &push,
+            (n as u32) / 32,
+        );
+    }
+
+    /// `-DKV_BDA` twin of [`Self::dequant_q8_f16`]: reads the planar-Q8 cache at `src_addr`. `src`
+    /// stays bound at slot 0 (inert READ) so the store→dequant-read barrier survives.
+    pub fn dequant_q8_f16_at(
+        &self,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        src_addr: u64,
+        n: usize,
+        cap: usize,
+    ) {
+        let k = self.be.kernel(
+            "dequant_q8_f16_bda",
+            crate::gemm::dequant_q8_f16_bda_spv(),
+            2,
+            16,
+        );
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(cap as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(src_addr as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&((src_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(src), Self::vkb(dst)],
+            1,
+            &push,
+            (n as u32).div_ceil(64),
+        );
+    }
+
+    /// `-DKV_BDA` twin of [`Self::quant_kv`]: writes the GGUF-block cache at `dst_addr`. `dst`
+    /// stays bound at slot 1 (inert) for the store→read barrier.
+    #[allow(clippy::too_many_arguments)]
+    pub fn quant_kv_at(
+        &self,
+        dt: infr_core::DType,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        dst_addr: u64,
+        n: usize,
+        off: usize,
+        src_f16: bool,
+    ) {
+        let (name, spv) = crate::gemm::quant_kv_bda_kernel(dt, src_f16);
+        let k = self.be.kernel(name, spv, 2, 16);
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(src), Self::vkb(dst)],
+            1,
+            &push,
+            ((n / 32) as u32).div_ceil(64),
+        );
+    }
+
+    /// `-DKV_BDA` twin of [`Self::dequant_kv_f16`]: reads the GGUF-block cache at `src_addr`. `src`
+    /// stays bound at slot 0 (inert READ) so the store→dequant-read barrier survives.
+    pub fn dequant_kv_f16_at(
+        &self,
+        dt: infr_core::DType,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        src_addr: u64,
+        n: usize,
+    ) {
+        let (name, spv) = crate::gemm::dequant_kv_bda_kernel(dt);
+        let k = self.be.kernel(name, spv, 2, 12);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(src_addr as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&((src_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(src), Self::vkb(dst)],
+            1,
+            &push,
+            (n as u32).div_ceil(64),
+        );
+    }
+
+    /// `-DKV_BDA` twin of [`Self::store_kv_dense`]: writes the dense (f32/bf16) cache at `dst_addr`.
+    /// `dst` stays bound at slot 1 (inert) for the store→read barrier.
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_kv_dense_at(
+        &self,
+        dst_dt: infr_core::DType,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        dst_addr: u64,
+        n: usize,
+        off: usize,
+        src_f16: bool,
+    ) {
+        let (name, spv) = crate::gemm::store_kv_dense_bda_kernel(dst_dt, src_f16);
+        let k = self.be.kernel(name, spv, 2, 16);
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(src), Self::vkb(dst)],
+            1,
+            &push,
+            (n as u32).div_ceil(64),
+        );
+    }
+
+    /// `-DKV_BDA` twin of [`Self::rope_f16`]: writes the f16 K cache at `y_addr`. `y` stays bound
+    /// at slot 1 (inert) for the store→read barrier.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_f16_at(
+        &self,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        y_addr: u64,
+        t: usize,
+        n_heads: usize,
+        hd: usize,
+        rope_dim: usize,
+        theta: f32,
+        pos_offset: usize,
+        out_base: usize,
+    ) {
+        let k = self
+            .be
+            .kernel("rope_f16_bda", crate::gemm::rope_f16_bda_spv(), 2, 36);
+        let mut push = [0u8; 36];
+        push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n_heads as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(hd as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(rope_dim as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&theta.to_ne_bytes());
+        push[20..24].copy_from_slice(&(pos_offset as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&(out_base as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&(y_addr as u32).to_ne_bytes());
+        push[32..36].copy_from_slice(&((y_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(y)],
+            1,
+            &push,
+            (t * n_heads) as u32,
+        );
+    }
+
+    /// `-DKV_BDA` twin of [`Self::rope_f16_dyn`]: writes the f16 K cache at `y_addr` (pos from
+    /// `params`). `y` stays bound at slot 2 (inert) for the store→read barrier.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_f16_dyn_at(
+        &self,
+        x: &dyn Buffer,
+        params: &dyn Buffer,
+        y: &dyn Buffer,
+        y_addr: u64,
+        t: usize,
+        n_heads: usize,
+        hd: usize,
+        rope_dim: usize,
+        theta: f32,
+        out_base_mul: usize,
+    ) {
+        let k = self.be.kernel(
+            "rope_f16_dyn_bda",
+            crate::gemm::rope_f16_dyn_bda_spv(),
+            3,
+            36,
+        );
+        let mut push = [0u8; 36];
+        push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n_heads as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(hd as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(rope_dim as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&theta.to_ne_bytes());
+        // [20..24] pos_offset: unused (from params)
+        push[24..28].copy_from_slice(&(out_base_mul as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&(y_addr as u32).to_ne_bytes());
+        push[32..36].copy_from_slice(&((y_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(params), Self::vkb(y)],
+            1,
+            &push,
+            (t * n_heads) as u32,
+        );
+    }
+
+    /// `-DKV_BDA` twin of [`Self::qk_norm_rope`]: writes the fused K cache at `y_addr`. `y` stays
+    /// bound at its (last) write slot (inert) for the store→read barrier.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qk_norm_rope_at(
+        &self,
+        x: &dyn Buffer,
+        nw: &dyn Buffer,
+        y: &dyn Buffer,
+        y_addr: u64,
+        rows: usize,
+        nheads: usize,
+        hd: usize,
+        rope_dim: usize,
+        theta: f32,
+        rope_pos: usize,
+        out_base: usize,
+        eps: f32,
+        freq_factors: Option<&dyn Buffer>,
+    ) {
+        let mut push = [0u8; 44];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(nheads as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(hd as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(rope_dim as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&theta.to_ne_bytes());
+        push[20..24].copy_from_slice(&(rope_pos as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&(out_base as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&eps.to_ne_bytes());
+        // [32..36] kcap: dyn-only, zero here.
+        push[36..40].copy_from_slice(&(y_addr as u32).to_ne_bytes());
+        push[40..44].copy_from_slice(&((y_addr >> 32) as u32).to_ne_bytes());
+        match freq_factors {
+            Some(ff) => {
+                let k = self.be.kernel(
+                    "qk_norm_rope_ff_bda",
+                    crate::gemm::qk_norm_rope_ff_bda_spv(),
+                    4,
+                    44,
+                );
+                self.dispatch(
+                    k,
+                    &[Self::vkb(x), Self::vkb(nw), Self::vkb(ff), Self::vkb(y)],
+                    1,
+                    &push,
+                    (rows * nheads) as u32,
+                );
+            }
+            None => {
+                let k = self.be.kernel(
+                    "qk_norm_rope_bda",
+                    crate::gemm::qk_norm_rope_bda_spv(),
+                    3,
+                    44,
+                );
+                self.dispatch(
+                    k,
+                    &[Self::vkb(x), Self::vkb(nw), Self::vkb(y)],
+                    1,
+                    &push,
+                    (rows * nheads) as u32,
+                );
+            }
+        }
+    }
+
+    /// `-DKV_BDA` twin of [`Self::qk_norm_rope_interleaved`]: writes the fused K cache at `y_addr`.
+    /// `y` stays bound at slot 2 (inert) for the store→read barrier.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qk_norm_rope_interleaved_at(
+        &self,
+        qg: &dyn Buffer,
+        nw: &dyn Buffer,
+        y: &dyn Buffer,
+        y_addr: u64,
+        rows: usize,
+        nheads: usize,
+        hd: usize,
+        rope_dim: usize,
+        theta: f32,
+        rope_pos: usize,
+        out_base: usize,
+        eps: f32,
+        src_stride: usize,
+    ) {
+        let k = self.be.kernel(
+            "qk_norm_rope_interleaved_bda",
+            crate::gemm::qk_norm_rope_interleaved_bda_spv(),
+            3,
+            44,
+        );
+        let mut push = [0u8; 44];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(nheads as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(hd as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(rope_dim as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&theta.to_ne_bytes());
+        push[20..24].copy_from_slice(&(rope_pos as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&(out_base as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&eps.to_ne_bytes());
+        push[32..36].copy_from_slice(&(src_stride as u32).to_ne_bytes());
+        push[36..40].copy_from_slice(&(y_addr as u32).to_ne_bytes());
+        push[40..44].copy_from_slice(&((y_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(qg), Self::vkb(nw), Self::vkb(y)],
+            1,
+            &push,
+            (rows * nheads) as u32,
+        );
+    }
+
+    /// `-DKV_BDA` twin of [`Self::qk_norm_rope_dyn`]: writes the fused K cache at `y_addr` (pos from
+    /// `params`). `y` stays bound at its (last) write slot (inert) for the store→read barrier.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qk_norm_rope_dyn_at(
+        &self,
+        x: &dyn Buffer,
+        nw: &dyn Buffer,
+        params: &dyn Buffer,
+        ff: Option<&dyn Buffer>,
+        y: &dyn Buffer,
+        y_addr: u64,
+        rows: usize,
+        nheads: usize,
+        hd: usize,
+        rope_dim: usize,
+        theta: f32,
+        out_base_mul: usize,
+        eps: f32,
+        kcap: usize,
+    ) {
+        let k = match ff {
+            Some(_) => self.be.kernel(
+                "qk_norm_rope_dyn_ff_bda",
+                crate::gemm::qk_norm_rope_dyn_ff_bda_spv(),
+                5,
+                44,
+            ),
+            None => self.be.kernel(
+                "qk_norm_rope_dyn_bda",
+                crate::gemm::qk_norm_rope_dyn_bda_spv(),
+                4,
+                44,
+            ),
+        };
+        let mut push = [0u8; 44];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(nheads as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(hd as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(rope_dim as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&theta.to_ne_bytes());
+        // [20..24] rope_pos: unused (from params)
+        push[24..28].copy_from_slice(&(out_base_mul as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&eps.to_ne_bytes());
+        push[32..36].copy_from_slice(&(kcap as u32).to_ne_bytes());
+        push[36..40].copy_from_slice(&(y_addr as u32).to_ne_bytes());
+        push[40..44].copy_from_slice(&((y_addr >> 32) as u32).to_ne_bytes());
+        match ff {
+            Some(f) => self.dispatch(
+                k,
+                &[
+                    Self::vkb(x),
+                    Self::vkb(nw),
+                    Self::vkb(params),
+                    Self::vkb(f),
+                    Self::vkb(y),
+                ],
+                1,
+                &push,
+                (rows * nheads) as u32,
+            ),
+            None => self.dispatch(
+                k,
+                &[Self::vkb(x), Self::vkb(nw), Self::vkb(params), Self::vkb(y)],
+                1,
+                &push,
+                (rows * nheads) as u32,
+            ),
+        }
+    }
+
+    /// `-DKV_BDA` twin of [`Self::qk_norm_rope_interleaved_dyn`]: writes the fused K cache at
+    /// `y_addr` (pos from `params`). `y` stays bound at slot 3 (inert) for the store→read barrier.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qk_norm_rope_interleaved_dyn_at(
+        &self,
+        qg: &dyn Buffer,
+        nw: &dyn Buffer,
+        params: &dyn Buffer,
+        y: &dyn Buffer,
+        y_addr: u64,
+        rows: usize,
+        nheads: usize,
+        hd: usize,
+        rope_dim: usize,
+        theta: f32,
+        out_base_mul: usize,
+        eps: f32,
+        src_stride: usize,
+    ) {
+        let k = self.be.kernel(
+            "qk_norm_rope_interleaved_dyn_bda",
+            crate::gemm::qk_norm_rope_interleaved_dyn_bda_spv(),
+            4,
+            44,
+        );
+        let mut push = [0u8; 44];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(nheads as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(hd as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(rope_dim as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&theta.to_ne_bytes());
+        // [20..24] rope_pos: unused (from params)
+        push[24..28].copy_from_slice(&(out_base_mul as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&eps.to_ne_bytes());
+        push[32..36].copy_from_slice(&(src_stride as u32).to_ne_bytes());
+        push[36..40].copy_from_slice(&(y_addr as u32).to_ne_bytes());
+        push[40..44].copy_from_slice(&((y_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[
+                Self::vkb(qg),
+                Self::vkb(nw),
+                Self::vkb(params),
+                Self::vkb(y),
+            ],
+            1,
+            &push,
+            (rows * nheads) as u32,
+        );
+    }
+
     /// Quantize `src[src_off..src_off+n]` → the Vulkan planar Q8_0 KV cache at element offset
     /// `off`. `cap` = total cache elements (the scales region begins at byte `cap`). `src_f16`
     /// selects the f16-source variant (the un-fused roped K staging); f32 otherwise (the V

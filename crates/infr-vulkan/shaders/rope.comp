@@ -12,18 +12,37 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC {
     uint t; uint nheads; uint hd; uint rope_dim; float theta; uint pos_offset; uint out_base;
+#ifdef KV_BDA
+    // -DKV_BDA (#74 slice 3, OUT_F16 only): write the f16 K cache by device address (kv_addr.glsl
+    // `k_addr`, d_lo/d_hi); the `y` binding disappears, cache stays bound inert for the barrier —
+    // see Recorder::rope_f16_at.
+    uint d_lo; uint d_hi;
+#endif
 } pc;
 layout(binding = 0) readonly buffer XB { float x[]; };
 #ifdef USE_PARAMS
 layout(binding = 1) readonly buffer PB { uint p_pos; uint p_kvlen; };
+#ifndef KV_BDA
 layout(binding = 2) buffer YB { float16_t y[]; };
+#endif
 #elif defined(OUT_F16)
+#ifndef KV_BDA
 layout(binding = 1) buffer YB { float16_t y[]; };
+#endif
 #else
 layout(binding = 1) buffer YB { float y[]; };
 #endif
+#if defined(OUT_F16) && defined(KV_BDA)
+#include "kv_addr.glsl"
+#define KVWH(idx, val) kv_store_half(k_addr, (idx), (val))
+#else
+#define KVWH(idx, val) y[idx] = float16_t(val)
+#endif
 
 void main() {
+#if defined(OUT_F16) && defined(KV_BDA)
+    k_addr = kv_base(pc.d_lo, pc.d_hi);
+#endif
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= pc.t * pc.nheads) { return; }
 #ifdef USE_PARAMS
@@ -36,7 +55,7 @@ void main() {
     uint base = idx * pc.hd;
     uint obase = out_base * pc.nheads * pc.hd + base;
 #ifdef OUT_F16
-    for (uint i = 0u; i < pc.hd; i++) { y[obase + i] = float16_t(x[base + i]); }
+    for (uint i = 0u; i < pc.hd; i++) { KVWH(obase + i, x[base + i]); }
 #else
     for (uint i = 0u; i < pc.hd; i++) { y[obase + i] = x[base + i]; }
 #endif
@@ -49,8 +68,8 @@ void main() {
         float a = x[base + 2u * i];
         float b = x[base + 2u * i + 1u];
 #ifdef OUT_F16
-        y[obase + 2u * i] = float16_t(a * co - b * s);
-        y[obase + 2u * i + 1u] = float16_t(a * s + b * co);
+        KVWH(obase + 2u * i, a * co - b * s);
+        KVWH(obase + 2u * i + 1u, a * s + b * co);
 #else
         y[obase + 2u * i] = a * co - b * s;
         y[obase + 2u * i + 1u] = a * s + b * co;
