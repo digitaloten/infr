@@ -206,6 +206,24 @@ fn main() {
             "attn_flash_partial_bm32",
             &["-DBM_TILE=32"],
         ),
+        // KV-cache u64/BDA twin (#74 slice 4 resurrection): `-DKV_COOPMAT_BDA` reads the K/V cache by
+        // 64-bit device address (kv_addr.glsl `KvMat(k_addr)/(v_addr)` coopMatLoad base) instead of the
+        // bound SSBOs at bindings 1/2 — which stay bound as INERT descriptors for Recorder::sync's
+        // store→read hazard edge. OPT-IN (INFR_KV_COOPMAT_BDA=1), default OFF: on RADV/RDNA3 the coopmat
+        // load gets no saddr from a buffer_reference base (~+33-40% code, ~0.8x prefill) so the bound
+        // build stays the default; kept for silicon that addresses coopmat loads better. All new code is
+        // under `#ifdef KV_COOPMAT_BDA`, so the base .spv above is byte-identical. Not combined with the
+        // STAGE/DEQUANT builds (a separate, mutually-exclusive experimental flag family).
+        (
+            "attn_flash_partial",
+            "attn_flash_partial_bda",
+            &["-DKV_COOPMAT_BDA"],
+        ),
+        (
+            "attn_flash_partial",
+            "attn_flash_partial_bm32_bda",
+            &["-DKV_COOPMAT_BDA", "-DBM_TILE=32"],
+        ),
         // Levers 2 & 5 (kv-decode-perf-levers): shmem-staged coopMatLoad variants of the coopmat
         // prefill partial. `_stage` = f16 K/V staged into a 32-wide `KVstg` slab then coopMatLoad
         // from shmem (Lever 5, INFR_FLASH_STAGE). `_deq_<fmt>` = the quantized KV cache decoded to
@@ -272,6 +290,19 @@ fn main() {
         // BM=32 tile: 29056 B shared (vs 58112 B), fits NVIDIA (48 KB) / MoltenVK (32 KB) devices
         // whose maxComputeSharedMemorySize is under the 64 KB the default BM=64 tile needs.
         ("attn_flash_warp", "attn_flash_warp_bm32", &["-DBM_TILE=32"]),
+        // KV-cache u64/BDA twins (#74 slice 4 resurrection): the hd==128 register-O DEFAULT prefill
+        // kernel reading K/V by device address (INFR_KV_COOPMAT_BDA=1, default OFF). See the
+        // attn_flash_partial_bda note above; base .spv byte-identical (all new code under the ifdef).
+        (
+            "attn_flash_warp",
+            "attn_flash_warp_bda",
+            &["-DKV_COOPMAT_BDA"],
+        ),
+        (
+            "attn_flash_warp",
+            "attn_flash_warp_bm32_bda",
+            &["-DKV_COOPMAT_BDA", "-DBM_TILE=32"],
+        ),
         // Lever 2 on the WARP kernel (kv-decode-perf-levers): dequant-in-flash that KEEPS the fast
         // register-tiled warp path (unlike attn_flash_partial's Lever-2 arm, which forfeits warp).
         // The quantized GGUF block cache is decoded to f16 in the QK/PV stage via native_decode's
@@ -321,6 +352,18 @@ fn main() {
         ("attn_flash_reg", "attn_flash_reg", &[]),
         // BR=64 tile: 29440 B shared (vs 58880 B) for sub-64 KB shared devices (NVIDIA, MoltenVK).
         ("attn_flash_reg", "attn_flash_reg_br64", &["-DBR_TILE=64"]),
+        // KV-cache u64/BDA twins (#74 slice 4 resurrection): K/V by device address (INFR_KV_COOPMAT_BDA
+        // =1, default OFF). See the attn_flash_partial_bda note; base .spv byte-identical.
+        (
+            "attn_flash_reg",
+            "attn_flash_reg_bda",
+            &["-DKV_COOPMAT_BDA"],
+        ),
+        (
+            "attn_flash_reg",
+            "attn_flash_reg_br64_bda",
+            &["-DKV_COOPMAT_BDA", "-DBR_TILE=64"],
+        ),
         ("attn_flash_combine", "attn_flash_combine", &[]),
         ("attn_softmax", "attn_softmax", &[]),
         ("attn_pv", "attn_pv", &[]),

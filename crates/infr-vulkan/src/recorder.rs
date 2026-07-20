@@ -3968,6 +3968,13 @@ impl<'a> Recorder<'a> {
         hd: usize,
         pos_offset: usize,
         stage: FlashStage,
+        // #74 slice 4 resurrection: Some((k_addr, v_addr)) → read the KV cache by 64-bit device address
+        // (kv_addr.glsl coopMatLoad base) via the `_bda` builds, opt-in (INFR_KV_COOPMAT_BDA) from the
+        // adapter. None → bound descriptors, EXACTLY as before. Only honored on the split-K Off path
+        // (partial/warp) — the fused single-kernel `attn_flash` and the Stage/Dequant experimental
+        // builds have no BDA arm, so they stay bound even when this is Some. kc/vc are ALWAYS bound
+        // (inert under BDA) so Recorder::sync keeps the KV store→read hazard edge.
+        kv_addr: Option<(u64, u64)>,
     ) {
         let mpad = (n.div_ceil(64) * 64) as u32;
         let base_wg = (mpad / 64) * nh as u32;
@@ -4044,6 +4051,9 @@ impl<'a> Recorder<'a> {
         }
         // split-K partials
         let ksplit = (kv_len as u32).div_ceil(n_splits).div_ceil(64) * 64;
+        // BDA is only wired for the Off (f16) split-K path — the Stage/Dequant experimental builds have
+        // no `_bda` twin (a separate, mutually-exclusive flag family). So opt into BDA only when Off.
+        let bda = kv_addr.is_some() && matches!(stage, FlashStage::Off);
         // hd=128 → register-blocked warp partial; else the 4-subgroup partial. Each picks its
         // bm-sized shared build (warp/partial share the bm*908 B footprint) and covers tile_wg groups.
         let (pname, pspv): (&'static str, &[u32]) = match stage {
@@ -4054,21 +4064,39 @@ impl<'a> Recorder<'a> {
                 .expect("attention_prefill_flash: no warp dequant-in-flash build for KV dtype"),
             FlashStage::Dequant(dt) => crate::gemm::attn_flash_partial_deq_spv(dt, bm == 32)
                 .expect("attention_prefill_flash: no dequant-in-flash build for KV dtype"),
-            FlashStage::Off => match (warp, bm) {
-                (true, 32) => (
+            FlashStage::Off => match (warp, bm, bda) {
+                (true, 32, true) => (
+                    "attn_flash_warp_bm32_bda",
+                    crate::gemm::attn_flash_warp_bm32_bda_spv(),
+                ),
+                (true, 32, false) => (
                     "attn_flash_warp_bm32",
                     crate::gemm::attn_flash_warp_bm32_spv(),
                 ),
-                (true, _) => ("attn_flash_warp", crate::gemm::attn_flash_warp_spv()),
-                (false, 32) => (
+                (true, _, true) => (
+                    "attn_flash_warp_bda",
+                    crate::gemm::attn_flash_warp_bda_spv(),
+                ),
+                (true, _, false) => ("attn_flash_warp", crate::gemm::attn_flash_warp_spv()),
+                (false, 32, true) => (
+                    "attn_flash_partial_bm32_bda",
+                    crate::gemm::attn_flash_partial_bm32_bda_spv(),
+                ),
+                (false, 32, false) => (
                     "attn_flash_partial_bm32",
                     crate::gemm::attn_flash_partial_bm32_spv(),
                 ),
-                (false, _) => ("attn_flash_partial", crate::gemm::attn_flash_partial_spv()),
+                (false, _, true) => (
+                    "attn_flash_partial_bda",
+                    crate::gemm::attn_flash_partial_bda_spv(),
+                ),
+                (false, _, false) => ("attn_flash_partial", crate::gemm::attn_flash_partial_spv()),
             },
         };
-        let kp = self.be.kernel_sg(pname, pspv, 6, 32, 32);
-        let mut pp = [0u8; 32];
+        // BDA grows the push by four u32 (k_lo/k_hi/v_lo/v_hi) after the 8 base fields; bound keeps 32.
+        let plen: usize = if bda { 48 } else { 32 };
+        let kp = self.be.kernel_sg(pname, pspv, 6, plen as u32, 32);
+        let mut pp = [0u8; 48];
         pp[0..4].copy_from_slice(&mpad.to_ne_bytes());
         pp[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());
         pp[8..12].copy_from_slice(&(nh as u32).to_ne_bytes());
@@ -4077,6 +4105,12 @@ impl<'a> Recorder<'a> {
         pp[20..24].copy_from_slice(&(pos_offset as u32).to_ne_bytes());
         pp[24..28].copy_from_slice(&n_splits.to_ne_bytes());
         pp[28..32].copy_from_slice(&ksplit.to_ne_bytes());
+        if let Some((k_addr, v_addr)) = kv_addr.filter(|_| bda) {
+            pp[32..36].copy_from_slice(&(k_addr as u32).to_ne_bytes());
+            pp[36..40].copy_from_slice(&((k_addr >> 32) as u32).to_ne_bytes());
+            pp[40..44].copy_from_slice(&(v_addr as u32).to_ne_bytes());
+            pp[44..48].copy_from_slice(&((v_addr >> 32) as u32).to_ne_bytes());
+        }
         self.dispatch3(
             kp,
             &[
@@ -4088,7 +4122,7 @@ impl<'a> Recorder<'a> {
                 Self::vkb(pl),
             ],
             3,
-            &pp,
+            &pp[..plen],
             tile_wg,
             n_splits,
             1,
@@ -4181,6 +4215,9 @@ impl<'a> Recorder<'a> {
         nkv: usize,
         hd: usize,
         pos_offset: usize,
+        // #74 slice 4 resurrection: Some((k_addr, v_addr)) → read KV by device address via the `_bda`
+        // builds (kc/vc stay bound inert for the store→read hazard edge); None → bound, as before.
+        kv_addr: Option<(u64, u64)>,
     ) {
         // mpad is 128-aligned → divisible by both BR tiles.
         let mpad = (n.div_ceil(128) * 128) as u32;
@@ -4209,16 +4246,22 @@ impl<'a> Recorder<'a> {
             }
         };
         let ksplit = (kv_len as u32).div_ceil(n_splits).div_ceil(64) * 64;
-        let (rname, rspv): (&'static str, &[u32]) = if br == 64 {
-            (
+        let bda = kv_addr.is_some();
+        let (rname, rspv): (&'static str, &[u32]) = match (br == 64, bda) {
+            (true, true) => (
+                "attn_flash_reg_br64_bda",
+                crate::gemm::attn_flash_reg_br64_bda_spv(),
+            ),
+            (true, false) => (
                 "attn_flash_reg_br64",
                 crate::gemm::attn_flash_reg_br64_spv(),
-            )
-        } else {
-            ("attn_flash_reg", crate::gemm::attn_flash_reg_spv())
+            ),
+            (false, true) => ("attn_flash_reg_bda", crate::gemm::attn_flash_reg_bda_spv()),
+            (false, false) => ("attn_flash_reg", crate::gemm::attn_flash_reg_spv()),
         };
-        let kp = self.be.kernel_sg(rname, rspv, 6, 32, 32);
-        let mut pp = [0u8; 32];
+        let plen: usize = if bda { 48 } else { 32 };
+        let kp = self.be.kernel_sg(rname, rspv, 6, plen as u32, 32);
+        let mut pp = [0u8; 48];
         pp[0..4].copy_from_slice(&mpad.to_ne_bytes());
         pp[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());
         pp[8..12].copy_from_slice(&(nh as u32).to_ne_bytes());
@@ -4227,6 +4270,12 @@ impl<'a> Recorder<'a> {
         pp[20..24].copy_from_slice(&(pos_offset as u32).to_ne_bytes());
         pp[24..28].copy_from_slice(&n_splits.to_ne_bytes());
         pp[28..32].copy_from_slice(&ksplit.to_ne_bytes());
+        if let Some((k_addr, v_addr)) = kv_addr {
+            pp[32..36].copy_from_slice(&(k_addr as u32).to_ne_bytes());
+            pp[36..40].copy_from_slice(&((k_addr >> 32) as u32).to_ne_bytes());
+            pp[40..44].copy_from_slice(&(v_addr as u32).to_ne_bytes());
+            pp[44..48].copy_from_slice(&((v_addr >> 32) as u32).to_ne_bytes());
+        }
         self.dispatch3(
             kp,
             &[
@@ -4238,7 +4287,7 @@ impl<'a> Recorder<'a> {
                 Self::vkb(pl),
             ],
             3,
-            &pp,
+            &pp[..plen],
             base_wg,
             n_splits,
             1,
@@ -9812,6 +9861,7 @@ mod tests {
             hd,
             pos_offset,
             FlashStage::Off,
+            None,
         );
         rec.finish().unwrap();
         let mut bytes = vec![0u8; mpad * nh * hd * 4];
@@ -9841,6 +9891,7 @@ mod tests {
         hd: usize,
         pos_offset: usize,
         stage: FlashStage,
+        kv_addr: Option<(u64, u64)>,
     ) -> Vec<u8> {
         let mpad = q_len.div_ceil(64) * 64;
         let bo = be.alloc(mpad * nh * hd * 4, BufferUsage::Readback).unwrap();
@@ -9869,6 +9920,7 @@ mod tests {
             hd,
             pos_offset,
             stage,
+            kv_addr,
         );
         rec.finish().unwrap();
         let mut bytes = vec![0u8; mpad * nh * hd * 4];
@@ -9950,6 +10002,7 @@ mod tests {
                 hd,
                 pos_offset,
                 FlashStage::Off,
+                None,
             );
             // sanity: not vacuously all-zero / NaN (a bitwise compare would pass vacuously otherwise)
             let df: &[f32] = bytemuck::cast_slice(&direct);
@@ -9972,6 +10025,7 @@ mod tests {
                 hd,
                 pos_offset,
                 FlashStage::Stage,
+                None,
             );
             assert_eq!(
                 direct, staged,
@@ -10019,6 +10073,7 @@ mod tests {
                     hd,
                     pos_offset,
                     FlashStage::Off,
+                    None,
                 );
                 let deq_test = run_flash_bytes(
                     &be,
@@ -10032,6 +10087,7 @@ mod tests {
                     hd,
                     pos_offset,
                     FlashStage::Dequant(dt),
+                    None,
                 );
                 assert_eq!(
                     deq_ref, deq_test,
@@ -10128,6 +10184,7 @@ mod tests {
                     hd,
                     pos_offset,
                     FlashStage::Off,
+                    None,
                 );
                 // sanity: not vacuously all-zero / NaN
                 let rf: &[f32] = bytemuck::cast_slice(&warp_ref);
@@ -10149,6 +10206,7 @@ mod tests {
                     hd,
                     pos_offset,
                     FlashStage::Dequant(dt),
+                    None,
                 );
                 assert_eq!(
                     warp_ref, warp_deq,
@@ -10161,6 +10219,224 @@ mod tests {
             }
         }
         std::env::remove_var("INFR_FLASH_SPLITS");
+    }
+
+    /// Upload f16 K/V into a `KvCache` buffer (device-addressed → `device_addr()` is `Some`), so the
+    /// coopmat flash-prefill `-DKV_COOPMAT_BDA` builds can read it by 64-bit pointer.
+    fn upf16_kv(be: &VulkanBackend, v: &[f32]) -> Box<dyn Buffer> {
+        let bits: Vec<u16> = v
+            .iter()
+            .map(|&x| half::f16::from_f32(x).to_bits())
+            .collect();
+        let b = be.alloc(bits.len() * 2, BufferUsage::KvCache).unwrap();
+        be.upload(b.as_ref(), bytemuck::cast_slice(&bits)).unwrap();
+        b
+    }
+
+    /// Run one `attention_prefill_flash_reg` and return the raw f32 output bytes (BITWISE compares).
+    #[allow(clippy::too_many_arguments)]
+    fn run_flash_reg_bytes(
+        be: &VulkanBackend,
+        bq: &dyn Buffer,
+        bk: &dyn Buffer,
+        bv: &dyn Buffer,
+        q_len: usize,
+        kv_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        pos_offset: usize,
+        kv_addr: Option<(u64, u64)>,
+    ) -> Vec<u8> {
+        let mpad = q_len.div_ceil(128) * 128;
+        let bo = be.alloc(mpad * nh * hd * 4, BufferUsage::Readback).unwrap();
+        let po = be
+            .alloc(8 * mpad * nh * hd * 4, BufferUsage::Activations)
+            .unwrap();
+        let pmb = be
+            .alloc(8 * mpad * nh * 4, BufferUsage::Activations)
+            .unwrap();
+        let plb = be
+            .alloc(8 * mpad * nh * 4, BufferUsage::Activations)
+            .unwrap();
+        let rec = be.recorder().unwrap();
+        rec.attention_prefill_flash_reg(
+            bq,
+            bk,
+            bv,
+            bo.as_ref(),
+            po.as_ref(),
+            pmb.as_ref(),
+            plb.as_ref(),
+            q_len,
+            kv_len,
+            nh,
+            nkv,
+            hd,
+            pos_offset,
+            kv_addr,
+        );
+        rec.finish().unwrap();
+        let mut bytes = vec![0u8; mpad * nh * hd * 4];
+        be.download(bo.as_ref(), &mut bytes).unwrap();
+        bytes
+    }
+
+    /// #74 slice 4 resurrection: the coopmat flash-prefill `-DKV_COOPMAT_BDA` builds (K/V read by 64-bit
+    /// device address via kv_addr.glsl `KvMat(k_addr)/(v_addr)`) compute BIT-IDENTICALLY to the bound
+    /// descriptor default — the ONLY change is the KV source (a bound-SSBO coopMatLoad vs a
+    /// buffer_reference coopMatLoad off the same bytes), the QK/PV coopMatMulAdd order is untouched, so
+    /// anything short of bytewise equality is an addressing bug. This is the correctness bar for the
+    /// opt-in flag (on RADV/RDNA3 the BDA arm merely regresses perf; it must never change results).
+    /// Covers the hd==128 coopmat-prefill kernels gpu_seam hits: the register-O warp default
+    /// (`attn_flash_warp`), the split-K partial reduce, the non-warp `attn_flash_partial`, the bm=32
+    /// tile, and the (test-only) register-O `attn_flash_reg`. GQA (nkv<nh), multi-BN-block kv, and a
+    /// non-zero pos_offset exercise the head/kv addressing the BDA offset must reproduce exactly.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn attn_flash_coopmat_bda_parity() {
+        let be = VulkanBackend::new().unwrap();
+        let gen = |n: usize, salt: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((i * 13 + salt) % 29) as f32 - 14.0) * 0.05)
+                .collect()
+        };
+        for &(q_len, kv_len, nh, nkv) in &[
+            (128usize, 512usize, 8usize, 2usize),
+            (64, 256, 4, 4),
+            (128, 320, 16, 8),
+            (192, 500, 2, 1),
+        ] {
+            let hd = 128usize;
+            let pos_offset = kv_len - q_len;
+            let padrows = kv_len + 128; // pad rows read past kv_len (masked; must be finite/zero)
+            let bq = {
+                let mut v = r16(&gen(q_len * nh * hd, 1));
+                v.resize(q_len.div_ceil(128) * 128 * nh * hd, 0.0);
+                upf16(&be, &v)
+            };
+            // K/V in KvCache buffers so both bound and BDA reads hit the same bytes.
+            let bk = {
+                let mut v = r16(&gen(kv_len * nkv * hd, 2));
+                v.resize(padrows * nkv * hd, 0.0);
+                upf16_kv(&be, &v)
+            };
+            let bv = {
+                let mut v = r16(&gen(kv_len * nkv * hd, 3));
+                v.resize(padrows * nkv * hd, 0.0);
+                upf16_kv(&be, &v)
+            };
+            let ka = bk
+                .device_addr()
+                .expect("KvCache K must have a device address");
+            let va = bv
+                .device_addr()
+                .expect("KvCache V must have a device address");
+            let addr = Some((ka, va));
+
+            // Exercise the four `attention_prefill_flash` build selections against their bound twin.
+            // (env, label)
+            let cases: &[(&[(&str, &str)], &str)] = &[
+                (&[], "warp (n_splits default)"),
+                (
+                    &[("INFR_FLASH_SPLITS", "2")],
+                    "warp split-K partial+combine",
+                ),
+                (
+                    &[("INFR_NO_FLASH_WARP", "1"), ("INFR_FLASH_SPLITS", "2")],
+                    "non-warp attn_flash_partial",
+                ),
+                (
+                    &[("INFR_FLASH_BM", "32"), ("INFR_FLASH_SPLITS", "2")],
+                    "bm=32 tile",
+                ),
+            ];
+            for (envs, label) in cases {
+                for (k, v) in *envs {
+                    std::env::set_var(k, v);
+                }
+                let bound = run_flash_bytes(
+                    &be,
+                    bq.as_ref(),
+                    bk.as_ref(),
+                    bv.as_ref(),
+                    q_len,
+                    kv_len,
+                    nh,
+                    nkv,
+                    hd,
+                    pos_offset,
+                    FlashStage::Off,
+                    None,
+                );
+                let bda = run_flash_bytes(
+                    &be,
+                    bq.as_ref(),
+                    bk.as_ref(),
+                    bv.as_ref(),
+                    q_len,
+                    kv_len,
+                    nh,
+                    nkv,
+                    hd,
+                    pos_offset,
+                    FlashStage::Off,
+                    addr,
+                );
+                for (k, _) in *envs {
+                    std::env::remove_var(k);
+                }
+                let bf: &[f32] = bytemuck::cast_slice(&bound);
+                assert!(
+                    bf[..q_len * nh * hd]
+                        .iter()
+                        .any(|x| x.is_finite() && *x != 0.0),
+                    "reference flash output degenerate (all zero/NaN) [{label}]"
+                );
+                assert_eq!(
+                    bound, bda,
+                    "INFR_KV_COOPMAT_BDA not bit-identical to bound flash [{label}] \
+                     (q={q_len} kv={kv_len} nh={nh} nkv={nkv})"
+                );
+                println!(
+                    "flash coopmat BDA parity OK [{label}] q={q_len} kv={kv_len} nh={nh} nkv={nkv}"
+                );
+            }
+
+            // The (test-only) register-O `attn_flash_reg` kernel, bound vs BDA.
+            let reg_bound = run_flash_reg_bytes(
+                &be,
+                bq.as_ref(),
+                bk.as_ref(),
+                bv.as_ref(),
+                q_len,
+                kv_len,
+                nh,
+                nkv,
+                hd,
+                pos_offset,
+                None,
+            );
+            let reg_bda = run_flash_reg_bytes(
+                &be,
+                bq.as_ref(),
+                bk.as_ref(),
+                bv.as_ref(),
+                q_len,
+                kv_len,
+                nh,
+                nkv,
+                hd,
+                pos_offset,
+                addr,
+            );
+            assert_eq!(
+                reg_bound, reg_bda,
+                "INFR_KV_COOPMAT_BDA not bit-identical to bound attn_flash_reg \
+                 (q={q_len} kv={kv_len} nh={nh} nkv={nkv})"
+            );
+            println!("flash_reg coopmat BDA parity OK q={q_len} kv={kv_len} nh={nh} nkv={nkv}");
+        }
     }
 
     /// Non-coopmat fma flash prefill (`attn_nc_fa`): host-reference parity across causal /
@@ -10354,6 +10630,7 @@ mod tests {
             nkv,
             hd,
             pos_offset,
+            None,
         );
         rec.finish().unwrap();
         let mut bytes = vec![0u8; mpad * nh * hd * 4];

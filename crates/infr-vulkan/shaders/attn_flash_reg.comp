@@ -39,10 +39,28 @@ layout(push_constant) uniform PC {
     uint pos_offset;
     uint n_splits;
     uint ksplit;
+#ifdef KV_COOPMAT_BDA
+    // -DKV_COOPMAT_BDA build (#74 slice 4 resurrection): K/V cache base device addresses, uvec2-split.
+    // K binding 1 / V binding 2 become INERT (bound only for Recorder::sync's store→read hazard edge);
+    // the QK/PV coopMatLoad reads via KvMat(k_addr)/KvMat(v_addr). See kv_addr.glsl.
+    uint k_lo; uint k_hi; uint v_lo; uint v_hi;
+#endif
 } pc;
+#ifdef KV_COOPMAT_BDA
+#include "kv_addr.glsl"
+#endif
 layout(binding = 0) readonly buffer QB { float16_t q[]; };
+#ifdef KV_COOPMAT_BDA
+// K binding 1 / V binding 2 stay INERT (recorder binds them for the store→read hazard edge only); the
+// QK/PV path reads via KvMat(k_addr)/KvMat(v_addr). No k[]/v[] arrays declared here.
+#define KMAT KvMat(k_addr).v
+#define VMAT KvMat(v_addr).v
+#else
 layout(binding = 1) readonly buffer KB { float16_t k[]; };   // QK: ColumnMajor coopMatLoad
 layout(binding = 2) readonly buffer VB { float16_t v[]; };   // PV: RowMajor coopMatLoad
+#define KMAT k
+#define VMAT v
+#endif
 layout(binding = 3) writeonly buffer POB { vec4 po[]; };     // [n_splits, mpad, nh, hd/4] un-norm O
 layout(binding = 4) writeonly buffer PMB { float pm[]; };    // [n_splits, mpad, nh]
 layout(binding = 5) writeonly buffer PLB { float pl[]; };    // [n_splits, mpad, nh]
@@ -68,6 +86,11 @@ void main() {
     uint nhhd = pc.nh * HD;
     uint nkvhd = pc.nkv * HD;
     float scale = 1.0 / sqrt(float(HD));
+#ifdef KV_COOPMAT_BDA
+    // Wave-uniform K/V cache base pointers, set ONCE (kv_addr.glsl); coopMatLoad carries the offset.
+    k_addr = kv_base(pc.k_lo, pc.k_hi);
+    v_addr = kv_base(pc.v_lo, pc.v_hi);
+#endif
 
     // this thread's logical row + column-worker (for softmax + register O)
     uint row = sg * 16u + lane / 2u;  // 0..127
@@ -93,7 +116,7 @@ void main() {
                             gl_CooperativeMatrixLayoutRowMajor);
             [[unroll]] for (uint b = 0u; b < 2u; b++) {
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
-                coopMatLoad(B, k, (kv0 + warp_c * 32u + b * 16u) * nkvhd + kvh * HD + kf, nkvhd,
+                coopMatLoad(B, KMAT, (kv0 + warp_c * 32u + b * 16u) * nkvhd + kvh * HD + kf, nkvhd,
                             gl_CooperativeMatrixLayoutColumnMajor);
                 [[unroll]] for (uint a = 0u; a < 2u; a++) sacc[a][b] = coopMatMulAdd(A[a], B, sacc[a][b]);
             }
@@ -143,7 +166,7 @@ void main() {
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> Pm;
                 coopMatLoad(Pm, Psh, (sg * 16u) * BC + bc, BC, gl_CooperativeMatrixLayoutRowMajor);
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> Vm;
-                coopMatLoad(Vm, v, (kv0 + bc) * nkvhd + kvh * HD + ct * 16u, nkvhd,
+                coopMatLoad(Vm, VMAT, (kv0 + bc) * nkvhd + kvh * HD + ct * 16u, nkvhd,
                             gl_CooperativeMatrixLayoutRowMajor);
                 pacc = coopMatMulAdd(Pm, Vm, pacc);
             }

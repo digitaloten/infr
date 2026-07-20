@@ -40,6 +40,22 @@ float kv_half(uint64_t base, uint i) {
     return float(KvHalf(base + uint64_t(i << 1u)).v[0]);
 }
 
+// ── Cooperative-matrix tensor base (coopmat flash prefill, #74 slice 4 resurrection) ────────────
+// The coopmat flash-prefill QK/PV `coopMatLoad` reads the KV tensor straight from a buffer_reference
+// base: `coopMatLoad(M, KvMat(k_addr).v, elem_off, stride, layout)`. The pointer carries ONLY the
+// wave-uniform arena base (k_addr / v_addr); the FULL intra-tensor element offset + row stride stay in
+// coopMatLoad's own 32-bit args — the slice-4-PROVEN spelling (base = wave-uniform push base, all
+// offset in the element/stride args). `v[]` is an unsized f16 runtime array, byte offset built by the
+// driver's per-lane coopmat addressing. WHY OPT-IN (RADV/RDNA3): RADV's coopMatLoad lowering emits
+// opaque per-lane addressing and will NOT select saddr from a buffer_reference base → per-lane 64-bit
+// carry-adds (~260-520 v_add_co/v_addc), ~+33-40% code, prefill ~0.80-0.83x. So on RDNA3 the bound
+// descriptor stays the DEFAULT; `-DKV_COOPMAT_BDA` is the alternate for silicon that addresses coopmat
+// loads better (NVIDIA cm2, future drivers). See kv-u64-campaign slice 4 + kv-decode-perf-levers.
+// Guarded on KV_COOPMAT_BDA so the decode `-DKV_BDA` includers (no coopmat) don't emit this block.
+#ifdef KV_COOPMAT_BDA
+layout(buffer_reference, std430, buffer_reference_align = 2) readonly buffer KvMat { float16_t v[]; };
+#endif
+
 // One u32 word `wi` off `base` — the planar-Q8 code/scale read (`ku[wi]` / `vu[wi]`). Identical
 // shape to native_weight_addr.glsl's `arena_word`: byte offset `wi<<2` in u32, deref index 0.
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer KvWords { uint v[]; };

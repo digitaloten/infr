@@ -1852,6 +1852,20 @@ const ATTN_FLASH_REG_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_reg.spv"));
 const ATTN_FLASH_REG_BR64_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_reg_br64.spv"));
+// KV-cache u64/BDA twins (#74 slice 4 resurrection): the coopmat flash-prefill kernels reading K/V by
+// device address (INFR_KV_COOPMAT_BDA=1, opt-in, default OFF). See attn_flash_partial.comp KV_COOPMAT_BDA.
+const ATTN_FLASH_PARTIAL_BDA_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_partial_bda.spv"));
+const ATTN_FLASH_PARTIAL_BM32_BDA_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_partial_bm32_bda.spv"));
+const ATTN_FLASH_WARP_BDA_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_warp_bda.spv"));
+const ATTN_FLASH_WARP_BM32_BDA_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_warp_bm32_bda.spv"));
+const ATTN_FLASH_REG_BDA_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_reg_bda.spv"));
+const ATTN_FLASH_REG_BR64_BDA_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_reg_br64_bda.spv"));
 const ATTN_FLASH_COMBINE_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_combine.spv"));
 const ATTN_SM_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_softmax.spv"));
@@ -1929,6 +1943,12 @@ static ATTN_FLASH_WARP_DEQ_Q5_1_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_WARP_DEQ_Q5_1_BM32_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_REG_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_REG_BR64_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_PARTIAL_BDA_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_PARTIAL_BM32_BDA_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_WARP_BDA_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_WARP_BM32_BDA_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_REG_BDA_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_REG_BR64_BDA_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_COMBINE_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_SM_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_PV_SPV: OnceLock<Vec<u32>> = OnceLock::new();
@@ -2165,6 +2185,36 @@ pub(crate) fn attn_flash_reg_spv() -> &'static [u32] {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_flash_reg_br64_spv() -> &'static [u32] {
     ATTN_FLASH_REG_BR64_SPV.get_or_init(|| spv_words(ATTN_FLASH_REG_BR64_SPV_BYTES))
+}
+// KV-cache u64/BDA twins (#74 slice 4 resurrection): the coopmat flash-prefill kernels reading K/V by
+// device address (kv_addr.glsl `KvMat(k_addr)/(v_addr)` coopMatLoad base). OPT-IN via
+// `INFR_KV_COOPMAT_BDA=1` (default OFF): on RADV/RDNA3 the coopmat load gets no saddr from a
+// buffer_reference base (~+33-40% code, ~0.8x prefill) so the bound build stays the default; kept for
+// silicon that addresses coopmat loads better. Selected by `attention_prefill_flash`/`_reg` when the
+// KV buffers report a device address AND the caller opts in (adapter's `kv_coopmat_bda` gate).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn attn_flash_partial_bda_spv() -> &'static [u32] {
+    ATTN_FLASH_PARTIAL_BDA_SPV.get_or_init(|| spv_words(ATTN_FLASH_PARTIAL_BDA_SPV_BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn attn_flash_partial_bm32_bda_spv() -> &'static [u32] {
+    ATTN_FLASH_PARTIAL_BM32_BDA_SPV.get_or_init(|| spv_words(ATTN_FLASH_PARTIAL_BM32_BDA_SPV_BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn attn_flash_warp_bda_spv() -> &'static [u32] {
+    ATTN_FLASH_WARP_BDA_SPV.get_or_init(|| spv_words(ATTN_FLASH_WARP_BDA_SPV_BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn attn_flash_warp_bm32_bda_spv() -> &'static [u32] {
+    ATTN_FLASH_WARP_BM32_BDA_SPV.get_or_init(|| spv_words(ATTN_FLASH_WARP_BM32_BDA_SPV_BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn attn_flash_reg_bda_spv() -> &'static [u32] {
+    ATTN_FLASH_REG_BDA_SPV.get_or_init(|| spv_words(ATTN_FLASH_REG_BDA_SPV_BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn attn_flash_reg_br64_bda_spv() -> &'static [u32] {
+    ATTN_FLASH_REG_BR64_BDA_SPV.get_or_init(|| spv_words(ATTN_FLASH_REG_BR64_BDA_SPV_BYTES))
 }
 /// Flash-attention split-K combine (merge partials → final O). Recorder use.
 #[cfg_attr(infr_profile, infr_prof::instrument)]

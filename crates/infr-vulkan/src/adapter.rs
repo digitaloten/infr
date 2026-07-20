@@ -2833,6 +2833,13 @@ fn lower_op(
                 } else {
                     crate::recorder::FlashStage::Off
                 };
+                // #74 slice 4 resurrection (INFR_KV_COOPMAT_BDA=1, opt-in, default OFF): read the KV
+                // cache in the coopmat flash prefill by 64-bit device address instead of bound SSBOs.
+                // Only meaningful on the Off (f16) path — the Stage/Dequant builds have no BDA arm — so
+                // gate it there. On RADV/RDNA3 this REGRESSES prefill (~0.8x, no saddr from a
+                // buffer_reference coopmat base), so it stays off by default; kept for other silicon.
+                let kv_coopmat_bda = matches!(flash_stage, crate::recorder::FlashStage::Off)
+                    && std::env::var("INFR_KV_COOPMAT_BDA").is_ok();
                 // Prefill at hd≠128 (qwen35/gemma hd=256): the non-FA coopmat pipeline
                 // (attn_qk → softmax → attn_pv) is hd-general and ~an order faster than the scalar
                 // attention_kv. Needs 64-row-padded q/dst (Internal buffers are row-padded), so
@@ -3011,6 +3018,13 @@ fn lower_op(
                         Some(k) => pool[k].as_ref(),
                         None => r(*v_cache)?,
                     };
+                    // Opt-in coopmat-prefill BDA (INFR_KV_COOPMAT_BDA): fork to the `_bda` builds only
+                    // when the flag is set AND both KV buffers carry a device address (KvCache always
+                    // does since #74). kc/vc stay bound (inert) so the store→read hazard edge holds.
+                    let kv_addr = match (kv_coopmat_bda, kcb.device_addr(), vcb.device_addr()) {
+                        (true, Some(ka), Some(va)) => Some((ka, va)),
+                        _ => None,
+                    };
                     rec.attention_prefill_flash(
                         r(*q)?,
                         kcb,
@@ -3026,6 +3040,7 @@ fn lower_op(
                         hd,
                         pos,
                         flash_stage,
+                        kv_addr,
                     );
                 } else if nonfa_ok {
                     let window = match mask {
