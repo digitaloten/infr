@@ -125,6 +125,77 @@ fn main() {
             "attn_partial_mrows_c256_bda",
             &["-DSC_MAX=256u", "-DKV_BDA"],
         ),
+        // Lever 1 (kv-decode-perf-levers #1): mainline low-bit KV decode reads the compact GGUF
+        // block format INLINE (native_decode `dq()` on the cache via `dq_addr`=k_addr/v_addr), so
+        // Q4/Q5 decode moves ¼ the traffic vs the dequant→f16 prepass + f16-scratch read. K and V
+        // always share the cache dtype, so both sides route through one FMT (-DKMAINLINE -DVMAINLINE).
+        // Always -DKV_BDA (the inline decode reads by device address). `_nohd` twin for
+        // INFR_NO_ATTN_HD A/B (matches the f16 `attn_partial_nohd_bda`). Selected by
+        // Recorder::attention_kv_split_impl's `kv_ml` arm; adapter.rs's `decode_inline` gate.
+        (
+            "attn_partial",
+            "attn_partial_ml_q4_0_bda",
+            &["-DKMAINLINE", "-DVMAINLINE", "-DFMT_Q4_0", "-DKV_BDA"],
+        ),
+        (
+            "attn_partial",
+            "attn_partial_ml_q4_0_nohd_bda",
+            &[
+                "-DKMAINLINE",
+                "-DVMAINLINE",
+                "-DFMT_Q4_0",
+                "-DNO_HD_SPEC",
+                "-DKV_BDA",
+            ],
+        ),
+        (
+            "attn_partial",
+            "attn_partial_ml_q4_1_bda",
+            &["-DKMAINLINE", "-DVMAINLINE", "-DFMT_Q4_1", "-DKV_BDA"],
+        ),
+        (
+            "attn_partial",
+            "attn_partial_ml_q4_1_nohd_bda",
+            &[
+                "-DKMAINLINE",
+                "-DVMAINLINE",
+                "-DFMT_Q4_1",
+                "-DNO_HD_SPEC",
+                "-DKV_BDA",
+            ],
+        ),
+        (
+            "attn_partial",
+            "attn_partial_ml_q5_0_bda",
+            &["-DKMAINLINE", "-DVMAINLINE", "-DFMT_Q5_0", "-DKV_BDA"],
+        ),
+        (
+            "attn_partial",
+            "attn_partial_ml_q5_0_nohd_bda",
+            &[
+                "-DKMAINLINE",
+                "-DVMAINLINE",
+                "-DFMT_Q5_0",
+                "-DNO_HD_SPEC",
+                "-DKV_BDA",
+            ],
+        ),
+        (
+            "attn_partial",
+            "attn_partial_ml_q5_1_bda",
+            &["-DKMAINLINE", "-DVMAINLINE", "-DFMT_Q5_1", "-DKV_BDA"],
+        ),
+        (
+            "attn_partial",
+            "attn_partial_ml_q5_1_nohd_bda",
+            &[
+                "-DKMAINLINE",
+                "-DVMAINLINE",
+                "-DFMT_Q5_1",
+                "-DNO_HD_SPEC",
+                "-DKV_BDA",
+            ],
+        ),
         ("attn_qk", "attn_qk", &[]),
         ("attn_qk_warp", "attn_qk_warp", &[]),
         ("attn_flash", "attn_flash", &[]),

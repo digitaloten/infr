@@ -5074,7 +5074,7 @@ impl<'a> Recorder<'a> {
     ) {
         self.attention_kv_split_impl(
             q, kc, vc, o, pm, pl, pacc, rows, pos, kv_len, nh, nkv, hd, chunk, n_chunks, scale,
-            window, canvas_lo, k_q8, v_q8, cap, batched, None,
+            window, canvas_lo, k_q8, v_q8, cap, batched, None, None,
         );
     }
 
@@ -5111,6 +5111,10 @@ impl<'a> Recorder<'a> {
         v_q8: bool,
         cap: usize,
         batched: bool,
+        // Lever 1: `Some(dt)` routes pass 1 through the mainline-INLINE `attn_partial` build for the
+        // low-bit block quant `dt` (K and V share the dtype) — the cache is read/dequanted in-kernel,
+        // no dequant→f16 prepass. Requires the BDA base (this `_at` method); `None` keeps f16/Q8.
+        kv_ml: Option<infr_core::DType>,
     ) {
         self.attention_kv_split_impl(
             q,
@@ -5136,6 +5140,7 @@ impl<'a> Recorder<'a> {
             cap,
             batched,
             Some((k_addr, v_addr)),
+            kv_ml,
         );
     }
 
@@ -5184,38 +5189,48 @@ impl<'a> Recorder<'a> {
         // attn_partial twins (kv_addr.glsl device-address reads); None keeps the bound-SSBO bindings.
         // kc/vc stay bound at slots 1/2 either way for the store→read hazard edge.
         kv_addr: Option<(u64, u64)>,
+        // Lever 1: `Some(dt)` → mainline-INLINE decode build (reads the compact block quant directly,
+        // no dequant→f16 prepass). Only ever set with `kv_addr` Some (inline decode needs the BDA
+        // base) and with `k_q8`/`v_q8`/`batched` false (mainline is a distinct read path).
+        kv_ml: Option<infr_core::DType>,
     ) {
         let bda = kv_addr.is_some();
         // pass 1: per-chunk partials (subgroup-reduction QK; needs requiredSubgroupSize=32). Each
         // f16 variant has a `_bda` twin selected when `kv_addr` is Some (device-address K/V reads).
-        let (p1name, p1spv) = match (k_q8, v_q8) {
-            (false, false) if crate::gemm::attn_hd_spec_disabled() => {
-                if bda {
-                    (
-                        "attn_partial_nohd_bda",
-                        crate::gemm::attn_partial_nohd_bda_spv(),
-                    )
-                } else {
-                    ("attn_partial_nohd", crate::gemm::attn_partial_nohd_spv())
+        let (p1name, p1spv) = if let Some(dt) = kv_ml {
+            // Lever 1: mainline low-bit KV decode reads the cache INLINE (per-format FMT build).
+            debug_assert!(bda && !k_q8 && !v_q8 && !batched);
+            crate::gemm::attn_partial_ml_kernel(dt, crate::gemm::attn_hd_spec_disabled())
+        } else {
+            match (k_q8, v_q8) {
+                (false, false) if crate::gemm::attn_hd_spec_disabled() => {
+                    if bda {
+                        (
+                            "attn_partial_nohd_bda",
+                            crate::gemm::attn_partial_nohd_bda_spv(),
+                        )
+                    } else {
+                        ("attn_partial_nohd", crate::gemm::attn_partial_nohd_spv())
+                    }
                 }
+                (false, false) if bda => ("attn_partial_bda", crate::gemm::attn_partial_bda_spv()),
+                (false, false) => ("attn_partial", crate::gemm::attn_partial_spv()),
+                (true, false) if bda => (
+                    "attn_partial_kq8_bda",
+                    crate::gemm::attn_partial_kq8_bda_spv(),
+                ),
+                (true, false) => ("attn_partial_kq8", crate::gemm::attn_partial_kq8_spv()),
+                (false, true) if bda => (
+                    "attn_partial_vq8_bda",
+                    crate::gemm::attn_partial_vq8_bda_spv(),
+                ),
+                (false, true) => ("attn_partial_vq8", crate::gemm::attn_partial_vq8_spv()),
+                (true, true) if bda => (
+                    "attn_partial_q8_bda",
+                    crate::gemm::attn_partial_q8_bda_spv(),
+                ),
+                (true, true) => ("attn_partial_q8", crate::gemm::attn_partial_q8_spv()),
             }
-            (false, false) if bda => ("attn_partial_bda", crate::gemm::attn_partial_bda_spv()),
-            (false, false) => ("attn_partial", crate::gemm::attn_partial_spv()),
-            (true, false) if bda => (
-                "attn_partial_kq8_bda",
-                crate::gemm::attn_partial_kq8_bda_spv(),
-            ),
-            (true, false) => ("attn_partial_kq8", crate::gemm::attn_partial_kq8_spv()),
-            (false, true) if bda => (
-                "attn_partial_vq8_bda",
-                crate::gemm::attn_partial_vq8_bda_spv(),
-            ),
-            (false, true) => ("attn_partial_vq8", crate::gemm::attn_partial_vq8_spv()),
-            (true, true) if bda => (
-                "attn_partial_q8_bda",
-                crate::gemm::attn_partial_q8_bda_spv(),
-            ),
-            (true, true) => ("attn_partial_q8", crate::gemm::attn_partial_q8_spv()),
         };
         // Rows-BATCHED pass 1 (INFR_MROWS_ATTN=1 [+ INFR_MROWS_CHUNK=256], OFF by default): one
         // workgroup per (head, chunk) streams K/V ONCE for a 4-row group — one subgroupAdd(vec4)

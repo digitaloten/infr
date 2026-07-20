@@ -3003,6 +3003,65 @@ dyn_spv!(
     attn_partial_mrows_c256_bda_spv,
     "attn_partial_mrows_c256_bda"
 );
+// Lever 1 (kv-decode-perf-levers #1): mainline low-bit KV decode reads the compact GGUF block
+// format INLINE (native_decode `dq()` via `dq_addr`=k_addr/v_addr) instead of the dequant→f16
+// prepass — the decode-side twin of dequant-in-flash. Per-format `-DKMAINLINE -DVMAINLINE -DFMT_*`
+// (K and V share the cache dtype) with the f16 `_nohd` A/B twin. Selected by `attn_partial_ml_kernel`.
+dyn_spv!(attn_partial_ml_q4_0_bda_spv, "attn_partial_ml_q4_0_bda");
+dyn_spv!(
+    attn_partial_ml_q4_0_nohd_bda_spv,
+    "attn_partial_ml_q4_0_nohd_bda"
+);
+dyn_spv!(attn_partial_ml_q4_1_bda_spv, "attn_partial_ml_q4_1_bda");
+dyn_spv!(
+    attn_partial_ml_q4_1_nohd_bda_spv,
+    "attn_partial_ml_q4_1_nohd_bda"
+);
+dyn_spv!(attn_partial_ml_q5_0_bda_spv, "attn_partial_ml_q5_0_bda");
+dyn_spv!(
+    attn_partial_ml_q5_0_nohd_bda_spv,
+    "attn_partial_ml_q5_0_nohd_bda"
+);
+dyn_spv!(attn_partial_ml_q5_1_bda_spv, "attn_partial_ml_q5_1_bda");
+dyn_spv!(
+    attn_partial_ml_q5_1_nohd_bda_spv,
+    "attn_partial_ml_q5_1_nohd_bda"
+);
+
+/// (kernel name, SPIR-V) for the mainline-INLINE split-K decode partial pass (`attn_partial`,
+/// `-DKMAINLINE -DVMAINLINE -DFMT_* -DKV_BDA`) of the low-bit block quant `dt`. `nohd` selects the
+/// `-DNO_HD_SPEC` A/B twin (INFR_NO_ATTN_HD). Covers the formats with a coalesced inline vec4 decoder
+/// (q4_0/q4_1/q5_0/q5_1); iq4_nl (codebook gather) + other prepass dtypes keep the dequant→f16 path.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn attn_partial_ml_kernel(
+    dt: infr_core::DType,
+    nohd: bool,
+) -> (&'static str, &'static [u32]) {
+    use infr_core::DType::*;
+    match (dt, nohd) {
+        (Q4_0, false) => ("attn_partial_ml_q4_0_bda", attn_partial_ml_q4_0_bda_spv()),
+        (Q4_0, true) => (
+            "attn_partial_ml_q4_0_nohd_bda",
+            attn_partial_ml_q4_0_nohd_bda_spv(),
+        ),
+        (Q4_1, false) => ("attn_partial_ml_q4_1_bda", attn_partial_ml_q4_1_bda_spv()),
+        (Q4_1, true) => (
+            "attn_partial_ml_q4_1_nohd_bda",
+            attn_partial_ml_q4_1_nohd_bda_spv(),
+        ),
+        (Q5_0, false) => ("attn_partial_ml_q5_0_bda", attn_partial_ml_q5_0_bda_spv()),
+        (Q5_0, true) => (
+            "attn_partial_ml_q5_0_nohd_bda",
+            attn_partial_ml_q5_0_nohd_bda_spv(),
+        ),
+        (Q5_1, false) => ("attn_partial_ml_q5_1_bda", attn_partial_ml_q5_1_bda_spv()),
+        (Q5_1, true) => (
+            "attn_partial_ml_q5_1_nohd_bda",
+            attn_partial_ml_q5_1_nohd_bda_spv(),
+        ),
+        _ => unreachable!("attn_partial_ml_kernel for non-inline-decode KV dtype {dt:?}"),
+    }
+}
 dyn_spv!(dequant_q8_f16_spv, "dequant_q8_f16");
 /// SPIR-V for the SELF-CHUNKING record-once split-K decode partial (adaptive chunk from the live
 /// kv_len; workgroups past the live range early-exit with a zero-weight header).

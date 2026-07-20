@@ -30,6 +30,96 @@ layout(push_constant) uniform PC {
 #ifdef KV_BDA
 #include "kv_addr.glsl"
 #endif
+#if defined(KMAINLINE) || defined(VMAINLINE)
+// Lever 1 (kv-decode-perf-levers #1): mainline low-bit KV (q4_0/q4_1/q5_0/q5_1) decode reads the
+// compact GGUF block format INLINE via a dedicated COALESCED, block-amortized decoder (`dqv4` below)
+// — instead of the dequant→f16 PREPASS (dequant_kv_f16 → f16 scratch → f16 attention). Decode is
+// KV-read-bound at long context; the prepass pays a 2× f16-scratch round-trip (write + read) the
+// inline path skips, so reading the ¼-size Q4 (⅜-size Q5) cache directly should win at depth. The
+// v1 attempt reused native_decode `dq()` PER ELEMENT (uncoalesced reads, scale re-decoded every
+// element) and regressed ~2.8×; `dqv4` fixes that the way the Q8 inline `dq8k`/`dq8v` do — scale
+// (and Q4_1/Q5_1 min, Q5 qh plane) decoded ONCE per block, the four codes pulled from ONE u32.
+// The NW/NW2/NW4 read chokepoint points at a MUTABLE `dq_addr` (kv_addr.glsl `kv_word*`), set to
+// k_addr for K reads / v_addr for V reads — the QK dot pass fully precedes the P·V pass, so one
+// global base is unambiguous. Same saddr `kv_word` shape dequant_kv_f16.comp's -DKV_BDA build uses.
+// Each vec4 is f16-rounded (`mlround`) to REPRODUCE the prepass's f16 scratch bit-for-bit → the
+// inline output is byte-identical to the dequant→f16 path (kv_addr_parity mainline case). iq4_nl
+// (codebook gather) is NOT inlined — it stays on the prepass.
+uint64_t dq_addr = 0ul;
+#define NW(i) kv_word(dq_addr, (i))
+#define NW2(wbase) kv_word2(dq_addr, (wbase))
+#define NW4(wbase) kv_word4(dq_addr, (wbase))
+#include "native_decode.glsl" // reused for the block-header readers ru16/ru32u/ru32b + f16tof32
+// Round a decoded vec4 to IEEE binary16 EXACTLY like the prepass's f16 scratch (`dequant_kv_f16.comp`
+// stores `float16_t(dq(i))`, later read back as an `f16vec4`). The round MUST go through a real
+// `f16vec4`: a scalar `float(float16_t(x))` gets folded back to full f32 by ACO (measured ~7e-4 off
+// the prepass), but building an `f16vec4` then `vec4()`-converting is the SAME op the bound f16 path
+// runs on a memory `f16vec4` (`vec4(k4[i])`), so the 16-bit round survives → byte-identical.
+vec4 mlround(vec4 v) {
+    return vec4(f16vec4(float16_t(v.x), float16_t(v.y), float16_t(v.z), float16_t(v.w)));
+}
+// ── COALESCED, block-AMORTIZED inline vec4 decoders (v2) ────────────────────────────────────────
+// The v1 arm called native_decode `dq()` PER ELEMENT — uncoalesced scalar reads + a re-decoded block
+// scale every element → ~2.8x the prepass KV-path cost (a decode regression). These decode a whole
+// vec4 (elements g..g+3, always within ONE 32-elem block and ONE nibble-half since g is a multiple of
+// 4) the way the Q8 inline `dq8k`/`dq8v` do: read the block's f16 scale (and Q4_1/Q5_1 min, Q5's qh
+// plane) ONCE per block, and pull the four 4-bit codes from ONE u32 word (`ru32u`, a single saddr
+// b32/b64) instead of four per-byte reads. Bit-identical to `dq()` (same integers, same product order)
+// and to the prepass after `mlround`. iq4_nl (codebook gather) is NOT inlined — it stays on the prepass.
+#if defined(FMT_Q4_0)
+// Q4_0 [f16 d][u8 qs[16]] = 18B. y = d*(nib-8). Low half (pos<16) → qs low nibbles, high half → high.
+vec4 dqv4(uint g) {
+    uint bd = (g / 32u) * 18u; uint p = g % 32u;
+    float d = f16tof32(ru16(bd));
+    uint w = ru32u(bd + 2u + ((p < 16u) ? p : p - 16u)); // 4 code bytes, one read
+    uint s0 = (p < 16u) ? 0u : 4u;                        // low vs high nibble of each byte
+    return mlround(vec4(d * (float((w >> s0) & 0xFu) - 8.0),
+                        d * (float((w >> (8u + s0)) & 0xFu) - 8.0),
+                        d * (float((w >> (16u + s0)) & 0xFu) - 8.0),
+                        d * (float((w >> (24u + s0)) & 0xFu) - 8.0)));
+}
+#elif defined(FMT_Q4_1)
+// Q4_1 [f16 d][f16 m][u8 qs[16]] = 20B. y = d*nib + m.
+vec4 dqv4(uint g) {
+    uint bd = (g / 32u) * 20u; uint p = g % 32u;
+    float d = f16tof32(ru16(bd)); float m = f16tof32(ru16(bd + 2u));
+    uint w = ru32u(bd + 4u + ((p < 16u) ? p : p - 16u));
+    uint s0 = (p < 16u) ? 0u : 4u;
+    return mlround(vec4(d * float((w >> s0) & 0xFu) + m,
+                        d * float((w >> (8u + s0)) & 0xFu) + m,
+                        d * float((w >> (16u + s0)) & 0xFu) + m,
+                        d * float((w >> (24u + s0)) & 0xFu) + m));
+}
+#elif defined(FMT_Q5_0)
+// Q5_0 [f16 d][u8 qh[4]][u8 qs[16]] = 22B. y = d*(q5-16); q5 = nib | (bit p of qh)<<4.
+vec4 dqv4(uint g) {
+    uint bd = (g / 32u) * 22u; uint p = g % 32u;
+    float d = f16tof32(ru16(bd)); uint qh = ru32b(bd + 2u);
+    uint w = ru32u(bd + 6u + ((p < 16u) ? p : p - 16u));
+    uint s0 = (p < 16u) ? 0u : 4u;
+    vec4 r;
+    r.x = d * (float(((w >> s0) & 0xFu) | (((qh >> p) & 1u) << 4u)) - 16.0);
+    r.y = d * (float(((w >> (8u + s0)) & 0xFu) | (((qh >> (p + 1u)) & 1u) << 4u)) - 16.0);
+    r.z = d * (float(((w >> (16u + s0)) & 0xFu) | (((qh >> (p + 2u)) & 1u) << 4u)) - 16.0);
+    r.w = d * (float(((w >> (24u + s0)) & 0xFu) | (((qh >> (p + 3u)) & 1u) << 4u)) - 16.0);
+    return mlround(r);
+}
+#elif defined(FMT_Q5_1)
+// Q5_1 [f16 d][f16 m][u8 qh[4]][u8 qs[16]] = 24B. y = d*q5 + m; q5 = nib | (bit p of qh)<<4.
+vec4 dqv4(uint g) {
+    uint bd = (g / 32u) * 24u; uint p = g % 32u;
+    float d = f16tof32(ru16(bd)); float m = f16tof32(ru16(bd + 2u)); uint qh = ru32b(bd + 4u);
+    uint w = ru32u(bd + 8u + ((p < 16u) ? p : p - 16u));
+    uint s0 = (p < 16u) ? 0u : 4u;
+    vec4 r;
+    r.x = d * float(((w >> s0) & 0xFu) | (((qh >> p) & 1u) << 4u)) + m;
+    r.y = d * float(((w >> (8u + s0)) & 0xFu) | (((qh >> (p + 1u)) & 1u) << 4u)) + m;
+    r.z = d * float(((w >> (16u + s0)) & 0xFu) | (((qh >> (p + 2u)) & 1u) << 4u)) + m;
+    r.w = d * float(((w >> (24u + s0)) & 0xFu) | (((qh >> (p + 3u)) & 1u) << 4u)) + m;
+    return mlround(r);
+}
+#endif
+#endif
 layout(binding = 0) readonly buffer QB { f16vec4 q4[]; };    // [rows, nh, hd] as vec4
 // PLANAR Q8_0 KV cache (per-side): codes int8[cap] then scales f16[cap/32] (see store_q8), read as
 // `uint` words — each `f16vec4` load becomes ONE aligned u32 (4 codes) + one scale word shared by the
@@ -37,7 +127,13 @@ layout(binding = 0) readonly buffer QB { f16vec4 q4[]; };    // [rows, nh, hd] a
 // combinations are separate pipeline variants. Q8 moves half the KV bytes at decode depth.
 // A planar-Q8 vec4 at vec4-index i4 (elements 4*i4..+3): word i4 = 4 packed int8 codes; the block's
 // f16 scale is at scale-word cap/4 + block/2 (block = 4*i4/32 = i4/8), lane picked by block&1.
-#ifdef KQ8
+#ifdef KMAINLINE
+// Mainline low-bit K: decode a vec4 (elements 4*i4..+3) inline. `dq_addr` is set to k_addr ONCE in
+// main (a single wave-uniform program point, like k_addr itself) before any K read, so native_decode's
+// kv_word reads keep a saddr scalar base. `dqh` rounds each element to f16 to match the prepass.
+vec4 kvec4_ml(uint i4) { return dqv4(i4 << 2u); }
+#define KVEC4(i) kvec4_ml(i)
+#elif defined(KQ8)
 #ifdef KV_BDA
 // Planar-Q8 K by device address: the code word (`ku[i4]`) and the block scale are single u32 words,
 // so each reads through kv_word (one global_load_b32) off k_addr — the wide KV2/KV4 reads are for the
@@ -77,7 +173,12 @@ layout(binding = 1) readonly buffer KB { f16vec4 k4[]; };    // cache [kv_len, n
 #define KVEC4(i) vec4(k4[i])
 #endif
 #endif
-#ifdef VQ8
+#ifdef VMAINLINE
+// Mainline low-bit V: `dq_addr` is re-pointed to v_addr ONCE in main just before the V pass (the QK
+// pass has fully finished by then, so switching the shared base is safe and stays wave-uniform).
+vec4 vvec4_ml(uint i4) { return dqv4(i4 << 2u); }
+#define VVEC4(i) vvec4_ml(i)
+#elif defined(VQ8)
 #ifdef KV_BDA
 vec4 vvec4(uint i4) {
     int cw = int(kv_word(v_addr, i4));
@@ -136,6 +237,10 @@ void main() {
     // 64-bit carry-add) and, for f16, a fused b64.
     k_addr = kv_base(pc.k_lo, pc.k_hi);
     v_addr = kv_base(pc.v_lo, pc.v_hi);
+#ifdef KMAINLINE
+    // Point native_decode's read chokepoint at the K cache for the whole QK pass (uniform, once).
+    dq_addr = k_addr;
+#endif
 #endif
     uint hd = pc.hd;
     uint hd4 = hd >> 2u;
@@ -347,6 +452,11 @@ void main() {
     }
     float l = red[0];
 
+#ifdef VMAINLINE
+    // Re-point native_decode's read chokepoint at the V cache for the P·V pass (uniform, once). The
+    // QK pass (which used dq_addr = k_addr under KMAINLINE) has fully completed above.
+    dq_addr = v_addr;
+#endif
     // V: thread owns a vec4 of output dims; one wide coalesced load per key.
     uint pbase = ((row * pc.nh + h) * pc.n_chunks + c) * hd;
     if (hd4 <= 32u) {

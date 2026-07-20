@@ -452,6 +452,7 @@ fn run_split(be: &VulkanBackend, c: &SplitCase, k_q8: bool, v_q8: bool) -> Legs 
                 v_q8,
                 cap,
                 batched,
+                None,
             ),
             None => rec.attention_kv_split(
                 q_buf.as_ref(),
@@ -591,6 +592,227 @@ fn attn_partial_bda_matches_bound_q8() {
         let name = format!("q8(k={k_q8},v={v_q8}) split kv={} hd={}", c.kv_len, c.hd);
         assert_legs(&name, &l);
         println!("ok: {name}");
+    }
+}
+
+// ── Lever 1 (kv-decode-perf-levers #1): mainline low-bit KV decode reads the compact GGUF block
+// format INLINE in `attn_partial` (`-DKMAINLINE -DVMAINLINE -DFMT_* -DKV_BDA`), instead of the
+// dequant→f16 PREPASS (`dequant_kv_f16` → f16 scratch → f16 `attention_kv_split`). The inline build
+// rounds each decoded element to f16 (`dqh`) to reproduce the scratch EXACTLY, so the two paths must
+// be BYTE-IDENTICAL — anything else is a decode/addressing bug, not a tolerance question. Two checks:
+//   * INLINE-VS-PREPASS: `attention_kv_split_at(kv_ml=Some(dt))` reading the quant cache directly vs
+//     the prepass (dequant to f16 scratch, then f16 `attention_kv_split`) — identical output bits.
+//   * OFFSET-INVARIANCE (load-bearing): the SAME quant cache parked behind a garbage byte prefix,
+//     `k_addr`/`v_addr` = base+prefix — a twin dropping its base offset would read the prefix.
+
+/// Bytes for one mainline-quant KV side holding `elems` cache elements (`block` bytes per 32 elems),
+/// crafted so EVERY dequantized value is exactly an integer (hence exactly f16-representable): the
+/// per-block scale `d` is forced to 1.0 and any min `m` to 0.0, while the quant codes (nibbles / qh
+/// high bits) are varied by `synth`. Then `dq()` yields `(code - bias)` — an integer in a small range,
+/// exact in f16 — so the prepass's `float16_t(dq)` store-round is the IDENTITY and the inline
+/// (f16-rounded) decode is BIT-IDENTICAL to it. This still exercises the whole inline read/decode path
+/// (block addressing, nibble+qh extraction, accumulation); only the non-exact scale-multiply rounding
+/// — where in-register f16 and memory f16 legitimately differ by a ULP on this driver — is factored out.
+fn mainline_side_bytes(elems: usize, dt: infr_core::DType, block: usize, seed: usize) -> Vec<u8> {
+    use infr_core::DType::*;
+    assert_eq!(elems % 32, 0, "mainline cache must be whole 32-elem blocks");
+    let mut b = synth_bytes((elems / 32) * block, seed);
+    let one = 0x3C00u16.to_le_bytes(); // f16 1.0
+    let zero = 0u16.to_le_bytes();
+    for blk in b.chunks_mut(block) {
+        blk[0..2].copy_from_slice(&one); // d = 1.0 (first field of every mainline block)
+        if matches!(dt, Q4_1 | Q5_1) {
+            blk[2..4].copy_from_slice(&zero); // m = 0.0 (Q4_1/Q5_1 carry a min after d)
+        }
+    }
+    b
+}
+
+/// Runs one mainline decode case (rows==1, full context) three ways and asserts byte-identity:
+/// prepass (dequant→f16 + f16 split), inline@0, inline@nonzero-offset.
+fn run_mainline(
+    be: &VulkanBackend,
+    dt: infr_core::DType,
+    block: usize,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    kv_len: usize,
+) {
+    let rows = 1usize;
+    let pos = kv_len - rows;
+    let scale = 0.0f32; // default 1/sqrt(hd)
+    let window = 0usize;
+    let cap = 0usize; // full-context (RROW identity); mainline ignores the planar-Q8 scales base
+    let chunk = (kv_len / 32).clamp(64, 512);
+    let n_chunks = kv_len.div_ceil(chunk);
+    assert!(
+        n_chunks > 1,
+        "case must split into >1 chunk to exercise the grid"
+    );
+    let elems = kv_len * nkv * hd; // full-context cache
+    let ne = elems;
+
+    let q = synth_f16(rows * nh * hd, 101);
+    let q_buf = be.alloc(q.len(), BufferUsage::Activations).unwrap();
+    be.upload(q_buf.as_ref(), &q).unwrap();
+    let o_bytes = rows * nh * hd * 4;
+
+    let kd = mainline_side_bytes(elems, dt, block, 11);
+    let vd = mainline_side_bytes(elems, dt, block, 23);
+
+    let pm = be
+        .alloc(rows * nh * n_chunks * 4, BufferUsage::Activations)
+        .unwrap();
+    let pl = be
+        .alloc(rows * nh * n_chunks * 4, BufferUsage::Activations)
+        .unwrap();
+    let pacc = be
+        .alloc(rows * nh * n_chunks * hd * 4, BufferUsage::Activations)
+        .unwrap();
+
+    // ── PREPASS reference: the exact production path is dequant→f16 scratch→f16 attention. To keep
+    // the reference trustworthy and DETERMINISTIC, materialize the f16 scratch as a CONCRETE uploaded
+    // cache: GPU-dequant (its own submit), download the f16 bytes, re-upload as a fresh f16 KvCache,
+    // then run f16 split attention on it in a clean submit. This severs the cross-recorder
+    // dequant→attention scratch hazard (which left a raw f16-scratch read flaky run-to-run) while
+    // using the SAME `dequant_kv_f16` bytes and the SAME `attn_partial` machinery the inline path uses.
+    let kq = be.alloc(kd.len(), BufferUsage::KvCache).unwrap();
+    let vq = be.alloc(vd.len(), BufferUsage::KvCache).unwrap();
+    be.upload(kq.as_ref(), &kd).unwrap();
+    be.upload(vq.as_ref(), &vd).unwrap();
+    let kf16 = be.alloc(ne * 2, BufferUsage::Activations).unwrap();
+    let vf16 = be.alloc(ne * 2, BufferUsage::Activations).unwrap();
+    {
+        let rec = be.recorder().unwrap();
+        rec.dequant_kv_f16(dt, kq.as_ref(), kf16.as_ref(), ne);
+        rec.dequant_kv_f16(dt, vq.as_ref(), vf16.as_ref(), ne);
+        rec.finish().unwrap();
+    }
+    let mut kf16_bytes = vec![0u8; ne * 2];
+    let mut vf16_bytes = vec![0u8; ne * 2];
+    be.download(kf16.as_ref(), &mut kf16_bytes).unwrap();
+    be.download(vf16.as_ref(), &mut vf16_bytes).unwrap();
+    let kf16c = be.alloc(ne * 2, BufferUsage::KvCache).unwrap();
+    let vf16c = be.alloc(ne * 2, BufferUsage::KvCache).unwrap();
+    be.upload(kf16c.as_ref(), &kf16_bytes).unwrap();
+    be.upload(vf16c.as_ref(), &vf16_bytes).unwrap();
+    let o_ref = be.alloc(o_bytes, BufferUsage::Activations).unwrap();
+    {
+        let rec = be.recorder().unwrap();
+        rec.attention_kv_split(
+            q_buf.as_ref(),
+            kf16c.as_ref(),
+            vf16c.as_ref(),
+            o_ref.as_ref(),
+            pm.as_ref(),
+            pl.as_ref(),
+            pacc.as_ref(),
+            rows,
+            pos,
+            kv_len,
+            nh,
+            nkv,
+            hd,
+            chunk,
+            n_chunks,
+            scale,
+            window,
+            None,
+            false,
+            false,
+            0,
+            false,
+        );
+        rec.finish().unwrap();
+    }
+    let mut ref_out = vec![0u8; o_bytes];
+    be.download(o_ref.as_ref(), &mut ref_out).unwrap();
+    let ref_bits = bits(&ref_out);
+
+    // ── INLINE leg: read the quant cache directly (no scratch), at base offset `prefix`.
+    let inline_leg = |prefix: usize| -> Vec<u32> {
+        let mut kback = synth_bytes(prefix, 0xBAD);
+        kback.extend_from_slice(&kd);
+        let mut vback = synth_bytes(prefix, 0xBEEF);
+        vback.extend_from_slice(&vd);
+        let kbuf = be.alloc(kback.len(), BufferUsage::KvCache).unwrap();
+        let vbuf = be.alloc(vback.len(), BufferUsage::KvCache).unwrap();
+        be.upload(kbuf.as_ref(), &kback).unwrap();
+        be.upload(vbuf.as_ref(), &vback).unwrap();
+        let ka = kbuf.device_addr().unwrap() + prefix as u64;
+        let va = vbuf.device_addr().unwrap() + prefix as u64;
+        let o_buf = be.alloc(o_bytes, BufferUsage::Activations).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.attention_kv_split_at(
+            q_buf.as_ref(),
+            kbuf.as_ref(),
+            vbuf.as_ref(),
+            ka,
+            va,
+            o_buf.as_ref(),
+            pm.as_ref(),
+            pl.as_ref(),
+            pacc.as_ref(),
+            rows,
+            pos,
+            kv_len,
+            nh,
+            nkv,
+            hd,
+            chunk,
+            n_chunks,
+            scale,
+            window,
+            None,
+            false,
+            false,
+            cap,
+            false,
+            Some(dt),
+        );
+        rec.finish().unwrap();
+        let mut out = vec![0u8; o_bytes];
+        be.download(o_buf.as_ref(), &mut out).unwrap();
+        bits(&out)
+    };
+    let inline0 = inline_leg(0);
+    let inlineoff = inline_leg(OFF);
+
+    let name = format!("mainline {dt:?} kv={kv_len} nh={nh} nkv={nkv} hd={hd}");
+    assert!(
+        ref_bits.iter().any(|&b| b != 0),
+        "{name}: prepass reference is all zeros — not exercising the kernel"
+    );
+    for (i, (&r, &p)) in ref_bits.iter().zip(inline0.iter()).enumerate() {
+        assert_eq!(r, p, "{name}: INLINE@0 differs from prepass at out {i}: {} vs {} (bits {r:#010x} vs {p:#010x})",
+            f32::from_bits(r), f32::from_bits(p));
+    }
+    for (i, (&r, &p)) in ref_bits.iter().zip(inlineoff.iter()).enumerate() {
+        assert_eq!(
+            r, p,
+            "{name}: INLINE@nonzero-offset differs from prepass at out {i} — the inline twin \
+            is ignoring its K/V base offset",
+        );
+    }
+    println!("ok: {name}");
+}
+
+/// Mainline inline-vs-prepass decode parity for q4_0 and q5_0, hd=128 (b64 fast path) and hd=64
+/// (general per-key loop). K and V both route through the inline `dq()` (they share the cache dtype).
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn attn_partial_mainline_matches_prepass() {
+    use infr_core::DType::*;
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    for (dt, block) in [(Q4_0, 18usize), (Q5_0, 22usize)] {
+        // hd=128 decode, full context (hd4==32 4-key fast path).
+        run_mainline(&be, dt, block, 8, 2, 128, 256);
+        // hd=64 decode (general per-key QK loop + hd4<=32 V path).
+        run_mainline(&be, dt, block, 8, 8, 64, 288);
     }
 }
 

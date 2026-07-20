@@ -116,6 +116,17 @@ fn is_kv_prepass(dt: infr_core::DType) -> bool {
     is_kv_quant(dt) || is_kv_dense_alt(dt) || is_turbo(dt)
 }
 
+/// Lever 1 (kv-decode-perf-levers #1): mainline low-bit block quants the DECODE split-K kernel can
+/// dequant INLINE via a coalesced block-amortized decoder (`attn_partial`'s `dqv4`,
+/// `attn_partial_ml_kernel`) — so decode reads the compact cache directly instead of a dequant→f16
+/// prepass. A strict subset of the `is_kv_quant` prepass set: exactly the formats with an inline
+/// decoder. iq4_nl (codebook gather, awkward to coalesce), bf16/f32/turbo keep the prepass.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+fn is_kv_inline_decode(dt: infr_core::DType) -> bool {
+    use infr_core::DType::*;
+    matches!(dt, Q4_0 | Q4_1 | Q5_0 | Q5_1)
+}
+
 /// `Op::MoeFfn` small-m fast-path threshold: at or below this many rows (tokens in one forward),
 /// use the per-active-expert id-indexed GEMV path instead of the batched whole-bank-streaming GEMM
 /// (see the two paths' docs at the `Op::MoeFfn` match arm).
@@ -2654,8 +2665,53 @@ fn lower_op(
                 // (prefill + decode). The persistent cache stays quantized (footprint preserved).
                 let kdt = graph.desc(*k_cache).dtype;
                 let vdt = graph.desc(*v_cache).dtype;
-                let deq_k = (k_q8 && rows > 1) || is_kv_prepass(kdt);
-                let deq_v = (v_q8 && rows > 1) || is_kv_prepass(vdt);
+                // Lever 1 (kv-decode-perf-levers #1): DECODE (rows==1) of a mainline low-bit KV cache
+                // reads the compact block format INLINE in `attn_partial` (no dequant→f16 prepass,
+                // no f16 scratch — the ¼-traffic win at long context). Gate it to the case the
+                // split-K decode path definitely handles inline: rows==1, K==V one inline-decode
+                // format, hd%4≤512, and the split-K tier is the one that fires (this predicate is
+                // EXACTLY `split_ok` at rows==1 for a full-context causal/SWA cache — see below).
+                // Conservatively keep the prepass for ring / capacity-limited caches (`ring_past` /
+                // `cap_short`) and for `hd` the split path rejects — those still run correctly (if
+                // slower) through the f16 scratch. PREFILL (rows>1) always keeps the prepass (coopmat
+                // needs f16; small-m suffix split reads the f16 scratch) — this only touches decode.
+                let dec_swa_window = match mask {
+                    AttnMask::SlidingWindow(w) => *w,
+                    _ => 0usize,
+                };
+                let dec_swa_base = if dec_swa_window > 0 {
+                    (pos + 1).saturating_sub(dec_swa_window)
+                } else {
+                    0
+                };
+                let dec_span = kv_len - dec_swa_base;
+                let dec_chunk = (dec_span / 32).clamp(64, 512);
+                // Only exclude a RING cache (SWA past its wrap) — its RROW-wrapped inline read is
+                // correct but out of the kv_addr_parity coverage, so keep the prepass there for now.
+                // (`cap_short` — the nonfa 256-row PREFILL tile-pad guard — is irrelevant to the
+                // rows==1 split-K decode read, which reads exactly kv_len keys ≤ att_cap_rows; gating
+                // on it here just disabled inline whenever the cache was sized tightly.)
+                let dec_ring_past = dec_swa_window > 0 && kv_len > att_cap_rows;
+                let decode_inline = rows == 1
+                    && hd % 4 == 0
+                    && hd <= 512
+                    && !dec_ring_past
+                    && dec_span > dec_chunk
+                    && kdt == vdt
+                    && is_kv_inline_decode(kdt)
+                    // OPT-IN (default OFF). MEASURED: the per-element inline `dq()` decode is a
+                    // growing DECODE REGRESSION vs the dequant→f16 prepass on RDNA3 (Qwen3-8B, Q4_0
+                    // KV, 7900 XTX: d1024 0.86x, d4096 0.72x, d8192 0.61x). `dq()` per element does
+                    // UNCOALESCED scalar block reads (kv_word → global_load_b32 per word) and
+                    // RE-DECODES the block f16 scale for every element, so the KV-path ALU/latency
+                    // outweighs the ¼-byte-traffic saving — the prepass's one coalesced dequant pass
+                    // + coalesced f16 attention read is faster. A real win needs a BLOCK-AMORTIZED
+                    // coalesced vec4 decoder (scale-once, b128 nibble reads), not per-element dq().
+                    // Kept behind INFR_KV_INLINE=1 for that follow-up + A/B; the shader arm, builds,
+                    // recorder plumbing and bit-identity are all in place and gate-clean.
+                    && std::env::var("INFR_KV_INLINE").is_ok();
+                let deq_k = (k_q8 && rows > 1) || (is_kv_prepass(kdt) && !decode_inline);
+                let deq_v = (v_q8 && rows > 1) || (is_kv_prepass(vdt) && !decode_inline);
                 // Ring cache: only att_cap_rows rows exist — dequant the WHOLE ring (element i →
                 // element i keeps the ring layout, so the f16 scratch is read with the same
                 // row-modulo mapping as the cache itself). Identity on full-context caches.
@@ -3021,6 +3077,12 @@ fn lower_op(
                     // buffers expose a device address. `kcb`/`vcb` MAY be the dequant scratch (rows>1
                     // quantized KV prefill) — those are Activations with no address and fall through to
                     // the bound arm, which is why this kernel stays dual-arm. Bit-identical either way.
+                    // Lever 1: mainline low-bit KV decode → the INLINE-decode build (`kv_ml`), which
+                    // reads the compact cache directly (no f16 scratch was allocated: `decode_inline`
+                    // drove `deq_k`/`deq_v` false, so `kcb`/`vcb` ARE the quant cache with a device
+                    // address → the `(Some, Some)` arm). `decode_inline` ⟹ `split_ok` here, so this
+                    // is the arm that fires. None for f16/Q8/prefill.
+                    let kv_ml = if decode_inline { Some(kdt) } else { None };
                     match (kcb.device_addr(), vcb.device_addr()) {
                         (Some(ka), Some(va)) => rec.attention_kv_split_at(
                             r(*q)?,
@@ -3047,6 +3109,7 @@ fn lower_op(
                             v_q8_eff,
                             cap,
                             batched_attn,
+                            kv_ml,
                         ),
                         _ => rec.attention_kv_split(
                             r(*q)?,
