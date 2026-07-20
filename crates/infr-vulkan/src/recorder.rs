@@ -16,6 +16,19 @@ use infr_core::{backend::Buffer, error::Result};
 use super::ops::ComputeKernel;
 use super::{as_vk_buf, be, Backing, VulkanBackend};
 
+/// Coopmat prefill shmem-staging mode for `attention_prefill_flash` (Levers 2 & 5,
+/// kv-decode-perf-levers). `Off` = the default direct coopMatLoad from the bound descriptor.
+/// `Stage` (INFR_FLASH_STAGE) stages the f16 K/V tile into shmem and coopMatLoads from there.
+/// `Dequant(dt)` (INFR_FLASH_DEQUANT) decodes the quantized GGUF block cache `dt` to f16 in the
+/// stage, skipping the dequant_kv_f16 prepass. Both route through `attn_flash_partial`'s staged
+/// builds and force the split-K partial+combine path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlashStage {
+    Off,
+    Stage,
+    Dequant(infr_core::DType),
+}
+
 /// State columns carried per subgroup by the token-serial DeltaNet scan; must match
 /// `deltanet_seq.comp`'s `NCOL`.
 ///
@@ -3930,6 +3943,13 @@ impl<'a> Recorder<'a> {
     /// emits an online-softmax partial into `po`/`pm`/`pl`, merged by attn_flash_combine. Scratch
     /// (caller, sized for ≤8 splits): `po` = 8·mpad·nh·hd f32, `pm`/`pl` = 8·mpad·nh f32. n_splits==1
     /// → single fused kernel writing `attn` directly (no scratch touched).
+    ///
+    /// `stage` (Levers 2 & 5): `Off` = the default (direct coopMatLoad from bound descriptor, f16
+    /// `kc`/`vc`). `Stage`/`Dequant(_)` route through the shmem-staged `attn_flash_partial` builds
+    /// (see attn_flash_partial.comp) and FORCE the split-K partial+combine path (the staged builds
+    /// exist only for that kernel, not the fused `attn_flash` / register `attn_flash_warp`). For
+    /// `Dequant(dt)`, `kc`/`vc` are the QUANTIZED GGUF block cache (dt) — decoded in-stage, so the
+    /// caller passes the cache directly and skips the dequant_kv_f16 prepass.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_prefill_flash(
         &self,
@@ -3946,6 +3966,7 @@ impl<'a> Recorder<'a> {
         nkv: usize,
         hd: usize,
         pos_offset: usize,
+        stage: FlashStage,
     ) {
         let mpad = (n.div_ceil(64) * 64) as u32;
         let base_wg = (mpad / 64) * nh as u32;
@@ -3990,8 +4011,12 @@ impl<'a> Recorder<'a> {
         // INFR_NO_FLASH_WARP routes to the non-warp partial. Both warp and non-warp paths have a
         // bm=32 build (29056 B) that fits sub-64 KB devices, so the knob is honored everywhere —
         // no longer forced back to warp on NVIDIA / MoltenVK.
-        let warp = hd == 128 && std::env::var("INFR_NO_FLASH_WARP").is_err();
-        if n_splits == 1 && !warp {
+        // A staging mode (Levers 2 & 5) has builds only for the split-K `attn_flash_partial`, so it
+        // forces that path: no register `attn_flash_warp`, no fused single-kernel `attn_flash`.
+        let warp = matches!(stage, FlashStage::Off)
+            && hd == 128
+            && std::env::var("INFR_NO_FLASH_WARP").is_err();
+        if n_splits == 1 && !warp && matches!(stage, FlashStage::Off) {
             let (fname, fspv): (&'static str, &[u32]) = if bm == 32 {
                 ("attn_flash_bm32", crate::gemm::attn_flash_bm32_spv())
             } else {
@@ -4018,17 +4043,22 @@ impl<'a> Recorder<'a> {
         let ksplit = (kv_len as u32).div_ceil(n_splits).div_ceil(64) * 64;
         // hd=128 → register-blocked warp partial; else the 4-subgroup partial. Each picks its
         // bm-sized shared build (warp/partial share the bm*908 B footprint) and covers tile_wg groups.
-        let (pname, pspv): (&'static str, &[u32]) = match (warp, bm) {
-            (true, 32) => (
-                "attn_flash_warp_bm32",
-                crate::gemm::attn_flash_warp_bm32_spv(),
-            ),
-            (true, _) => ("attn_flash_warp", crate::gemm::attn_flash_warp_spv()),
-            (false, 32) => (
-                "attn_flash_partial_bm32",
-                crate::gemm::attn_flash_partial_bm32_spv(),
-            ),
-            (false, _) => ("attn_flash_partial", crate::gemm::attn_flash_partial_spv()),
+        let (pname, pspv): (&'static str, &[u32]) = match stage {
+            FlashStage::Stage => crate::gemm::attn_flash_partial_stage_spv(bm == 32),
+            FlashStage::Dequant(dt) => crate::gemm::attn_flash_partial_deq_spv(dt, bm == 32)
+                .expect("attention_prefill_flash: no dequant-in-flash build for KV dtype"),
+            FlashStage::Off => match (warp, bm) {
+                (true, 32) => (
+                    "attn_flash_warp_bm32",
+                    crate::gemm::attn_flash_warp_bm32_spv(),
+                ),
+                (true, _) => ("attn_flash_warp", crate::gemm::attn_flash_warp_spv()),
+                (false, 32) => (
+                    "attn_flash_partial_bm32",
+                    crate::gemm::attn_flash_partial_bm32_spv(),
+                ),
+                (false, _) => ("attn_flash_partial", crate::gemm::attn_flash_partial_spv()),
+            },
         };
         let kp = self.be.kernel_sg(pname, pspv, 6, 32, 32);
         let mut pp = [0u8; 32];
@@ -9774,6 +9804,7 @@ mod tests {
             nkv,
             hd,
             pos_offset,
+            FlashStage::Off,
         );
         rec.finish().unwrap();
         let mut bytes = vec![0u8; mpad * nh * hd * 4];
@@ -9787,6 +9818,224 @@ mod tests {
             .fold(0f32, f32::max);
         println!("attn_prefill_flash q_len={q_len} kv_len={kv_len} max_err={err:e}");
         assert!(err < 5e-3, "attn_prefill_flash mismatch: {err}");
+    }
+
+    /// Run one `attention_prefill_flash` and return the raw f32 output bytes (for BITWISE compares).
+    #[allow(clippy::too_many_arguments)]
+    fn run_flash_bytes(
+        be: &VulkanBackend,
+        bq: &dyn Buffer,
+        bk: &dyn Buffer,
+        bv: &dyn Buffer,
+        q_len: usize,
+        kv_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        pos_offset: usize,
+        stage: FlashStage,
+    ) -> Vec<u8> {
+        let mpad = q_len.div_ceil(64) * 64;
+        let bo = be.alloc(mpad * nh * hd * 4, BufferUsage::Readback).unwrap();
+        let po = be
+            .alloc(8 * mpad * nh * hd * 4, BufferUsage::Activations)
+            .unwrap();
+        let pmb = be
+            .alloc(8 * mpad * nh * 4, BufferUsage::Activations)
+            .unwrap();
+        let plb = be
+            .alloc(8 * mpad * nh * 4, BufferUsage::Activations)
+            .unwrap();
+        let rec = be.recorder().unwrap();
+        rec.attention_prefill_flash(
+            bq,
+            bk,
+            bv,
+            bo.as_ref(),
+            po.as_ref(),
+            pmb.as_ref(),
+            plb.as_ref(),
+            q_len,
+            kv_len,
+            nh,
+            nkv,
+            hd,
+            pos_offset,
+            stage,
+        );
+        rec.finish().unwrap();
+        let mut bytes = vec![0u8; mpad * nh * hd * 4];
+        be.download(bo.as_ref(), &mut bytes).unwrap();
+        bytes
+    }
+
+    /// Levers 2 & 5 (kv-decode-perf-levers): the shmem-staged `attn_flash_partial` builds compute
+    /// BIT-IDENTICALLY to the direct (non-staged) `attn_flash_partial` — they differ ONLY in where
+    /// the K/V f16 the coopmat consumes comes from (a direct descriptor coopMatLoad vs a shmem slab
+    /// filled by an f16 copy (STAGE) or `native_decode` `dqblk` decode (DEQUANT)); the QK/PV
+    /// coopMatMulAdd sequence is the SAME order (kf ascends 0,16,32,48… in both), so anything short
+    /// of bitwise equality is a staging/decoding bug, not a tolerance question. Reference is the
+    /// DIRECT split-K partial (INFR_NO_FLASH_WARP + forced splits pin Off onto attn_flash_partial,
+    /// the same kernel the staged builds fork from — NOT the production warp/fused default, whose
+    /// different accumulation order would make a bitwise compare meaningless).
+    ///
+    /// Lever 5: staged f16 == direct f16. Lever 2: dequant-in-flash on the quant cache == direct on
+    /// the dequant_kv_f16 PREPASS output (proving the in-stage `dqblk` decode reproduces the prepass
+    /// f16 exactly, so the prepass can be skipped). GQA (nkv<nh) + multi-BN-block kv + non-zero
+    /// pos_offset exercise the head/kv-block addressing (the bound coopmat path has no per-tensor
+    /// arena base offset — vkb binds the whole cache — so BDA-style base offset-invariance N/A here).
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn attn_flash_stage_dequant_parity() {
+        use infr_core::DType;
+        let be = VulkanBackend::new().unwrap();
+        // Pin Off onto the DIRECT attn_flash_partial (same kernel the staged builds fork from):
+        // no register warp, forced split-K partial+combine (n_splits==1 else takes the fused
+        // attn_flash). Staged/Dequant force the partial path themselves but read the same splits.
+        std::env::set_var("INFR_NO_FLASH_WARP", "1");
+        std::env::set_var("INFR_FLASH_SPLITS", "2");
+        let gen = |n: usize, salt: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((i * 13 + salt) % 29) as f32 - 14.0) * 0.05)
+                .collect()
+        };
+        // finite quant block bytes (every f16 scale field's high byte < 0x40 → finite; codes/qh any)
+        let synth = |n: usize, seed: usize| -> Vec<u8> {
+            (0..n)
+                .map(|i| {
+                    ((i.wrapping_mul(2654435761) ^ seed.wrapping_mul(40503)) >> 7) as u8 % 0x40
+                })
+                .collect::<Vec<u8>>()
+        };
+        for &(q_len, kv_len, nh, nkv) in &[
+            (128usize, 512usize, 8usize, 2usize),
+            (64, 256, 4, 4),
+            (128, 320, 16, 8),
+        ] {
+            let hd = 128usize;
+            let pos_offset = kv_len - q_len;
+            let mpad = q_len.div_ceil(64) * 64;
+            let padrows = kv_len + 64; // Off reads tile-pad rows past kv_len (masked; must be finite)
+            let bq = {
+                let mut v = r16(&gen(q_len * nh * hd, 1));
+                v.resize(mpad * nh * hd, 0.0);
+                upf16(&be, &v)
+            };
+            let bk = {
+                let mut v = r16(&gen(kv_len * nkv * hd, 2));
+                v.resize(padrows * nkv * hd, 0.0);
+                upf16(&be, &v)
+            };
+            let bv = {
+                let mut v = r16(&gen(kv_len * nkv * hd, 3));
+                v.resize(padrows * nkv * hd, 0.0);
+                upf16(&be, &v)
+            };
+            let direct = run_flash_bytes(
+                &be,
+                bq.as_ref(),
+                bk.as_ref(),
+                bv.as_ref(),
+                q_len,
+                kv_len,
+                nh,
+                nkv,
+                hd,
+                pos_offset,
+                FlashStage::Off,
+            );
+            // sanity: not vacuously all-zero / NaN (a bitwise compare would pass vacuously otherwise)
+            let df: &[f32] = bytemuck::cast_slice(&direct);
+            assert!(
+                df[..q_len * nh * hd]
+                    .iter()
+                    .any(|x| x.is_finite() && *x != 0.0),
+                "reference flash output degenerate (all zero/NaN)"
+            );
+            // ---- Lever 5: STAGE (f16) == direct ----
+            let staged = run_flash_bytes(
+                &be,
+                bq.as_ref(),
+                bk.as_ref(),
+                bv.as_ref(),
+                q_len,
+                kv_len,
+                nh,
+                nkv,
+                hd,
+                pos_offset,
+                FlashStage::Stage,
+            );
+            assert_eq!(
+                direct, staged,
+                "INFR_FLASH_STAGE not bit-identical to direct attn_flash_partial \
+                 (q={q_len} kv={kv_len} nh={nh} nkv={nkv})"
+            );
+            // ---- Lever 2: DEQUANT (quant cache) == direct on the dequant_kv_f16 prepass output ----
+            let ne = kv_len * nkv * hd;
+            for &(dt, blk) in &[
+                (DType::Q4_0, 18usize),
+                (DType::Q4_1, 20),
+                (DType::Q5_0, 22),
+                (DType::Q5_1, 24),
+            ] {
+                let nblk = ne / 32;
+                let kq = synth(nblk * blk, 100 + blk);
+                let vq = synth(nblk * blk, 200 + blk);
+                let bkq = be.alloc(kq.len(), BufferUsage::KvCache).unwrap();
+                let bvq = be.alloc(vq.len(), BufferUsage::KvCache).unwrap();
+                be.upload(bkq.as_ref(), &kq).unwrap();
+                be.upload(bvq.as_ref(), &vq).unwrap();
+                // reference: prepass-dequant the quant cache → padded f16 scratch (pad rows stay 0 →
+                // finite), then the DIRECT partial reads the scratch.
+                let ksc = be
+                    .alloc(padrows * nkv * hd * 2, BufferUsage::Activations)
+                    .unwrap();
+                let vsc = be
+                    .alloc(padrows * nkv * hd * 2, BufferUsage::Activations)
+                    .unwrap();
+                {
+                    let rec = be.recorder().unwrap();
+                    rec.dequant_kv_f16(dt, bkq.as_ref(), ksc.as_ref(), ne);
+                    rec.dequant_kv_f16(dt, bvq.as_ref(), vsc.as_ref(), ne);
+                    rec.finish().unwrap();
+                }
+                let deq_ref = run_flash_bytes(
+                    &be,
+                    bq.as_ref(),
+                    ksc.as_ref(),
+                    vsc.as_ref(),
+                    q_len,
+                    kv_len,
+                    nh,
+                    nkv,
+                    hd,
+                    pos_offset,
+                    FlashStage::Off,
+                );
+                let deq_test = run_flash_bytes(
+                    &be,
+                    bq.as_ref(),
+                    bkq.as_ref(),
+                    bvq.as_ref(),
+                    q_len,
+                    kv_len,
+                    nh,
+                    nkv,
+                    hd,
+                    pos_offset,
+                    FlashStage::Dequant(dt),
+                );
+                assert_eq!(
+                    deq_ref, deq_test,
+                    "INFR_FLASH_DEQUANT {dt:?} not bit-identical to direct+prepass \
+                     (q={q_len} kv={kv_len} nh={nh} nkv={nkv})"
+                );
+                println!("flash dequant parity OK {dt:?} q={q_len} kv={kv_len} nh={nh} nkv={nkv}");
+            }
+        }
+        std::env::remove_var("INFR_NO_FLASH_WARP");
+        std::env::remove_var("INFR_FLASH_SPLITS");
     }
 
     /// Non-coopmat fma flash prefill (`attn_nc_fa`): host-reference parity across causal /

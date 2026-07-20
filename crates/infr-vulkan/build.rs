@@ -206,6 +206,68 @@ fn main() {
             "attn_flash_partial_bm32",
             &["-DBM_TILE=32"],
         ),
+        // Levers 2 & 5 (kv-decode-perf-levers): shmem-staged coopMatLoad variants of the coopmat
+        // prefill partial. `_stage` = f16 K/V staged into a 32-wide `KVstg` slab then coopMatLoad
+        // from shmem (Lever 5, INFR_FLASH_STAGE). `_deq_<fmt>` = the quantized KV cache decoded to
+        // f16 in the stage via native_decode's coalesced `dqblk`, skipping the dequant_kv_f16
+        // prepass (Lever 2, INFR_FLASH_DEQUANT). Both keep the default path (above) untouched — the
+        // staging code is entirely under `#ifdef STAGE`, so the base .spv is byte-identical. bm32
+        // twins mirror the base tile pick (small-m split tiles / INFR_FLASH_BM=32 parity coverage).
+        (
+            "attn_flash_partial",
+            "attn_flash_partial_stage",
+            &["-DSTAGE"],
+        ),
+        (
+            "attn_flash_partial",
+            "attn_flash_partial_stage_bm32",
+            &["-DSTAGE", "-DBM_TILE=32"],
+        ),
+        (
+            "attn_flash_partial",
+            "attn_flash_partial_deq_q4_0",
+            &["-DSTAGE", "-DDEQUANT", "-DFMT_Q4_0"],
+        ),
+        (
+            "attn_flash_partial",
+            "attn_flash_partial_deq_q4_0_bm32",
+            &["-DSTAGE", "-DDEQUANT", "-DFMT_Q4_0", "-DBM_TILE=32"],
+        ),
+        (
+            "attn_flash_partial",
+            "attn_flash_partial_deq_q4_1",
+            &["-DSTAGE", "-DDEQUANT", "-DFMT_Q4_1"],
+        ),
+        (
+            "attn_flash_partial",
+            "attn_flash_partial_deq_q4_1_bm32",
+            &["-DSTAGE", "-DDEQUANT", "-DFMT_Q4_1", "-DBM_TILE=32"],
+        ),
+        (
+            "attn_flash_partial",
+            "attn_flash_partial_deq_q5_0",
+            &["-DSTAGE", "-DDEQUANT", "-DFMT_Q5_0"],
+        ),
+        (
+            "attn_flash_partial",
+            "attn_flash_partial_deq_q5_0_bm32",
+            &["-DSTAGE", "-DDEQUANT", "-DFMT_Q5_0", "-DBM_TILE=32"],
+        ),
+        (
+            "attn_flash_partial",
+            "attn_flash_partial_deq_q5_1",
+            &["-DSTAGE", "-DDEQUANT", "-DFMT_Q5_1"],
+        ),
+        (
+            "attn_flash_partial",
+            "attn_flash_partial_deq_q5_1_bm32",
+            &["-DSTAGE", "-DDEQUANT", "-DFMT_Q5_1", "-DBM_TILE=32"],
+        ),
+        // Q8_0 is DEFERRED: infr's Q8_0 KV cache is PLANAR (codes[cap] then scales[cap/32]; see
+        // store_q8 / dequant_q8_f16), NOT 34-byte interleaved GGUF Q8_0 blocks — so native_decode's
+        // FMT_Q8_0 `dqblk` (which this shared substrate uses) would misread it. A Q8 dequant-in-flash
+        // needs a bespoke planar decoder + a `cap` push constant; out of scope for the GGUF-block
+        // substrate. iq4_nl (codebook gather) is likewise left on the prepass.
         ("attn_flash_warp", "attn_flash_warp", &[]),
         // BM=32 tile: 29056 B shared (vs 58112 B), fits NVIDIA (48 KB) / MoltenVK (32 KB) devices
         // whose maxComputeSharedMemorySize is under the 64 KB the default BM=64 tile needs.

@@ -18,7 +18,7 @@ pub mod pager;
 mod pcache;
 mod recorder;
 
-pub use recorder::{RecordedCmd, Recorder};
+pub use recorder::{FlashStage, RecordedCmd, Recorder};
 
 /// Shared-memory bytes consumed per query row of a flash-attention prefill tile
 /// (`Ss` + `Ps` + `Os` + softmax state, at `BN=64` / `HD=128`). The tile height is chosen so

@@ -1788,6 +1788,37 @@ const ATTN_FLASH_PARTIAL_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_partial.spv"));
 const ATTN_FLASH_PARTIAL_BM32_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_partial_bm32.spv"));
+// Levers 2 & 5 (kv-decode-perf-levers): shmem-staged coopMatLoad prefill variants (opt-in).
+const ATTN_FLASH_PARTIAL_STAGE_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_partial_stage.spv"));
+const ATTN_FLASH_PARTIAL_STAGE_BM32_SPV_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/attn_flash_partial_stage_bm32.spv"
+));
+const ATTN_FLASH_PARTIAL_DEQ_Q4_0_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_partial_deq_q4_0.spv"));
+const ATTN_FLASH_PARTIAL_DEQ_Q4_0_BM32_SPV_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/attn_flash_partial_deq_q4_0_bm32.spv"
+));
+const ATTN_FLASH_PARTIAL_DEQ_Q4_1_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_partial_deq_q4_1.spv"));
+const ATTN_FLASH_PARTIAL_DEQ_Q4_1_BM32_SPV_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/attn_flash_partial_deq_q4_1_bm32.spv"
+));
+const ATTN_FLASH_PARTIAL_DEQ_Q5_0_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_partial_deq_q5_0.spv"));
+const ATTN_FLASH_PARTIAL_DEQ_Q5_0_BM32_SPV_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/attn_flash_partial_deq_q5_0_bm32.spv"
+));
+const ATTN_FLASH_PARTIAL_DEQ_Q5_1_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_partial_deq_q5_1.spv"));
+const ATTN_FLASH_PARTIAL_DEQ_Q5_1_BM32_SPV_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/attn_flash_partial_deq_q5_1_bm32.spv"
+));
 const ATTN_FLASH_WARP_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_warp.spv"));
 const ATTN_FLASH_WARP_BM32_SPV_BYTES: &[u8] =
@@ -1851,6 +1882,16 @@ static ATTN_FLASH_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_BM32_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_PARTIAL_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_PARTIAL_BM32_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_PARTIAL_STAGE_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_PARTIAL_STAGE_BM32_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_PARTIAL_DEQ_Q4_0_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_PARTIAL_DEQ_Q4_0_BM32_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_PARTIAL_DEQ_Q4_1_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_PARTIAL_DEQ_Q4_1_BM32_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_PARTIAL_DEQ_Q5_0_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_PARTIAL_DEQ_Q5_0_BM32_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_PARTIAL_DEQ_Q5_1_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_PARTIAL_DEQ_Q5_1_BM32_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_WARP_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_WARP_BM32_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_REG_SPV: OnceLock<Vec<u32>> = OnceLock::new();
@@ -1941,6 +1982,79 @@ pub(crate) fn attn_flash_partial_spv() -> &'static [u32] {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_flash_partial_bm32_spv() -> &'static [u32] {
     ATTN_FLASH_PARTIAL_BM32_SPV.get_or_init(|| spv_words(ATTN_FLASH_PARTIAL_BM32_SPV_BYTES))
+}
+/// Lever 5 (INFR_FLASH_STAGE): f16-staged coopMatLoad build of the flash partial. Stages the K/V
+/// tile into a 32-wide `KVstg` shmem slab (reused K→V) and `coopMatLoad`s from shmem. `bm32` picks
+/// the small-tile twin.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn attn_flash_partial_stage_spv(bm32: bool) -> (&'static str, &'static [u32]) {
+    if bm32 {
+        (
+            "attn_flash_partial_stage_bm32",
+            ATTN_FLASH_PARTIAL_STAGE_BM32_SPV
+                .get_or_init(|| spv_words(ATTN_FLASH_PARTIAL_STAGE_BM32_SPV_BYTES)),
+        )
+    } else {
+        (
+            "attn_flash_partial_stage",
+            ATTN_FLASH_PARTIAL_STAGE_SPV
+                .get_or_init(|| spv_words(ATTN_FLASH_PARTIAL_STAGE_SPV_BYTES)),
+        )
+    }
+}
+/// Lever 2 (INFR_FLASH_DEQUANT): dequant-in-flash build for a quantized KV cache — decodes the
+/// GGUF block cache to f16 in the stage (native_decode `dqblk`), skipping the dequant_kv_f16
+/// prepass. `None` for a format without a build. `bm32` picks the small-tile twin.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn attn_flash_partial_deq_spv(
+    dt: infr_core::DType,
+    bm32: bool,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::{Q4_0, Q4_1, Q5_0, Q5_1};
+    let (name, spv): (&'static str, &'static [u32]) = match (dt, bm32) {
+        (Q4_0, false) => (
+            "attn_flash_partial_deq_q4_0",
+            ATTN_FLASH_PARTIAL_DEQ_Q4_0_SPV
+                .get_or_init(|| spv_words(ATTN_FLASH_PARTIAL_DEQ_Q4_0_SPV_BYTES)),
+        ),
+        (Q4_0, true) => (
+            "attn_flash_partial_deq_q4_0_bm32",
+            ATTN_FLASH_PARTIAL_DEQ_Q4_0_BM32_SPV
+                .get_or_init(|| spv_words(ATTN_FLASH_PARTIAL_DEQ_Q4_0_BM32_SPV_BYTES)),
+        ),
+        (Q4_1, false) => (
+            "attn_flash_partial_deq_q4_1",
+            ATTN_FLASH_PARTIAL_DEQ_Q4_1_SPV
+                .get_or_init(|| spv_words(ATTN_FLASH_PARTIAL_DEQ_Q4_1_SPV_BYTES)),
+        ),
+        (Q4_1, true) => (
+            "attn_flash_partial_deq_q4_1_bm32",
+            ATTN_FLASH_PARTIAL_DEQ_Q4_1_BM32_SPV
+                .get_or_init(|| spv_words(ATTN_FLASH_PARTIAL_DEQ_Q4_1_BM32_SPV_BYTES)),
+        ),
+        (Q5_0, false) => (
+            "attn_flash_partial_deq_q5_0",
+            ATTN_FLASH_PARTIAL_DEQ_Q5_0_SPV
+                .get_or_init(|| spv_words(ATTN_FLASH_PARTIAL_DEQ_Q5_0_SPV_BYTES)),
+        ),
+        (Q5_0, true) => (
+            "attn_flash_partial_deq_q5_0_bm32",
+            ATTN_FLASH_PARTIAL_DEQ_Q5_0_BM32_SPV
+                .get_or_init(|| spv_words(ATTN_FLASH_PARTIAL_DEQ_Q5_0_BM32_SPV_BYTES)),
+        ),
+        (Q5_1, false) => (
+            "attn_flash_partial_deq_q5_1",
+            ATTN_FLASH_PARTIAL_DEQ_Q5_1_SPV
+                .get_or_init(|| spv_words(ATTN_FLASH_PARTIAL_DEQ_Q5_1_SPV_BYTES)),
+        ),
+        (Q5_1, true) => (
+            "attn_flash_partial_deq_q5_1_bm32",
+            ATTN_FLASH_PARTIAL_DEQ_Q5_1_BM32_SPV
+                .get_or_init(|| spv_words(ATTN_FLASH_PARTIAL_DEQ_Q5_1_BM32_SPV_BYTES)),
+        ),
+        _ => return None,
+    };
+    Some((name, spv))
 }
 /// Register-blocked flash partial (hd=128). Used over attn_flash_partial when hd==128.
 #[cfg_attr(infr_profile, infr_prof::instrument)]

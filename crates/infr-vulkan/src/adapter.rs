@@ -2710,8 +2710,47 @@ fn lower_op(
                     // Kept behind INFR_KV_INLINE=1 for that follow-up + A/B; the shader arm, builds,
                     // recorder plumbing and bit-identity are all in place and gate-clean.
                     && std::env::var("INFR_KV_INLINE").is_ok();
-                let deq_k = (k_q8 && rows > 1) || (is_kv_prepass(kdt) && !decode_inline);
-                let deq_v = (v_q8 && rows > 1) || (is_kv_prepass(vdt) && !decode_inline);
+                // Lever 2 (INFR_FLASH_DEQUANT, kv-decode-perf-levers): dequant-in-flash. When the
+                // coopmat flash-prefill geometry holds AND the KV cache is a supported quant format
+                // (K==V ∈ {Q4_0,Q4_1,Q5_0,Q5_1,Q8_0}), SKIP the dequant_kv_f16 prepass and let
+                // attn_flash_partial's staged builds decode the GGUF block cache in the QK/PV stage
+                // (native_decode `dqblk`, coalesced scale-once). `flash_geom` is exactly flash_ok's
+                // geometry minus the quant-eff check; with the prepass skipped and q8-eff forced off
+                // below, flash_ok reduces to `flash_geom`, so the flash arm is guaranteed taken.
+                let flash_min_rows_env: usize = std::env::var("INFR_FLASH_MIN_ROWS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(24);
+                let flash_geom = (rows >= 64 || (rows >= flash_min_rows_env && kv_len >= 8192))
+                    && hd == 128
+                    && kv_len <= att_cap_rows
+                    && matches!(mask, AttnMask::Causal)
+                    && (*scale - 1.0 / (hd as f32).sqrt()).abs() < 1e-6
+                    && be_.caps().f16_coopmat()
+                    && matches!(graph.tensors[q.0 as usize].kind, TensorKind::Internal)
+                    && matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal);
+                let flash_deq_fmt = if flash_geom
+                    && kdt == vdt
+                    // GGUF-block low-bit set only (native_decode dqblk substrate). Q8_0 (planar
+                    // cache) and iq4_nl (codebook) stay on the dequant_kv_f16 prepass — see
+                    // attn_flash_partial.comp / build.rs.
+                    && matches!(
+                        kdt,
+                        infr_core::DType::Q4_0
+                            | infr_core::DType::Q4_1
+                            | infr_core::DType::Q5_0
+                            | infr_core::DType::Q5_1
+                    )
+                    && std::env::var("INFR_FLASH_DEQUANT").is_ok()
+                {
+                    Some(kdt)
+                } else {
+                    None
+                };
+                let deq_k = flash_deq_fmt.is_none()
+                    && ((k_q8 && rows > 1) || (is_kv_prepass(kdt) && !decode_inline));
+                let deq_v = flash_deq_fmt.is_none()
+                    && ((v_q8 && rows > 1) || (is_kv_prepass(vdt) && !decode_inline));
                 // Ring cache: only att_cap_rows rows exist — dequant the WHOLE ring (element i →
                 // element i keeps the ring layout, so the f16 scratch is read with the same
                 // row-modulo mapping as the cache itself). Identity on full-context caches.
@@ -2758,8 +2797,10 @@ fn lower_op(
                     None
                 };
                 // A dequanted side reads the f16 scratch; native Q8 read only when not dequanted.
-                let k_q8_eff = k_q8 && !deq_k;
-                let v_q8_eff = v_q8 && !deq_v;
+                // Dequant-in-flash reads the quant cache DIRECTLY (neither f16 scratch nor native-Q8
+                // planar read), so force q8-eff off — flash_ok then reduces to `flash_geom`.
+                let k_q8_eff = flash_deq_fmt.is_none() && k_q8 && !deq_k;
+                let v_q8_eff = flash_deq_fmt.is_none() && v_q8 && !deq_v;
                 // Prefill, causal, hd==128, standard 1/√hd scale: FlashAttention-2 (split-K
                 // online softmax, no materialized [m,kv] scores). The flash kernel hardcodes
                 // 1/√hd and reads/writes ceil(rows/64)*64 q/dst rows, so guard the scale and
@@ -2781,15 +2822,17 @@ fn lower_op(
                 // through to `split_ok`/the final `else` — `attention_kv_split`/`attention_kv`,
                 // already the scalar decode/short-prefill path, dispatch with no coopmat and no
                 // row-count ceiling, so they're a correct (if slower) fallback for ANY `rows`.
-                let flash_ok = (rows >= 64 || (rows >= flash_min_rows && kv_len >= 8192))
-                    && hd == 128
-                    && kv_len <= att_cap_rows // never a ring cache (Causal implies full-ctx)
-                    && matches!(mask, AttnMask::Causal)
-                    && (*scale - 1.0 / (hd as f32).sqrt()).abs() < 1e-6
-                    && !(k_q8_eff || v_q8_eff)
-                    && be_.caps().f16_coopmat()
-                    && matches!(graph.tensors[q.0 as usize].kind, TensorKind::Internal)
-                    && matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal);
+                let flash_ok = flash_geom && !(k_q8_eff || v_q8_eff);
+                // Coopmat prefill shmem-staging mode (Levers 2 & 5). Dequant wins over the pure-f16
+                // stage; both need the flash geometry. INFR_FLASH_STAGE stages the f16 KV (cache, or
+                // the prepass f16 scratch on a quant model) into shmem — the reuse experiment.
+                let flash_stage = if let Some(dt) = flash_deq_fmt {
+                    crate::recorder::FlashStage::Dequant(dt)
+                } else if flash_geom && std::env::var("INFR_FLASH_STAGE").is_ok() {
+                    crate::recorder::FlashStage::Stage
+                } else {
+                    crate::recorder::FlashStage::Off
+                };
                 // Prefill at hd≠128 (qwen35/gemma hd=256): the non-FA coopmat pipeline
                 // (attn_qk → softmax → attn_pv) is hd-general and ~an order faster than the scalar
                 // attention_kv. Needs 64-row-padded q/dst (Internal buffers are row-padded), so
@@ -2982,6 +3025,7 @@ fn lower_op(
                         nkv,
                         hd,
                         pos,
+                        flash_stage,
                     );
                 } else if nonfa_ok {
                     let window = match mask {
