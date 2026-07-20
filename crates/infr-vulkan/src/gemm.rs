@@ -1823,6 +1823,31 @@ const ATTN_FLASH_WARP_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_warp.spv"));
 const ATTN_FLASH_WARP_BM32_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_warp_bm32.spv"));
+// Lever 2 on the warp kernel: dequant-in-flash builds that keep the register-tiled warp path.
+const ATTN_FLASH_WARP_DEQ_Q4_0_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_warp_deq_q4_0.spv"));
+const ATTN_FLASH_WARP_DEQ_Q4_0_BM32_SPV_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/attn_flash_warp_deq_q4_0_bm32.spv"
+));
+const ATTN_FLASH_WARP_DEQ_Q4_1_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_warp_deq_q4_1.spv"));
+const ATTN_FLASH_WARP_DEQ_Q4_1_BM32_SPV_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/attn_flash_warp_deq_q4_1_bm32.spv"
+));
+const ATTN_FLASH_WARP_DEQ_Q5_0_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_warp_deq_q5_0.spv"));
+const ATTN_FLASH_WARP_DEQ_Q5_0_BM32_SPV_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/attn_flash_warp_deq_q5_0_bm32.spv"
+));
+const ATTN_FLASH_WARP_DEQ_Q5_1_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_warp_deq_q5_1.spv"));
+const ATTN_FLASH_WARP_DEQ_Q5_1_BM32_SPV_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/attn_flash_warp_deq_q5_1_bm32.spv"
+));
 const ATTN_FLASH_REG_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_reg.spv"));
 const ATTN_FLASH_REG_BR64_SPV_BYTES: &[u8] =
@@ -1894,6 +1919,14 @@ static ATTN_FLASH_PARTIAL_DEQ_Q5_1_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_PARTIAL_DEQ_Q5_1_BM32_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_WARP_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_WARP_BM32_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_WARP_DEQ_Q4_0_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_WARP_DEQ_Q4_0_BM32_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_WARP_DEQ_Q4_1_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_WARP_DEQ_Q4_1_BM32_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_WARP_DEQ_Q5_0_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_WARP_DEQ_Q5_0_BM32_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_WARP_DEQ_Q5_1_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_WARP_DEQ_Q5_1_BM32_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_REG_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_REG_BR64_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_COMBINE_SPV: OnceLock<Vec<u32>> = OnceLock::new();
@@ -2066,6 +2099,62 @@ pub(crate) fn attn_flash_warp_spv() -> &'static [u32] {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_flash_warp_bm32_spv() -> &'static [u32] {
     ATTN_FLASH_WARP_BM32_SPV.get_or_init(|| spv_words(ATTN_FLASH_WARP_BM32_SPV_BYTES))
+}
+/// Lever 2 on the WARP kernel (INFR_FLASH_DEQUANT): dequant-in-flash build that KEEPS the fast
+/// register-tiled warp path — decodes the quantized GGUF block cache (Q4_0/Q4_1/Q5_0/Q5_1) to f16
+/// in the QK/PV stage (native_decode `dqblk`), skipping the dequant_kv_f16 prepass without dropping
+/// to the ~2x-slower `attn_flash_partial`. `None` for a format without a build. `bm32` picks the
+/// small-tile twin (small-m deep-kv split tiles / INFR_FLASH_BM=32 coverage).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn attn_flash_warp_deq_spv(
+    dt: infr_core::DType,
+    bm32: bool,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::{Q4_0, Q4_1, Q5_0, Q5_1};
+    let (name, spv): (&'static str, &'static [u32]) = match (dt, bm32) {
+        (Q4_0, false) => (
+            "attn_flash_warp_deq_q4_0",
+            ATTN_FLASH_WARP_DEQ_Q4_0_SPV
+                .get_or_init(|| spv_words(ATTN_FLASH_WARP_DEQ_Q4_0_SPV_BYTES)),
+        ),
+        (Q4_0, true) => (
+            "attn_flash_warp_deq_q4_0_bm32",
+            ATTN_FLASH_WARP_DEQ_Q4_0_BM32_SPV
+                .get_or_init(|| spv_words(ATTN_FLASH_WARP_DEQ_Q4_0_BM32_SPV_BYTES)),
+        ),
+        (Q4_1, false) => (
+            "attn_flash_warp_deq_q4_1",
+            ATTN_FLASH_WARP_DEQ_Q4_1_SPV
+                .get_or_init(|| spv_words(ATTN_FLASH_WARP_DEQ_Q4_1_SPV_BYTES)),
+        ),
+        (Q4_1, true) => (
+            "attn_flash_warp_deq_q4_1_bm32",
+            ATTN_FLASH_WARP_DEQ_Q4_1_BM32_SPV
+                .get_or_init(|| spv_words(ATTN_FLASH_WARP_DEQ_Q4_1_BM32_SPV_BYTES)),
+        ),
+        (Q5_0, false) => (
+            "attn_flash_warp_deq_q5_0",
+            ATTN_FLASH_WARP_DEQ_Q5_0_SPV
+                .get_or_init(|| spv_words(ATTN_FLASH_WARP_DEQ_Q5_0_SPV_BYTES)),
+        ),
+        (Q5_0, true) => (
+            "attn_flash_warp_deq_q5_0_bm32",
+            ATTN_FLASH_WARP_DEQ_Q5_0_BM32_SPV
+                .get_or_init(|| spv_words(ATTN_FLASH_WARP_DEQ_Q5_0_BM32_SPV_BYTES)),
+        ),
+        (Q5_1, false) => (
+            "attn_flash_warp_deq_q5_1",
+            ATTN_FLASH_WARP_DEQ_Q5_1_SPV
+                .get_or_init(|| spv_words(ATTN_FLASH_WARP_DEQ_Q5_1_SPV_BYTES)),
+        ),
+        (Q5_1, true) => (
+            "attn_flash_warp_deq_q5_1_bm32",
+            ATTN_FLASH_WARP_DEQ_Q5_1_BM32_SPV
+                .get_or_init(|| spv_words(ATTN_FLASH_WARP_DEQ_Q5_1_BM32_SPV_BYTES)),
+        ),
+        _ => return None,
+    };
+    Some((name, spv))
 }
 /// FlashAttention-2 register-O flash partial (Br=128, per-thread register accumulator). hd=128.
 #[cfg_attr(infr_profile, infr_prof::instrument)]

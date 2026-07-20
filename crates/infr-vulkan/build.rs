@@ -272,6 +272,52 @@ fn main() {
         // BM=32 tile: 29056 B shared (vs 58112 B), fits NVIDIA (48 KB) / MoltenVK (32 KB) devices
         // whose maxComputeSharedMemorySize is under the 64 KB the default BM=64 tile needs.
         ("attn_flash_warp", "attn_flash_warp_bm32", &["-DBM_TILE=32"]),
+        // Lever 2 on the WARP kernel (kv-decode-perf-levers): dequant-in-flash that KEEPS the fast
+        // register-tiled warp path (unlike attn_flash_partial's Lever-2 arm, which forfeits warp).
+        // The quantized GGUF block cache is decoded to f16 in the QK/PV stage via native_decode's
+        // coalesced `dqblk` (32-wide KVstg slab, +4096 B), skipping the dequant_kv_f16 prepass. The
+        // staging is entirely under `#ifdef STAGE`, so the base warp .spv above stays byte-identical.
+        // bm32 twins mirror the small-m deep-kv split tiles (rows 24..64) / INFR_FLASH_BM=32 parity.
+        (
+            "attn_flash_warp",
+            "attn_flash_warp_deq_q4_0",
+            &["-DSTAGE", "-DDEQUANT", "-DFMT_Q4_0"],
+        ),
+        (
+            "attn_flash_warp",
+            "attn_flash_warp_deq_q4_0_bm32",
+            &["-DSTAGE", "-DDEQUANT", "-DFMT_Q4_0", "-DBM_TILE=32"],
+        ),
+        (
+            "attn_flash_warp",
+            "attn_flash_warp_deq_q4_1",
+            &["-DSTAGE", "-DDEQUANT", "-DFMT_Q4_1"],
+        ),
+        (
+            "attn_flash_warp",
+            "attn_flash_warp_deq_q4_1_bm32",
+            &["-DSTAGE", "-DDEQUANT", "-DFMT_Q4_1", "-DBM_TILE=32"],
+        ),
+        (
+            "attn_flash_warp",
+            "attn_flash_warp_deq_q5_0",
+            &["-DSTAGE", "-DDEQUANT", "-DFMT_Q5_0"],
+        ),
+        (
+            "attn_flash_warp",
+            "attn_flash_warp_deq_q5_0_bm32",
+            &["-DSTAGE", "-DDEQUANT", "-DFMT_Q5_0", "-DBM_TILE=32"],
+        ),
+        (
+            "attn_flash_warp",
+            "attn_flash_warp_deq_q5_1",
+            &["-DSTAGE", "-DDEQUANT", "-DFMT_Q5_1"],
+        ),
+        (
+            "attn_flash_warp",
+            "attn_flash_warp_deq_q5_1_bm32",
+            &["-DSTAGE", "-DDEQUANT", "-DFMT_Q5_1", "-DBM_TILE=32"],
+        ),
         ("attn_flash_reg", "attn_flash_reg", &[]),
         // BR=64 tile: 29440 B shared (vs 58880 B) for sub-64 KB shared devices (NVIDIA, MoltenVK).
         ("attn_flash_reg", "attn_flash_reg_br64", &["-DBR_TILE=64"]),

@@ -3945,11 +3945,12 @@ impl<'a> Recorder<'a> {
     /// → single fused kernel writing `attn` directly (no scratch touched).
     ///
     /// `stage` (Levers 2 & 5): `Off` = the default (direct coopMatLoad from bound descriptor, f16
-    /// `kc`/`vc`). `Stage`/`Dequant(_)` route through the shmem-staged `attn_flash_partial` builds
-    /// (see attn_flash_partial.comp) and FORCE the split-K partial+combine path (the staged builds
-    /// exist only for that kernel, not the fused `attn_flash` / register `attn_flash_warp`). For
-    /// `Dequant(dt)`, `kc`/`vc` are the QUANTIZED GGUF block cache (dt) — decoded in-stage, so the
-    /// caller passes the cache directly and skips the dequant_kv_f16 prepass.
+    /// `kc`/`vc`). `Dequant(dt)` (Lever 2) decodes the QUANTIZED GGUF block cache (dt) to f16 in the
+    /// QK/PV stage — the caller passes the cache directly and skips the dequant_kv_f16 prepass; on the
+    /// warp-eligible hd==128 geometry it uses the register-tiled `attn_flash_warp_deq_*` build (keeps
+    /// the fast kernel), else the `attn_flash_partial` staged build. `Stage` (Lever 5, f16) has builds
+    /// only for `attn_flash_partial`, so it alone forces the split-K partial+combine path (no fused
+    /// `attn_flash`, no `attn_flash_warp`). Both staged modes still use partial+combine at n_splits==1.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_prefill_flash(
         &self,
@@ -4011,9 +4012,11 @@ impl<'a> Recorder<'a> {
         // INFR_NO_FLASH_WARP routes to the non-warp partial. Both warp and non-warp paths have a
         // bm=32 build (29056 B) that fits sub-64 KB devices, so the knob is honored everywhere —
         // no longer forced back to warp on NVIDIA / MoltenVK.
-        // A staging mode (Levers 2 & 5) has builds only for the split-K `attn_flash_partial`, so it
-        // forces that path: no register `attn_flash_warp`, no fused single-kernel `attn_flash`.
-        let warp = matches!(stage, FlashStage::Off)
+        // Dequant-in-flash (Lever 2) now has a WARP build (attn_flash_warp_deq_*), so `Dequant` also
+        // keeps the fast register-tiled warp path here — it no longer forfeits warp to the ~2x-slower
+        // `attn_flash_partial` (kv-decode-perf-levers). `Stage` (Lever 5, f16) still has builds only
+        // for the split-K `attn_flash_partial`, so it alone forces that path (no fused `attn_flash`).
+        let warp = matches!(stage, FlashStage::Off | FlashStage::Dequant(_))
             && hd == 128
             && std::env::var("INFR_NO_FLASH_WARP").is_err();
         if n_splits == 1 && !warp && matches!(stage, FlashStage::Off) {
@@ -4045,6 +4048,10 @@ impl<'a> Recorder<'a> {
         // bm-sized shared build (warp/partial share the bm*908 B footprint) and covers tile_wg groups.
         let (pname, pspv): (&'static str, &[u32]) = match stage {
             FlashStage::Stage => crate::gemm::attn_flash_partial_stage_spv(bm == 32),
+            // Dequant on the warp-eligible geometry keeps the register-tiled warp path; otherwise
+            // (hd!=128 impossible here, or INFR_NO_FLASH_WARP) falls to the split-K partial build.
+            FlashStage::Dequant(dt) if warp => crate::gemm::attn_flash_warp_deq_spv(dt, bm == 32)
+                .expect("attention_prefill_flash: no warp dequant-in-flash build for KV dtype"),
             FlashStage::Dequant(dt) => crate::gemm::attn_flash_partial_deq_spv(dt, bm == 32)
                 .expect("attention_prefill_flash: no dequant-in-flash build for KV dtype"),
             FlashStage::Off => match (warp, bm) {
@@ -10035,6 +10042,124 @@ mod tests {
             }
         }
         std::env::remove_var("INFR_NO_FLASH_WARP");
+        std::env::remove_var("INFR_FLASH_SPLITS");
+    }
+
+    /// Lever 2 on the WARP kernel (kv-decode-perf-levers): the register-tiled `attn_flash_warp_deq_*`
+    /// dequant-in-flash build computes BIT-IDENTICALLY to warp+prepass. Unlike the partial-parity test
+    /// above (which pins INFR_NO_FLASH_WARP to compare on `attn_flash_partial`), this leaves warp ON:
+    /// both the reference (warp on the dequant_kv_f16 f16 scratch, `Off`) and the test (warp on the
+    /// quant cache, `Dequant(dt)`) dispatch `attn_flash_warp[_deq]` — proving the in-stage `dqblk`
+    /// decode reproduces the prepass f16 exactly AND the staged QK/PV accumulation order (dcol×kf2 in
+    /// QK, kf in PV) matches the direct warp path bit-for-bit, so the warp default can skip the prepass
+    /// while keeping the fast kernel. Forced splits exercise the split-K partial+combine reduce.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn attn_flash_warp_dequant_parity() {
+        use infr_core::DType;
+        let be = VulkanBackend::new().unwrap();
+        // Leave warp ON (no INFR_NO_FLASH_WARP). Force split-K so the warp partial+combine reduce is
+        // covered in addition to the n_splits==1 warp path.
+        std::env::set_var("INFR_FLASH_SPLITS", "2");
+        let gen = |n: usize, salt: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((i * 13 + salt) % 29) as f32 - 14.0) * 0.05)
+                .collect()
+        };
+        // finite quant block bytes (every f16 scale field's high byte < 0x40 → finite; codes/qh any)
+        let synth = |n: usize, seed: usize| -> Vec<u8> {
+            (0..n)
+                .map(|i| {
+                    ((i.wrapping_mul(2654435761) ^ seed.wrapping_mul(40503)) >> 7) as u8 % 0x40
+                })
+                .collect::<Vec<u8>>()
+        };
+        for &(q_len, kv_len, nh, nkv) in &[
+            (128usize, 512usize, 8usize, 2usize),
+            (64, 256, 4, 4),
+            (128, 320, 16, 8),
+        ] {
+            let hd = 128usize;
+            let pos_offset = kv_len - q_len;
+            let mpad = q_len.div_ceil(64) * 64;
+            let padrows = kv_len + 64; // warp reads tile-pad rows past kv_len (masked; must be finite)
+            let bq = {
+                let mut v = r16(&gen(q_len * nh * hd, 1));
+                v.resize(mpad * nh * hd, 0.0);
+                upf16(&be, &v)
+            };
+            let ne = kv_len * nkv * hd;
+            for &(dt, blk) in &[
+                (DType::Q4_0, 18usize),
+                (DType::Q4_1, 20),
+                (DType::Q5_0, 22),
+                (DType::Q5_1, 24),
+            ] {
+                let nblk = ne / 32;
+                let kq = synth(nblk * blk, 100 + blk);
+                let vq = synth(nblk * blk, 200 + blk);
+                let bkq = be.alloc(kq.len(), BufferUsage::KvCache).unwrap();
+                let bvq = be.alloc(vq.len(), BufferUsage::KvCache).unwrap();
+                be.upload(bkq.as_ref(), &kq).unwrap();
+                be.upload(bvq.as_ref(), &vq).unwrap();
+                // reference: prepass-dequant the quant cache → padded f16 scratch (pad rows 0 →
+                // finite), then warp (Off) reads the scratch.
+                let ksc = be
+                    .alloc(padrows * nkv * hd * 2, BufferUsage::Activations)
+                    .unwrap();
+                let vsc = be
+                    .alloc(padrows * nkv * hd * 2, BufferUsage::Activations)
+                    .unwrap();
+                {
+                    let rec = be.recorder().unwrap();
+                    rec.dequant_kv_f16(dt, bkq.as_ref(), ksc.as_ref(), ne);
+                    rec.dequant_kv_f16(dt, bvq.as_ref(), vsc.as_ref(), ne);
+                    rec.finish().unwrap();
+                }
+                let warp_ref = run_flash_bytes(
+                    &be,
+                    bq.as_ref(),
+                    ksc.as_ref(),
+                    vsc.as_ref(),
+                    q_len,
+                    kv_len,
+                    nh,
+                    nkv,
+                    hd,
+                    pos_offset,
+                    FlashStage::Off,
+                );
+                // sanity: not vacuously all-zero / NaN
+                let rf: &[f32] = bytemuck::cast_slice(&warp_ref);
+                assert!(
+                    rf[..q_len * nh * hd]
+                        .iter()
+                        .any(|x| x.is_finite() && *x != 0.0),
+                    "reference warp flash output degenerate (all zero/NaN)"
+                );
+                let warp_deq = run_flash_bytes(
+                    &be,
+                    bq.as_ref(),
+                    bkq.as_ref(),
+                    bvq.as_ref(),
+                    q_len,
+                    kv_len,
+                    nh,
+                    nkv,
+                    hd,
+                    pos_offset,
+                    FlashStage::Dequant(dt),
+                );
+                assert_eq!(
+                    warp_ref, warp_deq,
+                    "warp INFR_FLASH_DEQUANT {dt:?} not bit-identical to warp+prepass \
+                     (q={q_len} kv={kv_len} nh={nh} nkv={nkv})"
+                );
+                println!(
+                    "warp flash dequant parity OK {dt:?} q={q_len} kv={kv_len} nh={nh} nkv={nkv}"
+                );
+            }
+        }
         std::env::remove_var("INFR_FLASH_SPLITS");
     }
 
