@@ -355,6 +355,17 @@ pub(crate) fn pin_kv_auto_q8() {
     let _ = PINNED_KV_Q8.set(());
 }
 
+/// Opt-in KV overflow to system RAM (`INFR_KV_OVERFLOW=1`): the Vulkan backend places the KV
+/// cache in host RAM (read by attention over PCIe by device address) instead of device-local
+/// VRAM. Read here so the default-ctx clamp ladder's LAST rung can keep the requested big context
+/// (KV in host) rather than clamping/erroring when it doesn't fit VRAM. Must match the backend's
+/// own `kv_overflow_enabled` (empty or `0` = off). Off by default.
+pub(crate) fn kv_overflow_enabled() -> bool {
+    std::env::var("INFR_KV_OVERFLOW")
+        .ok()
+        .is_some_and(|v| !v.is_empty() && v != "0")
+}
+
 /// True when the user expressed NO explicit KV-format choice — the only state auto-q8 may fill.
 pub(crate) fn kv_env_unset() -> bool {
     std::env::var("INFR_KV_TYPE_K").is_err()

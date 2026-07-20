@@ -355,6 +355,18 @@ impl SeamModel {
                 );
                 return want;
             }
+            // Placement ladder's LAST rung (SWA ring → auto-q8 → THIS): if the context still does
+            // not fit VRAM and the user opted into KV overflow, keep the requested window and let
+            // the KV cache live in system RAM (`INFR_KV_OVERFLOW`, honored by the Vulkan backend's
+            // `BufferUsage::KvCache` alloc). Read over PCIe by attention — slower, but the big
+            // context actually runs instead of clamping. Flag off ⇒ today's clamp/error unchanged.
+            if crate::seam::kv_overflow_enabled() {
+                eprintln!(
+                    "ctx overflow: keeping default context {want} (would clamp to {fit} in VRAM); \
+                     INFR_KV_OVERFLOW=1 places the KV cache in system RAM, read over PCIe"
+                );
+                return want;
+            }
             let vram = vk.vram();
             let fp = crate::weights::weight_footprint(&self.gguf);
             eprintln!(

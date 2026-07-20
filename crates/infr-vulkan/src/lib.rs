@@ -33,7 +33,7 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ash::vk;
@@ -176,6 +176,13 @@ struct VulkanShared {
     /// is full. See [`probe_uma_overflow_type`] for why counting that heap in the budget is not
     /// enough on its own — the bytes have to be able to land there too.
     uma_overflow_type: Option<u32>,
+    /// The host-visible memory type on a NON-device-local heap, probed on EVERY device (unlike
+    /// `uma_overflow_type`, which is UMA-only). On a discrete card this heap is system RAM across
+    /// PCIe. `None` if the device exposes no such type. Used ONLY by the opt-in
+    /// `INFR_KV_OVERFLOW` path to place the KV cache in system RAM (read by attention over PCIe
+    /// via its device address — the KV read seam is 100% `bufferDeviceAddress`, so the bytes may
+    /// live off-device with no shader change). See [`Self::alloc_kv_host`].
+    host_overflow_type: Option<u32>,
     /// Bytes this process has placed on the UMA OVERFLOW heap (`uma_overflow_type`). Counted apart
     /// from `device_used`, which stays "bytes on the DEVICE-LOCAL heaps" — the spill decision is
     /// exactly "would this push the device-local heap past its declared size", so it must not see
@@ -474,6 +481,19 @@ fn probe_uma_overflow_type(mp: &vk::PhysicalDeviceMemoryProperties) -> Option<u3
             && !heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
     })
 }
+
+/// Opt-in: place the KV cache in system RAM (host-visible heap, read by attention over PCIe via
+/// its device address) instead of device-local VRAM, so a context whose KV would not fit VRAM can
+/// still run. `INFR_KV_OVERFLOW=1`. Default OFF (empty or `0` = off) = today's VRAM-only behavior,
+/// unchanged. See [`VulkanBackend::alloc_kv_host`] and the ctx-clamp ladder's last rung.
+fn kv_overflow_enabled() -> bool {
+    std::env::var("INFR_KV_OVERFLOW")
+        .ok()
+        .is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// One-shot latch for the LOUD "KV is in system RAM" banner (see [`VulkanBackend::alloc_kv_host`]).
+static KV_OVERFLOW_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Free bytes on the DEVICE-LOCAL heaps alone — what the UMA spill decision keys off (unlike
 /// [`vram_info`]'s UMA figure, which spans every heap). Live VK_EXT_memory_budget when present, so
@@ -1661,6 +1681,9 @@ impl VulkanBackend {
             .unified_memory
             .then(|| probe_uma_overflow_type(&mem_props))
             .flatten();
+        // Same probe, but WITHOUT the UMA gate — on a discrete card this resolves to the GTT
+        // host-visible type (system RAM over PCIe). Only the opt-in KV-overflow path uses it.
+        let host_overflow_type = probe_uma_overflow_type(&mem_props);
 
         Ok(Self {
             moe_pager: Mutex::new(None),
@@ -1686,6 +1709,7 @@ impl VulkanBackend {
                 device_used: AtomicU64::new(0),
                 submit_dispatch_cap: AtomicUsize::new(submit_dispatch_cap),
                 uma_overflow_type,
+                host_overflow_type,
                 uma_spilled: AtomicU64::new(0),
                 staging_ring: Mutex::new(None),
             }),
@@ -1941,8 +1965,15 @@ impl VulkanBackend {
         ty: u32,
         spilled: bool,
         device_address: bool,
+        budget_check: bool,
     ) -> Result<VkBuffer> {
-        self.check_vram_budget(requirements.size)?;
+        // The KV-overflow path (`alloc_kv_host`) places bytes in SYSTEM RAM across PCIe, not VRAM,
+        // so it opts out of the device-local budget guard entirely (`budget_check == false`). The
+        // UMA spill keeps it: on a unified part every heap IS the same DDR pool and the guard
+        // budgets against all of them.
+        if budget_check {
+            self.check_vram_budget(requirements.size)?;
+        }
 
         let mut flags_info =
             vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
@@ -2012,6 +2043,59 @@ impl VulkanBackend {
 
     fn make_buf(&self, size: usize, location: MemoryLocation, label: &str) -> Result<VkBuffer> {
         self.make_buf_ex(size, location, label, false, false)
+    }
+
+    /// Allocate one KV-cache buffer in SYSTEM RAM (host-visible, non-device-local heap) WITH a
+    /// device address — the opt-in `INFR_KV_OVERFLOW` path. The KV read seam is 100%
+    /// `bufferDeviceAddress` (issue #74: `attn_partial`/`attention_kv`/dequant read K/V only
+    /// through `k_addr`/`v_addr` pointers), so a KV buffer whose bytes live off-device is read by
+    /// attention over PCIe with NO shader change; only the store→read barrier's inert bound
+    /// descriptors still bind the same buffer, which is valid on any heap. Same bytes, different
+    /// heap ⇒ bit-identical logits to a VRAM KV cache, at PCIe bandwidth.
+    ///
+    /// This is SYSTEM RAM, not VRAM, so it does NOT go through the device-local budget guard
+    /// (`budget_check == false`) and is charged to `uma_spilled`, not `device_used` — leaving the
+    /// VRAM guard to protect only the weights + activations that actually live on-device. Requires
+    /// `host_overflow_type` (present on RDNA3 = the GTT host-visible type); the caller has already
+    /// checked the flag, so a missing type here is a hard error rather than a silent VRAM fallback.
+    fn alloc_kv_host(&self, size: usize) -> Result<VkBuffer> {
+        let ty =
+            self.shared.host_overflow_type.ok_or_else(|| {
+                be("INFR_KV_OVERFLOW set but this device exposes no host-visible non-device-local \
+                memory type to place the KV cache in — unset it to run in VRAM".to_string())
+            })?;
+        // KV buffers are addressed by device address (issue #74), so this buffer needs the
+        // SHADER_DEVICE_ADDRESS usage exactly like the VRAM KV path (`make_buf_ex(.., true)`).
+        let usage = vk::BufferUsageFlags::from_raw(
+            BUFFER_USAGE.as_raw() | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS.as_raw(),
+        );
+        let buf_ci = vk::BufferCreateInfo::default()
+            .size(size as u64)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer = unsafe { self.shared.device.create_buffer(&buf_ci, None) }
+            .map_err(|e| be(format!("create_buffer(kv-host): {e}")))?;
+        let requirements = unsafe { self.shared.device.get_buffer_memory_requirements(buffer) };
+        if requirements.memory_type_bits & (1 << ty) == 0 {
+            unsafe { self.shared.device.destroy_buffer(buffer, None) };
+            return Err(be(
+                "INFR_KV_OVERFLOW: the host-visible overflow memory type is not compatible with a \
+                 KV storage buffer on this device"
+                    .to_string(),
+            ));
+        }
+        if !KV_OVERFLOW_LOGGED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[infr] INFR_KV_OVERFLOW: KV cache is in SYSTEM RAM (host-visible heap), NOT VRAM. \
+                 Attention reads K/V over PCIe by device address — expect PCIe-bound decode and \
+                 markedly slower prefill. KV bytes are exempt from the VRAM budget guard."
+            );
+        }
+        // spilled=true (charged to uma_spilled, not device_used), device_address=true,
+        // budget_check=false (this is system RAM). On Err, `alloc_vram_mapped` leaves the buffer
+        // to us.
+        self.alloc_vram_mapped(buffer, size, &requirements, ty, true, true, false)
+            .inspect_err(|_| unsafe { self.shared.device.destroy_buffer(buffer, None) })
     }
 
     /// Allocate the paged-MoE expert arena as a `bufferDeviceAddress` buffer and return it with its
@@ -2231,6 +2315,7 @@ impl VulkanBackend {
                         ty,
                         true,
                         device_address,
+                        true,
                     ) {
                         Ok(b) => Ok(b),
                         Err(e) => {
@@ -2389,6 +2474,14 @@ impl VulkanBackend {
         // an `own_addr`. Smallest blast radius: only KV buffers get an address, not every
         // `Activations` scratch/partial/logits allocation in the engine.
         if usage == BufferUsage::KvCache {
+            // Opt-in overflow (issue: KV-in-system-RAM): place the whole KV cache in host RAM,
+            // read by attention over PCIe via its device address (the read seam is 100% BDA — see
+            // `alloc_kv_host`). Off by default ⇒ unchanged device-local VRAM KV. `host_overflow_type`
+            // is None only on a device with no host-visible non-device-local heap, in which case
+            // `alloc_kv_host` errors clearly rather than silently landing in VRAM.
+            if kv_overflow_enabled() {
+                return self.alloc_kv_host(bytes);
+            }
             return self.make_buf_ex(bytes, MemoryLocation::GpuOnly, "kv-cache", false, true);
         }
         let (location, label) = match usage {
