@@ -571,6 +571,132 @@ impl Op {
             Op::MoeSharedExpertAdd { .. } => "MoeSharedExpertAdd",
         }
     }
+
+    /// The tensor handles this op READS and the ones it WRITES, as `(reads, writes)`.
+    ///
+    /// Used by the multi-device pipeline executor (`infr-vulkan`'s `PipelineBackend`) to infer,
+    /// from the DEVICE each bound operand lives on, which physical device an op runs on — and to
+    /// detect the cross-device "cut" tensors (a handle written by an op on device A and read by an
+    /// op on device B) that must be handed off at the layer-split boundary. An IN-PLACE update
+    /// (`dst == x`, a `+=`, or a stateful `state`/`cache` write) appears in BOTH lists: it is read
+    /// and written. Kept exhaustive (no `_` arm) so a new [`Op`] variant forces a decision here.
+    pub fn io(&self) -> (Vec<TensorId>, Vec<TensorId>) {
+        match *self {
+            Op::RmsNorm { x, weight, dst, .. } => (vec![x, weight], vec![dst]),
+            Op::RmsNormAdd { x, weight, dst, .. } => (vec![x, weight, dst], vec![dst]),
+            Op::Softmax {
+                x, dst, scale_buf, ..
+            } => {
+                let mut r = vec![x];
+                r.extend(scale_buf);
+                (r, vec![dst])
+            }
+            Op::Linear { x, weight, dst, .. } => (vec![x, weight], vec![dst]),
+            Op::QkNorm { x, weight, dst, .. } => (vec![x, weight], vec![dst]),
+            Op::GatedRmsNorm {
+                x,
+                weight,
+                gate,
+                dst,
+                ..
+            } => (vec![x, weight, gate], vec![dst]),
+            Op::Rope {
+                x,
+                positions,
+                dst,
+                freq_factors,
+                ..
+            } => {
+                let mut r = vec![x, positions];
+                r.extend(freq_factors);
+                (r, vec![dst])
+            }
+            Op::QkNormRope {
+                x,
+                weight,
+                positions,
+                dst,
+                freq_factors,
+                ..
+            } => {
+                let mut r = vec![x, weight, positions];
+                r.extend(freq_factors);
+                (r, vec![dst])
+            }
+            Op::WriteKv { src, cache, .. } => (vec![src, cache], vec![cache]),
+            Op::Attention {
+                q,
+                k_cache,
+                v_cache,
+                dst,
+                ..
+            } => (vec![q, k_cache, v_cache], vec![dst]),
+            Op::GatedAct { gate, up, dst, .. } => (vec![gate, up], vec![dst]),
+            Op::GatedActFused { gu, dst, .. } => (vec![gu], vec![dst]),
+            Op::Add { a, b, dst, .. } => (vec![a, b], vec![dst]),
+            Op::AddBias { x, bias, dst, .. } => (vec![x, bias], vec![dst]),
+            Op::Scale { x, dst, .. } => (vec![x], vec![dst]),
+            Op::MulVec { x, vec: v, dst, .. } => (vec![x, v], vec![dst]),
+            Op::Softcap { x, dst, .. } => (vec![x], vec![dst]),
+            Op::Argmax { x, dst, .. } => (vec![x], vec![dst]),
+            Op::ArgmaxProb {
+                x,
+                dst_id,
+                dst_prob,
+                ..
+            } => (vec![x], vec![dst_id, dst_prob]),
+            Op::Sample { x, u, dst, .. } => (vec![x, u], vec![dst]),
+            Op::EmbedGather {
+                ids, table, dst, ..
+            } => (vec![ids, table], vec![dst]),
+            Op::Copy { src, dst, .. } => (vec![src], vec![dst]),
+            Op::CopyStrided { src, dst, .. } => (vec![src], vec![dst]),
+            Op::MoeFfn {
+                x,
+                router_x,
+                router,
+                gate_exps,
+                up_exps,
+                down_exps,
+                down_scale,
+                dst,
+                ..
+            } => {
+                let mut r = vec![x, router_x, router, gate_exps, up_exps, down_exps];
+                r.extend(down_scale);
+                (r, vec![dst])
+            }
+            Op::Conv1dSilu {
+                x,
+                weight,
+                state,
+                dst,
+                ..
+            } => (vec![x, weight, state], vec![state, dst]),
+            Op::DeltaNet {
+                q,
+                k,
+                v,
+                b,
+                a,
+                a_coef,
+                dt_bias,
+                state,
+                dst,
+                ..
+            } => (
+                vec![q, k, v, b, a, a_coef, dt_bias, state],
+                vec![state, dst],
+            ),
+            Op::MoeSharedExpertAdd {
+                moe,
+                shexp,
+                gate,
+                dst,
+                ..
+            } => (vec![moe, shexp, gate], vec![dst]),
+        }
+    }
 }
 
 /// An ordered op-list over declared tensor handles. Node index in `tensors` == [`TensorId`].
@@ -697,5 +823,89 @@ impl Graph {
 
     pub fn kind(&self, id: TensorId) -> TensorKind {
         self.tensors[id.0 as usize].kind
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tensor::{DType, TensorDesc};
+
+    /// `Op::io` reports the exact read/write handles — the contract the multi-device pipeline
+    /// executor infers each op's device and cut tensors from.
+    #[test]
+    fn op_io_reads_and_writes() {
+        let t = |n: u32| TensorId(n);
+        // Linear reads x + weight, writes dst.
+        let lin = Op::Linear {
+            x: t(0),
+            weight: t(1),
+            dst: t(2),
+            m: 1,
+            in_f: 4,
+            out_f: 4,
+            w_off: 0,
+        };
+        assert_eq!(lin.io(), (vec![t(0), t(1)], vec![t(2)]));
+
+        // In-place residual Add: reads a + b, writes dst (== a here).
+        let add = Op::Add {
+            a: t(2),
+            b: t(3),
+            dst: t(2),
+            n: 4,
+        };
+        assert_eq!(add.io(), (vec![t(2), t(3)], vec![t(2)]));
+
+        // WriteKv: the KV cache is BOTH read and written (stateful append pins the op's device).
+        let wk = Op::WriteKv {
+            src: t(5),
+            cache: t(6),
+            rows: 1,
+            row_stride: 8,
+            pos: 0,
+        };
+        assert_eq!(wk.io(), (vec![t(5), t(6)], vec![t(6)]));
+
+        // Attention reads q + both caches, writes dst (caches are read-only here — WriteKv wrote them).
+        let attn = Op::Attention {
+            q: t(7),
+            k_cache: t(6),
+            v_cache: t(8),
+            dst: t(9),
+            rows: 1,
+            kv_len: 1,
+            n_head: 1,
+            n_kv: 1,
+            head_dim: 8,
+            scale: 1.0,
+            mask: AttnMask::Causal,
+            pos: 0,
+        };
+        assert_eq!(attn.io(), (vec![t(7), t(6), t(8)], vec![t(9)]));
+    }
+
+    /// Optional read operands (rope `freq_factors`) appear only when present.
+    #[test]
+    fn op_io_optional_operands() {
+        let t = |n: u32| TensorId(n);
+        let rope = |ff: Option<TensorId>| Op::Rope {
+            x: t(0),
+            positions: t(1),
+            dst: t(0),
+            rows: 1,
+            n_head: 1,
+            head_dim: 8,
+            rope_dim: 8,
+            theta: 1e4,
+            freq_factors: ff,
+            x_stride: 0,
+        };
+        assert_eq!(rope(None).io(), (vec![t(0), t(1)], vec![t(0)]));
+        assert_eq!(rope(Some(t(2))).io(), (vec![t(0), t(1), t(2)], vec![t(0)]));
+        // A minimal graph round-trips a declared handle's kind (keeps the tensor imports live).
+        let mut g = Graph::new();
+        let w = g.weight(TensorDesc::new(vec![4], DType::F32));
+        assert_eq!(g.kind(w), TensorKind::Weight);
     }
 }

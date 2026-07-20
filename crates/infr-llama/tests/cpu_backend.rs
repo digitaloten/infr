@@ -3022,3 +3022,87 @@ fn two_models_two_devices_concurrent() {
         );
     }
 }
+
+// ─── Multi-GPU PIPELINE (layer-split): correctness = single-device-identical ──────────────────
+//
+// Splits ONE model's transformer layers across TWO physical GPUs (layers [0..k) on device A,
+// [k..N) on device B), each layer's weights + KV resident on its device, the residual hidden state
+// handed across the boundary (P2P dma-buf when available, else host-bounce). The KEY correctness
+// claim: the split forward is BIT-IDENTICAL to the SAME model run on ONE device.
+//
+// The reference is the pipeline path itself on a SINGLE device (`[d0]`): identical runner code path
+// (host-embed + static execute — see `PipelineBackend::capabilities`), with NO cut/handoff. Only
+// the split + cross-device handoff differs between the two runs, so identical output ids prove the
+// mechanism is exactly single-device. (Comparing against the fast production path instead would mix
+// in the record-once-replay `_dyn`-kernel ULP noise — see `Graph::no_decode_replay` — a different
+// axis than the split we're validating here.)
+//
+// Also demonstrated: coherent greedy output across both devices, and the per-device placement
+// (printed) landing distinct physical GPUs. `#[ignore]` + self-skips below 2 Vulkan devices. Run:
+//   INFR_TEMP=0 cargo test --release -p infr-llama --test cpu_backend \
+//     pipeline_matches_single_device -- --include-ignored --nocapture
+#[test]
+#[ignore = "requires TWO Vulkan GPUs: run with --include-ignored on a multi-GPU box"]
+fn pipeline_matches_single_device() {
+    let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
+    let devs = infr_vulkan::VulkanBackend::enumerate_devices().expect("enumerate devices");
+    if devs.len() < 2 {
+        eprintln!(
+            "skip: pipeline_matches_single_device needs >=2 Vulkan devices (found {})",
+            devs.len()
+        );
+        return;
+    }
+    let _tlk = test_serial_lock();
+    std::env::set_var("INFR_TEMP", "0");
+    std::env::set_var("INFR_NO_THINK", "1");
+
+    let model = infr_llama::SeamModel::load(&path, None).expect("load");
+    let prompt = model
+        .render_chat("What is the capital of France? Reply with just the city name.")
+        .expect("render");
+    let enc = model.encode(&prompt).expect("encode");
+    let n = 24;
+    let d0 = devs[0].index;
+    let d1 = devs[1].index;
+
+    // Reference: the SAME pipeline runner path on ONE device (no split, no handoff).
+    eprintln!("\n[pipeline] reference: single-device [Vulkan{d0}]");
+    let ref_ids = model
+        .generate_pipeline_ids(&[d0], &enc, n, |_| {})
+        .expect("single-device pipeline gen");
+
+    // Split across BOTH devices — layers [0..k) on Vulkan{d0}, [k..N) on Vulkan{d1}.
+    eprintln!("[pipeline] split: [Vulkan{d0}, Vulkan{d1}]");
+    let split_ids = model
+        .generate_pipeline_ids(&[d0, d1], &enc, n, |_| {})
+        .expect("two-device pipeline gen");
+
+    // BIT-IDENTICAL: the split produces the exact same token ids as single-device.
+    assert_eq!(
+        ref_ids, split_ids,
+        "layer-split output diverged from single-device — the cross-device handoff is not \
+         value-preserving"
+    );
+
+    // Coherent greedy output across the two-device split.
+    let text = model.decode(&split_ids).expect("decode split ids");
+    eprintln!("[pipeline] split output: {text:?}");
+    assert!(
+        text.contains("Paris"),
+        "two-device split output not coherent: {text:?}"
+    );
+
+    // Distinct physical devices actually held the two halves.
+    assert_ne!(
+        devs[0].name, devs[1].name,
+        "the two devices must be distinct physical GPUs"
+    );
+    eprintln!(
+        "[pipeline] PASS — {}-token split across Vulkan{d0} ({}) + Vulkan{d1} ({}) is \
+         token-identical to single-device",
+        split_ids.len(),
+        devs[0].name,
+        devs[1].name,
+    );
+}

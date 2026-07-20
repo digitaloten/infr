@@ -17,9 +17,11 @@ mod ops;
 pub mod p2p;
 pub mod pager;
 mod pcache;
+pub mod pipeline;
 mod recorder;
 
 pub use p2p::{P2pExport, P2pHandleType};
+pub use pipeline::{PipelineBackend, PipelineBuffer};
 pub use recorder::{FlashStage, RecordedCmd, Recorder};
 
 /// Shared-memory bytes consumed per query row of a flash-attention prefill tile

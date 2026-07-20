@@ -904,6 +904,58 @@ impl SeamModel {
         Ok(generated)
     }
 
+    /// Multi-GPU PIPELINE (layer-split) twin of [`generate_dense_vulkan`](Self::generate_dense_vulkan):
+    /// split this model's transformer layers across the physical `devices` (e.g. `[0, 1]`), each
+    /// layer's weights + KV resident on its device, the residual handed across at the boundary.
+    /// BIT-IDENTICAL to the single-device path (same ops + per-device kernels). Dense models only.
+    pub fn generate_dense_vulkan_pipeline(
+        &self,
+        devices: &[usize],
+        prompt: &str,
+        max_new: usize,
+    ) -> Result<String> {
+        let enc = self
+            .tokenizer
+            .encode(prompt, false)
+            .map_err(|e| anyhow!("encode: {e}"))?;
+        let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
+        let (generated, _stats) = crate::seam::generate_dense_vulkan_pipeline(
+            devices,
+            &self.gguf,
+            &self.cfg,
+            self.embd(),
+            self.per_layer_embd.as_ref(),
+            &prompt_tokens,
+            max_new,
+            |_| {},
+        )?;
+        self.tokenizer
+            .decode(&generated, true)
+            .map_err(|e| anyhow!("decode: {e}"))
+    }
+
+    /// Token-id twin of [`generate_dense_vulkan_pipeline`](Self::generate_dense_vulkan_pipeline)
+    /// (raw ids for a bit-identity check vs [`generate_vulkan_ids`](Self::generate_vulkan_ids)).
+    pub fn generate_pipeline_ids(
+        &self,
+        devices: &[usize],
+        prompt_tokens: &[u32],
+        max_new: usize,
+        on_id: impl FnMut(u32),
+    ) -> Result<Vec<u32>> {
+        let (generated, _stats) = crate::seam::generate_dense_vulkan_pipeline(
+            devices,
+            &self.gguf,
+            &self.cfg,
+            self.embd(),
+            self.per_layer_embd.as_ref(),
+            prompt_tokens,
+            max_new,
+            on_id,
+        )?;
+        Ok(generated)
+    }
+
     /// Token-level bench on the Vulkan seam, llama-bench-comparable: ONE weight upload (a
     /// persistent session) + an untimed pipeline warmup, then per rep — reset the KV, warm it to
     /// `depth` (untimed), and time ONE metric: `pg` = a whole (P prefill + G decode) turn,

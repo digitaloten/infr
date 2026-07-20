@@ -1201,6 +1201,157 @@ pub(crate) fn vulkan_moe_binder<'a>(
     }))
 }
 
+/// Parse the `INFR_PIPELINE` device list (`Vulkan0,Vulkan1,…`) into physical device indices, or
+/// `None` when the flag is unset. An empty/garbage list errors loudly.
+pub fn parse_pipeline_devices() -> AResult<Option<Vec<usize>>> {
+    let Some(spec) = std::env::var_os("INFR_PIPELINE") else {
+        return Ok(None);
+    };
+    let spec = spec.to_string_lossy();
+    let mut devs = Vec::new();
+    for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let idx = part
+            .strip_prefix("Vulkan")
+            .unwrap_or(part)
+            .parse::<usize>()
+            .map_err(|_| anyhow!("INFR_PIPELINE: '{part}' is not VulkanN or a device index"))?;
+        devs.push(idx);
+    }
+    if devs.len() < 2 {
+        return Err(anyhow!(
+            "INFR_PIPELINE needs >=2 devices for a layer split (got '{spec}'); \
+             unset it to run single-device"
+        ));
+    }
+    Ok(Some(devs))
+}
+
+/// A device-aware [`BindWeight`] for the multi-GPU pipeline: each weight is placed on the device
+/// [`PipelineBackend::device_for_weight`] chooses (by tensor name — `blk.{l}.*` → layer `l`'s
+/// device, `output*`/`token_embd` → last device) and wrapped in a single-device
+/// [`infr_vulkan::PipelineBuffer`] so the executor can pin its readers to that device. Dense
+/// resident weights only (pipeline v1 is dense-attention; the MoE-paged / dense-streamed placement
+/// tiers of [`vulkan_moe_binder`] are out of scope).
+fn pipeline_binder<'a>(pb: &'a infr_vulkan::PipelineBackend) -> Box<BindWeight<'a>> {
+    Box::new(move |name: &str, tb: WBytes, dt: DType, numel: usize| {
+        check_bda_element_cap(name, "tensor", numel)?;
+        let d = pb.device_for_weight(name);
+        let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
+        let buf = pb
+            .backend(d)
+            .alloc_uninit(padded.len(), BufferUsage::Weights)
+            .map_err(|e| anyhow!("{e}"))?;
+        pb.backend(d)
+            .upload(buf.as_ref(), &padded)
+            .map_err(|e| anyhow!("{e}"))?;
+        Ok((infr_vulkan::PipelineBuffer::single(d, buf), dt))
+    })
+}
+
+/// Multi-GPU PIPELINE (layer-split) dense generation — the layers of ONE model are split across
+/// the `devices` (a physical index list, e.g. `[0, 1]`), each layer's weights + KV resident on its
+/// device, the residual hidden state handed across at the split (P2P dma-buf when available, else
+/// host-bounce). The forward is BIT-IDENTICAL to the same model run single-device (identical ops +
+/// per-device kernels; only the boundary residual crosses via a value-preserving copy).
+///
+/// Dense attention models only (Qwen3/Llama/Gemma-dense); MoE / qwen35 DeltaNet / gemma E2B / the
+/// paged + streamed weight tiers are rejected with a clear message (they need per-layer placement
+/// work beyond this slice). Runs one-shot (a single conversation, no slot pool).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn generate_dense_vulkan_pipeline(
+    devices: &[usize],
+    g: &Gguf,
+    cfg: &Config,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    max_new: usize,
+    on_token: impl FnMut(u32),
+) -> AResult<(Vec<u32>, GenStats)> {
+    if cfg.moe.is_some() {
+        return Err(anyhow!(
+            "INFR_PIPELINE (layer-split) supports dense models only; this is an MoE model \
+             (expert-bank per-layer placement is a separate slice)"
+        ));
+    }
+    if cfg.qwen35 {
+        return Err(anyhow!(
+            "INFR_PIPELINE does not yet support qwen35 (DeltaNet recurrent-state placement is a \
+             separate slice)"
+        ));
+    }
+    if cfg.n_embd_per_layer > 0 {
+        return Err(anyhow!(
+            "INFR_PIPELINE does not yet support gemma E2B per-layer embeddings"
+        ));
+    }
+    if cfg.diffusion_gemma {
+        return Err(anyhow!("INFR_PIPELINE does not support diffusion-gemma"));
+    }
+    let mut backends = Vec::with_capacity(devices.len());
+    for &idx in devices {
+        backends.push(
+            infr_vulkan::VulkanBackend::new_on(idx)
+                .map_err(|e| anyhow!("vulkan init (Vulkan{idx}): {e}"))?,
+        );
+    }
+    let layer_map = infr_vulkan::PipelineBackend::balanced_layer_map(cfg.n_layer, backends.len());
+    // Placement report: how many layers landed on each physical device.
+    let names = backends
+        .iter()
+        .map(|b| {
+            use infr_core::backend::Backend;
+            b.capabilities().name
+        })
+        .collect::<Vec<_>>();
+    let use_p2p = std::env::var_os("INFR_PIPELINE_HOST").is_none();
+    let pb = infr_vulkan::PipelineBackend::new(backends, layer_map.clone(), use_p2p)
+        .map_err(|e| anyhow!("{e}"))?;
+    eprintln!(
+        "pipeline: {}-way layer split of {} layers:",
+        devices.len(),
+        cfg.n_layer
+    );
+    for (di, &idx) in devices.iter().enumerate() {
+        let lo = layer_map.iter().position(|&d| d == di);
+        let hi = layer_map.iter().rposition(|&d| d == di);
+        let count = layer_map.iter().filter(|&&d| d == di).count();
+        match (lo, hi) {
+            (Some(lo), Some(hi)) => eprintln!(
+                "  Vulkan{idx} ({}): layers [{lo}..={hi}] ({count} layers){}",
+                names[di],
+                if di + 1 < devices.len() {
+                    ""
+                } else {
+                    " + final norm + lm_head"
+                }
+            ),
+            _ => eprintln!("  Vulkan{idx} ({}): (no layers)", names[di]),
+        }
+    }
+    let bind = pipeline_binder(&pb);
+    generate_dense_backend(
+        &pb,
+        &*bind,
+        g,
+        cfg,
+        token_embd,
+        ple,
+        prompt,
+        max_new,
+        on_token,
+        &mut None,
+        prompt.len() + max_new + 1,
+        None, // constraint
+        None, // verify
+        None, // verify_ids
+        None, // logits_out
+        None, // h_out
+        None, // denoise_req
+        None, // req
+    )
+}
+
 /// Metal seam runner: the SAME dense forward as [`generate_dense_cpu`], on the reference Metal
 /// backend through the agnostic [`Graph`]. Weights are uploaded to Metal buffers in their NATIVE
 /// GGUF dtype (the backend dequantizes lazily in its own `bytes_to_f32`, exactly like the CPU
