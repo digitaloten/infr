@@ -36,9 +36,24 @@ pub use vulkan::DenseSeamChat;
 /// are `&mut dyn FnMut`. A stateful backend (dense) may keep a KV cache warm across `generate` calls;
 /// stateless ones prefill the whole prompt each turn.
 pub trait ChatModel {
+    /// The [`SeamModel`](crate::SeamModel) whose embedded chat template renders this backend's
+    /// prompts. Backends that keep the default [`render`](Self::render) implement this one-liner
+    /// instead of repeating the render body (every real backend funnels to the same
+    /// `SeamModel::render_chat_messages`). Backends that override `render` — the test mocks, which
+    /// own no `SeamModel` — never call it; the default panics so a missing override is a loud bug,
+    /// not a silent wrong render.
+    fn render_model(&self) -> &crate::SeamModel {
+        unreachable!("ChatModel::render_model must be implemented when using the default render()")
+    }
+
     /// Render a conversation `(role, content)` into a prompt string via the model's embedded chat
     /// template. All backends funnel to `infr_chat::render_chat_jinja` (the single prompt renderer).
-    fn render(&self, messages: &[(&str, &str)]) -> Result<String>;
+    /// The provided default routes through [`render_model`](Self::render_model) —
+    /// `SeamModel::render_chat_messages` — so a backend names its field once rather than repeating
+    /// this body; override only where the render genuinely differs (the test mocks do).
+    fn render(&self, messages: &[(&str, &str)]) -> Result<String> {
+        self.render_model().render_chat_messages(messages)
+    }
 
     /// Generate a completion for the already-rendered `prompt`, streaming decoded text to `on_piece`.
     ///
@@ -191,9 +206,21 @@ impl<'a> Chat<'a> {
         }
         // `req: None` — the interactive REPL is a sole sequence: sampling comes from the env/CLI
         // defaults, there is no stop-sequence latch, and there is no GPU to share.
-        let stats = self
+        //
+        // A generate failure must roll the just-pushed user turn back, exactly like the render
+        // failure above: leaving it in `history` with no assistant reply would make the NEXT turn
+        // push a second consecutive `user` message, permanently corrupting the alternating-role
+        // conversation state (the model re-renders with two user turns and no assistant between).
+        let stats = match self
             .model
-            .generate_with_step_hook(&prompt, max_new, None, &mut emit, on_step)?;
+            .generate_with_step_hook(&prompt, max_new, None, &mut emit, on_step)
+        {
+            Ok(s) => s,
+            Err(e) => {
+                self.history.pop();
+                return Err(e);
+            }
+        };
         self.history
             .push(("assistant".into(), strip_think(&answer)));
         Ok(stats)
@@ -341,6 +368,75 @@ mod tests {
             "prior think must be excluded: {second}"
         );
         assert!(second.contains("user: and of Italy?"), "{second}");
+    }
+
+    /// A mock whose FIRST `generate` fails and whose later ones succeed — proves a failed generate
+    /// does not orphan the just-pushed user turn (finding: a `generate` `Err` used to propagate
+    /// with the user turn still in `history`, so the next `turn` pushed a 2nd consecutive user
+    /// message and corrupted the conversation).
+    struct FlakyModel {
+        rendered: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        fail_next: std::cell::Cell<bool>,
+    }
+
+    impl ChatModel for FlakyModel {
+        fn render(&self, messages: &[(&str, &str)]) -> Result<String> {
+            let s = messages
+                .iter()
+                .map(|(r, c)| format!("{r}: {c}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.rendered.borrow_mut().push(s.clone());
+            Ok(s)
+        }
+
+        fn generate(
+            &mut self,
+            _prompt: &str,
+            _max_new: usize,
+            _req: Option<&crate::sampling::RequestCtx>,
+            on_piece: &mut dyn FnMut(&str),
+        ) -> Result<GenStats> {
+            if self.fail_next.get() {
+                self.fail_next.set(false);
+                return Err(anyhow::anyhow!("transient generate failure"));
+            }
+            on_piece("ok");
+            Ok(GenStats::default())
+        }
+    }
+
+    #[test]
+    fn failed_generate_does_not_orphan_user_turn() {
+        let rendered = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let model = FlakyModel {
+            rendered: rendered.clone(),
+            fail_next: std::cell::Cell::new(true),
+        };
+        let mut chat = Chat::new(Box::new(model));
+
+        // Turn 1 fails inside `generate`.
+        let before = chat.history.len();
+        assert!(chat.turn("hi", 8, &mut |_| {}).is_err());
+        // The failed turn must leave history exactly as it was — no dangling user turn.
+        assert_eq!(
+            chat.history.len(),
+            before,
+            "a failed generate must not leave an orphaned user turn"
+        );
+
+        // Turn 2 succeeds: history stays alternating (user, assistant) — NOT (user, user, …).
+        chat.turn("hello again", 8, &mut |_| {}).unwrap();
+        assert_eq!(chat.history.len(), 2);
+        assert_eq!(chat.history[0].0, "user");
+        assert_eq!(chat.history[1].0, "assistant");
+        // The successful render saw exactly ONE user turn (no doubled user message).
+        let last = rendered.borrow().last().unwrap().clone();
+        assert_eq!(
+            last.matches("user:").count(),
+            1,
+            "render must not contain two consecutive user turns: {last}"
+        );
     }
 
     #[test]

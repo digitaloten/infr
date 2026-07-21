@@ -172,23 +172,19 @@ impl DiffusionGemmaChat {
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl ChatModel for DiffusionGemmaChat {
-    fn render(&self, messages: &[(&str, &str)]) -> Result<String> {
-        self.model.render_chat_messages(messages)
+    fn render_model(&self) -> &SeamModel {
+        &self.model
     }
 
     fn warmup(&mut self) -> Result<()> {
         use crate::diffusion::DiffusionSession;
-        let prof2 = std::env::var_os("INFR_PROF2");
-        if prof2.is_some() {
-            std::env::remove_var("INFR_PROF2");
-        }
         // A tiny PREFILL-only forward compiles the lazily-built pipelines (GEMM/attention/batched
         // MoE — a cold DG prefill was measured at 26 t/s vs 1424 t/s warm, ~5s of one-time compile
         // otherwise billed to the first request). No denoise: the canvas plans build per (cc, p)
         // anyway, and their couple of extra pipelines (canvas attention, softmax) are cheap next
         // to the shared set warmed here. The throwaway tokens pollute the session's cached prefix
         // harmlessly — a real prompt prefix-diffs to 0 and re-prefills from scratch.
-        let r = (|| -> Result<()> {
+        crate::with_prof2_suppressed(|| -> Result<()> {
             self.ensure_sess(64)?;
             let enc = self
                 .model
@@ -199,11 +195,7 @@ impl ChatModel for DiffusionGemmaChat {
                 .as_mut()
                 .unwrap()
                 .prefill(&self.model, enc.get_ids())
-        })();
-        if let Some(v) = prof2 {
-            std::env::set_var("INFR_PROF2", v);
-        }
-        r
+        })
     }
 
     /// `_req` is ACCEPTED AND IGNORED, which is exactly what this backend did before the
@@ -300,11 +292,17 @@ impl DiffusionGemmaChat {
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = 0usize;
         let mut on_block = |committed: &[u32]| {
-            for &id in committed {
-                crate::stream_token(tokenizer, &mut acc, &mut printed, id, &mut |p: &str| {
-                    on_piece(p)
-                });
-            }
+            // The whole block's ids are in hand, so decode the committed span in ONE pass through
+            // the shared incremental UTF-8-safe detok — NOT once per id over the growing `acc`
+            // (that was O(total²): every token re-decoded the entire accumulator). Same holdback
+            // semantics, same emitted bytes; only the per-token redundant decode is gone.
+            crate::stream_tokens(
+                tokenizer,
+                &mut acc,
+                &mut printed,
+                committed,
+                &mut |p: &str| on_piece(p),
+            );
         };
 
         let result = crate::diffusion::diffusion_generate(

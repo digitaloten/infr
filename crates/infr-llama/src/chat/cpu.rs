@@ -31,8 +31,8 @@ impl CpuDenseChat {
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl ChatModel for CpuDenseChat {
-    fn render(&self, messages: &[(&str, &str)]) -> Result<String> {
-        self.model.render_chat_messages(messages)
+    fn render_model(&self) -> &SeamModel {
+        &self.model
     }
 
     fn generate(
@@ -55,10 +55,7 @@ impl ChatModel for CpuDenseChat {
         // CPU MTP (INFR_MTP=1 on a head-bearing qwen35 GGUF): the exact-f32 reference for the
         // draft-verify loop — its acceptance rate is the oracle a GPU backend's alpha is judged
         // against (a backend whose head numerics drift from its trunk shows a lower alpha here).
-        if crate::mtp::mtp_enabled()
-            && std::env::var("INFR_MTP").ok().as_deref() == Some("1")
-            && self.model.config().n_layer_nextn > 0
-        {
+        if crate::mtp::should_use_mtp(self.model.config()) {
             let head = crate::mtp::load_mtp_head(self.model.gguf(), self.model.config())?;
             return crate::mtp::generate_mtp_spec_cpu_timed(
                 &self.model,

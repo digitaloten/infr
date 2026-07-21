@@ -64,12 +64,66 @@ pub(crate) fn stream_token(
     on_piece: &mut impl FnMut(&str),
 ) {
     acc.push(id);
+    emit_decoded_suffix(tokenizer, acc, printed, on_piece);
+}
+
+/// Like [`stream_token`], but commits a whole SPAN of ids at once. Callers that already hold every
+/// id of a chunk (diffusion's per-block `on_block` — the whole block's tokens are decided together)
+/// use this so the accumulator is decoded ONCE per span instead of once per id: re-decoding the
+/// growing `acc` after every single id is O(total²) detok for a path where nothing is streamed
+/// token-by-token. Same UTF-8 holdback semantics and same emitted bytes as feeding the ids through
+/// [`stream_token`] one at a time — only the number of `decode` calls (and `on_piece` chunk
+/// boundaries) differs.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn stream_tokens(
+    tokenizer: &Tokenizer,
+    acc: &mut Vec<u32>,
+    printed: &mut usize,
+    ids: &[u32],
+    on_piece: &mut impl FnMut(&str),
+) {
+    if ids.is_empty() {
+        return;
+    }
+    acc.extend_from_slice(ids);
+    emit_decoded_suffix(tokenizer, acc, printed, on_piece);
+}
+
+/// Shared tail of [`stream_token`]/[`stream_tokens`]: decode the whole accumulator, emit the
+/// newly-completed suffix past `printed`, and hold back a trailing `�` (a multi-byte char split
+/// across the token boundary) until it completes.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+fn emit_decoded_suffix(
+    tokenizer: &Tokenizer,
+    acc: &[u32],
+    printed: &mut usize,
+    on_piece: &mut impl FnMut(&str),
+) {
     if let Ok(full) = tokenizer.decode(acc, true) {
         if !full.ends_with('\u{FFFD}') && full.len() > *printed && full.is_char_boundary(*printed) {
             on_piece(&full[*printed..]);
             *printed = full.len();
         }
     }
+}
+
+/// Run `f` with `INFR_PROF2` unset for its duration, restoring the prior value afterward. Every
+/// backend's `warmup()` / startup path (`chat::vulkan`, `chat::diffusion`, `parallel::init_slots`)
+/// needs this identical dance: the per-op profiling recorders read `INFR_PROF2` at CONSTRUCTION, and
+/// a throwaway warmup submit would otherwise pollute a later bench's per-op aggregate. Extracted so
+/// the four call sites can't drift (the Metal path deliberately does NOT use it — the Metal backend
+/// reads its profile env at construction inside the warmup generate itself; see `chat::metal`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn with_prof2_suppressed<T>(f: impl FnOnce() -> T) -> T {
+    let prof2 = std::env::var_os("INFR_PROF2");
+    if prof2.is_some() {
+        std::env::remove_var("INFR_PROF2");
+    }
+    let r = f();
+    if let Some(v) = prof2 {
+        std::env::set_var("INFR_PROF2", v);
+    }
+    r
 }
 
 // Chat-template rendering (`render_chat_jinja`, `render_chat_user`) lives in the shared `infr-chat`

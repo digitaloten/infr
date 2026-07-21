@@ -42,10 +42,10 @@ impl MetalSeamChat {
             return Ok(false);
         }
         self.mtp_checked = true;
-        if !crate::mtp::mtp_enabled()
-            || std::env::var("INFR_MTP").ok().as_deref() != Some("1")
-            || self.model.config().n_layer_nextn == 0
-        {
+        // Shared gate (`crate::mtp::should_use_mtp`) — the Metal twin of Vulkan's `wants_mtp`, one
+        // decision so the two can't drift (Metal previously ignored the parked path SILENTLY while
+        // Vulkan warned; the shared gate warns for both).
+        if !crate::mtp::should_use_mtp(self.model.config()) {
             return Ok(false);
         }
         self.mtp_head = Some(crate::mtp::load_mtp_head(
@@ -74,8 +74,8 @@ impl MetalSeamChat {
 #[cfg(target_os = "macos")]
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl ChatModel for MetalSeamChat {
-    fn render(&self, messages: &[(&str, &str)]) -> Result<String> {
-        self.model.render_chat_messages(messages)
+    fn render_model(&self) -> &SeamModel {
+        &self.model
     }
 
     fn reset_kv(&mut self) {
@@ -192,8 +192,8 @@ impl SpecMetalChat {
 #[cfg(target_os = "macos")]
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl ChatModel for SpecMetalChat {
-    fn render(&self, messages: &[(&str, &str)]) -> Result<String> {
-        self.target.render_chat_messages(messages)
+    fn render_model(&self) -> &SeamModel {
+        &self.target
     }
 
     fn warmup(&mut self) -> Result<()> {

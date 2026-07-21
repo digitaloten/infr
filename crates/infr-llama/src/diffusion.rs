@@ -224,6 +224,43 @@ fn reborrow_step_hook<'b>(
     }
 }
 
+/// NaN-safe ascending entropy order (`diffusion.cpp:644`'s sort). Uses `total_cmp` — the GPU
+/// (`DenoiseOutcome::Reduced`) adopts `entropy` verbatim, and a single NaN row would make
+/// `partial_cmp(..).unwrap()` panic mid-generation. `total_cmp` gives a total order (NaN sorts to
+/// the end), turning a numeric glitch back into a merely-degraded step instead of a hard crash.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+fn entropy_order(entropy: &[f32]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..entropy.len()).collect();
+    order.sort_by(|&a, &b| entropy[a].total_cmp(&entropy[b]));
+    order
+}
+
+/// Entropy-bound acceptance (`diffusion.cpp:644-652`): walk positions in ascending-entropy `order`
+/// and accept each whose STRICTLY-EARLIER cumulative entropy stays within `bound`, returning the
+/// per-position `accepted` mask.
+///
+/// The scan stops at the FIRST rejection. This drops nothing the un-broken loop accepted: the
+/// exclusive-prefix sum `cum_e - entropy[pos]` is monotonic non-decreasing from the first position
+/// that exceeds a (positive) `bound`. Shannon entropy is non-negative, so any fp-noise negatives
+/// from the GPU reducer sort to the FRONT of `order` and are summed BEFORE the bound can be
+/// crossed — hence at and after the crossing every remaining term is `>= 0` and the prefix only
+/// grows. A NaN (sorted last by `entropy_order`) makes `cum_e` NaN, the comparison false, and the
+/// loop breaks — identical to the un-broken loop, which also accepts no NaN position.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+fn accept_by_entropy_bound(entropy: &[f32], order: &[usize], bound: f32) -> Vec<bool> {
+    let mut accepted = vec![false; entropy.len()];
+    let mut cum_e = 0f64;
+    for &pos in order {
+        cum_e += entropy[pos] as f64;
+        if cum_e - entropy[pos] as f64 <= bound as f64 {
+            accepted[pos] = true;
+        } else {
+            break;
+        }
+    }
+    accepted
+}
+
 /// ONE block's entropy-bound denoise (`diffusion_generate_entropy_bound`, `diffusion.cpp:442-683`)
 /// against a session already `prefill`ed with the committed prefix. Returns the block's argmax
 /// canvas (the observable output — `diffusion.cpp:658` writes `argmax_canvas` to `output_tokens`
@@ -254,7 +291,11 @@ fn denoise_block(
     // treats `None` as that gate (see `DenoiseReq`'s doc), so we don't track `step_idx` separately.
     let mut sc_buffer: Option<Vec<f32>> = None;
     let mut argmax_canvas = vec![0u32; c];
-    let mut prev_argmax: Option<Vec<u32>> = None; // None == "step 0, never stable" (-1 sentinel upstream)
+    // Reusable buffer for the previous step's argmax + a "have we a previous step yet" flag
+    // (`have_prev == false` is step 0, never stable — the -1 sentinel upstream). `clone_from`
+    // below refills this buffer in place every step instead of allocating a fresh `Vec` clone.
+    let mut prev_argmax: Vec<u32> = Vec::new();
+    let mut have_prev = false;
     let mut entropy = vec![0f32; c];
     let mut denoiser = vec![0u32; c];
 
@@ -313,16 +354,27 @@ fn denoise_block(
                 // The original computed `exp(raw*temp_inv - m)` TWICE per vocab element (once to
                 // accumulate `z_sum`, again — bit-for-bit the same value, since `exp` is a pure
                 // function of its input bits — to get `e` for the entropy/cumsum pass). Caching that
-                // first `exp` in a per-thread scratch buffer (`map_init`, reused across this worker's
+                // first `exp` in a per-thread scratch buffer (reused across this worker's
                 // positions instead of a fresh per-position `Vec`) drops the loop from 2 exp passes +
                 // 1 ln pass to 1 exp pass + 1 ln pass over the row — same values, same order,
                 // bit-identical output, ~1/3 fewer transcendental calls and one fewer full 1 MB/row
                 // traversal.
+                // The `escratch` is a persistent PER-THREAD `thread_local` grown once to `vocab`,
+                // NOT a `map_init` init closure — the latter reallocated the ~1 MB buffer fresh on
+                // every `par_iter` (i.e. every denoise step). Same values/order, bit-identical.
+                thread_local! {
+                    static ESCRATCH: std::cell::RefCell<Vec<f32>> =
+                        const { std::cell::RefCell::new(Vec::new()) };
+                }
                 let per_pos: Vec<(u32, f32, u32)> = (0..c)
                     .into_par_iter()
-                    .map_init(
-                        || vec![0f32; vocab],
-                        |escratch, pos| {
+                    .map(|pos| {
+                        ESCRATCH.with(|cell| {
+                            let mut escratch = cell.borrow_mut();
+                            if escratch.len() < vocab {
+                                escratch.resize(vocab, 0.0);
+                            }
+                            let escratch = &mut escratch[..vocab];
                             let row = &logits[pos * vocab..(pos + 1) * vocab];
                             let mut m = f32::NEG_INFINITY;
                             let mut amax = 0u32;
@@ -356,8 +408,8 @@ fn denoise_block(
                                 }
                             }
                             (amax, h, sampled)
-                        },
-                    )
+                        })
+                    })
                     .collect();
                 for (pos, &(amax, h, sampled)) in per_pos.iter().enumerate() {
                     argmax_canvas[pos] = amax;
@@ -382,17 +434,10 @@ fn denoise_block(
         }
 
         // Accept the lowest-entropy positions whose STRICTLY-EARLIER cumulative entropy stays
-        // within the MI bound (`diffusion.cpp:644-652`).
-        let mut order: Vec<usize> = (0..c).collect();
-        order.sort_by(|&a, &b| entropy[a].partial_cmp(&entropy[b]).unwrap());
-        let mut accepted = vec![false; c];
-        let mut cum_e = 0f64;
-        for &pos in &order {
-            cum_e += entropy[pos] as f64;
-            if cum_e - entropy[pos] as f64 <= eb.entropy_bound as f64 {
-                accepted[pos] = true;
-            }
-        }
+        // within the MI bound (`diffusion.cpp:644-652`) — NaN-safe sort + early-out scan (see the
+        // helpers' docs).
+        let order = entropy_order(&entropy);
+        let accepted = accept_by_entropy_bound(&entropy, &order, eb.entropy_bound);
 
         // Renoise: accepted -> sampled token, rest -> fresh random; the OUTPUT canvas is always
         // the argmax, whether or not a position was accepted this step (`diffusion.cpp:654-660`).
@@ -419,11 +464,12 @@ fn denoise_block(
 
         // Adaptive stop: argmax stable for `stability_threshold` steps AND confident (mean
         // entropy below the bound) — `diffusion.cpp:662-667`.
-        let stable = prev_argmax.as_deref() == Some(argmax_canvas.as_slice());
+        let stable = have_prev && prev_argmax == argmax_canvas;
         held = if stable { held + 1 } else { 0 };
         let mean_entropy = entropy_sum / c as f32;
         let confident = mean_entropy < eb.confidence_threshold;
-        prev_argmax = Some(argmax_canvas.clone());
+        prev_argmax.clone_from(&argmax_canvas); // reuse the buffer, no fresh per-step allocation
+        have_prev = true;
         prev_temp_inv = temp_inv;
         if eb_trace {
             let n_accepted = accepted.iter().filter(|&&a| a).count();
@@ -593,7 +639,65 @@ pub fn is_diffusion_gemma(path: &std::path::Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::trim_canvas;
+    use super::{accept_by_entropy_bound, entropy_order, trim_canvas};
+
+    #[test]
+    fn entropy_order_is_ascending_and_nan_safe() {
+        // A NaN row must NOT panic (the old `partial_cmp(..).unwrap()` did) — total_cmp gives a
+        // total order and sorts NaN to the end.
+        let entropy = [0.5f32, f32::NAN, 0.1, 0.3];
+        let order = entropy_order(&entropy);
+        // The three finite values come out ascending; the NaN is last.
+        assert_eq!(order.len(), 4);
+        assert_eq!(&order[..3], &[2usize, 3, 0]);
+        assert!(entropy[order[3]].is_nan());
+    }
+
+    #[test]
+    fn accept_bound_break_matches_unbroken_loop() {
+        // Reference (un-broken) acceptance to compare the early-out against.
+        fn reference(entropy: &[f32], order: &[usize], bound: f32) -> Vec<bool> {
+            let mut accepted = vec![false; entropy.len()];
+            let mut cum = 0f64;
+            for &pos in order {
+                cum += entropy[pos] as f64;
+                if cum - entropy[pos] as f64 <= bound as f64 {
+                    accepted[pos] = true;
+                }
+            }
+            accepted
+        }
+        // Non-negative entropies (Shannon entropy is >= 0): exclusive prefix is monotonic, so the
+        // break drops nothing.
+        let entropy = [0.4f32, 0.4, 0.4, 0.4, 0.4];
+        let order = entropy_order(&entropy);
+        for &bound in &[0.0f32, 0.3, 0.8, 1.0, 1.6, 5.0] {
+            assert_eq!(
+                accept_by_entropy_bound(&entropy, &order, bound),
+                reference(&entropy, &order, bound),
+                "bound {bound}"
+            );
+        }
+        // Distinct values + a fp-noise negative (sorts to the front) — still identical.
+        let entropy = [0.1f32, -1e-6, 0.9, 0.2, 0.05];
+        let order = entropy_order(&entropy);
+        for &bound in &[0.0f32, 0.1, 0.35, 1.0] {
+            assert_eq!(
+                accept_by_entropy_bound(&entropy, &order, bound),
+                reference(&entropy, &order, bound),
+                "bound {bound}"
+            );
+        }
+    }
+
+    #[test]
+    fn accept_bound_with_nan_does_not_panic() {
+        let entropy = [0.2f32, f32::NAN, 0.1];
+        let order = entropy_order(&entropy);
+        // NaN sorted last → its exclusive-prefix check is false → not accepted, no panic.
+        let accepted = accept_by_entropy_bound(&entropy, &order, 10.0);
+        assert!(!accepted[1]);
+    }
 
     #[test]
     fn trim_canvas_cuts_at_eog() {

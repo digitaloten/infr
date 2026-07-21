@@ -22,7 +22,7 @@ reproduce/confirm are dropped (not listed) to keep this a verified-only ledger.
 
 - **Original audit:** 157 findings across 24 module slices (1 🔴 critical, 33 🟠
   major, 123 🟡 minor).
-- **Remaining open:** **123** — 0 🔴, 22 🟠, 101 🟡.
+- **Remaining open:** **116** — 0 🔴, 20 🟠, 96 🟡.
 
 No finding was accepted on an agent's word — each was re-read against the source
 by the coordinator; two agent-flagged "MAJOR"s (the Q5_1 clamp in the shader and
@@ -97,13 +97,24 @@ parked path).
   template source (was rebuilt every render); `bos_token_id` falls back to `""`
   not `2` (EOS on Llama); `emit` scans via resumable cursors (was O(n²));
   `remove_spans` de-duplicates the two parsers.
+- **`infr-llama` diffusion/parallel/util/chat (all 7 findings)** — TDD, +7
+  tests. A failed `generate` now pops the just-pushed user turn (no orphaned
+  double-user-turn); `parallel.rs checkout` drops the pool lock across the
+  `seed_from` GPU submit (reserving the slots) and picks the longest-prefix free
+  slot (was first-match); diffusion entropy sort is NaN-safe (`total_cmp`), the
+  per-step `escratch` (~1MB) and `prev_argmax` clone are hoisted/reused, and the
+  acceptance loop `break`s at the (proven-monotonic) entropy cutoff; per-block
+  detok decodes the committed span once (was O(total²)); and
+  `with_prof2_suppressed` / a `ChatModel::render` default / one
+  `should_use_mtp(cfg)` de-duplicate the four backends (fixing the `wants_mtp`
+  drift).
 
 ### Highest-priority (production default paths)
 
 | #      | Sev | Location                              | Issue                                                                                                                            |
 | ------ | --- | ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
 | ~~1~~  | ✅  | `infr-hub`                            | ~~Downloaded blob never sha256-verified~~ — **FIXED** (`1263bcc`, + full hub slice).                                             |
-| 2      | 🟠  | `infr-llama chat/mod.rs:186`          | Generate error leaves an **orphaned user turn** → next turn has two consecutive user messages, permanent history corruption.     |
+| ~~2~~  | ✅  | `infr-llama chat/mod.rs`              | ~~Generate error orphans the user turn~~ — **FIXED** (`Err` arm pops the user turn).                                             |
 | ~~3~~  | ✅  | `infr-server lib.rs`                  | ~~Streaming swallows errors as `stop`~~ — **FIXED** (error frame + panic-safe `DoneGuard`).                                      |
 | ~~4~~  | ✅  | `infr-server lib.rs`                  | ~~No per-request cancellation~~ — **FIXED** (cancel latch → `req.abort()` frees the slot).                                       |
 | 5      | 🟠  | `infr-llama runner.rs:3743,3989`      | Prefix-cache records **KV rows never materialized** (`max_new==0` frontier; grammar-forced tokens) → next turn attends stale KV. |
@@ -743,53 +754,6 @@ items below are latent acceptance-rate/perf bugs, not output corruption._
    lock-step with no enforcement. \_Fix:* `emit_mtp_layer` helper, shared
    upload/bind helper, per-backend `mtp_bind_weight(be)`, and a single
    `Option<Leading{…}>` enum for the leading state.
-
-## infr-llama/src/{diffusion,parallel,util}.rs + chat/\*
-
-1. **🟠 `chat/mod.rs:186 — a failed `generate` leaves an orphaned user turn in
-   history.** The user message is pushed at `158`; a _render_ failure rolls it
-   back (`168`) but a `generate_with_step_hook(...)?` error at `188` propagates
-   with the user turn still in `history` and no assistant reply — asymmetric.
-   Any transient generate error (GPU fault, KV overflow, stop-abort) then makes
-   the next `turn` push a second consecutive `user` message → the model
-   re-renders with two user turns and no assistant between → permanently corrupt
-   conversation state. _Fix:_ `history.pop()` on the generate `Err` too (or push
-   the user turn only after success).
-2. **🟠
-   `parallel.rs:304 — `checkout`holds the pool`Mutex`across a device-side`seed_from`
-   GPU submit** (`307-313`), directly against the module doc (`48-59`). Under
-   `--parallel N` every other request's `checkout` and every `SlotGuard::drop`
-   serializes behind a KV-copy submit → global chokepoint. _Fix:_ take
-   `src`/`dst` out, drop the lock across `seed_from`, re-acquire to finish
-   bookkeeping.
-3. **🟡 `parallel.rs:276 — prefix-continuation picks the first matching free
-   slot, not the longest-prefix one** (same bug shape as `seam/model.rs`
-   `SlotPool::pick`) → re-prefills more suffix, undercutting the ~7x TTFT
-   prefix-cache win. _Fix:_ `max_by_key(prefix_score)` over the qualifying free
-   slots.
-4. **🟡 `diffusion.rs:387 — `entropy[a].partial_cmp(&entropy[b]).unwrap()`
-   panics on NaN.** The `DenoiseOutcome::Reduced` branch adopts `entropy`
-   verbatim from GPU output; a single NaN row turns a numeric glitch into a hard
-   mid-generation panic. _Fix:_ `total_cmp` / `unwrap_or(Equal)`.
-5. **🟡 `diffusion.rs:323,426 + 390 — hot-loop waste in denoise.**
-   `map_init(|| vec![0f32; vocab], …)` reallocates the ~1 MB (`vocab≈262144`)
-   per-thread `escratch` every step (fresh `par_iter`/step) — hoist a persistent
-   per-thread scratch; `prev_argmax=Some(argmax_canvas.clone())` (`426`) clones
-   the whole canvas every step — `mem::swap` a reusable buffer; the acceptance
-   loop (`390`) never `break`s though `cum_e-entropy[pos]` is monotonic once
-   past the bound — add the `break`.
-6. **🟡 `chat/diffusion.rs:302 / util.rs:59 — per-block stream detok redecodes
-   the whole accumulator per token** (`decode(acc,true)` over growing `acc` per
-   id) → O(total²) detok for a block path where the whole block's ids are
-   already in hand. _Fix:_ decode the newly-committed span once (tracking the
-   char-boundary holdback).
-7. **🟡 DRY — per-backend chat boilerplate.** The `INFR_PROF2`-suppress +
-   throwaway warmup dance (`chat/vulkan.rs:149`, `metal.rs:81`,
-   `diffusion.rs:179`, `parallel.rs:154`) and the byte-identical `render` impl
-   recur across all four `ChatModel`s; `wants_mtp` is duplicated near-verbatim
-   (`vulkan.rs:71` vs `metal.rs:37`) and has already drifted (one warns, one
-   doesn't). _Fix:_ `with_prof2_suppressed(||…)` helper, a provided
-   `ChatModel::render` default, and one shared `should_use_mtp(cfg)` + loader.
 
 ## infr-metal/src/exec.rs (Metal backend — audited by reading; not runnable here)
 

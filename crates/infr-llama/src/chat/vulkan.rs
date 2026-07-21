@@ -76,21 +76,9 @@ impl DenseSeamChat {
             return Ok(false);
         }
         self.mtp_checked = true;
-        if std::env::var("INFR_MTP").ok().as_deref() != Some("1") {
-            return Ok(false);
-        }
-        // MTP is PARKED (`mtp::mtp_enabled`'s doc): honour the env var with a warning, then fall
-        // through to the ordinary decode path. A head-bearing GGUF still runs — its `nextn` tensors
-        // are simply unused.
-        if !crate::mtp::mtp_enabled() {
-            eprintln!(
-                "[infr] INFR_MTP=1 ignored: MTP speculative decode is disabled (known-broken — it \
-                 no longer matches greedy output under the int8 decode kernels; see README). \
-                 Running the ordinary decode path."
-            );
-            return Ok(false);
-        }
-        if self.model.config().n_layer_nextn == 0 {
+        // Shared gate (`crate::mtp::should_use_mtp`) so Vulkan and Metal can't drift: `INFR_MTP=1`,
+        // MTP not parked, and a head-bearing GGUF. It emits the "parked" warning itself.
+        if !crate::mtp::should_use_mtp(self.model.config()) {
             return Ok(false);
         }
         self.mtp_head = Some(crate::mtp::load_mtp_head(
@@ -142,8 +130,8 @@ impl DenseSeamChat {
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl ChatModel for DenseSeamChat {
-    fn render(&self, messages: &[(&str, &str)]) -> Result<String> {
-        self.model.render_chat_messages(messages)
+    fn render_model(&self) -> &SeamModel {
+        &self.model
     }
 
     fn reset_kv(&mut self) {
@@ -153,15 +141,7 @@ impl ChatModel for DenseSeamChat {
     }
 
     fn warmup(&mut self) -> Result<()> {
-        let prof2 = std::env::var_os("INFR_PROF2");
-        if prof2.is_some() {
-            std::env::remove_var("INFR_PROF2");
-        }
-        let r = self.generate("Hi", 2, None, &mut |_| {});
-        if let Some(v) = prof2 {
-            std::env::set_var("INFR_PROF2", v);
-        }
-        r?;
+        crate::with_prof2_suppressed(|| self.generate("Hi", 2, None, &mut |_| {}))?;
         // Drop the warmup tokens so the first real prompt prefills clean slots from row 0
         // instead of forking off a garbage prefix.
         if let Some(s) = &mut self.session {

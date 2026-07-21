@@ -95,6 +95,28 @@ pub fn mtp_enabled() -> bool {
     false
 }
 
+/// The SINGLE MTP opt-in decision the chat backends share (`chat::vulkan`/`chat::metal`/`chat::cpu`
+/// `ChatModel`s). Returns `true` only when the user asked (`INFR_MTP=1`), MTP is not parked
+/// ([`mtp_enabled`]), AND the GGUF actually ships an MTP head (`cfg.n_layer_nextn > 0`). When
+/// `INFR_MTP=1` but MTP is parked it warns once and returns `false` (the head-bearing GGUF still
+/// runs — its `nextn` tensors are simply unused). Extracted because the Vulkan and Metal gates had
+/// drifted: one warned on the parked path, the other silently ignored the env var.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub fn should_use_mtp(cfg: &crate::Config) -> bool {
+    if std::env::var("INFR_MTP").ok().as_deref() != Some("1") {
+        return false;
+    }
+    if !mtp_enabled() {
+        eprintln!(
+            "[infr] INFR_MTP=1 ignored: MTP speculative decode is disabled (known-broken — it \
+             no longer matches greedy output under the int8 decode kernels; see README). \
+             Running the ordinary decode path."
+        );
+        return false;
+    }
+    cfg.n_layer_nextn > 0
+}
+
 /// Cheap arch/head check from a resolved GGUF path — no `Config`/tensor validation, just the
 /// metadata flag (mirrors `qwen35::is_qwen35`/`diffusion::is_diffusion_gemma`'s "peek without a
 /// full load" convention). `infr compare`'s MTP DECODE section and the `--sweep` `mtp` column

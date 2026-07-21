@@ -42,6 +42,26 @@ use crate::{Config, GenStats, SeamModel};
 use anyhow::{anyhow, Result};
 use std::sync::{Arc, Condvar, Mutex};
 
+/// Pure continuation-slot selection (the "this conversation continuing" case of [`checkout`], and
+/// the twin of `seam::model::SlotPool::pick`'s first arm). Given `(slot_idx, prefix_score,
+/// cached_len)` for each candidate free slot and the `prompt_len`, pick the qualifying slot with
+/// the LONGEST reusable prefix — a slot qualifies when the prompt EXTENDS its cache (`score ==
+/// cached_len`) or EQUALS it (`score == prompt_len`), and its score is positive. Returns the
+/// winning `slot_idx`, or `None` if no slot qualifies.
+///
+/// Split out as a pure fn so this decision is unit-testable without a live Vulkan backend / KV
+/// slots (the lock-drop and device-side `seed_from` around it stay integration-only).
+fn pick_continuation(
+    candidates: impl IntoIterator<Item = (usize, usize, usize)>,
+    prompt_len: usize,
+) -> Option<usize> {
+    candidates
+        .into_iter()
+        .filter(|&(_, score, cached)| score > 0 && (score == cached || score == prompt_len))
+        .max_by_key(|&(_, score, _)| score)
+        .map(|(idx, _, _)| idx)
+}
+
 /// One KV slot: its cache (moved OUT while a request holds it, so the generation gets the
 /// `&mut Option<SeamKv>` the runner wants without holding the pool lock), plus the bookkeeping the
 /// prefix-match/LRU policy needs.
@@ -155,30 +175,25 @@ impl ParallelSeam {
         let t0 = std::time::Instant::now();
         // The warmup generation both uploads the weights and compiles every lazily-built pipeline,
         // so the first REAL request pays neither. INFR_PROF2 is suppressed for it (recorders read
-        // it at construction; warmup submits would pollute a later bench's per-op aggregate).
-        let prof2 = std::env::var_os("INFR_PROF2");
-        if prof2.is_some() {
-            std::env::remove_var("INFR_PROF2");
-        }
+        // it at construction; warmup submits would pollute a later bench's per-op aggregate) via the
+        // shared `with_prof2_suppressed` helper.
         let mut slot0: Option<SeamKv> = None;
-        let warm = crate::seam::generate_dense_vulkan_session(
-            &self.vk,
-            self.model.gguf(),
-            self.model.config(),
-            self.model.embd(),
-            self.model.per_layer_embd(),
-            &[1u32],
-            2,
-            |_| {},
-            &mut slot0,
-            self.max_ctx,
-            None, // constraint
-            None, // req: startup, not a request — env sampling, no gate
-        );
-        if let Some(v) = prof2 {
-            std::env::set_var("INFR_PROF2", v);
-        }
-        warm?;
+        crate::with_prof2_suppressed(|| {
+            crate::seam::generate_dense_vulkan_session(
+                &self.vk,
+                self.model.gguf(),
+                self.model.config(),
+                self.model.embd(),
+                self.model.per_layer_embd(),
+                &[1u32],
+                2,
+                |_| {},
+                &mut slot0,
+                self.max_ctx,
+                None, // constraint
+                None, // req: startup, not a request — env sampling, no gate
+            )
+        })?;
         let mut slot0 = slot0.ok_or_else(|| anyhow!("warmup did not initialize a KV slot"))?;
         // Drop the warmup tokens so the first real prompt prefills a clean slot from row 0 instead
         // of forking off a garbage prefix.
@@ -272,13 +287,19 @@ impl ParallelSeam {
                 continue;
             }
             let score = |s: &Slot| s.kv.as_ref().map_or(0, |k| k.prefix_score(prompt));
-            // 1. This conversation continuing: a slot whose cache the prompt extends (or equals).
-            let cont = free.iter().copied().find(|&i| {
-                p.slots[i].kv.as_ref().is_some_and(|k| {
-                    let sc = k.prefix_score(prompt);
-                    sc > 0 && (sc == k.cached_len() || sc == prompt.len())
-                })
-            });
+            // 1. This conversation continuing: the free slot with the LONGEST reusable prefix among
+            //    those the prompt extends (or equals) — not merely the first such slot (which would
+            //    re-prefill more suffix). Pure decision, unit-tested via `pick_continuation`.
+            let cont = pick_continuation(
+                free.iter().map(|&i| {
+                    let (sc, cached) = p.slots[i]
+                        .kv
+                        .as_ref()
+                        .map_or((0, 0), |k| (k.prefix_score(prompt), k.cached_len()));
+                    (i, sc, cached)
+                }),
+                prompt.len(),
+            );
             // 2. Otherwise the LRU free slot, preferring an already-empty one (nothing to lose).
             let target = match cont {
                 Some(i) => i,
@@ -293,30 +314,45 @@ impl ParallelSeam {
             // Seed the target with the best shared prefix among the other FREE slots (a common
             // system prompt), via a device-side KV copy instead of re-prefilling it.
             if cont.is_none() {
-                if let Some(&best) = free
+                let best = free
                     .iter()
-                    .filter(|&&i| i != target)
-                    .max_by_key(|&&i| score(&p.slots[i]))
-                {
+                    .copied()
+                    .filter(|&i| i != target)
+                    .max_by_key(|&i| score(&p.slots[i]));
+                if let Some(best) = best {
                     let best_s = score(&p.slots[best]);
                     if best_s >= MIN_SEED && best_s > score(&p.slots[target]) {
-                        // Take both out to satisfy the borrow checker, then put them back.
-                        let src = p.slots[best].kv.take().expect("scored slot is Some");
                         // `seed_from` is a device-side KV copy — it RECORDS, so it takes a turn on
-                        // the baton like any other GPU region (see `StepGate`).
+                        // the baton like any other GPU submit. The module doc forbids holding the
+                        // pool `Mutex` across a submit (it would serialize every other request's
+                        // checkout/drop behind this copy). So: RESERVE both slots (mark them busy so
+                        // no concurrent checkout can select them), take their KV out, DROP the lock
+                        // across `seed_from`, then re-acquire to put them back.
+                        p.slots[best].busy = true;
+                        p.slots[target].busy = true;
+                        let src = p.slots[best].kv.take().expect("scored slot is Some");
+                        let mut dst = p.slots[target].kv.take();
+                        drop(p);
                         let r = {
                             let _gp = req.gate_pass();
-                            match p.slots[target].kv.as_mut() {
+                            match dst.as_mut() {
                                 Some(dst) => dst.seed_from(&self.vk, cfg, &src, best_s),
                                 None => Ok(()),
                             }
                         };
+                        p = self.pool.lock().expect("pool poisoned");
+                        // Return the source slot's KV and release its reservation; `target` stays
+                        // reserved (busy) — it is checked out just below.
                         p.slots[best].kv = Some(src);
+                        p.slots[best].busy = false;
+                        p.slots[target].kv = dst;
                         // A failed seed costs only the prefix reuse — the slot re-prefills from
                         // scratch and the answer is identical. Never fail the request for it.
                         if let Err(e) = r {
                             eprintln!("kv slots: prefix seed failed ({e}); re-prefilling instead");
                         }
+                        // `best` just went free again — wake a waiter that may want it.
+                        self.freed.notify_one();
                     }
                 }
             }
@@ -380,5 +416,39 @@ impl ParallelSeam {
             Some(req),
         )?;
         Ok(stats)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pick_continuation;
+
+    #[test]
+    fn continuation_picks_longest_prefix_not_first() {
+        // Three free slots, prompt_len = 100. Slots 0 and 2 both qualify (prompt extends their
+        // cache: score == cached_len); slot 2 has the LONGER reusable prefix, so it must win even
+        // though slot 0 appears first. Slot 1 is a different conversation (score below its cache).
+        let candidates = [
+            (0usize, 20usize, 20usize), // extends: score 20 == cached 20
+            (1, 5, 40),                 // no: 5 != 40 and 5 != 100
+            (2, 60, 60),                // extends: score 60 == cached 60 (longest)
+        ];
+        assert_eq!(pick_continuation(candidates, 100), Some(2));
+    }
+
+    #[test]
+    fn continuation_accepts_exact_equal_prompt() {
+        // score == prompt_len (the prompt EQUALS the cache) qualifies even when cached_len differs.
+        let candidates = [(7usize, 30usize, 50usize)];
+        assert_eq!(pick_continuation(candidates, 30), Some(7));
+    }
+
+    #[test]
+    fn continuation_none_when_no_slot_qualifies() {
+        // A partial-but-diverged prefix (score < cached_len and < prompt_len) does not continue.
+        let candidates = [(0usize, 10usize, 40usize), (1, 0, 0)];
+        assert_eq!(pick_continuation(candidates, 100), None);
+        // Empty candidate set.
+        assert_eq!(pick_continuation(std::iter::empty(), 100), None);
     }
 }
