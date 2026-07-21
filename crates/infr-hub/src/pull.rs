@@ -76,15 +76,25 @@ fn pull_repo_latest(repo: &str, sel: Option<&str>) -> Result<PathBuf> {
     let url = format!("https://huggingface.co/{repo}/resolve/main/{filename}");
     // The commit moved but the FILE may be byte-identical (e.g. the repo only added a sibling like an
     // mmproj). Blobs are content-addressed by sha256, so if the file's sha is already cached we just
-    // relink — no multi-GB re-download. A HEAD gives the LFS sha (`X-Linked-Etag`) without the body.
-    let hex = match head_blob_sha(repo, &filename) {
-        Ok(sha) if blobs.join(&sha).exists() => {
+    // relink — no multi-GB re-download. A HEAD gives the LFS sha (`X-Linked-Etag`) without the body,
+    // which also lets the download verify the body against it.
+    let want = head_lfs_sha(repo, &filename).ok().flatten();
+    let hex = match &want {
+        Some(sha) if blobs.join(sha).exists() => {
             info!("hf:{repo}:{filename} content unchanged; relinking → {commit}");
-            sha
+            sha.clone()
         }
         _ => {
             info!("Updating hf:{repo}:{filename} → {commit}");
-            download_to_blob(&http_client()?, &url, token().as_deref(), &blobs, &filename)?.1
+            download_to_blob(
+                &http_client()?,
+                &url,
+                token().as_deref(),
+                &blobs,
+                &filename,
+                want.as_deref(),
+            )?
+            .1
         }
     };
 
@@ -101,9 +111,13 @@ fn pull_repo_latest(repo: &str, sel: Option<&str>) -> Result<PathBuf> {
 }
 
 /// HEAD the resolve URL to read the file's LFS sha256 (HF's `X-Linked-Etag`) WITHOUT downloading the
-/// body — so a commit bump that left the file unchanged can relink the cached blob. Redirects are
-/// disabled because the sha header is on huggingface.co's 302, not the CDN's final 200.
-fn head_blob_sha(repo: &str, filename: &str) -> Result<String> {
+/// body — so a commit bump that left the file unchanged can relink the cached blob, and so the
+/// download can verify the body against it. Returns `Ok(Some(sha))` for an LFS file, `Ok(None)` for a
+/// non-LFS file (no `X-Linked-Etag`), and `Err` only on a transport failure. The plain `ETag` is a
+/// quoted md5, NOT the content sha256, so it is deliberately never used here — treating it as a sha
+/// would defeat both the relink fast-path and integrity verification. Redirects are disabled because
+/// the sha header is on huggingface.co's 302, not the CDN's final 200.
+fn head_lfs_sha(repo: &str, filename: &str) -> Result<Option<String>> {
     let client = Client::builder()
         .user_agent("infr-hub/0.1")
         .redirect(reqwest::redirect::Policy::none())
@@ -117,12 +131,18 @@ fn head_blob_sha(repo: &str, filename: &str) -> Result<String> {
     let resp = req
         .send()
         .map_err(|e| Error::Other(format!("HEAD {url}: {e}")))?;
-    let h = resp.headers();
-    h.get("x-linked-etag")
-        .or_else(|| h.get("etag"))
+    let sha = resp
+        .headers()
+        .get("x-linked-etag")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.trim_matches('"').to_string())
-        .ok_or_else(|| Error::Other("no etag in HEAD response".into()))
+        .map(|s| s.trim_matches('"').to_ascii_lowercase())
+        .filter(|s| is_sha256(s));
+    Ok(sha)
+}
+
+/// True for a lowercase hex sha256 digest: exactly 64 hex digits.
+fn is_sha256(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn http_client() -> Result<Client> {
@@ -155,8 +175,27 @@ fn pull_repo(repo: &str, sel: Option<&str>) -> Result<PathBuf> {
     let repo_dir = store.repo_dir(repo);
     let blobs = repo_dir.join("blobs");
     let url = format!("https://huggingface.co/{repo}/resolve/main/{filename}");
-    let (blob, hex, _size) =
-        download_to_blob(&http_client()?, &url, token().as_deref(), &blobs, &filename)?;
+    // Fetch the expected LFS sha256 (GGUFs are LFS) so the download is (a) skipped when the
+    // content-addressed blob is already on disk and (b) verified against it. A non-LFS file or a HEAD
+    // failure yields None → the download proceeds unverified (best-effort).
+    let want = head_lfs_sha(repo, &filename).ok().flatten();
+    let hex = match &want {
+        Some(sha) if blobs.join(sha).exists() => {
+            debug!("hf:{repo}:{filename} blob already present; linking → {sha}");
+            sha.clone()
+        }
+        _ => {
+            download_to_blob(
+                &http_client()?,
+                &url,
+                token().as_deref(),
+                &blobs,
+                &filename,
+                want.as_deref(),
+            )?
+            .1
+        }
+    };
 
     // Write the HF Hub pointers: refs/main = commit, snapshots/<commit>/<file> -> ../../blobs/<sha>.
     write_text(&repo_dir.join("refs").join("main"), &commit)?;
@@ -166,7 +205,6 @@ fn pull_repo(repo: &str, sel: Option<&str>) -> Result<PathBuf> {
     let _ = fs::remove_file(&link); // replace a stale/dangling link
     symlink(format!("../../blobs/{hex}"), &link).map_err(Error::from)?;
     debug!("linked {link:?} -> blobs/{hex}");
-    let _ = blob;
     fetch_companions(repo, &blobs, &snap, &siblings);
     Ok(link)
 }
@@ -235,8 +273,9 @@ fn fetch_companions(repo: &str, blobs: &Path, snap: &Path, siblings: &[String]) 
             continue; // already cached
         }
         let url = format!("https://huggingface.co/{repo}/resolve/main/{name}");
-        let dl =
-            http_client().and_then(|c| download_to_blob(&c, &url, token().as_deref(), blobs, name));
+        // Companions are small (often non-LFS) convenience files; download best-effort, unverified.
+        let dl = http_client()
+            .and_then(|c| download_to_blob(&c, &url, token().as_deref(), blobs, name, None));
         match dl {
             Ok((_, hex, _)) => {
                 let _ = fs::remove_file(&link);
@@ -255,16 +294,34 @@ fn fetch_companions(repo: &str, blobs: &Path, snap: &Path, siblings: &[String]) 
 // ---------------------------------------------------------------------------
 
 /// Stream `url` into `blobs/<sha256>` (HF's content-addressed blob name), resuming a prior partial if
-/// present. Returns `(blob_path, hex_digest, total_bytes)`. On error the partial temp file is KEPT so
-/// a later call resumes from where it stopped.
+/// present. Returns `(blob_path, hex_digest, total_bytes)`. On a transport error the partial temp file
+/// is KEPT so a later call resumes from where it stopped.
+///
+/// When `expected_sha` is `Some`, it is HF's advertised LFS sha256 and is used two ways: the download
+/// is skipped entirely if that content-addressed blob is already on disk, and the downloaded bytes are
+/// verified against it before the blob is committed — a mismatch discards the temp and errors (a
+/// corrupt/truncated body, or a resume of a stale partial from a since-changed file, must never be
+/// linked as the model). `None` (non-LFS file / no digest available) proceeds without verification.
 fn download_to_blob(
     client: &Client,
     url: &str,
     bearer: Option<&str>,
     blobs: &Path,
     label: &str,
+    expected_sha: Option<&str>,
 ) -> Result<(PathBuf, String, u64)> {
     fs::create_dir_all(blobs).map_err(Error::from)?;
+    // Content-addressed short-circuit: if we already know the sha and hold that blob, we're done.
+    if let Some(sha) = expected_sha {
+        let blob = blobs.join(sha);
+        if blob.exists() {
+            let size = fs::metadata(&blob).map(|m| m.len()).unwrap_or(0);
+            debug!("blob {sha} already present ({size} bytes); skipping download of {label}");
+            return Ok((blob, sha.to_string(), size));
+        }
+    } else {
+        debug!("no expected sha256 for {label}; download will not be integrity-checked");
+    }
     let tmp = blobs.join(format!(".dl-{}", sanitise(label)));
     let have = fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
 
@@ -319,12 +376,31 @@ fn download_to_blob(
         .map(|b| format!("{b:02x}"))
         .collect();
     let size = fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+
+    // Integrity gate: the body MUST hash to HF's advertised LFS sha256. On mismatch discard the temp
+    // (do NOT keep it for resume — a resumed corrupt prefix stays corrupt) and fail loudly.
+    if let Err(e) = verify_sha(label, &hex, expected_sha) {
+        pb.abandon_with_message(format!("⚠ {label} sha256 mismatch"));
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
     pb.finish_with_message(format!("✓ {label} ({} MiB)", size / (1024 * 1024)));
 
     let blob = blobs.join(&hex); // HF blob name = bare sha256 hex
     fs::rename(&tmp, &blob).map_err(Error::from)?;
     info!("Saved blob: {blob:?}");
     Ok((blob, hex, size))
+}
+
+/// Assert the downloaded digest `hex` matches the `expected` LFS sha256 (case-insensitive). `None`
+/// means no digest was available (non-LFS file) → verification is skipped.
+fn verify_sha(label: &str, hex: &str, expected: Option<&str>) -> Result<()> {
+    match expected {
+        Some(exp) if !hex.eq_ignore_ascii_case(exp) => Err(Error::Other(format!(
+            "sha256 mismatch for {label}: expected {exp}, got {hex} — corrupt download discarded"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Read an existing file fully through `hasher` (to continue a resumed digest).
@@ -385,4 +461,36 @@ fn sanitise(s: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn is_sha256_shape() {
+        assert!(is_sha256(SHA_A));
+        assert!(is_sha256(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        ));
+        assert!(!is_sha256(&"a".repeat(63))); // too short
+        assert!(!is_sha256(&"a".repeat(65))); // too long
+        assert!(!is_sha256(&"g".repeat(64))); // non-hex
+        assert!(!is_sha256("d41d8cd98f00b204e9800998ecf8427e")); // md5 (32 chars)
+        assert!(!is_sha256(""));
+    }
+
+    #[test]
+    fn verify_sha_gate() {
+        // Match (case-insensitive) passes.
+        assert!(verify_sha("f", SHA_A, Some(SHA_A)).is_ok());
+        assert!(verify_sha("f", SHA_A, Some(&SHA_A.to_ascii_uppercase())).is_ok());
+        // No expected digest → skipped (non-LFS best-effort).
+        assert!(verify_sha("f", SHA_A, None).is_ok());
+        // Mismatch fails loudly.
+        let other = "b".repeat(64);
+        assert!(verify_sha("f", SHA_A, Some(&other)).is_err());
+    }
 }
