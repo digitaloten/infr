@@ -24,6 +24,7 @@ shared uint bucket[16];
 shared uint sh_sel;
 shared uint sh_krem;
 shared uint gcnt;
+shared uint geqcnt;
 shared float gval[KMAX];
 shared uint gidx[KMAX];
 
@@ -72,21 +73,34 @@ void main() {
     }
     uint thresh = prefix; // key of the k-th largest value
 
-    // Phase B: gather values with key ≥ threshold into shared (cap k).
-    if (tid == 0u) { gcnt = 0u; }
+    // Phase B: gather the TRUE top-k. Values with key STRICTLY > thresh are all retained (there are
+    // < k of them, since thresh is the k-th largest key); the remaining slots are then filled with
+    // key == thresh values. All key-equal values are numerically equal (f2ui is a bijection on the
+    // float bit pattern), so any choice among the threshold ties is a valid top-k — but WHICH tied
+    // indices land in the retained set is nondeterministic (atomic order). The old single-pass
+    // "gather ≥thresh, cap at k" could let equal-to-threshold values race into the low slots and
+    // evict a strictly-greater logit to slot ≥ k (dropped) → not the true top-k.
+    if (tid == 0u) { gcnt = 0u; geqcnt = 0u; }
     barrier();
-    for (uint i = tid; i < pc.n; i += BLOCK) {
-        float v = logits[i];
-        if (f2ui(v) >= thresh) {
+    for (uint i = tid; i < pc.n; i += BLOCK) { // pass 1: strictly greater — always fits (< k)
+        if (f2ui(logits[i]) > thresh) {
             uint slot = atomicAdd(gcnt, 1u);
-            if (slot < k) { gval[slot] = v; gidx[slot] = i; }
+            if (slot < k) { gval[slot] = logits[i]; gidx[slot] = i; }
+        }
+    }
+    barrier();
+    uint ngt = min(gcnt, k);
+    for (uint i = tid; i < pc.n; i += BLOCK) { // pass 2: equal to threshold — fill remaining slots
+        if (f2ui(logits[i]) == thresh) {
+            uint slot = ngt + atomicAdd(geqcnt, 1u);
+            if (slot < k) { gval[slot] = logits[i]; gidx[slot] = i; }
         }
     }
     barrier();
 
     // Phase C (single lane): sort the ≤k candidates, softmax+temp, nucleus, inverse-CDF sample.
     if (tid == 0u) {
-        uint m = min(gcnt, k);
+        uint m = min(gcnt + geqcnt, k);
         for (uint a = 1u; a < m; a++) {
             float vv = gval[a];
             uint ii = gidx[a];

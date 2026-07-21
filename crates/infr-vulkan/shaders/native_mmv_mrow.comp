@@ -70,7 +70,11 @@ layout(binding = 4) buffer YB { float y_buf[]; };
 #endif
 const uint MR = uint(MRV);
 const uint MAX_SG = 8u;                  // 64 threads / min 8-wide subgroup
+#ifndef OUTS4
+// Only the 2-output (non-OUTS4) reduction uses this tree; the OUTS4 build reduces via part4, so
+// declaring `part` there just burned 512 B of LDS and cut occupancy on the small-in_f shape.
 shared float part[2u * MR * MAX_SG];     // one partial per (output, row, subgroup)
+#endif
 
 // Weight-word read chokepoint — see native_mmv.comp for why this family declares its own `NW(i)`
 // instead of inheriting native_decode.glsl's.

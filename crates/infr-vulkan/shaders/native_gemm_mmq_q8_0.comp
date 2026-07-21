@@ -6,6 +6,10 @@
 // per block — no superblock sub-block indexing like Q4_K/Q6_K need). Mirrors native_gemm_mmq_q6k
 // (register-blocked 64×64 tile, TM×TN=4×4, scalar dp4a — RADV int8 WMMA hangs). w_base =
 // expert·stride. Requires n%64, k%32.
+// Padded-C contract (same as gemm_proj.comp:6): the `qa`/`dact` staging reads for rows ≥ m pull
+// garbage (their output is ignored) and — outside the EXPERT_GRID rowEnd guard — the store writes
+// the full BM-row tile unconditionally, so C MUST be allocated ceil(m/64)*64 rows. Every caller
+// honors this (recorder.rs `matmul_native_dp4a_q8_0`/`matmul_native` allocate the padded dst).
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require

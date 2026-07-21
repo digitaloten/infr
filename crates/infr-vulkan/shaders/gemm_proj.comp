@@ -9,8 +9,6 @@
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_KHR_shader_subgroup_basic : require
-#extension GL_EXT_buffer_reference2 : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
@@ -20,22 +18,23 @@ const uint BK = 32u;
 
 // Resident-BDA: the weight is read through a 64-bit buffer_reference into the resident arena
 // (base = arena_lo/arena_hi) instead of a bound SSBO — see linear_f32.comp's header for the
-// campaign rationale.
+// campaign rationale. Reads funnel through native_weight_addr.glsl's arena_word() (saddr scalar-base
+// global_load) rather than a divergent-index 64-bit deref — see that file's header.
 layout(push_constant) uniform PC { uint m; uint n; uint k; uint arena_lo; uint arena_hi; } pc;
 layout(binding = 0) readonly buffer ABuf { float a[]; };       // [M, K] f32 activations
-layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ArenaW { uint v[]; };
-uint64_t w_ptr = 0ul;
-#define WQ(i) ArenaW(w_ptr).v[i]
 layout(binding = 2) writeonly buffer CBuf { float c[]; };
 
+#include "native_weight_addr.glsl"
+#define NW(i) arena_word(i)
+
 shared float16_t As[BM * BK];
-shared float16_t Bs[BK * BN];
+shared float16_t Bs[BN * BK]; // [n][k] — staged k-inner so the global weight reads coalesce
 
 // f16 weight element g (global index into [N,K] = out*K + in)
-float wf(uint g) { return unpackHalf2x16(WQ(g >> 1u))[g & 1u]; }
+float wf(uint g) { return unpackHalf2x16(NW(g >> 1u))[g & 1u]; }
 
 void main() {
-    w_ptr = (uint64_t(pc.arena_hi) << 32) | uint64_t(pc.arena_lo); // resident tensor base byte address
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident tensor base byte address
     uint tilesN = pc.n / BN;
     uint wgRow = (gl_WorkGroupID.x / tilesN) * BM;
     uint wgCol = (gl_WorkGroupID.x % tilesN) * BN;
@@ -57,10 +56,10 @@ void main() {
             uint gr = wgRow + r;
             As[idx] = (gr < pc.m) ? float16_t(a[gr * pc.k + k0 + cc]) : float16_t(0.0);
         }
-        for (uint idx = li; idx < BK * BN; idx += 128u) {
-            uint r = idx / BN;  // k within tile
-            uint cc = idx % BN; // n within tile
-            Bs[idx] = float16_t(wf((wgCol + cc) * pc.k + (k0 + r)));
+        for (uint idx = li; idx < BN * BK; idx += 128u) {
+            uint cc = idx / BK; // n within tile
+            uint kk = idx % BK; // k within tile (contiguous → coalesced weight reads)
+            Bs[cc * BK + kk] = float16_t(wf((wgCol + cc) * pc.k + (k0 + kk)));
         }
         barrier();
 
@@ -71,8 +70,8 @@ void main() {
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b1;
             coopMatLoad(a0, As, (sgRow + 0u) * BK + kf, BK, gl_CooperativeMatrixLayoutRowMajor);
             coopMatLoad(a1, As, (sgRow + 16u) * BK + kf, BK, gl_CooperativeMatrixLayoutRowMajor);
-            coopMatLoad(b0, Bs, kf * BN + (sgCol + 0u), BN, gl_CooperativeMatrixLayoutRowMajor);
-            coopMatLoad(b1, Bs, kf * BN + (sgCol + 16u), BN, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b0, Bs, (sgCol + 0u) * BK + kf, BK, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(b1, Bs, (sgCol + 16u) * BK + kf, BK, gl_CooperativeMatrixLayoutColumnMajor);
             acc00 = coopMatMulAdd(a0, b0, acc00);
             acc01 = coopMatMulAdd(a0, b1, acc01);
             acc10 = coopMatMulAdd(a1, b0, acc10);

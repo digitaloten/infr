@@ -4,6 +4,10 @@
 // from native blocks during shared staging via dqblk() — so each weight element is decoded ONCE and
 // reused across all BM=64 activation rows (the row-amortization GEMV lacks). -DFMT_* selects the
 // format; build-compiled into one .spv per format. Requires requiredSubgroupSize=32, N%64, K%32.
+// Padded-C contract (same as gemm_proj.comp:6): A staging guards `gr<pc.m` (rows ≥ M load 0), but
+// the coopMatStore below writes the FULL 64-row tile unconditionally — so C MUST be allocated
+// ceil(M/64)*64 rows (padded rows receive 0, harmless). Every caller honors this (recorder.rs
+// `matmul_native_off`/`matmul_native` etc. all allocate the ceil(m/64)*64-row dst).
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require

@@ -67,7 +67,9 @@ float dqsub_dbuf(uint gstart, uint xoff, inout float next_v[32], inout uint next
 #endif
 
 #ifdef VARIANT_REG
-shared float reg_part[2];
+// One slot per subgroup: THREADS/minSubgroupSize upper-bounds gl_NumSubgroups (WG128 → 8, WG64 → 4).
+// The former [2] overflowed under -DVARIANT_WG128 (4 wave32 subgroups wrote idx 2,3 OOB).
+shared float reg_part[THREADS / 16u];
 #elif defined(VARIANT_SG)
 shared float red[8]; // up to 8 subgroups with 256-thread WG
 #elif !defined(VARIANT_SG) && !defined(VARIANT_REG)
@@ -124,9 +126,6 @@ void main() {
     [[unroll]] for (uint rr = 0u; rr < uint(RM); rr++) {
         float sg_sum = subgroupAdd(acc[rr]);
         if (subgroupElect()) { reg_part[gl_SubgroupID] = sg_sum; }
-        barrier();
-        float tot = 0.0;
-        if (t < gl_NumSubgroups) { tot = reg_part[t]; }
         barrier();
         // Thread 0 holds the final sum (sum of subgroup sums)
         uint o = o0 + rr;

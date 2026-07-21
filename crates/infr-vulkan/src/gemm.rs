@@ -1571,11 +1571,9 @@ pub(crate) fn splitk_reduce_spv() -> &'static [u32] {
     })
 }
 
-const GEMM_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coopmat.spv"));
 const GEMM_TILED_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coopmat_tiled.spv"));
 const GEMM_WARP_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_warp.spv"));
-const GEMM_DP4A_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_dp4a.spv"));
 const QUANT_Q8_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quant_q8.spv"));
 const ATTN_PARTIAL_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_partial.spv"));
 const ATTN_PARTIAL_DYNAC_SPV_BYTES: &[u8] =
@@ -1711,10 +1709,8 @@ const ATTENTION_KV_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/
 const QK_NORM_ROPE_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/qk_norm_rope.spv"));
 const QK_NORM_ROPE_FF_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/qk_norm_rope_ff.spv"));
-static GEMM_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static GEMM_TILED_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static GEMM_WARP_SPV: OnceLock<Vec<u32>> = OnceLock::new();
-static GEMM_DP4A_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static QUANT_Q8_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static GEMM_PROJ_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static GEMM_PROJ_WARP_SPV: OnceLock<Vec<u32>> = OnceLock::new();
@@ -1761,20 +1757,12 @@ static ATTN_PV_REDUCE_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static RMSNORM_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-fn gemm_spv() -> &'static [u32] {
-    GEMM_SPV.get_or_init(|| spv_words(GEMM_SPV_BYTES))
-}
-#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn gemm_tiled_spv() -> &'static [u32] {
     GEMM_TILED_SPV.get_or_init(|| spv_words(GEMM_TILED_SPV_BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn gemm_warp_spv() -> &'static [u32] {
     GEMM_WARP_SPV.get_or_init(|| spv_words(GEMM_WARP_SPV_BYTES))
-}
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-fn gemm_dp4a_spv() -> &'static [u32] {
-    GEMM_DP4A_SPV.get_or_init(|| spv_words(GEMM_DP4A_SPV_BYTES))
 }
 /// SPIR-V for the activation int8 quantize pass (Q8 per block) feeding the dp4a mmq matmul.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -3141,25 +3129,6 @@ pub(crate) fn attn_live_spv() -> &'static [u32] {
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl VulkanBackend {
-    /// Untiled coopmat GEMM (m,n,k multiples of 16). Correct but memory-bound; use `matmul_f16`
-    /// (tiled) for throughput.
-    pub fn matmul_f16_untiled(
-        &self,
-        a: &[f32],
-        b: &[f32],
-        m: usize,
-        k: usize,
-        n: usize,
-    ) -> Result<Vec<f32>> {
-        assert!(m.is_multiple_of(16) && n.is_multiple_of(16) && k.is_multiple_of(16));
-        // Pin subgroup size 32: the shader computes one subgroup-scope coopmat tile per
-        // 32-thread workgroup, and an unpinned compute pipeline may get wave64 on RDNA3 — a
-        // workgroup that's a fraction of a subgroup, which the spec forbids for subgroup-scope
-        // cooperative matrices (VUID-VkPipelineShaderStageCreateInfo-module-08987).
-        let kern = self.kernel_sg("gemm_coopmat", gemm_spv(), 3, 12, 32);
-        self.run_gemm(kern, a, b, m, k, n, (n / 16) as u32, (m / 16) as u32)
-    }
-
     /// mul_mm-style warp-tiled coopmat GEMM `C[m,n]=A[m,k]·B[k,n]`. m,n %128, k %16.
     pub fn matmul_warp(
         &self,
@@ -3296,53 +3265,6 @@ impl VulkanBackend {
         t.elapsed().as_secs_f64() / iters as f64
     }
 
-    /// Benchmark the RAW dp4a scalar GEMM (m,n %64, k %32). Ceiling probe. Returns avg sec/dispatch.
-    #[doc(hidden)]
-    pub fn bench_dp4a_gemm(&self, m: usize, k: usize, n: usize, iters: usize) -> f64 {
-        let kp = k / 4;
-        let kern = self.kernel_sg("gemm_dp4a", gemm_dp4a_spv(), 3, 12, 32);
-        let buf_a = self.alloc(m * kp * 4, BufferUsage::Staging).unwrap();
-        let buf_b = self.alloc(n * kp * 4, BufferUsage::Staging).unwrap();
-        let buf_c = self.alloc(m * n * 4, BufferUsage::Activations).unwrap();
-        self.upload(buf_a.as_ref(), &vec![0u8; m * kp * 4]).unwrap();
-        self.upload(buf_b.as_ref(), &vec![0u8; n * kp * 4]).unwrap();
-        let bufs = [
-            unsafe { as_vk_buf(buf_a.as_ref()) }.buffer,
-            unsafe { as_vk_buf(buf_b.as_ref()) }.buffer,
-            unsafe { as_vk_buf(buf_c.as_ref()) }.buffer,
-        ];
-        let binding = self.eager_bind(&kern, &bufs).unwrap();
-        let mut push = [0u8; 12];
-        push[0..4].copy_from_slice(&(m as u32).to_le_bytes());
-        push[4..8].copy_from_slice(&(n as u32).to_le_bytes());
-        push[8..12].copy_from_slice(&(kp as u32).to_le_bytes());
-        let (gx, gy) = ((n / 64) as u32, (m / 64) as u32);
-        let dispatch = || {
-            let shared = &self.shared;
-            self.one_shot(|cmd| unsafe {
-                shared
-                    .device
-                    .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, kern.pipeline);
-                binding.bind(shared, cmd, kern.pipeline_layout);
-                shared.device.cmd_push_constants(
-                    cmd,
-                    kern.pipeline_layout,
-                    vk::ShaderStageFlags::COMPUTE,
-                    0,
-                    &push,
-                );
-                shared.device.cmd_dispatch(cmd, gx, gy, 1);
-            })
-            .unwrap();
-        };
-        dispatch(); // warm
-        let t = std::time::Instant::now();
-        for _ in 0..iters {
-            dispatch();
-        }
-        t.elapsed().as_secs_f64() / iters as f64
-    }
-
     fn run_gemm(
         &self,
         kern: super::ops::ComputeKernel,
@@ -3428,17 +3350,6 @@ mod tests {
 
     #[test]
     #[ignore = "requires a Vulkan GPU with cooperative matrix"]
-    fn coopmat_gemm_untiled_matches_cpu() {
-        let be = VulkanBackend::new().unwrap();
-        let (m, k, n) = (64usize, 48usize, 32usize);
-        let a: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
-        let b: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32 - 3.0) * 0.1).collect();
-        let got = be.matmul_f16_untiled(&a, &b, m, k, n).unwrap();
-        check(&got, &cpu(&a, &b, m, k, n), "untiled");
-    }
-
-    #[test]
-    #[ignore = "requires a Vulkan GPU with cooperative matrix"]
     fn coopmat_gemm_tiled_matches_cpu() {
         let be = VulkanBackend::new().unwrap();
         let (m, k, n) = (128usize, 96usize, 64usize); // m,n %64, k %32
@@ -3461,26 +3372,6 @@ mod tests {
             let b: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32 - 3.0) * 0.05).collect();
             let got = be.matmul_warp(&a, &b, m, k, n).unwrap();
             check(&got, &cpu(&a, &b, m, k, n), "warp");
-        }
-    }
-
-    #[test]
-    #[ignore = "benchmark, requires GPU"]
-    fn dp4a_ceiling() {
-        use std::io::Write as _;
-        let be = VulkanBackend::new().unwrap();
-        for &(m, k, n, label) in &[
-            (2048usize, 2048usize, 2048usize, "dp4a 2048^3"),
-            (2048, 1024, 2048, "dp4a proj m2048 k1024 n2048"),
-            (512, 1024, 2048, "dp4a proj-smallM m512 k1024 n2048"),
-            (2048, 1024, 6144, "dp4a ffn m2048 k1024 n6144"),
-        ] {
-            print!("running {label}... ");
-            std::io::stdout().flush().ok();
-            let dt = be.bench_dp4a_gemm(m, k, n, 30);
-            let flops = 2.0 * m as f64 * k as f64 * n as f64;
-            println!("{:.3} ms, {:.0} GFLOP/s", dt * 1e3, flops / dt / 1e9);
-            std::io::stdout().flush().ok();
         }
     }
 
@@ -3517,20 +3408,6 @@ mod tests {
             (512, 32768, 128, "warp PV m512 k32k n128"),
         ] {
             let dt = be.bench_warp_gemm(m, k, n, 20);
-            let flops = 2.0 * m as f64 * k as f64 * n as f64;
-            println!(
-                "{label}: {:.3} ms, {:.0} GFLOP/s",
-                dt * 1e3,
-                flops / dt / 1e9
-            );
-        }
-        // RAW dp4a scalar ceiling (int8 WMMA hangs on RADV). GFLOP/s comparable to the f16 numbers.
-        for &(m, k, n, label) in &[
-            (2048usize, 2048usize, 2048usize, "dp4a 2048^3"),
-            (2048, 1024, 2048, "dp4a proj m2048 k1024 n2048"),
-            (512, 1024, 2048, "dp4a proj-smallM m512 k1024 n2048"),
-        ] {
-            let dt = be.bench_dp4a_gemm(m, k, n, 20);
             let flops = 2.0 * m as f64 * k as f64 * n as f64;
             println!(
                 "{label}: {:.3} ms, {:.0} GFLOP/s",

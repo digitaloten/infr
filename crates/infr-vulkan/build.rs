@@ -16,10 +16,8 @@ fn main() {
     gen_grids(&out);
     // (source stem, output stem, extra glslc defines)
     let builds: &[(&str, &str, &[&str])] = &[
-        ("gemm_coopmat", "gemm_coopmat", &[]),
         ("gemm_coopmat_tiled", "gemm_coopmat_tiled", &[]),
         ("gemm_warp", "gemm_warp", &[]),
-        ("gemm_dp4a", "gemm_dp4a", &[]),
         ("quant_q8", "quant_q8", &[]),
         ("gemm_proj", "gemm_proj", &[]),
         ("gemm_proj_warp", "gemm_proj_warp", &[]),
