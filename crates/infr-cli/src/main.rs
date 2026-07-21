@@ -73,27 +73,21 @@ enum Backend {
 /// ([`resolve_backend`]/[`selected_backend`]) is a pure, unit-testable function of its inputs rather
 /// than a scatter of ad-hoc `std::env::var` reads with drifting precedence.
 ///
-/// `INFR_DEV` is the SINGLE canonical device-selection env (same grammar as `--dev`). `metal`/`cpu`
-/// mirror the DEPRECATED `INFR_METAL=1`/`INFR_CPU=1` aliases, honoured only when `INFR_DEV` is unset.
+/// `INFR_DEV` is the SINGLE device-selection env (same grammar as `--dev`). The old
+/// `INFR_METAL=1`/`INFR_CPU=1` flags were removed cleanly (no aliases) — use `INFR_DEV=metal`/`cpu`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct BackendEnv {
-    /// `INFR_DEV` (the canonical device spec — `VulkanN`/`metal`/`cpu`), if non-empty.
+    /// `INFR_DEV` (the device spec — `VulkanN`/`metal`/`cpu`), if non-empty.
     dev: Option<String>,
-    /// Deprecated `INFR_METAL` alias (present-or-not).
-    metal: bool,
-    /// Deprecated `INFR_CPU` alias (present-or-not).
-    cpu: bool,
 }
 
 impl BackendEnv {
-    /// Read the live process env (`INFR_DEV`, plus the deprecated `INFR_METAL`/`INFR_CPU`).
+    /// Read the live process env (`INFR_DEV`).
     fn current() -> Self {
         Self {
             dev: std::env::var("INFR_DEV")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
-            metal: std::env::var_os("INFR_METAL").is_some(),
-            cpu: std::env::var_os("INFR_CPU").is_some(),
         }
     }
 }
@@ -115,44 +109,22 @@ fn parse_dev_spec(d: &str) -> anyhow::Result<Backend> {
     }
 }
 
-/// Emit a ONE-TIME deprecation warning for a legacy backend-selection env, steering the user to the
-/// canonical `INFR_DEV`. Idempotent across the process (a `Once`), so a long-lived `serve` doesn't
-/// spam it per resolve.
-fn warn_deprecated_backend_env(var: &str, spec: &str) {
-    static WARNED: std::sync::Once = std::sync::Once::new();
-    WARNED.call_once(|| {
-        tracing::warn!(
-            "{var} is deprecated; use INFR_DEV={spec} instead \
-             (INFR_DEV is the single device-selection env, same grammar as --dev)"
-        );
-    });
-}
-
 /// The SINGLE backend decision, shared by `--dev` resolution and the per-command readers.
 ///
 /// Precedence (mirrors how `--ctx`/`-u`/`-t` relate to their envs): the `--dev` flag > the
-/// `INFR_DEV` env (SAME grammar/parser as `--dev`) > the DEPRECATED `INFR_METAL`/`INFR_CPU` aliases
-/// (honoured only when `INFR_DEV` is unset, with a one-time deprecation warning) > the default
-/// (`Vulkan(None)` = first discrete GPU, else device 0). A garbage `--dev`/`INFR_DEV` errors early.
+/// `INFR_DEV` env (SAME grammar/parser as `--dev`) > the default (`Vulkan(None)` = first discrete
+/// GPU, else device 0). A garbage `--dev`/`INFR_DEV` errors early. The legacy `INFR_METAL`/`INFR_CPU`
+/// flags were removed cleanly — they are no longer read; `INFR_DEV=metal`/`cpu` replaces them.
 fn resolve_backend(dev: Option<&str>, env: BackendEnv) -> anyhow::Result<Backend> {
     // 1. an explicit `--dev` flag wins outright.
     if let Some(d) = dev {
         return parse_dev_spec(d).with_context(|| format!("invalid --dev `{d}`"));
     }
-    // 2. `INFR_DEV` — the canonical env, same grammar as `--dev`.
+    // 2. `INFR_DEV` — the device-selection env, same grammar as `--dev`.
     if let Some(d) = env.dev.as_deref() {
         return parse_dev_spec(d).with_context(|| format!("invalid INFR_DEV `{d}`"));
     }
-    // 3. deprecated `INFR_METAL`/`INFR_CPU` — only when `INFR_DEV` is unset. `METAL > CPU`.
-    if env.metal {
-        warn_deprecated_backend_env("INFR_METAL", "metal");
-        return Ok(Backend::Metal);
-    }
-    if env.cpu {
-        warn_deprecated_backend_env("INFR_CPU", "cpu");
-        return Ok(Backend::Cpu);
-    }
-    // 4. default: the first discrete Vulkan GPU.
+    // 3. default: the first discrete Vulkan GPU.
     Ok(Backend::Vulkan(None))
 }
 
@@ -3631,13 +3603,10 @@ mod tests {
 
     // ── finding 1: unified backend decision (resolve_backend / selected_backend) ────────────────
 
-    /// Build a `BackendEnv` from an `INFR_DEV` value + the two deprecated aliases, for pure
-    /// decision tests (no process env).
-    fn env(dev: Option<&str>, metal: bool, cpu: bool) -> BackendEnv {
+    /// Build a `BackendEnv` from an `INFR_DEV` value, for pure decision tests (no process env).
+    fn env(dev: Option<&str>) -> BackendEnv {
         BackendEnv {
             dev: dev.map(str::to_string),
-            metal,
-            cpu,
         }
     }
 
@@ -3645,16 +3614,11 @@ mod tests {
     fn dev_flag_beats_infr_dev_env() {
         // The `--dev` flag wins over INFR_DEV: `--dev metal` under `INFR_DEV=cpu` resolves to Metal.
         assert_eq!(
-            resolve_backend(Some("metal"), env(Some("cpu"), false, false)).unwrap(),
+            resolve_backend(Some("metal"), env(Some("cpu"))).unwrap(),
             Backend::Metal
         );
-        // The flag also wins over the deprecated aliases.
         assert_eq!(
-            resolve_backend(Some("vulkan0"), env(None, true, true)).unwrap(),
-            Backend::Vulkan(Some("vulkan0".to_string()))
-        );
-        assert_eq!(
-            resolve_backend(Some("cpu"), env(None, true, false)).unwrap(),
+            resolve_backend(Some("cpu"), env(Some("Vulkan1"))).unwrap(),
             Backend::Cpu
         );
         // Case-insensitive; the original casing is preserved for the Vulkan spec.
@@ -3670,49 +3634,40 @@ mod tests {
     fn infr_dev_env_parses_same_grammar_as_dev_flag() {
         // No flag: INFR_DEV drives the pick, same grammar as `--dev`.
         assert_eq!(
-            resolve_backend(None, env(Some("Vulkan1"), false, false)).unwrap(),
+            resolve_backend(None, env(Some("Vulkan1"))).unwrap(),
             Backend::Vulkan(Some("Vulkan1".to_string()))
         );
         assert_eq!(
-            resolve_backend(None, env(Some("cpu"), false, false)).unwrap(),
+            resolve_backend(None, env(Some("cpu"))).unwrap(),
             Backend::Cpu
         );
         assert_eq!(
-            resolve_backend(None, env(Some("metal"), false, false)).unwrap(),
+            resolve_backend(None, env(Some("metal"))).unwrap(),
             Backend::Metal
         );
         // Garbage INFR_DEV errors early with a clear message (typo protection).
-        let e = resolve_backend(None, env(Some("foo"), false, false)).unwrap_err();
+        let e = resolve_backend(None, env(Some("foo"))).unwrap_err();
         let msg = format!("{e:#}");
         assert!(msg.contains("INFR_DEV"), "message names the source: {msg}");
         assert!(msg.contains("foo"), "message echoes the bad value: {msg}");
-    }
-
-    #[test]
-    fn deprecated_aliases_honoured_only_when_infr_dev_unset() {
-        // INFR_DEV unset: the deprecated INFR_CPU/INFR_METAL still work, METAL > CPU.
-        assert_eq!(
-            resolve_backend(None, env(None, false, true)).unwrap(),
-            Backend::Cpu
-        );
-        assert_eq!(
-            resolve_backend(None, env(None, true, false)).unwrap(),
-            Backend::Metal
-        );
-        assert_eq!(
-            resolve_backend(None, env(None, true, true)).unwrap(),
-            Backend::Metal
-        );
-        // INFR_DEV set: it WINS over the deprecated aliases (INFR_DEV=metal beats INFR_CPU=1).
-        assert_eq!(
-            resolve_backend(None, env(Some("metal"), false, true)).unwrap(),
-            Backend::Metal
-        );
-        // Default: no env at all → first discrete Vulkan GPU.
+        // No env at all → the default, first discrete Vulkan GPU.
         assert_eq!(
             resolve_backend(None, BackendEnv::default()).unwrap(),
             Backend::Vulkan(None)
         );
+    }
+
+    #[test]
+    fn legacy_metal_cpu_flags_are_no_longer_read() {
+        // The old INFR_METAL=1 / INFR_CPU=1 flags were removed cleanly — with no INFR_DEV set they
+        // do NOT select a backend; the resolver falls through to the Vulkan default.
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("INFR_DEV");
+        std::env::set_var("INFR_CPU", "1");
+        std::env::set_var("INFR_METAL", "1");
+        assert_eq!(selected_backend().unwrap(), Backend::Vulkan(None));
+        std::env::remove_var("INFR_CPU");
+        std::env::remove_var("INFR_METAL");
     }
 
     // Serialise the few tests that must touch the real process env (env is process-global).
@@ -3721,8 +3676,8 @@ mod tests {
     #[test]
     fn device_resolve_publishes_infr_dev_and_wins_over_stale_alias() {
         let _g = ENV_LOCK.lock().unwrap();
-        // Inherit a stale INFR_CPU, then pass `--dev vulkan0`: resolve publishes INFR_DEV (the flag
-        // wins), and the reader must pick Vulkan despite the stale INFR_CPU (INFR_DEV > deprecated).
+        // Inherit a stale INFR_CPU (now a dead env), then pass `--dev vulkan0`: resolve publishes
+        // INFR_DEV=vulkan0 and the reader picks Vulkan (the stale INFR_CPU is not read at all).
         std::env::set_var("INFR_CPU", "1");
         std::env::remove_var("INFR_METAL");
         std::env::remove_var("INFR_DEV");
