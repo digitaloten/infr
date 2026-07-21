@@ -22,7 +22,9 @@ reproduce/confirm are dropped (not listed) to keep this a verified-only ledger.
 
 - **Original audit:** 157 findings across 24 module slices (1 🔴 critical, 33 🟠
   major, 123 🟡 minor).
-- **Remaining open:** **77** — 0 🔴, 12 🟠, 65 🟡.
+- **Remaining open:** **71** — 0 🔴, 11 🟠, 60 🟡. (1 🟠 — `make_compute_kernel`
+  OOM→Result — is explicitly **deferred**, not open work; see the ops.rs
+  section.)
 
 No finding was accepted on an agent's word — each was re-read against the source
 by the coordinator; two agent-flagged "MAJOR"s (the Q5_1 clamp in the shader and
@@ -184,6 +186,18 @@ parked path).
   `pcache` uses a unique temp suffix + a per-instance nonce on the
   poison-tripwire marker (no cross-thread/backend collisions). Success/alloc
   path byte-identical.
+- **`infr-vulkan` ops + pager (6 of 7; #2 deferred)** — TDD, +7 tests,
+  **gpu_seam byte-identity verified** (pager gemv/mmq/multi, MoE, attention).
+  `kernel`/ `kernel_sg` build under one lock (`entry().or_insert_with`) — no
+  double-compile/leaked-pipeline race; the cache hit `debug_assert`s the
+  request's `n_buf`/`push_size`/spv-hash match (silent-mismatch guard);
+  `GpuPager::new` + the `pub` accessors return `Err` on bad dims / unregistered
+  buffers (were `assert!`/`.expect()`); the triplicated LUT evict+insert becomes
+  one `record_placement` (silent-zero-safe, byte-identical);
+  `touch_role`/`stage` reuse scratch buffers;
+  `expert_bytes`/`pager_stats_enabled`/`stats_suffix` de-duplicate the two
+  sessions. #2 (make_compute_kernel OOM→Result) deferred — 155 call sites across
+  127 `()`-returning fns; panic messages improved instead.
 
 ### Highest-priority (production default paths)
 
@@ -195,7 +209,7 @@ parked path).
 | ~~4~~  | ✅  | `infr-server lib.rs`                  | ~~No per-request cancellation~~ — **FIXED** (cancel latch → `req.abort()` frees the slot).                     |
 | ~~5~~  | ✅  | `infr-llama runner.rs`                | ~~Prefix-cache records unmaterialized KV rows~~ — **FIXED** (`last_written` tracker + `resident_after_gen`).   |
 | ~~6~~  | ✅  | `infr-vulkan adapter.rs`              | ~~Static split-K `n_chunks>1024` overruns `wexp[1024]`~~ — **FIXED** (bounds `n_chunks ≤ 1024`).               |
-| 7      | 🟠  | `infr-vulkan ops.rs:229`              | Kernel-cache double-checked lock **double-compiles + leaks a pipeline** under concurrent first use.            |
+| ~~7~~  | ✅  | `infr-vulkan ops.rs`                  | ~~Kernel-cache double-checked lock double-compiles + leaks~~ — **FIXED** (single-lock `or_insert_with`).       |
 | ~~8~~  | ✅  | `infr-llama sampling.rs`              | ~~Repeat penalty per-occurrence~~ — **FIXED** (`70bbe4e`; now per-distinct-token).                             |
 | 9      | 🟠  | `infr-vulkan shaders dg_eb_sample:61` | argmax reduce **drops the lower-index tie-break** → diverges from host on ties (feeds diffusion goldens).      |
 | ~~10~~ | ✅  | `infr-gguf lib.rs`                    | ~~Corrupt GGUF `pos+n` overflow panic~~ — **FIXED** (`checked_add`/`checked_mul` → `Error::Loader`).           |
@@ -230,48 +244,16 @@ detail per module below.
 
 ## infr-vulkan/src/ops.rs + pager.rs
 
-1. **🟠 `ops.rs:229-244` (& `256-272`) — `kernel`/`kernel_sg` double-checked
-   locking double-compiles and leaks a pipeline under concurrent first use.**
-   `lock→get→unlock→compile→lock→insert`: two threads racing the first fetch of
-   a `name` each run `make_compute_kernel` (full shader+pipeline+pool+layout),
-   then both `insert` — the second overwrites the first, whose Vulkan objects
-   are never destroyed (map holds one entry) → leak for process life, cache
-   persisted twice. Reachable via lazy kernel fetch during parallel prefill /
-   multi-stream serve. _Fix:_ build under one lock (`get_or_insert_with`) or a
-   per-name `OnceCell`.
-2. **🟠 `ops.rs:43,98-104,128 — `make_compute_kernel` panics on recoverable
-   driver/OOM errors.** `create_shader_module`/`create_pipeline_layout`/
-   `create_descriptor_pool` use `.expect()` and pipeline creation `panic!`s;
-   `kernel`/`kernel_sg` return a bare `ComputeKernel`, so a late
-   `OUT_OF_DEVICE_MEMORY` on kernel compile aborts the process instead of an
-   `Err` the seam could handle. _Fix:_ thread `Result` through (keep the
-   null-handle assert).
-3. **🟡 `ops.rs:229` — kernel cache keyed on `name` alone; `spv`/`n_buf`/
-   `push_size` ignored on hit.** A name reused with a different shader/layout
-   silently returns a mismatched pipeline (VUID/UB); enforced only by manual
-   discipline (see rope comment `396`). _Fix:_ debug-assert cached `n_buf`/
-   `push_size` (+ spv hash) match the request.
-4. **🟡 `pager.rs:97,850-879,711` — `assert!`/`.expect()` on recoverable
-   input.** `GpuPager::new` (returns `Result`) asserts on `n_slots==0` /
-   misaligned `slot_bytes` — reachable from a too-small seam VRAM budget;
-   `pool_of`/`arena`/ `arena_addr`/`touch_all_hits`/`begin_batch` (all `pub`)
-   `.expect()` on an unregistered buffer while siblings
-   `touch_role`/`stage_role` return `Err`. _Fix:_ return `Err(be(…))`
-   consistently.
-5. **🟡 `pager.rs:199-209,273-282,317-327` — LUT-mirror evict+insert
-   triplicated** across `touch_staged`/`schedule_staged`/`ensure_resident`
-   (verified byte-for- byte identical) — the one place a wrong LUT entry becomes
-   silent-zero MoE output. _Fix:_ extract `record_placement(id, slot, evicted)`.
-6. **🟡 `pager.rs:646-678` — `touch_role` decode path allocates a `Vec` per call
-   and does one synchronous `one_shot` submit per expert miss.** Steady-state
-   demand path (per layer per token); the batched ring path exists to avoid
-   exactly this serialized round-trip. _Fix:_ reuse a scratch `Vec`; batch the
-   miss copies into one submission. (`DensePagerSession::stage` `1112` similarly
-   allocates `seg_refs` per call.)
-7. **🟡 `pager.rs:611/1038` — `MoePagerSession`/`DensePagerSession` duplicate
-   the `INFR_PAGER_STATS` read, stats printer, and the subtle `&**arc as &dyn
-   AsRef<[u8]>`deref dance** (guards against`Arc`'s own `AsRef`; a copy omitting it compiles but resolves wrong). *Fix:* shared `expert_bytes(arc)->&[u8]` +
-   stats helpers; read env once.
+_6 of 7 findings fixed (see Resolved log); the one below is **DEFERRED**._
+
+1. **🟠 `make_compute_kernel` panics on recoverable driver/OOM errors**
+   (`.expect()`/ `panic!`); `kernel`/`kernel_sg` return a bare `ComputeKernel`,
+   so a late `OUT_OF_DEVICE_MEMORY` on kernel compile aborts the process.
+   _Deferred:_ threading `Result` ripples to **155 call sites across 127
+   `()`-returning fns** (ops/gemm/recorder) — a byte-critical mass migration
+   disproportionate to a rare OOM path. Interim: the panic messages now name the
+   kernel + flag it as a recoverable alloc failure. A full `Result`-ification of
+   the recorder dispatch surface is its own focused effort.
 
 ## infr-vulkan/src/gemm.rs + matmul.rs + linear.rs
 

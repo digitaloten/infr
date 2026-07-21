@@ -24,6 +24,21 @@ pub(crate) struct ComputeKernel {
     pub desc_pool: vk::DescriptorPool,
     pub n_buf: usize,
     pub push_size: u32,
+    /// Hash of the SPIR-V this kernel was built from. The cache is keyed on `name` alone, so this
+    /// lets [`VulkanBackend::kernel`]/[`VulkanBackend::kernel_sg`] debug-assert on a cache hit that
+    /// the request's shader/layout matches the built one — a name reused with a different
+    /// `spv`/`n_buf`/`push_size` would otherwise silently return a mismatched pipeline.
+    pub spv_hash: u64,
+}
+
+/// Cheap non-cryptographic hash of a kernel's SPIR-V words — only used to catch a `name` reused
+/// with a different shader on a cache hit (see [`ComputeKernel::spv_hash`]). Computed once per
+/// build; the request side is only hashed inside the `debug_assert!`, so release builds skip it.
+fn hash_spv(spv: &[u32]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    spv.hash(&mut h);
+    h.finish()
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -40,7 +55,13 @@ pub(crate) fn make_compute_kernel(
     let shader = unsafe {
         device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(spv), None)
     }
-    .expect("shader module");
+    .unwrap_or_else(|e| {
+        panic!(
+            "create_shader_module failed for kernel {name:?}: {e} — recoverable driver/alloc \
+             failure (e.g. OUT_OF_DEVICE_MEMORY) during kernel compile; kernel build does not yet \
+             thread Result (see AUDIT.md ops.rs finding 2)"
+        )
+    });
 
     let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..n_buf)
         .map(|i| {
@@ -59,7 +80,13 @@ pub(crate) fn make_compute_kernel(
         ds_ci = ds_ci.flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR);
     }
     let ds_layout =
-        unsafe { device.create_descriptor_set_layout(&ds_ci, None) }.expect("ds layout");
+        unsafe { device.create_descriptor_set_layout(&ds_ci, None) }.unwrap_or_else(|e| {
+            panic!(
+                "create_descriptor_set_layout failed for kernel {name:?}: {e} — recoverable \
+                 driver/alloc failure (e.g. OUT_OF_DEVICE_MEMORY) during kernel compile; kernel \
+                 build does not yet thread Result (see AUDIT.md ops.rs finding 2)"
+            )
+        });
 
     let mut plinfo =
         vk::PipelineLayoutCreateInfo::default().set_layouts(std::slice::from_ref(&ds_layout));
@@ -71,7 +98,13 @@ pub(crate) fn make_compute_kernel(
         plinfo = plinfo.push_constant_ranges(std::slice::from_ref(&push_range));
     }
     let pipeline_layout =
-        unsafe { device.create_pipeline_layout(&plinfo, None) }.expect("pl layout");
+        unsafe { device.create_pipeline_layout(&plinfo, None) }.unwrap_or_else(|e| {
+            panic!(
+                "create_pipeline_layout failed for kernel {name:?}: {e} — recoverable driver/alloc \
+                 failure (e.g. OUT_OF_DEVICE_MEMORY) during kernel compile; kernel build does not \
+                 yet thread Result (see AUDIT.md ops.rs finding 2)"
+            )
+        });
 
     let entry = c"main";
     let mut req_sz =
@@ -125,7 +158,13 @@ pub(crate) fn make_compute_kernel(
             None,
         )
     }
-    .expect("desc pool");
+    .unwrap_or_else(|e| {
+        panic!(
+            "create_descriptor_pool failed for kernel {name:?}: {e} — recoverable driver/alloc \
+             failure (e.g. OUT_OF_DEVICE_MEMORY) during kernel compile; kernel build does not yet \
+             thread Result (see AUDIT.md ops.rs finding 2)"
+        )
+    });
 
     ComputeKernel {
         name,
@@ -136,6 +175,7 @@ pub(crate) fn make_compute_kernel(
         desc_pool,
         n_buf,
         push_size,
+        spv_hash: hash_spv(spv),
     }
 }
 
@@ -226,22 +266,7 @@ impl VulkanBackend {
         n_buf: usize,
         push_size: u32,
     ) -> ComputeKernel {
-        if let Some(k) = self.shared.kernels.lock().unwrap().get(name) {
-            return *k;
-        }
-        let k = make_compute_kernel(
-            &self.shared.device,
-            self.shared.pipeline_cache,
-            name,
-            spv,
-            n_buf,
-            push_size,
-            None,
-            self.shared.push_descriptor.is_some(),
-        );
-        self.shared.kernels.lock().unwrap().insert(name, k);
-        self.shared.persist_pipeline_cache(); // new pipeline -> debounced disk save
-        k
+        self.kernel_inner(name, spv, n_buf, push_size, None)
     }
 
     /// Like `kernel`, but pins the pipeline's subgroup size (coopmat needs wave32 on RDNA3).
@@ -253,21 +278,61 @@ impl VulkanBackend {
         push_size: u32,
         sg_size: u32,
     ) -> ComputeKernel {
-        if let Some(k) = self.shared.kernels.lock().unwrap().get(name) {
-            return *k;
+        self.kernel_inner(name, spv, n_buf, push_size, Some(sg_size))
+    }
+
+    /// Shared fetch-or-build for [`Self::kernel`]/[`Self::kernel_sg`]. The build runs UNDER the
+    /// cache lock (via the `entry` API) so exactly one thread compiles a given `name` on
+    /// concurrent first use — the old lock→get→unlock→compile→lock→insert had two racing threads
+    /// both build the full shader+pipeline+pool and the second `insert` overwrite (and leak for
+    /// process life) the first's Vulkan objects.
+    fn kernel_inner(
+        &self,
+        name: &'static str,
+        spv: &[u32],
+        n_buf: usize,
+        push_size: u32,
+        required_sg: Option<u32>,
+    ) -> ComputeKernel {
+        let mut map = self.shared.kernels.lock().unwrap();
+        let mut built = false;
+        let k = *map.entry(name).or_insert_with(|| {
+            built = true;
+            make_compute_kernel(
+                &self.shared.device,
+                self.shared.pipeline_cache,
+                name,
+                spv,
+                n_buf,
+                push_size,
+                required_sg,
+                self.shared.push_descriptor.is_some(),
+            )
+        });
+        drop(map);
+        if built {
+            self.shared.persist_pipeline_cache(); // new pipeline -> debounced disk save
+        } else {
+            // Cache HIT: the cache is keyed on `name` alone, so a name reused with a different
+            // shader/layout would silently hand back a mismatched pipeline (VUID/UB). Fail loudly
+            // in debug instead. The spv hash is only computed on this hit path in debug builds.
+            debug_assert_eq!(
+                k.n_buf, n_buf,
+                "kernel {name:?} cached with n_buf={} but re-requested with n_buf={n_buf}",
+                k.n_buf
+            );
+            debug_assert_eq!(
+                k.push_size, push_size,
+                "kernel {name:?} cached with push_size={} but re-requested with push_size={push_size}",
+                k.push_size
+            );
+            debug_assert_eq!(
+                k.spv_hash,
+                hash_spv(spv),
+                "kernel {name:?} cached from a different SPIR-V than this request — a name reused \
+                 across two distinct shaders returns a mismatched pipeline"
+            );
         }
-        let k = make_compute_kernel(
-            &self.shared.device,
-            self.shared.pipeline_cache,
-            name,
-            spv,
-            n_buf,
-            push_size,
-            Some(sg_size),
-            self.shared.push_descriptor.is_some(),
-        );
-        self.shared.kernels.lock().unwrap().insert(name, k);
-        self.shared.persist_pipeline_cache(); // new pipeline -> debounced disk save
         k
     }
 

@@ -47,6 +47,38 @@ use infr_core::Backend;
 
 use super::{as_vk_buf, be, VulkanBackend};
 
+/// Validate [`GpuPager::new`]'s block dimensions. Pure (no GPU) so it can be unit-tested and so a
+/// bad seam budget (0 slots) or sizing bug (misaligned stride) returns `Err` before any allocation.
+fn validate_pager_dims(n_slots: usize, slot_bytes: usize) -> Result<()> {
+    if n_slots == 0 {
+        return Err(be("GpuPager needs at least one slot"));
+    }
+    if !slot_bytes.is_multiple_of(4) {
+        return Err(be(
+            "GpuPager slot_bytes must be u32-aligned (the arena is read as u32 words)",
+        ));
+    }
+    Ok(())
+}
+
+/// Apply one LUT-mirror placement to `lut_host`: clear an evicted block's entry to `NOT_RESIDENT`,
+/// then record the newly-resident block's SLOT INDEX. Pure over the mirror slice (no `lut_dirty`,
+/// no GPU) so the eviction/insert bookkeeping — the one place a wrong LUT entry becomes silent-zero
+/// MoE output — is unit-testable. Out-of-range ids are ignored (mirrors the old inline
+/// `get_mut(..)` guards). See [`GpuPager::record_placement`].
+fn apply_placement(lut_host: &mut [u32], id: BlockId, slot: u32, evicted: Option<u32>) {
+    if let Some(e) = evicted {
+        if let Some(v) = lut_host.get_mut(e as usize) {
+            *v = NOT_RESIDENT;
+        }
+    }
+    if let Some(v) = lut_host.get_mut(id as usize) {
+        // Slot index — the shader scales it onto the arena's 64-bit base address (see the
+        // `lut_host` field's doc).
+        *v = slot;
+    }
+}
+
 /// Fixed-budget evictable VRAM cache of uniform `slot_bytes` blocks. See the module doc.
 pub struct GpuPager {
     pager: Pager,
@@ -94,11 +126,9 @@ impl GpuPager {
         n_slots: usize,
         slot_bytes: usize,
     ) -> Result<Self> {
-        assert!(n_slots > 0, "GpuPager needs at least one slot");
-        assert!(
-            slot_bytes.is_multiple_of(4),
-            "GpuPager slot_bytes must be u32-aligned (the arena is read as u32 words)"
-        );
+        // Both are reachable from a too-small seam VRAM budget (0 slots) or a sizing bug, i.e.
+        // recoverable input — return `Err` rather than aborting the process.
+        validate_pager_dims(n_slots, slot_bytes)?;
         // Pointer-addressed: no per-arena binding cap — a pool spans as much VRAM as the budget
         // allows (the alloc-time VRAM budget guard is the only backstop).
         let (arena, arena_addr) = vk.alloc_arena_bda(n_slots * slot_bytes)?;
@@ -196,17 +226,7 @@ impl GpuPager {
                     slot as usize * self.slot_bytes,
                     self.slot_bytes,
                 );
-                if let Some(e) = evicted {
-                    if let Some(v) = self.lut_host.get_mut(e as usize) {
-                        *v = NOT_RESIDENT;
-                    }
-                }
-                if let Some(v) = self.lut_host.get_mut(id as usize) {
-                    // Slot index — the shader scales it onto the arena's 64-bit base address (see
-                    // `lut_host`'s doc).
-                    *v = slot;
-                }
-                self.lut_dirty = true;
+                self.record_placement(id, slot, evicted);
                 Ok(self.slot_bytes)
             }
         }
@@ -216,6 +236,16 @@ impl GpuPager {
     /// copies from (see [`MoePagerSession::lut_window`]).
     fn lut_words(&self, base: usize, n: usize) -> &[u32] {
         &self.lut_host[base..base + n]
+    }
+
+    /// Mirror one miss's placement into the host LUT and mark it dirty — the shared
+    /// eviction-then-insert bookkeeping formerly triplicated across [`Self::touch_staged`],
+    /// [`Self::schedule_staged`] and [`Self::ensure_resident`]. Byte-for-byte the same writes those
+    /// inline blocks made (see [`apply_placement`]); the one place a wrong LUT entry becomes
+    /// silent-zero MoE output, so it lives in exactly one function now.
+    fn record_placement(&mut self, id: BlockId, slot: u32, evicted: Option<u32>) {
+        apply_placement(&mut self.lut_host, id, slot, evicted);
+        self.lut_dirty = true;
     }
 
     /// [`Self::touch_staged`]'s DENSE-STREAMING twin: residency via the exact cyclic-sweep policy
@@ -240,12 +270,12 @@ impl GpuPager {
         ring: &dyn Buffer,
         ring_off: usize,
         id: BlockId,
-        segments: &[&[u8]],
+        segments: &[Arc<dyn AsRef<[u8]> + Send + Sync>],
     ) -> Result<(u32, usize)> {
         match self.pager.schedule(id) {
             Resolution::Hit { slot } => Ok((slot, 0)),
             Resolution::Miss { slot, evicted } => {
-                let total: usize = segments.iter().map(|s| s.len()).sum();
+                let total: usize = segments.iter().map(|s| expert_bytes(s).len()).sum();
                 debug_assert!(
                     total <= self.slot_bytes,
                     "dense block bytes ({total}) exceed the pool's slot stride ({})",
@@ -257,8 +287,9 @@ impl GpuPager {
                     .ok_or_else(|| be("pager staging ring is not persistently mapped"))?;
                 let mut off = ring_off;
                 for s in segments {
-                    par_copy_to_mapped(s, unsafe { base.add(off) });
-                    off += s.len();
+                    let seg = expert_bytes(s);
+                    par_copy_to_mapped(seg, unsafe { base.add(off) });
+                    off += seg.len();
                 }
                 // Word-align the copy length (the ring pad bytes it may carry are never read —
                 // see the fn doc); `total <= slot_bytes` and `slot_bytes % 4 == 0` keep it in
@@ -270,16 +301,7 @@ impl GpuPager {
                     slot as usize * self.slot_bytes,
                     total.next_multiple_of(4),
                 );
-                if let Some(e) = evicted {
-                    if let Some(v) = self.lut_host.get_mut(e as usize) {
-                        *v = NOT_RESIDENT;
-                    }
-                }
-                if let Some(v) = self.lut_host.get_mut(id as usize) {
-                    // Slot index (dense pool keeps this coherent but never reads it).
-                    *v = slot;
-                }
-                self.lut_dirty = true;
+                self.record_placement(id, slot, evicted);
                 Ok((slot, self.slot_bytes))
             }
         }
@@ -314,17 +336,7 @@ impl GpuPager {
             Resolution::Miss { slot, evicted } => {
                 vk.upload(staging, bytes)?;
                 copy_into_slot(vk, staging, self.arena.as_ref(), slot, self.slot_bytes)?;
-                if let Some(e) = evicted {
-                    if let Some(v) = self.lut_host.get_mut(e as usize) {
-                        *v = NOT_RESIDENT;
-                    }
-                }
-                if let Some(v) = self.lut_host.get_mut(id as usize) {
-                    // The LUT stores the resident slot INDEX; the shader scales it onto the arena's
-                    // 64-bit base address — see `lut_host`'s doc.
-                    *v = slot;
-                }
-                self.lut_dirty = true;
+                self.record_placement(id, slot, evicted);
                 Ok(slot)
             }
         }
@@ -459,6 +471,36 @@ pub fn buffer_identity(b: &dyn Buffer) -> usize {
     std::ptr::from_ref(b) as *const () as usize
 }
 
+/// One expert/segment source's bytes. `Arc<T>` itself implements `AsRef<T>`, so a bare
+/// `arc.as_ref()` would resolve to THAT (returning the fat `&(dyn AsRef<[u8]> + Send + Sync)`)
+/// instead of the inner `AsRef<[u8]>::as_ref` every caller needs — force the deref-to-trait-object
+/// FIRST so only the trait object's own impl is a candidate. Factored so every call site shares
+/// this one guarded deref (a copy that omits it compiles but resolves wrong).
+fn expert_bytes(arc: &Arc<dyn AsRef<[u8]> + Send + Sync>) -> &[u8] {
+    let inner: &(dyn AsRef<[u8]> + Send + Sync) = &**arc;
+    inner.as_ref()
+}
+
+/// `INFR_PAGER_STATS` gate, read from the environment exactly ONCE per process (both pager
+/// sessions share this) rather than re-`getenv`-ing in each `new`.
+fn pager_stats_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("INFR_PAGER_STATS").is_ok())
+}
+
+/// The shared `hits/misses/evictions/hit_rate` fragment of both sessions' `INFR_PAGER_STATS` lines
+/// (each session prepends its own label + slot size and appends its own slot-count suffix).
+fn stats_suffix(s: &PagerStats) -> String {
+    format!(
+        "hits={} misses={} evictions={} hit_rate={:.3}",
+        s.hits,
+        s.misses,
+        s.evictions,
+        s.hit_rate(),
+    )
+}
+
 /// Where one paged layer's whole per-role expert bank lives: a zero-copy view into the GGUF mmap
 /// (kept alive via `Arc` — see `infr_gguf::TensorBytes`, which this trait object mirrors without
 /// infr-vulkan taking a dependency on infr-gguf), plus the byte stride of ONE expert within it.
@@ -515,6 +557,9 @@ pub struct MoePagerSession {
     tape: Box<dyn Buffer>,
     tape_words: usize,
     print_stats: bool,
+    /// Reusable output buffer for [`Self::touch_role`]'s global-id list — cleared and refilled per
+    /// call so the demand path allocates no per-touch `Vec`.
+    global_scratch: Vec<u32>,
 }
 
 /// One pool's spec in [`MoePagerLayout`]: slot counts are INDEPENDENT per pool. Each pool's arena
@@ -608,7 +653,8 @@ impl MoePagerSession {
             ring_half_bytes,
             tape,
             tape_words,
-            print_stats: std::env::var("INFR_PAGER_STATS").is_ok(),
+            print_stats: pager_stats_enabled(),
+            global_scratch: Vec::new(),
         })
     }
 
@@ -649,22 +695,25 @@ impl MoePagerSession {
         role: Role,
         buf_id: usize,
         local_ids: &[u32],
-    ) -> Result<Vec<u32>> {
+    ) -> Result<&[u32]> {
         let (r, pool, src) = self
             .sources
             .get(&buf_id)
             .ok_or_else(|| be("moe pager: touch on an unregistered buffer"))?;
         debug_assert_eq!(*r, role, "touch_role: role/buffer mismatch");
-        let pager = &mut self.pools[*pool].pager;
         let stride = src.stride_bytes;
-        // Explicit deref-to-trait-object first: `Arc<T>` itself implements `AsRef<T>`, which
-        // would make a bare `src.bytes.as_ref()` resolve to THAT (returning the fat
-        // `&(dyn AsRef<[u8]> + Send + Sync)`) instead of the inner `AsRef<[u8]>::as_ref` this
-        // needs — force the deref first so only the trait object's own impl is a candidate.
-        let inner: &(dyn AsRef<[u8]> + Send + Sync) = &*src.bytes;
-        let bytes: &[u8] = inner.as_ref();
         let layer_base = src.layer_base;
-        let mut global = Vec::with_capacity(local_ids.len());
+        let bytes = expert_bytes(&src.bytes);
+        let pager = &mut self.pools[*pool].pager;
+        // Reuse a scratch Vec across calls instead of allocating one per touch — this is the
+        // steady-state demand path (per layer per token). NOTE: each miss still does one
+        // synchronous `one_shot` submit (inside `ensure_resident`); batching those into a single
+        // recorded submission would materially change the recorded stream — the RING/`stage_role`
+        // path exists precisely for that — so the demand path keeps the per-miss copy and only the
+        // per-call allocation is removed here.
+        let global = &mut self.global_scratch;
+        global.clear();
+        global.reserve(local_ids.len());
         for &lid in local_ids {
             let off = lid as usize * stride;
             let slice = bytes
@@ -674,7 +723,7 @@ impl MoePagerSession {
             global.push(layer_base + lid);
         }
         pager.flush_lut(vk)?;
-        Ok(global)
+        Ok(&self.global_scratch)
     }
 
     /// The shared upload ring / its per-half capacity (see the `ring` field's doc). The CURSOR
@@ -708,11 +757,11 @@ impl MoePagerSession {
     /// MRU. Callers gate on [`Self::all_resident`], so every touch is a hit — no uploads, no LUT
     /// mutation (the property that makes inline recording safe while earlier segments are still
     /// in flight).
-    pub fn touch_all_hits(&mut self, buf_id: usize, n_expert: usize) {
+    pub fn touch_all_hits(&mut self, buf_id: usize, n_expert: usize) -> Result<()> {
         let (_, pool, src) = self
             .sources
             .get(&buf_id)
-            .expect("moe pager: touch on an unregistered buffer");
+            .ok_or_else(|| be("moe pager: touch on an unregistered buffer"))?;
         let layer_base = src.layer_base;
         let pager = &mut self.pools[*pool].pager;
         pager.begin_batch();
@@ -723,17 +772,19 @@ impl MoePagerSession {
                 "touch_all_hits on a non-resident block (all_resident gate violated)"
             );
         }
+        Ok(())
     }
 
     /// Open a touch batch on `buf_id`'s pool — call once per (layer, role) residency resolution,
     /// BEFORE the first [`Self::stage_role`] call of that batch (rotations re-call `stage_role`
     /// WITHIN the same batch; the epoch protection must span them).
-    pub fn begin_batch(&mut self, buf_id: usize) {
+    pub fn begin_batch(&mut self, buf_id: usize) -> Result<()> {
         let (_, pool, _) = self
             .sources
             .get(&buf_id)
-            .expect("moe pager: begin_batch on an unregistered buffer");
+            .ok_or_else(|| be("moe pager: begin_batch on an unregistered buffer"))?;
         self.pools[*pool].pager.begin_batch();
+        Ok(())
     }
 
     /// Stage `local_ids`' residency for `buf_id`'s layer through `rec`-recorded ring→arena
@@ -772,9 +823,7 @@ impl MoePagerSession {
                 Arc::clone(&src.bytes),
             )
         };
-        // See `touch_role` for why the explicit deref-to-trait-object.
-        let inner: &(dyn AsRef<[u8]> + Send + Sync) = &*bytes_arc;
-        let bytes: &[u8] = inner.as_ref();
+        let bytes = expert_bytes(&bytes_arc);
         // Disjoint field borrows (the pool mutably, the ring by ref) — destructure once.
         let Self {
             pools,
@@ -847,35 +896,35 @@ impl MoePagerSession {
         Ok(w)
     }
 
-    fn pool_of(&self, buf_id: usize) -> &Pool {
+    fn pool_of(&self, buf_id: usize) -> Result<&Pool> {
         let (_, pool, _) = self
             .sources
             .get(&buf_id)
-            .expect("moe pager: arena/lut lookup on an unregistered buffer");
-        &self.pools[*pool]
+            .ok_or_else(|| be("moe pager: arena/lut lookup on an unregistered buffer"))?;
+        Ok(&self.pools[*pool])
     }
 
     /// The arena buffer `buf_id`'s pool dispatches against (callers gate on [`Self::is_paged`]
-    /// first — this panics on an unregistered buffer).
-    pub fn arena(&self, buf_id: usize) -> &dyn Buffer {
-        self.pool_of(buf_id).pager.arena_buffer()
+    /// first — this errors on an unregistered buffer).
+    pub fn arena(&self, buf_id: usize) -> Result<&dyn Buffer> {
+        Ok(self.pool_of(buf_id)?.pager.arena_buffer())
     }
 
     /// `buf_id`'s pool arena's 64-bit `VkDeviceAddress` — the base the paged kernels scale the LUT
     /// slot index onto (`arena_addr + slot * slot_bytes`). Passed to the shader as a push constant.
-    pub fn arena_addr(&self, buf_id: usize) -> u64 {
-        self.pool_of(buf_id).pager.arena_addr()
+    pub fn arena_addr(&self, buf_id: usize) -> Result<u64> {
+        Ok(self.pool_of(buf_id)?.pager.arena_addr())
     }
 
     /// `buf_id`'s pool per-slot byte stride — the multiplier the paged kernels apply to the LUT
     /// slot index (see [`Self::arena_addr`]).
-    pub fn slot_bytes(&self, buf_id: usize) -> usize {
-        self.pool_of(buf_id).slot_bytes
+    pub fn slot_bytes(&self, buf_id: usize) -> Result<usize> {
+        Ok(self.pool_of(buf_id)?.slot_bytes)
     }
 
     /// [`Self::arena`]'s LUT twin.
-    pub fn lut(&self, buf_id: usize) -> &dyn Buffer {
-        self.pool_of(buf_id).pager.lut_buffer()
+    pub fn lut(&self, buf_id: usize) -> Result<&dyn Buffer> {
+        Ok(self.pool_of(buf_id)?.pager.lut_buffer())
     }
 
     /// Aggregate stats across every pool of `role` (the pool split is a capacity detail; the
@@ -901,13 +950,10 @@ impl MoePagerSession {
         for p in &self.pools {
             let s = p.pager.stats();
             eprintln!(
-                "[moe pager] {}/{:.1}MB: hits={} misses={} evictions={} hit_rate={:.3} slots={}",
+                "[moe pager] {}/{:.1}MB: {} slots={}",
                 p.role.name(),
                 p.slot_bytes as f64 / 1e6,
-                s.hits,
-                s.misses,
-                s.evictions,
-                s.hit_rate(),
+                stats_suffix(&s),
                 p.pager.n_slots(),
             );
         }
@@ -1035,7 +1081,7 @@ impl DensePagerSession {
             sources: HashMap::new(),
             ring,
             ring_half_bytes,
-            print_stats: std::env::var("INFR_PAGER_STATS").is_ok(),
+            print_stats: pager_stats_enabled(),
         })
     }
 
@@ -1048,14 +1094,7 @@ impl DensePagerSession {
             .pools
             .get(pool)
             .ok_or_else(|| be(format!("dense pager: pool index {pool} out of range")))?;
-        let total: usize = source
-            .segments
-            .iter()
-            .map(|s| {
-                let inner: &(dyn AsRef<[u8]> + Send + Sync) = &**s;
-                inner.as_ref().len()
-            })
-            .sum();
+        let total: usize = source.segments.iter().map(|s| expert_bytes(s).len()).sum();
         if total > p.spec.slot_bytes {
             return Err(be(format!(
                 "dense pager: block bytes ({total}) exceed pool {pool}'s slot stride ({})",
@@ -1110,18 +1149,15 @@ impl DensePagerSession {
             return Ok(None); // half full — caller rotates and re-calls
         }
         pool.pager.begin_batch();
-        // See `MoePagerSession::touch_role` for why the explicit deref-to-trait-object.
-        let seg_refs: Vec<&[u8]> = src
-            .segments
-            .iter()
-            .map(|s| {
-                let inner: &(dyn AsRef<[u8]> + Send + Sync) = &**s;
-                inner.as_ref()
-            })
-            .collect();
-        let (slot, consumed) =
-            pool.pager
-                .schedule_staged(rec, ring.as_ref(), half_base + *cursor, id, &seg_refs)?;
+        // Pass the mmap-backed segment `Arc`s straight through — `schedule_staged` derefs each via
+        // `expert_bytes`, so no per-call `Vec<&[u8]>` is materialized.
+        let (slot, consumed) = pool.pager.schedule_staged(
+            rec,
+            ring.as_ref(),
+            half_base + *cursor,
+            id,
+            &src.segments,
+        )?;
         *cursor += consumed;
         // Slot base BYTE address = arena base + slot * slot_bytes, in 64-bit (the BDA arena's
         // `arena_addr()`; the streamed kernel dereferences this pointer). No cap: the multiply and
@@ -1144,13 +1180,9 @@ impl DensePagerSession {
         for (i, p) in self.pools.iter().enumerate() {
             let s = p.pager.stats();
             eprintln!(
-                "[dense pager] pool{i}/{:.1}MB: hits={} misses={} evictions={} hit_rate={:.3} \
-                 slots={}/{}",
+                "[dense pager] pool{i}/{:.1}MB: {} slots={}/{}",
                 p.spec.slot_bytes as f64 / 1e6,
-                s.hits,
-                s.misses,
-                s.evictions,
-                s.hit_rate(),
+                stats_suffix(&s),
                 p.spec.n_slots,
                 p.spec.n_blocks,
             );
@@ -1160,3 +1192,73 @@ impl DensePagerSession {
 
 /// `VulkanBackend::dense_pager`'s field type — same locking story as [`MoePagerCell`].
 pub type DensePagerCell = Mutex<Option<DensePagerSession>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── #4: GpuPager::new dimension validation returns Err (not panic) on bad input ──────────────
+    #[test]
+    fn validate_pager_dims_rejects_zero_slots() {
+        assert!(validate_pager_dims(0, 64).is_err());
+    }
+
+    #[test]
+    fn validate_pager_dims_rejects_misaligned_slot_bytes() {
+        assert!(validate_pager_dims(4, 3).is_err());
+        assert!(validate_pager_dims(4, 6).is_err());
+    }
+
+    #[test]
+    fn validate_pager_dims_accepts_valid() {
+        assert!(validate_pager_dims(1, 4).is_ok());
+        assert!(validate_pager_dims(238, 13 << 20).is_ok());
+    }
+
+    // ── #5: record_placement / apply_placement LUT bookkeeping is byte-identical to the old
+    //        inline evict-then-insert blocks (unit-tested on a plain mirror, no GPU) ──────────────
+    #[test]
+    fn apply_placement_insert_no_eviction() {
+        let mut lut = vec![NOT_RESIDENT; 8];
+        apply_placement(&mut lut, 3, 5, None);
+        assert_eq!(lut[3], 5);
+        // every other entry untouched
+        for (i, &v) in lut.iter().enumerate() {
+            if i != 3 {
+                assert_eq!(v, NOT_RESIDENT);
+            }
+        }
+    }
+
+    #[test]
+    fn apply_placement_evict_then_insert() {
+        let mut lut = vec![NOT_RESIDENT; 8];
+        // block 2 already resident in slot 5
+        apply_placement(&mut lut, 2, 5, None);
+        // block 6 moves into slot 5, evicting block 2 (the old occupant of that slot)
+        apply_placement(&mut lut, 6, 5, Some(2));
+        assert_eq!(
+            lut[2], NOT_RESIDENT,
+            "evicted block must clear to NOT_RESIDENT"
+        );
+        assert_eq!(lut[6], 5, "new block records the reused slot index");
+    }
+
+    #[test]
+    fn apply_placement_insert_evict_order_matters_for_self_reuse() {
+        // If a block were (pathologically) evicting itself, the insert must win — evict clears
+        // first, then insert writes. Guards the ordering the old inline blocks had.
+        let mut lut = vec![NOT_RESIDENT; 4];
+        apply_placement(&mut lut, 1, 7, Some(1));
+        assert_eq!(lut[1], 7);
+    }
+
+    #[test]
+    fn apply_placement_ignores_out_of_range_ids() {
+        // Mirrors the old `get_mut(..)` guards: an id/evicted past the mirror end is a no-op, not
+        // a panic (an out-of-pool layer's block is never asked for, but stay total).
+        let mut lut = vec![NOT_RESIDENT; 2];
+        apply_placement(&mut lut, 99, 3, Some(88));
+        assert_eq!(lut, vec![NOT_RESIDENT; 2]);
+    }
+}

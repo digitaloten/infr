@@ -5109,7 +5109,7 @@ fn stage_and_window<'a>(
     {
         let mut guard = be_.moe_pager().lock().unwrap();
         let sess = guard.as_mut().expect("paged execution requires a session");
-        sess.begin_batch(buf_id);
+        sess.begin_batch(buf_id)?;
     }
     let mut start = 0;
     while start < ids.len() {
@@ -5311,11 +5311,11 @@ fn execute_paged_moe<'a>(
         if inline_ok {
             let mut guard = be_.moe_pager().lock().unwrap();
             let sess = guard.as_mut().expect("checked above");
-            sess.touch_all_hits(gate_id, n_expert);
+            sess.touch_all_hits(gate_id, n_expert)?;
             if !*fused_gate_up {
-                sess.touch_all_hits(up_id, n_expert);
+                sess.touch_all_hits(up_id, n_expert)?;
             }
-            sess.touch_all_hits(down_id, n_expert);
+            sess.touch_all_hits(down_id, n_expert)?;
         } else {
             // Split: the router's routing is host-unknown and some routed expert may be absent —
             // block once, read the ids off the mapped Staging buffer, stage exactly the routed
@@ -5452,8 +5452,8 @@ fn execute_paged_moe<'a>(
                     pool[&qa].as_ref(),
                     pool[&qda].as_ref(),
                     gate_needs_sact.then(|| pool[&qsa].as_ref()),
-                    sess.arena_addr(gate_id),
-                    sess.slot_bytes(gate_id) as u32,
+                    sess.arena_addr(gate_id)?,
+                    sess.slot_bytes(gate_id)? as u32,
                     sess.tape(),
                     gate_w as usize,
                     pool[&counts].as_ref(),
@@ -5476,8 +5476,8 @@ fn execute_paged_moe<'a>(
                         pool[&qa].as_ref(),
                         pool[&qda].as_ref(),
                         up_needs_sact.then(|| pool[&qsa].as_ref()),
-                        sess.arena_addr(up_id),
-                        sess.slot_bytes(up_id) as u32,
+                        sess.arena_addr(up_id)?,
+                        sess.slot_bytes(up_id)? as u32,
                         sess.tape(),
                         up_w as usize,
                         pool[&counts].as_ref(),
@@ -5546,8 +5546,8 @@ fn execute_paged_moe<'a>(
                     pool[&dqa].as_ref(),
                     pool[&dda].as_ref(),
                     down_needs_sact.then(|| pool[&dsa].as_ref()),
-                    sess.arena_addr(down_id),
-                    sess.slot_bytes(down_id) as u32,
+                    sess.arena_addr(down_id)?,
+                    sess.slot_bytes(down_id)? as u32,
                     sess.tape(),
                     down_w as usize,
                     pool[&counts].as_ref(),
@@ -5595,8 +5595,8 @@ fn execute_paged_moe<'a>(
         let sess = guard.as_ref().expect("checked above");
         rec2.linear_native_id_multi_paged(
             gdt,
-            sess.arena_addr(gate_id),
-            sess.slot_bytes(gate_id) as u32,
+            sess.arena_addr(gate_id)?,
+            sess.slot_bytes(gate_id)? as u32,
             sess.tape(),
             pool[&ids_key].as_ref(),
             n_used,
@@ -5611,8 +5611,8 @@ fn execute_paged_moe<'a>(
         if let Some(ubuf) = &ubuf {
             rec2.linear_native_id_multi_paged(
                 udt,
-                sess.arena_addr(up_id),
-                sess.slot_bytes(up_id) as u32,
+                sess.arena_addr(up_id)?,
+                sess.slot_bytes(up_id)? as u32,
                 sess.tape(),
                 pool[&ids_key].as_ref(),
                 n_used,
@@ -5684,8 +5684,8 @@ fn execute_paged_moe<'a>(
         let sess = guard.as_ref().expect("checked above");
         rec2.linear_native_id_multi_paged(
             ddt,
-            sess.arena_addr(down_id),
-            sess.slot_bytes(down_id) as u32,
+            sess.arena_addr(down_id)?,
+            sess.slot_bytes(down_id)? as u32,
             sess.tape(),
             pool[&ids_key].as_ref(),
             n_used,
