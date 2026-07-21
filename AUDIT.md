@@ -22,7 +22,7 @@ reproduce/confirm are dropped (not listed) to keep this a verified-only ledger.
 
 - **Original audit:** 157 findings across 24 module slices (1 🔴 critical, 33 🟠
   major, 123 🟡 minor).
-- **Remaining open:** **96** — 0 🔴, 16 🟠, 80 🟡.
+- **Remaining open:** **90** — 0 🔴, 14 🟠, 76 🟡.
 
 No finding was accepted on an agent's word — each was re-read against the source
 by the coordinator; two agent-flagged "MAJOR"s (the Q5_1 clamp in the shader and
@@ -147,6 +147,19 @@ parked path).
   DiffusionGemma upload closures route through shared helpers. No logits/golden
   path touched. **infr-llama's seam core is now fully cleared** (only the parked
   MTP slice remains in this crate).
+- **`infr-vulkan` recorder (all 6 findings)** — TDD, +2 tests, **gpu_seam
+  byte-identity verified on the RX 7900 XTX** (MoE-mmq resident+paged, GEMV
+  row1/mrow/mw/id, and weight-addr goldens all match host). Per-dispatch
+  `INFR_GEMV_*` env reads are resolved once into a `GemvKnobs` `OnceLock` (same
+  routing); `dispatch3`/`bind_descriptors` use stack arrays (no per-dispatch
+  heap `Vec`); `finish`/`finish_nowait` free the cmd buffer + pools on their
+  error paths (was a leak); the two ~180-line `matmul_mmq_experts`/`_paged`
+  tables collapse to one `moe_mmq_desc` table (a drift test asserts the same
+  `(kernel,nbind)` for every `MOE_MMQ_DTYPES`); the descriptor pool is
+  proportioned so sets+descriptors exhaust together. #5: the 2 genuinely
+  parity-only `_at` fns are gated behind a new `parity` feature — the other 9
+  carried a **stale** "not wired" doc but are in fact production-wired
+  (correctly left `pub`).
 
 ### Highest-priority (production default paths)
 
@@ -190,52 +203,6 @@ detail per module below.
   CLI).
 
 <!-- SLICES APPENDED BELOW AS THEY ARE VERIFIED -->
-
-## infr-vulkan/src/recorder.rs
-
-1. **🟠 `recorder.rs:2537,2545,2558` (helpers `119`,`153`,`194`) —
-   `std::env::var` on the per-dispatch GEMV recording path, contradicting the
-   struct's own "read once" note (`466`).** `linear_native` calls
-   `native_sg_choice` (≤4 env lookups), then
-   `INFR_NO_GEMV_REG`/`INFR_GEMV_VARIANT` (2), then `native_rm_choice` (≤4) —
-   ~10 process-mutex-guarded env lookups per GEMV. `no_barrier`/`prof`/`prof2`
-   are already cached to fields at construction; these routing knobs are not.
-   Prefill records thousands of GEMVs/forward = thousands×10 needless host
-   lookups in exactly the many-op regime the recorder optimizes. _Fix:_ resolve
-   all `INFR_GEMV_*` knobs once into `self`/`OnceLock` at `new_inner`.
-2. **🟠 `recorder.rs:957` (also `918`,`856`,`875`) — every dispatch
-   heap-allocates ≥3 transient `Vec`s.** `dispatch3` builds
-   `read_bufs`+`write_bufs` `Vec<vk::Buffer>` per call; `bind_descriptors` a
-   `Vec<WriteDescriptorSet>`. Binding counts are statically ≤ ~9. A batched MoE
-   prefill chunk records ~50k dispatches → ~150k tiny allocations of pure
-   allocator churn on the host-bound path. _Fix:_ `SmallVec<[_; 12]>`/`ArrayVec`
-   — counts are known-small.
-3. **🟡 `recorder.rs:8627,8636,8639` — `finish` leaks cmd buffer + descriptor
-   pools + query pool on the submit/wait error path.** `Recorder` has no `Drop`
-   (by design); `end_command_buffer`/`queue_submit`/`queue_wait_idle` use `?`
-   and early-return before the cleanup at 8651-8655. Fires on device-lost —
-   exactly when live pools then get flagged at `vkDestroyDevice`.
-   `finish_nowait` has the same asymmetry. _Fix:_ guard struct /
-   free-then-propagate on both paths (as `discard` already does).
-4. **🟡 `recorder.rs:7417 & 7696` — `matmul_mmq_experts` and
-   `matmul_mmq_experts_paged` carry near-duplicate ~180-line dtype→kernel match
-   tables** differing only by an `_xp`/`_xpg` suffix; the `unreachable!` arms
-   must be hand-kept in sync. Drift hazard. _Fix:_ one dtype-keyed table
-   returning stem + binding count, append suffixes programmatically.
-5. **🟡 `recorder.rs` (5 `pub fn` sites) — parity-only `_at`/streamed entry
-   points are `pub`**, each documented "Not wired into any production dispatch
-   yet; exists so a parity test can exercise the `_streamed` SPV." They widen
-   the crate's public contract and hide dead-in-prod code from dead-code lints.
-   _Fix:_ `pub(crate)` + `#[cfg(any(test, feature="parity"))]`.
-6. **🟡 `recorder.rs:643` — descriptor-pool tranche under-provisions descriptors
-   vs sets.** `max_sets(4096)` but `descriptor_count: 16384`; dispatches binding
-   ~8 buffers exhaust descriptors at ~2048 sets (half of `max_sets`), doubling
-   pool-growth frequency. _Fix:_ size
-   `descriptor_count ≈ max_sets × max_bindings` or lower `max_sets` to match.
-
-_Clean:_ push-constant packing, `sync` RAW/WAR/WAW hazard logic + stage-mask
-pairing, inert-bound-descriptor hazard convention, chunk-split math,
-split-K/flash `n_splits`, `RecordedCmd`/`PendingSegment` ownership.
 
 ## infr-vulkan/src/adapter.rs
 

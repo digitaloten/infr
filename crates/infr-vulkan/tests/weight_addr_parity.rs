@@ -1629,6 +1629,9 @@ fn gemm_proj_matches_resident() {
 // kernel by hand (as this test does) would just prove nothing on a box without the coopmat shape —
 // self-skip instead of silently passing vacuously.
 
+// Exercises `Recorder::matmul_i8cm_q8_0_at`, a parity-only entry point gated behind the crate's
+// `parity` feature (no production caller) — so this test only compiles with `--features parity`.
+#[cfg(feature = "parity")]
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn i8cm_matches_resident() {
@@ -1728,6 +1731,9 @@ fn i8cm_matches_resident() {
 // support the coopmat tier detects, and the shader's own header notes this path is
 // "compile-checked only" on hardware without it.
 
+// Exercises `Recorder::repack_q8_to_f8_at`, a parity-only entry point gated behind the crate's
+// `parity` feature (no production caller) — so this test only compiles with `--features parity`.
+#[cfg(feature = "parity")]
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn repack_matches_resident() {

@@ -5,6 +5,14 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Compiles the parity-only `_at`/`_streamed` recorder entry points that have NO production caller
+# and exist solely for the `weight_addr_parity` integration test to exercise a `_streamed` SPV
+# directly. Off by default so those stay out of the crate's public API and a normal build; the
+# integration tests that call them are `#[cfg(feature = "parity")]` too. Run them with
+# `cargo test -p infr-vulkan --features parity`.
+parity = []
+
 [build-dependencies]
 infr-core.workspace = true
 

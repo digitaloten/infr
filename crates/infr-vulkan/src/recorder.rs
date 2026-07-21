@@ -109,6 +109,76 @@ const DENSE_SMALL_TILE_MAX_M: usize = 24;
 /// applies within the small-tile band and never disturbs `INFR_NO_SMALL_BM`'s BM=64 override.
 const DENSE_SMALL_TILE_MAX_M16: usize = 16;
 
+/// Upper bound on the number of buffers any single recorded dispatch binds (the widest kernel
+/// binds ≤ ~9). Sizes the stack scratch arrays in `dispatch3`/`dispatch_indirect`/`bind_descriptors`
+/// so those hot recording paths never touch the heap; a `debug_assert` guards the bound.
+const MAX_DISPATCH_BINDINGS: usize = 16;
+
+/// The `INFR_GEMV_*` / `INFR_NO_GEMV_*` routing knobs, resolved ONCE from the environment (env is
+/// process-constant) into a single struct behind [`gemv_knobs`]'s `OnceLock`. The native GEMV
+/// dispatchers (`linear_native`, `linear_add_native_at`, `native_rm_choice`, `native_sg_choice`,
+/// `native_id_sg_choice`) previously re-read ~10 of these via `std::env::var` on EVERY recorded
+/// GEMV — each a process-mutex-guarded lookup — contradicting `Recorder`'s own "debug knobs, read
+/// once" note. Prefill records thousands of GEMVs/forward, so that was thousands×10 needless host
+/// lookups in exactly the many-op regime the recorder is built to keep cheap. The routing
+/// decisions are unchanged: every field mirrors the exact default and parse the old inline reads
+/// used, so kernel selection stays byte-identical.
+struct GemvKnobs {
+    // `native_rm_choice`
+    no_gemv_rm: bool,
+    gemv_rm_maxout: usize,
+    gemv_rm_minout: usize,
+    gemv_rm: u32,
+    // `native_sg_choice` / `native_id_sg_choice` (shared band knobs)
+    no_gemv_sg: bool,
+    no_gemv_id_sg: bool,
+    gemv_sg_minout: usize,
+    gemv_sg_maxout: usize,
+    gemv_sg_nr: u32,
+    // `linear_native` / `linear_add_native_at` RM-v2 variant selection
+    // (`INFR_NO_GEMV_REG` / `INFR_GEMV_VARIANT`).
+    gemv_variant: Option<String>,
+}
+
+impl GemvKnobs {
+    /// Pure resolver: given an env reader (`name -> value`), produce the cached knobs. Split out so
+    /// a unit test can drive it against synthetic env states and confirm each field equals what the
+    /// old per-call `std::env::var` reads would have returned. `get(name).is_some()` mirrors
+    /// `std::env::var(name).is_ok()` (variable present, even if empty); the `parse().ok()` +
+    /// `unwrap_or(default)` chains mirror the originals exactly.
+    fn resolve(get: impl Fn(&str) -> Option<String>) -> Self {
+        let parse = |name: &str, default: usize| -> usize {
+            get(name).and_then(|s| s.parse().ok()).unwrap_or(default)
+        };
+        let parse_u32 = |name: &str, default: u32| -> u32 {
+            get(name).and_then(|s| s.parse().ok()).unwrap_or(default)
+        };
+        let gemv_variant = if get("INFR_NO_GEMV_REG").is_some() {
+            None
+        } else {
+            get("INFR_GEMV_VARIANT").or_else(|| Some("reg".to_string()))
+        };
+        Self {
+            no_gemv_rm: get("INFR_NO_GEMV_RM").is_some(),
+            gemv_rm_maxout: parse("INFR_GEMV_RM_MAXOUT", usize::MAX),
+            gemv_rm_minout: parse("INFR_GEMV_RM_MINOUT", 2048),
+            gemv_rm: parse_u32("INFR_GEMV_RM", 2),
+            no_gemv_sg: get("INFR_NO_GEMV_SG").is_some(),
+            no_gemv_id_sg: get("INFR_NO_GEMV_ID_SG").is_some(),
+            gemv_sg_minout: parse("INFR_GEMV_SG_MINOUT", 2048),
+            gemv_sg_maxout: parse("INFR_GEMV_SG_MAXOUT", 8192),
+            gemv_sg_nr: parse_u32("INFR_GEMV_SG_NR", 2),
+            gemv_variant,
+        }
+    }
+}
+
+/// Process-once cached [`GemvKnobs`] — the native GEMV dispatchers read these instead of the env.
+fn gemv_knobs() -> &'static GemvKnobs {
+    static KNOBS: std::sync::OnceLock<GemvKnobs> = std::sync::OnceLock::new();
+    KNOBS.get_or_init(|| GemvKnobs::resolve(|name| std::env::var(name).ok()))
+}
+
 /// Rows-per-workgroup for the multi-output-row decode GEMV, or `None` to keep the RM=1 path.
 /// The RM variant packs RM output rows into one workgroup (RM× the in-flight weight streams per
 /// wave) to feed enough MLP at low `out_f`, where the RM=1 grid (out_f workgroups) is too shallow
@@ -118,26 +188,18 @@ const DENSE_SMALL_TILE_MAX_M16: usize = 16;
 /// `INFR_GEMV_RM_MAXOUT` overrides the out_f gate.
 fn native_rm_choice(dtype: infr_core::DType, out_f: usize) -> Option<u32> {
     use infr_core::DType::*;
-    if !matches!(dtype, Q4K | Q6K) || std::env::var("INFR_NO_GEMV_RM").is_ok() {
+    let k = gemv_knobs();
+    if !matches!(dtype, Q4K | Q6K) || k.no_gemv_rm {
         return None;
     }
-    let max_out = std::env::var("INFR_GEMV_RM_MAXOUT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(usize::MAX);
+    let max_out = k.gemv_rm_maxout;
     // Below ~2k outputs the RM=1 grid is already shallow; halving it starves the machine (k/v,
     // out_f=1024, regressed in the cold A/B), so those stay on RM=1.
-    let min_out = std::env::var("INFR_GEMV_RM_MINOUT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(2048usize);
+    let min_out = k.gemv_rm_minout;
     if out_f > max_out || out_f < min_out {
         return None;
     }
-    let rm = std::env::var("INFR_GEMV_RM")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(2u32);
+    let rm = k.gemv_rm;
     (rm == 2 || rm == 4).then_some(rm)
 }
 
@@ -158,28 +220,20 @@ fn native_sg_choice(dtype: infr_core::DType, in_f: usize, out_f: usize) -> Optio
     // out_f≈2048 (attn_v, out_f=1024: grid too shallow) and above the band (lm_head, out_f=151936:
     // already peak on the tree kernel + subgroupAdd occupancy regression) — so the band is the
     // out_f≈4096 Q6_K projections (ffn_down / o). Default NR=2 (best at every winning shape).
-    if !matches!(dtype, Q6K) || std::env::var("INFR_NO_GEMV_SG").is_ok() {
+    let k = gemv_knobs();
+    if !matches!(dtype, Q6K) || k.no_gemv_sg {
         return None;
     }
     // wave32 lanes stride 32-elem sub-blocks; in_f must be a multiple of 32 (all projections are).
     if !in_f.is_multiple_of(32) {
         return None;
     }
-    let min_out = std::env::var("INFR_GEMV_SG_MINOUT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(2048usize);
-    let max_out = std::env::var("INFR_GEMV_SG_MAXOUT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8192usize);
+    let min_out = k.gemv_sg_minout;
+    let max_out = k.gemv_sg_maxout;
     if out_f < min_out || out_f > max_out {
         return None;
     }
-    let nr = std::env::var("INFR_GEMV_SG_NR")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(2u32);
+    let nr = k.gemv_sg_nr;
     matches!(nr, 2 | 4 | 8).then_some(nr)
 }
 
@@ -193,7 +247,8 @@ fn native_sg_choice(dtype: infr_core::DType, in_f: usize, out_f: usize) -> Optio
 /// the dense and id SG routes; `INFR_GEMV_SG_MINOUT`/`MAXOUT`/`INFR_GEMV_SG_NR` are the shared knobs.
 fn native_id_sg_choice(dtype: infr_core::DType, in_f: usize, out_f: usize) -> Option<u32> {
     use infr_core::DType::*;
-    if std::env::var("INFR_NO_GEMV_ID_SG").is_ok() || std::env::var("INFR_NO_GEMV_SG").is_ok() {
+    let k = gemv_knobs();
+    if k.no_gemv_id_sg || k.no_gemv_sg {
         return None;
     }
     // Heavy K-quant decodes only (Q6_K/Q5_K): the extra unpack ALU is where wave32 + subgroupAdd's
@@ -221,21 +276,12 @@ fn native_id_sg_choice(dtype: infr_core::DType, in_f: usize, out_f: usize) -> Op
     if !in_f.is_multiple_of(32) {
         return None;
     }
-    let min_out = std::env::var("INFR_GEMV_SG_MINOUT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(2048usize);
-    let max_out = std::env::var("INFR_GEMV_SG_MAXOUT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8192usize);
+    let min_out = k.gemv_sg_minout;
+    let max_out = k.gemv_sg_maxout;
     if out_f < min_out || out_f > max_out {
         return None;
     }
-    let nr = std::env::var("INFR_GEMV_SG_NR")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(2u32);
+    let nr = k.gemv_sg_nr;
     matches!(nr, 2 | 4 | 8).then_some(nr)
 }
 
@@ -262,6 +308,358 @@ fn expert_stride_bytes(dtype: infr_core::DType, stride: usize) -> u32 {
         "per-expert byte stride {bytes} ({dtype:?}) exceeds the u32 addressing unit (4 GiB)"
     );
     bytes as u32
+}
+
+/// A batched-MoE expert-GEMM kernel variant: `(kernel name, SPIR-V)`.
+type MmqKern = (&'static str, &'static [u32]);
+
+/// ONE dtype-keyed source of truth for batched-MoE expert-GEMM kernel selection, driving BOTH the
+/// resident (`_xp`) dispatch in [`Recorder::matmul_mmq_experts`] and the paged (`_xpg`) one in
+/// [`Recorder::matmul_mmq_experts_paged`]. Each previously carried its own ~180-line dtype→kernel
+/// match whose covered set and `unreachable!` arms had to be hand-kept in sync — a dtype added to
+/// one but not the other would silently `unreachable!` at runtime. Here the two share this single
+/// `match dtype`, so the set can't drift; the callers pick the variant (tile/wide) and apply the
+/// paged +1 LUT binding. `resident_nb` is the resident binding count; paged is always
+/// `resident_nb + 1`. `moe_mmq_kernels_match` (in `#[cfg(test)]`) freezes the whole mapping so a
+/// refactor can't change any `(name, nb)` the two old tables produced.
+struct MoeMmqDesc {
+    /// Resident (`_xp`) STORAGE_BUFFER binding count; the paged (`_xpg`) build adds one for the LUT.
+    resident_nb: usize,
+    /// Resident non-wide: `_xp` (big BM=64 tile) / `_xp32` (small BM=32 tile).
+    xp: MmqKern,
+    xp32: MmqKern,
+    /// Resident wide-BN (`_xp128` big-tile / `_xp32w` small-tile) — Q4_K/Q6_K only, else `None`.
+    /// The caller only reads this when `wide_bn`, which it only sets for Q4_K/Q6_K.
+    xp_wide: Option<(MmqKern, MmqKern)>,
+    /// Paged: `_xpg` (big-tile) / `_xpg32` (small-tile).
+    xpg: MmqKern,
+    xpg32: MmqKern,
+}
+
+/// The single dtype→kernel table (see [`MoeMmqDesc`]). `None` for any dtype outside the mmq set.
+fn moe_mmq_desc(dtype: infr_core::DType) -> Option<MoeMmqDesc> {
+    use crate::gemm as g;
+    use infr_core::DType as D;
+    let d = match dtype {
+        D::Q4K => MoeMmqDesc {
+            resident_nb: 7,
+            xp: ("native_gemm_mmq_q4k_xp", g::native_gemm_mmq_q4k_xp_spv()),
+            xp32: (
+                "native_gemm_mmq_q4k_xp32",
+                g::native_gemm_mmq_q4k_xp32_spv(),
+            ),
+            xp_wide: Some((
+                (
+                    "native_gemm_mmq_q4k_xp128",
+                    g::native_gemm_mmq_q4k_xp128_spv(),
+                ),
+                (
+                    "native_gemm_mmq_q4k_xp32w",
+                    g::native_gemm_mmq_q4k_xp32w_spv(),
+                ),
+            )),
+            xpg: ("native_gemm_mmq_q4k_xpg", g::native_gemm_mmq_q4k_xpg_spv()),
+            xpg32: (
+                "native_gemm_mmq_q4k_xpg32",
+                g::native_gemm_mmq_q4k_xpg32_spv(),
+            ),
+        },
+        D::Q6K => MoeMmqDesc {
+            resident_nb: 6,
+            xp: ("native_gemm_mmq_q6k_xp", g::native_gemm_mmq_q6k_xp_spv()),
+            xp32: (
+                "native_gemm_mmq_q6k_xp32",
+                g::native_gemm_mmq_q6k_xp32_spv(),
+            ),
+            xp_wide: Some((
+                (
+                    "native_gemm_mmq_q6k_xp128",
+                    g::native_gemm_mmq_q6k_xp128_spv(),
+                ),
+                (
+                    "native_gemm_mmq_q6k_xp32w",
+                    g::native_gemm_mmq_q6k_xp32w_spv(),
+                ),
+            )),
+            xpg: ("native_gemm_mmq_q6k_xpg", g::native_gemm_mmq_q6k_xpg_spv()),
+            xpg32: (
+                "native_gemm_mmq_q6k_xpg32",
+                g::native_gemm_mmq_q6k_xpg32_spv(),
+            ),
+        },
+        D::Q8_0 => MoeMmqDesc {
+            resident_nb: 6,
+            xp: ("native_gemm_mmq_q8_0_xp", g::native_gemm_mmq_q8_0_xp_spv()),
+            xp32: (
+                "native_gemm_mmq_q8_0_xp32",
+                g::native_gemm_mmq_q8_0_xp32_spv(),
+            ),
+            xp_wide: None,
+            xpg: (
+                "native_gemm_mmq_q8_0_xpg",
+                g::native_gemm_mmq_q8_0_xpg_spv(),
+            ),
+            xpg32: (
+                "native_gemm_mmq_q8_0_xpg32",
+                g::native_gemm_mmq_q8_0_xpg32_spv(),
+            ),
+        },
+        D::Q5_0 => MoeMmqDesc {
+            resident_nb: 6,
+            xp: ("native_gemm_mmq_q5_0_xp", g::native_gemm_mmq_q5_0_xp_spv()),
+            xp32: (
+                "native_gemm_mmq_q5_0_xp32",
+                g::native_gemm_mmq_q5_0_xp32_spv(),
+            ),
+            xp_wide: None,
+            xpg: (
+                "native_gemm_mmq_q5_0_xpg",
+                g::native_gemm_mmq_q5_0_xpg_spv(),
+            ),
+            xpg32: (
+                "native_gemm_mmq_q5_0_xpg32",
+                g::native_gemm_mmq_q5_0_xpg32_spv(),
+            ),
+        },
+        D::Q5K => MoeMmqDesc {
+            resident_nb: 7,
+            xp: ("native_gemm_mmq_q5k_xp", g::native_gemm_mmq_q5k_xp_spv()),
+            xp32: (
+                "native_gemm_mmq_q5k_xp32",
+                g::native_gemm_mmq_q5k_xp32_spv(),
+            ),
+            xp_wide: None,
+            xpg: ("native_gemm_mmq_q5k_xpg", g::native_gemm_mmq_q5k_xpg_spv()),
+            xpg32: (
+                "native_gemm_mmq_q5k_xpg32",
+                g::native_gemm_mmq_q5k_xpg32_spv(),
+            ),
+        },
+        D::Q5_1 => MoeMmqDesc {
+            resident_nb: 7,
+            xp: ("native_gemm_mmq_q5_1_xp", g::native_gemm_mmq_q5_1_xp_spv()),
+            xp32: (
+                "native_gemm_mmq_q5_1_xp32",
+                g::native_gemm_mmq_q5_1_xp32_spv(),
+            ),
+            xp_wide: None,
+            xpg: (
+                "native_gemm_mmq_q5_1_xpg",
+                g::native_gemm_mmq_q5_1_xpg_spv(),
+            ),
+            xpg32: (
+                "native_gemm_mmq_q5_1_xpg32",
+                g::native_gemm_mmq_q5_1_xpg32_spv(),
+            ),
+        },
+        D::Q2K => MoeMmqDesc {
+            resident_nb: 6,
+            xp: ("native_gemm_mmq_q2_k_xp", g::native_gemm_mmq_q2_k_xp_spv()),
+            xp32: (
+                "native_gemm_mmq_q2_k_xp32",
+                g::native_gemm_mmq_q2_k_xp32_spv(),
+            ),
+            xp_wide: None,
+            xpg: (
+                "native_gemm_mmq_q2_k_xpg",
+                g::native_gemm_mmq_q2_k_xpg_spv(),
+            ),
+            xpg32: (
+                "native_gemm_mmq_q2_k_xpg32",
+                g::native_gemm_mmq_q2_k_xpg32_spv(),
+            ),
+        },
+        D::Q3K => MoeMmqDesc {
+            resident_nb: 6,
+            xp: ("native_gemm_mmq_q3_k_xp", g::native_gemm_mmq_q3_k_xp_spv()),
+            xp32: (
+                "native_gemm_mmq_q3_k_xp32",
+                g::native_gemm_mmq_q3_k_xp32_spv(),
+            ),
+            xp_wide: None,
+            xpg: (
+                "native_gemm_mmq_q3_k_xpg",
+                g::native_gemm_mmq_q3_k_xpg_spv(),
+            ),
+            xpg32: (
+                "native_gemm_mmq_q3_k_xpg32",
+                g::native_gemm_mmq_q3_k_xpg32_spv(),
+            ),
+        },
+        D::Q4_0 => MoeMmqDesc {
+            resident_nb: 6,
+            xp: ("native_gemm_mmq_q4_0_xp", g::native_gemm_mmq_q4_0_xp_spv()),
+            xp32: (
+                "native_gemm_mmq_q4_0_xp32",
+                g::native_gemm_mmq_q4_0_xp32_spv(),
+            ),
+            xp_wide: None,
+            xpg: (
+                "native_gemm_mmq_q4_0_xpg",
+                g::native_gemm_mmq_q4_0_xpg_spv(),
+            ),
+            xpg32: (
+                "native_gemm_mmq_q4_0_xpg32",
+                g::native_gemm_mmq_q4_0_xpg32_spv(),
+            ),
+        },
+        D::Q4_1 => MoeMmqDesc {
+            resident_nb: 7,
+            xp: ("native_gemm_mmq_q4_1_xp", g::native_gemm_mmq_q4_1_xp_spv()),
+            xp32: (
+                "native_gemm_mmq_q4_1_xp32",
+                g::native_gemm_mmq_q4_1_xp32_spv(),
+            ),
+            xp_wide: None,
+            xpg: (
+                "native_gemm_mmq_q4_1_xpg",
+                g::native_gemm_mmq_q4_1_xpg_spv(),
+            ),
+            xpg32: (
+                "native_gemm_mmq_q4_1_xpg32",
+                g::native_gemm_mmq_q4_1_xpg32_spv(),
+            ),
+        },
+        D::Iq4Nl => MoeMmqDesc {
+            resident_nb: 6,
+            xp: (
+                "native_gemm_mmq_iq4_nl_xp",
+                g::native_gemm_mmq_iq4_nl_xp_spv(),
+            ),
+            xp32: (
+                "native_gemm_mmq_iq4_nl_xp32",
+                g::native_gemm_mmq_iq4_nl_xp32_spv(),
+            ),
+            xp_wide: None,
+            xpg: (
+                "native_gemm_mmq_iq4_nl_xpg",
+                g::native_gemm_mmq_iq4_nl_xpg_spv(),
+            ),
+            xpg32: (
+                "native_gemm_mmq_iq4_nl_xpg32",
+                g::native_gemm_mmq_iq4_nl_xpg32_spv(),
+            ),
+        },
+        D::Iq4Xs => MoeMmqDesc {
+            resident_nb: 6,
+            xp: (
+                "native_gemm_mmq_iq4_xs_xp",
+                g::native_gemm_mmq_iq4_xs_xp_spv(),
+            ),
+            xp32: (
+                "native_gemm_mmq_iq4_xs_xp32",
+                g::native_gemm_mmq_iq4_xs_xp32_spv(),
+            ),
+            xp_wide: None,
+            xpg: (
+                "native_gemm_mmq_iq4_xs_xpg",
+                g::native_gemm_mmq_iq4_xs_xpg_spv(),
+            ),
+            xpg32: (
+                "native_gemm_mmq_iq4_xs_xpg32",
+                g::native_gemm_mmq_iq4_xs_xpg32_spv(),
+            ),
+        },
+        D::Iq2S => MoeMmqDesc {
+            resident_nb: 6,
+            xp: (
+                "native_gemm_mmq_iq2_s_xp",
+                g::native_gemm_mmq_iq2_s_xp_spv(),
+            ),
+            xp32: (
+                "native_gemm_mmq_iq2_s_xp32",
+                g::native_gemm_mmq_iq2_s_xp32_spv(),
+            ),
+            xp_wide: None,
+            xpg: (
+                "native_gemm_mmq_iq2_s_xpg",
+                g::native_gemm_mmq_iq2_s_xpg_spv(),
+            ),
+            xpg32: (
+                "native_gemm_mmq_iq2_s_xpg32",
+                g::native_gemm_mmq_iq2_s_xpg32_spv(),
+            ),
+        },
+        D::Iq3S => MoeMmqDesc {
+            resident_nb: 6,
+            xp: (
+                "native_gemm_mmq_iq3_s_xp",
+                g::native_gemm_mmq_iq3_s_xp_spv(),
+            ),
+            xp32: (
+                "native_gemm_mmq_iq3_s_xp32",
+                g::native_gemm_mmq_iq3_s_xp32_spv(),
+            ),
+            xp_wide: None,
+            xpg: (
+                "native_gemm_mmq_iq3_s_xpg",
+                g::native_gemm_mmq_iq3_s_xpg_spv(),
+            ),
+            xpg32: (
+                "native_gemm_mmq_iq3_s_xpg32",
+                g::native_gemm_mmq_iq3_s_xpg32_spv(),
+            ),
+        },
+        D::Mxfp4 => MoeMmqDesc {
+            resident_nb: 6,
+            xp: (
+                "native_gemm_mmq_mxfp4_xp",
+                g::native_gemm_mmq_mxfp4_xp_spv(),
+            ),
+            xp32: (
+                "native_gemm_mmq_mxfp4_xp32",
+                g::native_gemm_mmq_mxfp4_xp32_spv(),
+            ),
+            xp_wide: None,
+            xpg: (
+                "native_gemm_mmq_mxfp4_xpg",
+                g::native_gemm_mmq_mxfp4_xpg_spv(),
+            ),
+            xpg32: (
+                "native_gemm_mmq_mxfp4_xpg32",
+                g::native_gemm_mmq_mxfp4_xpg32_spv(),
+            ),
+        },
+        D::Nvfp4 => MoeMmqDesc {
+            resident_nb: 6,
+            xp: (
+                "native_gemm_mmq_nvfp4_xp",
+                g::native_gemm_mmq_nvfp4_xp_spv(),
+            ),
+            xp32: (
+                "native_gemm_mmq_nvfp4_xp32",
+                g::native_gemm_mmq_nvfp4_xp32_spv(),
+            ),
+            xp_wide: None,
+            xpg: (
+                "native_gemm_mmq_nvfp4_xpg",
+                g::native_gemm_mmq_nvfp4_xpg_spv(),
+            ),
+            xpg32: (
+                "native_gemm_mmq_nvfp4_xpg32",
+                g::native_gemm_mmq_nvfp4_xpg32_spv(),
+            ),
+        },
+        D::Q2_0 => MoeMmqDesc {
+            resident_nb: 6,
+            xp: ("native_gemm_mmq_q2_0_xp", g::native_gemm_mmq_q2_0_xp_spv()),
+            xp32: (
+                "native_gemm_mmq_q2_0_xp32",
+                g::native_gemm_mmq_q2_0_xp32_spv(),
+            ),
+            xp_wide: None,
+            xpg: (
+                "native_gemm_mmq_q2_0_xpg",
+                g::native_gemm_mmq_q2_0_xpg_spv(),
+            ),
+            xpg32: (
+                "native_gemm_mmq_q2_0_xpg32",
+                g::native_gemm_mmq_q2_0_xpg32_spv(),
+            ),
+        },
+        _ => return None,
+    };
+    Some(d)
 }
 
 /// The u32 addressing-unit caps a single dense weight (or one output-row chunk of it) must stay
@@ -642,16 +1040,26 @@ impl<'a> Recorder<'a> {
         }
     }
 
+    /// Sets per descriptor-pool tranche.
+    const DESC_POOL_MAX_SETS: u32 = 4096;
+    /// Upper bound on STORAGE_BUFFER bindings any single recorded dispatch uses (the widest kernel
+    /// binds ≤ ~9; 12 leaves headroom). The tranche is sized so its sets and its descriptors
+    /// exhaust TOGETHER: a set-count-limited pool with fewer descriptors (the old
+    /// `descriptor_count: 16384` against `max_sets: 4096` = 4 descriptors/set) ran dry on
+    /// descriptors at ~2048 heavily-bound sets — half its set capacity — doubling how often
+    /// `alloc_set` has to grow the chain.
+    const DESC_POOL_MAX_BINDINGS_PER_SET: u32 = 12;
+
     /// Create one descriptor pool tranche (the chain grows by these on exhaustion).
     fn new_desc_pool(device: &ash::Device) -> Result<vk::DescriptorPool> {
         let pool_sizes = [vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,
-            descriptor_count: 16384,
+            descriptor_count: Self::DESC_POOL_MAX_SETS * Self::DESC_POOL_MAX_BINDINGS_PER_SET,
         }];
         unsafe {
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(4096)
+                    .max_sets(Self::DESC_POOL_MAX_SETS)
                     .pool_sizes(&pool_sizes),
                 None,
             )
@@ -855,37 +1263,43 @@ impl<'a> Recorder<'a> {
     fn bind_descriptors(&self, k: ComputeKernel, buffers: &[vk::DescriptorBufferInfo]) {
         let device = &self.be.shared.device;
         unsafe { device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, k.pipeline) };
+        let n = buffers.len();
+        debug_assert!(
+            n <= MAX_DISPATCH_BINDINGS,
+            "dispatch binds {n} buffers; raise MAX_DISPATCH_BINDINGS (currently {MAX_DISPATCH_BINDINGS})"
+        );
+        // Stack-built descriptor writes (binding counts are statically ≤ ~9) — no per-dispatch
+        // `Vec` heap churn on this host-bound recording path (a batched MoE prefill chunk records
+        // tens of thousands of dispatches).
+        let mut ds_writes: [vk::WriteDescriptorSet; MAX_DISPATCH_BINDINGS] =
+            std::array::from_fn(|_| vk::WriteDescriptorSet::default());
         if let Some(pd) = &self.be.shared.push_descriptor {
-            let ds_writes: Vec<vk::WriteDescriptorSet> = (0..buffers.len())
-                .map(|i| {
-                    vk::WriteDescriptorSet::default()
-                        .dst_binding(i as u32)
-                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                        .buffer_info(&buffers[i..i + 1])
-                })
-                .collect();
+            for i in 0..n {
+                ds_writes[i] = vk::WriteDescriptorSet::default()
+                    .dst_binding(i as u32)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&buffers[i..i + 1]);
+            }
             unsafe {
                 pd.cmd_push_descriptor_set(
                     self.cmd,
                     vk::PipelineBindPoint::COMPUTE,
                     k.pipeline_layout,
                     0,
-                    &ds_writes,
+                    &ds_writes[..n],
                 );
             }
         } else {
             let set = self.alloc_set(k.ds_layout);
-            let ds_writes: Vec<vk::WriteDescriptorSet> = (0..buffers.len())
-                .map(|i| {
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(set)
-                        .dst_binding(i as u32)
-                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                        .buffer_info(&buffers[i..i + 1])
-                })
-                .collect();
+            for i in 0..n {
+                ds_writes[i] = vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(i as u32)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&buffers[i..i + 1]);
+            }
             unsafe {
-                device.update_descriptor_sets(&ds_writes, &[]);
+                device.update_descriptor_sets(&ds_writes[..n], &[]);
                 device.cmd_bind_descriptor_sets(
                     self.cmd,
                     vk::PipelineBindPoint::COMPUTE,
@@ -916,13 +1330,27 @@ impl<'a> Recorder<'a> {
         // before `sync` so a barrier's cost lands in the op it fences (same as the old
         // stamp-at-op-start convention). One `prof2` branch when profiling is off.
         self.stamp(k.name);
-        let split = buffers.len() - n_out;
-        let (reads, writes) = buffers.split_at(split);
-        let write_bufs: Vec<vk::Buffer> = writes.iter().map(|i| i.buffer).collect();
-        let mut all_reads: Vec<vk::Buffer> = reads.iter().map(|i| i.buffer).collect();
-        all_reads.push(args);
+        let n = buffers.len();
+        debug_assert!(
+            n <= MAX_DISPATCH_BINDINGS,
+            "indirect dispatch binds {n} buffers"
+        );
+        let split = n - n_out;
+        // Stack scratch (no per-dispatch `Vec`): reads get `args` appended (the indirect-command
+        // read joins the hazard reads), writes are the trailing `n_out` bindings.
+        let mut all_reads: [vk::Buffer; MAX_DISPATCH_BINDINGS + 1] =
+            [vk::Buffer::null(); MAX_DISPATCH_BINDINGS + 1];
+        for (i, b) in buffers[..split].iter().enumerate() {
+            all_reads[i] = b.buffer;
+        }
+        all_reads[split] = args;
+        let mut write_bufs: [vk::Buffer; MAX_DISPATCH_BINDINGS] =
+            [vk::Buffer::null(); MAX_DISPATCH_BINDINGS];
+        for (i, b) in buffers[split..].iter().enumerate() {
+            write_bufs[i] = b.buffer;
+        }
         self.indirect_pending.set(true);
-        self.sync(&all_reads, &write_bufs, false);
+        self.sync(&all_reads[..split + 1], &write_bufs[..n_out], false);
         self.indirect_pending.set(false);
         self.bind_descriptors(k, buffers);
         let device = &self.be.shared.device;
@@ -954,12 +1382,17 @@ impl<'a> Recorder<'a> {
         // Auto-label (INFR_PROF2): see `dispatch_indirect` — kernel-name timestamp per dispatch.
         self.stamp(k.name);
         // The last `n_out` bound buffers are outputs; the rest are inputs. Inputs keep in-place
-        // buffers (e.g. rope x==y) so a RAW from a prior op is still seen.
-        let split = buffers.len() - n_out;
-        let (reads, writes) = buffers.split_at(split);
-        let read_bufs: Vec<vk::Buffer> = reads.iter().map(|i| i.buffer).collect();
-        let write_bufs: Vec<vk::Buffer> = writes.iter().map(|i| i.buffer).collect();
-        self.sync(&read_bufs, &write_bufs, false);
+        // buffers (e.g. rope x==y) so a RAW from a prior op is still seen. Handles are copied into
+        // one stack array (no per-dispatch `Vec`); reads/writes are then just subslices of it.
+        let n = buffers.len();
+        debug_assert!(n <= MAX_DISPATCH_BINDINGS, "dispatch binds {n} buffers");
+        let split = n - n_out;
+        let mut handles: [vk::Buffer; MAX_DISPATCH_BINDINGS] =
+            [vk::Buffer::null(); MAX_DISPATCH_BINDINGS];
+        for (i, b) in buffers.iter().enumerate() {
+            handles[i] = b.buffer;
+        }
+        self.sync(&handles[..split], &handles[split..n], false);
         self.bind_descriptors(k, buffers);
         let device = &self.be.shared.device;
 
@@ -1963,8 +2396,12 @@ impl<'a> Recorder<'a> {
     /// inline 64-bit buffer_reference into the resident arena (`native_gemm_i8cm_q8_0.comp`'s
     /// STREAMED doc) instead of the bound binding-2 SSBO. The resident build's weight-SSBO slot
     /// takes a harmless FILLER (`qa`) since the arena is never bound as a descriptor — same
-    /// convention as [`Self::matmul_proj_at`]. Not wired into any production dispatch yet;
-    /// exists so a parity test can exercise the `_streamed` SPV directly.
+    /// convention as [`Self::matmul_proj_at`]. Not wired into any production dispatch (verified: no
+    /// non-test caller) — it exists ONLY so a parity test can exercise the `_streamed` SPV
+    /// directly, so it is compiled out of a normal build (`parity` feature / `test`). Kept `pub`
+    /// (not `pub(crate)`) because its sole caller is the `weight_addr_parity` INTEGRATION test,
+    /// which links the crate externally.
+    #[cfg(any(test, feature = "parity"))]
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_i8cm_q8_0_at(
         &self,
@@ -2249,8 +2686,13 @@ impl<'a> Recorder<'a> {
     /// `native_weight_addr.glsl`'s `NW()` chokepoint into the resident arena instead of the bound
     /// binding-0 SSBO (`repack_q8_to_f8.comp`'s STREAMED doc). The vacated binding-0 slot takes a
     /// harmless FILLER (`w8`, the only other buffer this dispatch touches) since the arena is never
-    /// bound as a descriptor. Not wired into any production dispatch yet; exists so a parity test
-    /// can exercise the `_streamed` SPV directly.
+    /// bound as a descriptor. Not wired into any production dispatch (verified: no non-test caller)
+    /// — it exists ONLY so a parity test can exercise the `_streamed` SPV directly, so it is
+    /// compiled out of a normal build (`parity` feature / `test`). Kept `pub` (not `pub(crate)`)
+    /// because its sole caller is the `weight_addr_parity` INTEGRATION test, which links the crate
+    /// externally.
+    #[cfg(any(test, feature = "parity"))]
+    #[allow(clippy::too_many_arguments)]
     pub fn repack_q8_to_f8_at(
         &self,
         arena_addr: u64,
@@ -2545,14 +2987,7 @@ impl<'a> Recorder<'a> {
                     return;
                 }
             }
-            let variant = if std::env::var("INFR_NO_GEMV_REG").is_ok() {
-                None
-            } else {
-                std::env::var("INFR_GEMV_VARIANT")
-                    .ok()
-                    .or_else(|| Some("reg".to_string()))
-            };
-            if let Some(ref v) = variant {
+            if let Some(v) = &gemv_knobs().gemv_variant {
                 if crate::gemm::native_rm_v2_streamed_build_spv(v, dtype, false).is_some() {
                     self.linear_native_rm_v2_at(v, dtype, arena_addr, w_base, x, y, in_f, out_f);
                     return;
@@ -3130,14 +3565,7 @@ impl<'a> Recorder<'a> {
         }
         // Multi-output-row route — mirrors linear_add_native's variant-then-RM fallback.
         if rows == 1 {
-            let variant = if std::env::var("INFR_NO_GEMV_REG").is_ok() {
-                None
-            } else {
-                std::env::var("INFR_GEMV_VARIANT")
-                    .ok()
-                    .or_else(|| Some("reg".to_string()))
-            };
-            if let Some(ref v) = variant {
+            if let Some(v) = &gemv_knobs().gemv_variant {
                 if let Some((name, spv)) =
                     crate::gemm::native_rm_v2_streamed_build_spv(v, dtype, true)
                 {
@@ -7456,202 +7884,31 @@ impl<'a> Recorder<'a> {
             && matches!(dtype, infr_core::DType::Q4K | infr_core::DType::Q6K);
         let bm: usize = if small_tile { 32 } else { 64 };
         let bn: usize = if wide_bn { 128 } else { 64 };
-        let (name, spv, nb): (_, _, usize) = match (dtype, small_tile) {
-            (infr_core::DType::Q4K, false) if wide_bn => (
-                "native_gemm_mmq_q4k_xp128",
-                crate::gemm::native_gemm_mmq_q4k_xp128_spv(),
-                7,
-            ),
-            (infr_core::DType::Q4K, false) => (
-                "native_gemm_mmq_q4k_xp",
-                crate::gemm::native_gemm_mmq_q4k_xp_spv(),
-                7,
-            ),
-            (infr_core::DType::Q4K, true) if wide_bn => (
-                "native_gemm_mmq_q4k_xp32w",
-                crate::gemm::native_gemm_mmq_q4k_xp32w_spv(),
-                7,
-            ),
-            (infr_core::DType::Q4K, true) => (
-                "native_gemm_mmq_q4k_xp32",
-                crate::gemm::native_gemm_mmq_q4k_xp32_spv(),
-                7,
-            ),
-            (infr_core::DType::Q6K, false) if wide_bn => (
-                "native_gemm_mmq_q6k_xp128",
-                crate::gemm::native_gemm_mmq_q6k_xp128_spv(),
-                6,
-            ),
-            (infr_core::DType::Q6K, false) => (
-                "native_gemm_mmq_q6k_xp",
-                crate::gemm::native_gemm_mmq_q6k_xp_spv(),
-                6,
-            ),
-            (infr_core::DType::Q6K, true) if wide_bn => (
-                "native_gemm_mmq_q6k_xp32w",
-                crate::gemm::native_gemm_mmq_q6k_xp32w_spv(),
-                6,
-            ),
-            (infr_core::DType::Q6K, true) => (
-                "native_gemm_mmq_q6k_xp32",
-                crate::gemm::native_gemm_mmq_q6k_xp32_spv(),
-                6,
-            ),
-            (infr_core::DType::Q8_0, false) => (
-                "native_gemm_mmq_q8_0_xp",
-                crate::gemm::native_gemm_mmq_q8_0_xp_spv(),
-                6,
-            ),
-            (infr_core::DType::Q8_0, true) => (
-                "native_gemm_mmq_q8_0_xp32",
-                crate::gemm::native_gemm_mmq_q8_0_xp32_spv(),
-                6,
-            ),
-            (infr_core::DType::Q5_0, false) => (
-                "native_gemm_mmq_q5_0_xp",
-                crate::gemm::native_gemm_mmq_q5_0_xp_spv(),
-                6,
-            ),
-            (infr_core::DType::Q5_0, true) => (
-                "native_gemm_mmq_q5_0_xp32",
-                crate::gemm::native_gemm_mmq_q5_0_xp32_spv(),
-                6,
-            ),
-            (infr_core::DType::Q5K, false) => (
-                "native_gemm_mmq_q5k_xp",
-                crate::gemm::native_gemm_mmq_q5k_xp_spv(),
-                7,
-            ),
-            (infr_core::DType::Q5K, true) => (
-                "native_gemm_mmq_q5k_xp32",
-                crate::gemm::native_gemm_mmq_q5k_xp32_spv(),
-                7,
-            ),
-            (infr_core::DType::Q5_1, false) => (
-                "native_gemm_mmq_q5_1_xp",
-                crate::gemm::native_gemm_mmq_q5_1_xp_spv(),
-                7,
-            ),
-            (infr_core::DType::Q5_1, true) => (
-                "native_gemm_mmq_q5_1_xp32",
-                crate::gemm::native_gemm_mmq_q5_1_xp32_spv(),
-                7,
-            ),
-            (infr_core::DType::Q2K, false) => (
-                "native_gemm_mmq_q2_k_xp",
-                crate::gemm::native_gemm_mmq_q2_k_xp_spv(),
-                6,
-            ),
-            (infr_core::DType::Q2K, true) => (
-                "native_gemm_mmq_q2_k_xp32",
-                crate::gemm::native_gemm_mmq_q2_k_xp32_spv(),
-                6,
-            ),
-            (infr_core::DType::Q3K, false) => (
-                "native_gemm_mmq_q3_k_xp",
-                crate::gemm::native_gemm_mmq_q3_k_xp_spv(),
-                6,
-            ),
-            (infr_core::DType::Q3K, true) => (
-                "native_gemm_mmq_q3_k_xp32",
-                crate::gemm::native_gemm_mmq_q3_k_xp32_spv(),
-                6,
-            ),
-            (infr_core::DType::Q4_0, false) => (
-                "native_gemm_mmq_q4_0_xp",
-                crate::gemm::native_gemm_mmq_q4_0_xp_spv(),
-                6,
-            ),
-            (infr_core::DType::Q4_0, true) => (
-                "native_gemm_mmq_q4_0_xp32",
-                crate::gemm::native_gemm_mmq_q4_0_xp32_spv(),
-                6,
-            ),
-            (infr_core::DType::Q4_1, false) => (
-                "native_gemm_mmq_q4_1_xp",
-                crate::gemm::native_gemm_mmq_q4_1_xp_spv(),
-                7,
-            ),
-            (infr_core::DType::Q4_1, true) => (
-                "native_gemm_mmq_q4_1_xp32",
-                crate::gemm::native_gemm_mmq_q4_1_xp32_spv(),
-                7,
-            ),
-            (infr_core::DType::Iq4Nl, false) => (
-                "native_gemm_mmq_iq4_nl_xp",
-                crate::gemm::native_gemm_mmq_iq4_nl_xp_spv(),
-                6,
-            ),
-            (infr_core::DType::Iq4Nl, true) => (
-                "native_gemm_mmq_iq4_nl_xp32",
-                crate::gemm::native_gemm_mmq_iq4_nl_xp32_spv(),
-                6,
-            ),
-            (infr_core::DType::Iq4Xs, false) => (
-                "native_gemm_mmq_iq4_xs_xp",
-                crate::gemm::native_gemm_mmq_iq4_xs_xp_spv(),
-                6,
-            ),
-            (infr_core::DType::Iq4Xs, true) => (
-                "native_gemm_mmq_iq4_xs_xp32",
-                crate::gemm::native_gemm_mmq_iq4_xs_xp32_spv(),
-                6,
-            ),
-            (infr_core::DType::Iq2S, false) => (
-                "native_gemm_mmq_iq2_s_xp",
-                crate::gemm::native_gemm_mmq_iq2_s_xp_spv(),
-                6,
-            ),
-            (infr_core::DType::Iq2S, true) => (
-                "native_gemm_mmq_iq2_s_xp32",
-                crate::gemm::native_gemm_mmq_iq2_s_xp32_spv(),
-                6,
-            ),
-            (infr_core::DType::Iq3S, false) => (
-                "native_gemm_mmq_iq3_s_xp",
-                crate::gemm::native_gemm_mmq_iq3_s_xp_spv(),
-                6,
-            ),
-            (infr_core::DType::Iq3S, true) => (
-                "native_gemm_mmq_iq3_s_xp32",
-                crate::gemm::native_gemm_mmq_iq3_s_xp32_spv(),
-                6,
-            ),
-            (infr_core::DType::Mxfp4, false) => (
-                "native_gemm_mmq_mxfp4_xp",
-                crate::gemm::native_gemm_mmq_mxfp4_xp_spv(),
-                6,
-            ),
-            (infr_core::DType::Mxfp4, true) => (
-                "native_gemm_mmq_mxfp4_xp32",
-                crate::gemm::native_gemm_mmq_mxfp4_xp32_spv(),
-                6,
-            ),
-            (infr_core::DType::Nvfp4, false) => (
-                "native_gemm_mmq_nvfp4_xp",
-                crate::gemm::native_gemm_mmq_nvfp4_xp_spv(),
-                6,
-            ),
-            (infr_core::DType::Nvfp4, true) => (
-                "native_gemm_mmq_nvfp4_xp32",
-                crate::gemm::native_gemm_mmq_nvfp4_xp32_spv(),
-                6,
-            ),
-            (infr_core::DType::Q2_0, false) => (
-                "native_gemm_mmq_q2_0_xp",
-                crate::gemm::native_gemm_mmq_q2_0_xp_spv(),
-                6,
-            ),
-            (infr_core::DType::Q2_0, true) => (
-                "native_gemm_mmq_q2_0_xp32",
-                crate::gemm::native_gemm_mmq_q2_0_xp32_spv(),
-                6,
-            ),
-            _ => unreachable!(
+        // Kernel selection from the SINGLE dtype→kernel table shared with the paged twin (see
+        // [`moe_mmq_desc`]) — resident suffix + tile picked here, byte-identical to the old inline
+        // match. `wide_bn` is only ever set for Q4_K/Q6_K (see its definition above), which are the
+        // only dtypes carrying `xp_wide`.
+        let desc = moe_mmq_desc(dtype).unwrap_or_else(|| {
+            unreachable!(
                 "batched MoE expert GEMM (streamed): the MOE_MMQ_DTYPES set only (Q4_0/Q4_1/Q4_K/\
                  Q5_K/Q6_K/Q8_0/Q5_0/Q5_1/Q2_K/Q3_K/Q2_0/IQ4_NL/IQ4_XS/IQ2_S/IQ3_S/MXFP4/NVFP4)"
-            ),
+            )
+        });
+        let (name, spv) = if wide_bn {
+            let (w128, w32w) = desc
+                .xp_wide
+                .expect("wide_bn is set only for Q4_K/Q6_K, which carry xp_wide");
+            if small_tile {
+                w32w
+            } else {
+                w128
+            }
+        } else if small_tile {
+            desc.xp32
+        } else {
+            desc.xp
         };
+        let nb = desc.resident_nb;
         let kern = self.be.kernel(name, spv, nb, 24);
         let mut push = [0u8; 24];
         let stride_bytes = expert_stride_bytes(dtype, stride);
@@ -7720,190 +7977,19 @@ impl<'a> Recorder<'a> {
         let avg_rows = rows.saturating_mul(n_used) / n_expert.max(1);
         let small_tile = avg_rows <= MOE_EXPERT_SMALL_TILE_AVG_ROWS;
         let bm: usize = if small_tile { 32 } else { 64 };
-        let (name, spv, nb): (_, _, usize) = match (dtype, small_tile) {
-            (infr_core::DType::Q2K, false) => (
-                "native_gemm_mmq_q2_k_xpg",
-                crate::gemm::native_gemm_mmq_q2_k_xpg_spv(),
-                7,
-            ),
-            (infr_core::DType::Q2K, true) => (
-                "native_gemm_mmq_q2_k_xpg32",
-                crate::gemm::native_gemm_mmq_q2_k_xpg32_spv(),
-                7,
-            ),
-            (infr_core::DType::Q3K, false) => (
-                "native_gemm_mmq_q3_k_xpg",
-                crate::gemm::native_gemm_mmq_q3_k_xpg_spv(),
-                7,
-            ),
-            (infr_core::DType::Q3K, true) => (
-                "native_gemm_mmq_q3_k_xpg32",
-                crate::gemm::native_gemm_mmq_q3_k_xpg32_spv(),
-                7,
-            ),
-            (infr_core::DType::Q4_0, false) => (
-                "native_gemm_mmq_q4_0_xpg",
-                crate::gemm::native_gemm_mmq_q4_0_xpg_spv(),
-                7,
-            ),
-            (infr_core::DType::Q4_0, true) => (
-                "native_gemm_mmq_q4_0_xpg32",
-                crate::gemm::native_gemm_mmq_q4_0_xpg32_spv(),
-                7,
-            ),
-            // Q4_1: min-carrying — one extra `sact` binding vs the symmetric formats above.
-            (infr_core::DType::Q4_1, false) => (
-                "native_gemm_mmq_q4_1_xpg",
-                crate::gemm::native_gemm_mmq_q4_1_xpg_spv(),
-                8,
-            ),
-            (infr_core::DType::Q4_1, true) => (
-                "native_gemm_mmq_q4_1_xpg32",
-                crate::gemm::native_gemm_mmq_q4_1_xpg32_spv(),
-                8,
-            ),
-            (infr_core::DType::Iq4Nl, false) => (
-                "native_gemm_mmq_iq4_nl_xpg",
-                crate::gemm::native_gemm_mmq_iq4_nl_xpg_spv(),
-                7,
-            ),
-            (infr_core::DType::Iq4Nl, true) => (
-                "native_gemm_mmq_iq4_nl_xpg32",
-                crate::gemm::native_gemm_mmq_iq4_nl_xpg32_spv(),
-                7,
-            ),
-            (infr_core::DType::Iq4Xs, false) => (
-                "native_gemm_mmq_iq4_xs_xpg",
-                crate::gemm::native_gemm_mmq_iq4_xs_xpg_spv(),
-                7,
-            ),
-            (infr_core::DType::Iq4Xs, true) => (
-                "native_gemm_mmq_iq4_xs_xpg32",
-                crate::gemm::native_gemm_mmq_iq4_xs_xpg32_spv(),
-                7,
-            ),
-            // Q8_0/Q5_0/Q6_K: symmetric, no `sact` (7 bindings = resident's 6 + LUT).
-            (infr_core::DType::Q8_0, false) => (
-                "native_gemm_mmq_q8_0_xpg",
-                crate::gemm::native_gemm_mmq_q8_0_xpg_spv(),
-                7,
-            ),
-            (infr_core::DType::Q8_0, true) => (
-                "native_gemm_mmq_q8_0_xpg32",
-                crate::gemm::native_gemm_mmq_q8_0_xpg32_spv(),
-                7,
-            ),
-            (infr_core::DType::Q5_0, false) => (
-                "native_gemm_mmq_q5_0_xpg",
-                crate::gemm::native_gemm_mmq_q5_0_xpg_spv(),
-                7,
-            ),
-            (infr_core::DType::Q5_0, true) => (
-                "native_gemm_mmq_q5_0_xpg32",
-                crate::gemm::native_gemm_mmq_q5_0_xpg32_spv(),
-                7,
-            ),
-            (infr_core::DType::Q6K, false) => (
-                "native_gemm_mmq_q6k_xpg",
-                crate::gemm::native_gemm_mmq_q6k_xpg_spv(),
-                7,
-            ),
-            (infr_core::DType::Q6K, true) => (
-                "native_gemm_mmq_q6k_xpg32",
-                crate::gemm::native_gemm_mmq_q6k_xpg32_spv(),
-                7,
-            ),
-            // Q4_K/Q5_K/Q5_1: min-carrying — one extra `sact` binding (8 = resident's 7 + LUT).
-            (infr_core::DType::Q4K, false) => (
-                "native_gemm_mmq_q4k_xpg",
-                crate::gemm::native_gemm_mmq_q4k_xpg_spv(),
-                8,
-            ),
-            (infr_core::DType::Q4K, true) => (
-                "native_gemm_mmq_q4k_xpg32",
-                crate::gemm::native_gemm_mmq_q4k_xpg32_spv(),
-                8,
-            ),
-            (infr_core::DType::Q5K, false) => (
-                "native_gemm_mmq_q5k_xpg",
-                crate::gemm::native_gemm_mmq_q5k_xpg_spv(),
-                8,
-            ),
-            (infr_core::DType::Q5K, true) => (
-                "native_gemm_mmq_q5k_xpg32",
-                crate::gemm::native_gemm_mmq_q5k_xpg32_spv(),
-                8,
-            ),
-            (infr_core::DType::Q5_1, false) => (
-                "native_gemm_mmq_q5_1_xpg",
-                crate::gemm::native_gemm_mmq_q5_1_xpg_spv(),
-                8,
-            ),
-            (infr_core::DType::Q5_1, true) => (
-                "native_gemm_mmq_q5_1_xpg32",
-                crate::gemm::native_gemm_mmq_q5_1_xpg32_spv(),
-                8,
-            ),
-            // IQ2_S/IQ3_S: grid codebook, symmetric, no `sact` (7 bindings = resident's 6 + LUT).
-            (infr_core::DType::Iq2S, false) => (
-                "native_gemm_mmq_iq2_s_xpg",
-                crate::gemm::native_gemm_mmq_iq2_s_xpg_spv(),
-                7,
-            ),
-            (infr_core::DType::Iq2S, true) => (
-                "native_gemm_mmq_iq2_s_xpg32",
-                crate::gemm::native_gemm_mmq_iq2_s_xpg32_spv(),
-                7,
-            ),
-            (infr_core::DType::Iq3S, false) => (
-                "native_gemm_mmq_iq3_s_xpg",
-                crate::gemm::native_gemm_mmq_iq3_s_xpg_spv(),
-                7,
-            ),
-            (infr_core::DType::Iq3S, true) => (
-                "native_gemm_mmq_iq3_s_xpg32",
-                crate::gemm::native_gemm_mmq_iq3_s_xpg32_spv(),
-                7,
-            ),
-            // MXFP4/NVFP4: symmetric codebook, no `sact` (7 bindings = resident's 6 + LUT).
-            (infr_core::DType::Mxfp4, false) => (
-                "native_gemm_mmq_mxfp4_xpg",
-                crate::gemm::native_gemm_mmq_mxfp4_xpg_spv(),
-                7,
-            ),
-            (infr_core::DType::Mxfp4, true) => (
-                "native_gemm_mmq_mxfp4_xpg32",
-                crate::gemm::native_gemm_mmq_mxfp4_xpg32_spv(),
-                7,
-            ),
-            (infr_core::DType::Nvfp4, false) => (
-                "native_gemm_mmq_nvfp4_xpg",
-                crate::gemm::native_gemm_mmq_nvfp4_xpg_spv(),
-                7,
-            ),
-            (infr_core::DType::Nvfp4, true) => (
-                "native_gemm_mmq_nvfp4_xpg32",
-                crate::gemm::native_gemm_mmq_nvfp4_xpg32_spv(),
-                7,
-            ),
-            // Q2_0: Bonsai ternary, symmetric small-int, no `sact` (7 bindings = resident's 6 +
-            // LUT).
-            (infr_core::DType::Q2_0, false) => (
-                "native_gemm_mmq_q2_0_xpg",
-                crate::gemm::native_gemm_mmq_q2_0_xpg_spv(),
-                7,
-            ),
-            (infr_core::DType::Q2_0, true) => (
-                "native_gemm_mmq_q2_0_xpg32",
-                crate::gemm::native_gemm_mmq_q2_0_xpg32_spv(),
-                7,
-            ),
-            _ => unreachable!(
+        // Kernel selection from the SAME dtype→kernel table as the resident twin (see
+        // [`moe_mmq_desc`]): paged uses the `_xpg`/`_xpg32` variants and one MORE binding than
+        // resident (the LUT slot — `nb = resident_nb + 1`). Min-carrying dtypes (Q4_K/Q5_K/Q5_1/
+        // Q4_1) thus land at 8 bindings, the rest at 7; byte-identical to the old inline match.
+        let desc = moe_mmq_desc(dtype).unwrap_or_else(|| {
+            unreachable!(
                 "paged batched MoE expert GEMM: the MOE_MMQ_PAGED_DTYPES set only \
                  (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K/Q3_K/Q2_0/Q4_K/Q5_K/Q6_K/IQ4_NL/IQ4_XS/IQ2_S/\
                  IQ3_S/MXFP4/NVFP4)"
-            ),
-        };
+            )
+        });
+        let (name, spv) = if small_tile { desc.xpg32 } else { desc.xpg };
+        let nb = desc.resident_nb + 1;
         let kern = self.be.kernel(name, spv, nb, 28);
         let mut push = [0u8; 28];
         // pc.m unused in the PAGED build (slot bases come from the LUT); pc.w_base carries the
@@ -8608,6 +8694,27 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Free the recorder's transient Vulkan objects — the query pool (if any), the command buffer,
+    /// and every descriptor-pool tranche. `Recorder` has no `Drop` (by design — the arena pools
+    /// would otherwise be reported live at `vkDestroyDevice`), so `finish`/`finish_nowait` must
+    /// call this on BOTH their success AND their `?`-error exits; a bare early return would leak
+    /// these — and it leaks precisely on device-lost, exactly when those live pools then trip
+    /// `vkDestroyDevice`. Call once per recorder. Mirrors `discard`'s cleanup block.
+    fn free_transient(&self) {
+        let device = &self.be.shared.device;
+        unsafe {
+            // query_pool is null unless prof2 created one; the null check is equivalent to `prof2`.
+            if self.query_pool != vk::QueryPool::null() {
+                device.destroy_query_pool(self.query_pool, None);
+            }
+            let cmd_pool = *self.be.shared.cmd_pool.lock().unwrap();
+            device.free_command_buffers(cmd_pool, &[self.cmd]);
+            for p in self.pools.borrow().iter() {
+                device.destroy_descriptor_pool(*p, None);
+            }
+        }
+    }
+
     /// End recording, submit once, wait, and release transient objects.
     pub fn finish(self) -> Result<()> {
         let device = &self.be.shared.device;
@@ -8627,36 +8734,40 @@ impl<'a> Recorder<'a> {
                 );
             }
         }
-        unsafe { device.end_command_buffer(self.cmd) }.map_err(|e| be(format!("end cmd: {e}")))?;
         let queue = self.be.shared.queue;
-        unsafe {
-            device
-                .queue_submit(
-                    queue,
-                    &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.cmd))],
-                    vk::Fence::null(),
-                )
-                .map_err(|e| be(format!("queue_submit: {e}")))?;
-            device
-                .queue_wait_idle(queue)
-                .map_err(|e| be(format!("queue_wait_idle: {e}")))?;
-            if self.prof {
-                eprintln!(
-                    "[prof] record={:.1}ms submit+gpu={:.1}ms",
-                    t_record.as_secs_f64() * 1e3,
-                    (self.t0.elapsed() - t_record).as_secs_f64() * 1e3,
-                );
-            }
-            if self.prof2 {
-                self.report_timestamps();
-                device.destroy_query_pool(self.query_pool, None);
-            }
-            let cmd_pool = *self.be.shared.cmd_pool.lock().unwrap();
-            device.free_command_buffers(cmd_pool, &[self.cmd]);
-            for p in self.pools.borrow().iter() {
-                device.destroy_descriptor_pool(*p, None);
-            }
+        // Each fallible step frees the transient objects before propagating — see `free_transient`.
+        if let Err(e) = unsafe { device.end_command_buffer(self.cmd) } {
+            self.free_transient();
+            return Err(be(format!("end cmd: {e}")));
         }
+        let submit = unsafe {
+            device.queue_submit(
+                queue,
+                &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.cmd))],
+                vk::Fence::null(),
+            )
+        };
+        if let Err(e) = submit {
+            self.free_transient();
+            return Err(be(format!("queue_submit: {e}")));
+        }
+        if let Err(e) = unsafe { device.queue_wait_idle(queue) } {
+            self.free_transient();
+            return Err(be(format!("queue_wait_idle: {e}")));
+        }
+        if self.prof {
+            eprintln!(
+                "[prof] record={:.1}ms submit+gpu={:.1}ms",
+                t_record.as_secs_f64() * 1e3,
+                (self.t0.elapsed() - t_record).as_secs_f64() * 1e3,
+            );
+        }
+        // Report BEFORE freeing (report_timestamps reads the query pool); `free_transient` then
+        // destroys it. Order matches the old success path.
+        if self.prof2 {
+            self.report_timestamps();
+        }
+        self.free_transient();
         Ok(())
     }
 
@@ -8717,9 +8828,20 @@ impl<'a> Recorder<'a> {
             });
         }
         let device = &self.be.shared.device;
-        unsafe { device.end_command_buffer(self.cmd) }.map_err(|e| be(format!("end cmd: {e}")))?;
-        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
-            .map_err(|e| be(format!("create fence: {e}")))?;
+        // On SUCCESS the cmd buffer + pools are handed to the returned `PendingSegment` (freed in
+        // its `wait`); on every ERROR exit we own them still and must free them here (`Recorder`
+        // has no `Drop`) — see `free_transient`.
+        if let Err(e) = unsafe { device.end_command_buffer(self.cmd) } {
+            self.free_transient();
+            return Err(be(format!("end cmd: {e}")));
+        }
+        let fence = match unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) } {
+            Ok(f) => f,
+            Err(e) => {
+                self.free_transient();
+                return Err(be(format!("create fence: {e}")));
+            }
+        };
         let submit = unsafe {
             device.queue_submit(
                 self.be.shared.queue,
@@ -8729,6 +8851,7 @@ impl<'a> Recorder<'a> {
         };
         if let Err(e) = submit {
             unsafe { device.destroy_fence(fence, None) };
+            self.free_transient();
             return Err(be(format!("queue_submit: {e}")));
         }
         Ok(PendingSegment {
@@ -9241,6 +9364,168 @@ mod chunk_math_tests {
 mod tests {
     use super::*;
     use infr_core::{backend::BufferUsage, Backend};
+
+    /// #1 drift guard: the once-cached `GemvKnobs` must resolve, for any env state, EXACTLY what
+    /// the old per-call `std::env::var` reads in the GEMV dispatchers would have returned — so
+    /// caching the routing knobs can't change any kernel-selection decision.
+    #[test]
+    fn gemv_knobs_resolve_matches_env_reads() {
+        use std::collections::HashMap;
+        let states: Vec<HashMap<&str, &str>> = vec![
+            // all defaults
+            HashMap::new(),
+            // every disable flag set (value present, even empty)
+            HashMap::from([
+                ("INFR_NO_GEMV_RM", ""),
+                ("INFR_NO_GEMV_SG", ""),
+                ("INFR_NO_GEMV_ID_SG", ""),
+                ("INFR_NO_GEMV_REG", ""),
+            ]),
+            // explicit overrides on the numeric knobs + a variant
+            HashMap::from([
+                ("INFR_GEMV_RM", "4"),
+                ("INFR_GEMV_RM_MAXOUT", "9000"),
+                ("INFR_GEMV_RM_MINOUT", "1000"),
+                ("INFR_GEMV_SG_MINOUT", "512"),
+                ("INFR_GEMV_SG_MAXOUT", "4096"),
+                ("INFR_GEMV_SG_NR", "8"),
+                ("INFR_GEMV_VARIANT", "o4"),
+            ]),
+            // unparseable values must fall back to the defaults, same as `.parse().ok()` did
+            HashMap::from([("INFR_GEMV_RM", "xx"), ("INFR_GEMV_SG_NR", "yy")]),
+        ];
+        for st in states {
+            let get = |name: &str| st.get(name).map(|s| s.to_string());
+            let k = GemvKnobs::resolve(get);
+            // The OLD inline reads, replicated verbatim against the same env map:
+            let old_variant = if get("INFR_NO_GEMV_REG").is_some() {
+                None
+            } else {
+                get("INFR_GEMV_VARIANT").or_else(|| Some("reg".to_string()))
+            };
+            assert_eq!(k.no_gemv_rm, get("INFR_NO_GEMV_RM").is_some());
+            assert_eq!(
+                k.gemv_rm_maxout,
+                get("INFR_GEMV_RM_MAXOUT")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(usize::MAX)
+            );
+            assert_eq!(
+                k.gemv_rm_minout,
+                get("INFR_GEMV_RM_MINOUT")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(2048usize)
+            );
+            assert_eq!(
+                k.gemv_rm,
+                get("INFR_GEMV_RM")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(2u32)
+            );
+            assert_eq!(k.no_gemv_sg, get("INFR_NO_GEMV_SG").is_some());
+            assert_eq!(k.no_gemv_id_sg, get("INFR_NO_GEMV_ID_SG").is_some());
+            assert_eq!(
+                k.gemv_sg_minout,
+                get("INFR_GEMV_SG_MINOUT")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(2048usize)
+            );
+            assert_eq!(
+                k.gemv_sg_maxout,
+                get("INFR_GEMV_SG_MAXOUT")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(8192usize)
+            );
+            assert_eq!(
+                k.gemv_sg_nr,
+                get("INFR_GEMV_SG_NR")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(2u32)
+            );
+            assert_eq!(k.gemv_variant, old_variant);
+        }
+    }
+
+    /// #4 drift guard: the ONE unified [`moe_mmq_desc`] table must produce, for every dtype in
+    /// `MOE_MMQ_DTYPES`, the SAME `(kernel_name, nbind)` the two old hand-synced match tables did —
+    /// resident (`_xp`/`_xp32` + Q4_K/Q6_K wide `_xp128`/`_xp32w`) and paged (`_xpg`/`_xpg32`,
+    /// `nb = resident_nb + 1`). Golden is an independent stem+nb copy so a name/nb edit in
+    /// `moe_mmq_desc` is caught here rather than at a mid-inference `unreachable!`.
+    #[test]
+    fn moe_mmq_table_matches_frozen_names() {
+        use infr_core::DType as D;
+        // (dtype, kernel stem, resident binding count) — the frozen snapshot of both old tables.
+        let golden: &[(D, &str, usize)] = &[
+            (D::Q4_0, "q4_0", 6),
+            (D::Q4_1, "q4_1", 7),
+            (D::Q5_0, "q5_0", 6),
+            (D::Q5_1, "q5_1", 7),
+            (D::Q8_0, "q8_0", 6),
+            (D::Q2K, "q2_k", 6),
+            (D::Q3K, "q3_k", 6),
+            (D::Q4K, "q4k", 7),
+            (D::Q5K, "q5k", 7),
+            (D::Q6K, "q6k", 6),
+            (D::Iq4Nl, "iq4_nl", 6),
+            (D::Iq4Xs, "iq4_xs", 6),
+            (D::Iq2S, "iq2_s", 6),
+            (D::Iq3S, "iq3_s", 6),
+            (D::Mxfp4, "mxfp4", 6),
+            (D::Nvfp4, "nvfp4", 6),
+            (D::Q2_0, "q2_0", 6),
+        ];
+        // Golden and MOE_MMQ_DTYPES must cover exactly the same set.
+        assert_eq!(golden.len(), infr_core::tensor::MOE_MMQ_DTYPES.len());
+        for dt in infr_core::tensor::MOE_MMQ_DTYPES {
+            assert!(
+                golden.iter().any(|(g, _, _)| g == dt),
+                "MOE_MMQ_DTYPES member {dt:?} missing from golden"
+            );
+        }
+        let wide = [D::Q4K, D::Q6K];
+        for &(dt, stem, nb) in golden {
+            let d = moe_mmq_desc(dt).unwrap_or_else(|| panic!("moe_mmq_desc None for {dt:?}"));
+            assert_eq!(d.resident_nb, nb, "{dt:?} resident_nb");
+            assert_eq!(
+                d.xp.0,
+                format!("native_gemm_mmq_{stem}_xp").as_str(),
+                "{dt:?} xp"
+            );
+            assert_eq!(
+                d.xp32.0,
+                format!("native_gemm_mmq_{stem}_xp32").as_str(),
+                "{dt:?} xp32"
+            );
+            // paged variants + the +1 LUT binding are applied by the caller; names must match.
+            assert_eq!(
+                d.xpg.0,
+                format!("native_gemm_mmq_{stem}_xpg").as_str(),
+                "{dt:?} xpg"
+            );
+            assert_eq!(
+                d.xpg32.0,
+                format!("native_gemm_mmq_{stem}_xpg32").as_str(),
+                "{dt:?} xpg32"
+            );
+            if wide.contains(&dt) {
+                let (w128, w32w) = d.xp_wide.expect("Q4_K/Q6_K carry xp_wide");
+                assert_eq!(
+                    w128.0,
+                    format!("native_gemm_mmq_{stem}_xp128").as_str(),
+                    "{dt:?} xp128"
+                );
+                assert_eq!(
+                    w32w.0,
+                    format!("native_gemm_mmq_{stem}_xp32w").as_str(),
+                    "{dt:?} xp32w"
+                );
+            } else {
+                assert!(d.xp_wide.is_none(), "{dt:?} must not carry xp_wide");
+            }
+        }
+        // A dtype outside the mmq set maps to None (drives the callers' `unreachable!`).
+        assert!(moe_mmq_desc(D::F32).is_none());
+    }
 
     fn rmsnorm_cpu(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
         let n = x.len();
