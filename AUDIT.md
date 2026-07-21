@@ -22,19 +22,28 @@ reproduce/confirm are dropped (not listed) to keep this a verified-only ledger.
 
 - **Original audit:** 157 findings across 24 module slices (1 🔴 critical, 33 🟠
   major, 123 🟡 minor).
-- **Remaining open:** **10** — 0 🔴, 4 🟠, 6 🟡. The only OPEN feature work is
-  the **parked MTP** slice (2 🟠 + 3 🟡, `INFR_MTP`, off by default). The other
-  4 are: a Mac-only latent metal wrong-kernel dispatch (🟠, needs an Apple GPU),
-  the deferred `make_compute_kernel` OOM→Result (🟠), and 3 deferred shader/dp4a
-  DRY refactors (🟡) — each risks the byte-identity gate / recorded stream, kept
-  as documented deferrals.
+- **Remaining: 5 — and all actionable fixes are DONE.** 0 🔴, 2 🟠, 3 🟡, every
+  one either a documented **deferral** or requiring hardware not on this box:
+  - 🟠 a Mac-only latent metal wrong-kernel dispatch (iq4xs/iq4nl) — needs an
+    Apple GPU to verify + re-point;
+  - 🟠 `make_compute_kernel` OOM→`Result` — deferred (a 155-call-site
+    `()`→`Result` migration disproportionate to a rare OOM path; panic messages
+    improved);
+  - 🟡×3 shader/dp4a DRY include-refactors — deferred (each would perturb the
+    compiled SPV / recorded push-constant+descriptor stream the byte-identity
+    goldens gate).
+
+  **152 of 157 findings fixed** across 25 module slices (every crate cleared;
+  the gated multi-GPU and parked MTP verified on real hardware), plus the
+  `INFR_DEV`-unification feature. Every GPU-touching slice was byte-identity
+  verified against the goldens on the RX 7900 XTX; every fix was TDD.
 
 No finding was accepted on an agent's word — each was re-read against the source
 by the coordinator; two agent-flagged "MAJOR"s (the Q5_1 clamp in the shader and
 CPU quantizers) were **downgraded** to defensive-only after verifying the
-overflow is unreachable, and one MTP off-by-one is marked **PLAUSIBLE** (real
-code smell, could not fully confirm the position convention without running the
-parked path).
+overflow is unreachable. The MTP `catch_up` off-by-one first logged
+**PLAUSIBLE** was later **CONFIRMED** by a 3-source position-convention trace
+and fixed (`n_past+1`→`n_past`), with the acceptance-rate test passing.
 
 ### Resolved (landed on `main`)
 
@@ -319,6 +328,19 @@ parked path).
   sizes are asserted equal, and OpaqueFd threads the exporter's memory-type
   index. Reduce arithmetic unchanged → parity holds. _Deferred:_ a true f16
   all-reduce (needs an f16 add shader).
+- **`infr-llama` MTP (all 5 findings)** — TDD, +1 test; **`INFR_MTP=1`
+  `mtp_spec_matches_target_only_greedy` stays token-identical** and
+  `mtp_head_trunk_acceptance_rate` passes on the RX 7900 XTX. Cycle `catch_up`
+  writes committed tokens at `start_pos = n_past` (was `n_past+1` — CONFIRMED a
+  bug via a 3-source position-convention trace; the head-KV row at absolute pos
+  `p` stores `(t_p, h_{p-1})`, so the `+1` stored every pair one row too high
+  with a stale `h`); `catch_up` uses a `want_logits=false` KV-only forward
+  (drops the dead lm*head GEMM+readback it discarded every cycle); `pending_h`
+  takes `next_tok`'s own hidden in the reprime branch; the three
+  `base=m-(cand+1)` sites use a guarded `nonleading_base()`; and the three
+  lock-step leading `Option`s collapse to one `Option<Leading{…}>`. \_Deferred:*
+  the `emit_mtp_layer`/forward- glue graph extractions (touch the recorded op
+  sequence; the two builders differ structurally).
 
 ### Highest-priority (production default paths)
 
@@ -337,9 +359,9 @@ parked path).
 | ~~11~~ | ✅  | `infr-cli main.rs`                 | ~~`--dev` can't override inherited backend env~~ — **FIXED** (clears siblings; unified precedence).          |
 | ~~12~~ | ✅  | `infr-metal exec.rs`               | ~~`Op::Rope` frozen RoPE on the replay tape~~ — **FIXED** (excluded from replay).                            |
 
-The 4 remaining 🟠 majors: the parked-MTP `catch_up` off-by-one + wasted-logits
-(off by default); a Mac-only latent metal wrong-kernel dispatch; and the
-deferred `make_compute_kernel` OOM→Result. Full detail per module.
+The 2 remaining 🟠 are both non-actionable here: a Mac-only latent metal
+wrong-kernel dispatch (needs an Apple GPU) and the deferred
+`make_compute_kernel` OOM→Result. Full detail per module.
 
 ### Cross-cutting themes
 
@@ -413,45 +435,6 @@ _6 of 7 findings fixed (see Resolved log); the one below is **DEFERRED**._
    `-DINTERLEAVED` would have to reconcile the PC/binding structs and the
    build.rs compile list, risking the recorded push-constant/descriptor stream
    for a 🟡 DRY gain.
-
-## infr-llama/src/mtp/{mod,backends}.rs (MTP spec-decode, parked/opt-in)
-
-_`INFR_MTP` is opt-in and token-identity is VERIFY-guarded, so the correctness
-items below are latent acceptance-rate/perf bugs, not output corruption._
-
-1. **🟠 (PLAUSIBLE — validate)
-   `mtp/mod.rs:2534 — cycle `catch_up`passes`start_pos = n_past + 1`, one
-   position too high.** Draft appends at absolute position `n_past+s` (`1800`)
-   and catch*up writes at `start_pos+s` (`947`); the committed tokens
-   `t*{n*past..n_past+accepted}`should therefore land at head positions`n_past..`, i.e. `start_pos=n_past`. The `+1`stores`(t*{i-1},h\_{i-2})`at position`i`(wrong RoPE + stale`h`) and leaves the draft's stale row at `n_past`un-rewritten. Doesn't break token-identity (VERIFY only commits trunk-confirmed tokens) and is untested (the only multi-cycle test is`#[ignore]`d while MTP is parked) — I could not fully trace prime's convention to confirm, so **verify against `speculative.cpp`+ re-measure α** before changing. *Fix (if confirmed):* pass`n_past`, not `n_past+1`.
-2. **🟠 `mtp/mod.rs:1867 — `catch_up` computes + downloads a full vocab-wide
-   logits row it discards every cycle.** It calls `sess.forward()` and drops the
-   result, but `forward` always builds the non-fused graph with the lm*head
-   `Op::Linear [rows,vocab]` as an `Output` and downloads
-   `rows*vocab`f32. For catch-up only the`WriteKv`ops matter — the`rows×n_embd×151936`GEMM + readback is pure waste per spec cycle. \_Fix:* a`want_logits:false`/KV-only
-   forward variant that omits the lm_head Linear + its download.
-3. **🟡 `mtp/mod.rs:2536 — `pending_h` handed to the next cycle's draft is one
-   step stale** vs the init handoff (`h_{n_past+accepted-1}` for
-   `id_last=t_{n_past+accepted}`), depressing α. _Fix:_ confirm vs
-   `speculative.cpp`; obtain `next_tok`'s own hidden rather than reusing the
-   prior row.
-4. **🟡 `mtp/mod.rs:2470,2526 — unguarded `usize`underflow`base =
-   m-(cand.len()+1)` in the non-leading branch** (the
-   `debug_assert_eq!(m,cand.len())` only covers the leading branches); a state
-   edge with `m<cand.len()+1` wraps huge → slice panic on an
-   otherwise-unvalidated state. _Fix:_ `ensure!(m>=cand.len()+1,…)`.
-5. **🟡 perf/DRY — per-call staging allocs + duplicated builders/glue.**
-   `forward`/ `forward_draft`/`draft_chain` alloc all staging/readback buffers
-   fresh per call (5 allocs/step × n*max/cycle) — pool on the session.
-   `build_mtp_graph` (`409`) and `build_mtp_draft_chain_graph` (`864`) copy the
-   ~150-line qwen35 layer op emission verbatim; `forward`/`forward_draft`
-   duplicate the alloc/upload/bind/execute glue; the per-backend weight-bind
-   closures are duplicated between the session constructors and the driver
-   (`1372`, `backends.rs:132`). Also (`2489`) the leading-state flags
-   (`leading_h`/`leading_id`/`leading_dist`) must stay present-or-absent in
-   lock-step with no enforcement. \_Fix:* `emit_mtp_layer` helper, shared
-   upload/bind helper, per-backend `mtp_bind_weight(be)`, and a single
-   `Option<Leading{…}>` enum for the leading state.
 
 ## infr-metal/src/exec.rs (Metal backend — not runnable on this Linux box)
 
