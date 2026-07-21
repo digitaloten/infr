@@ -22,7 +22,7 @@ reproduce/confirm are dropped (not listed) to keep this a verified-only ledger.
 
 - **Original audit:** 157 findings across 24 module slices (1 🔴 critical, 33 🟠
   major, 123 🟡 minor).
-- **Remaining open:** **90** — 0 🔴, 14 🟠, 76 🟡.
+- **Remaining open:** **84** — 0 🔴, 13 🟠, 71 🟡.
 
 No finding was accepted on an agent's word — each was re-read against the source
 by the coordinator; two agent-flagged "MAJOR"s (the Q5_1 clamp in the shader and
@@ -160,23 +160,35 @@ parked path).
   parity-only `_at` fns are gated behind a new `parity` feature — the other 9
   carried a **stale** "not wired" doc but are in fact production-wired
   (correctly left `pub`).
+- **`infr-vulkan` adapter (all 6 findings)** — TDD, +3 pure tests, **gpu_seam
+  byte-identity verified** (GEMM prefill `nc_gemm`/`warp_gemm`, attention/KV
+  `kv_addr` 15, MoE-mmq all match host). Batched-MoE `counts` drops the
+  redundant host-blocking calloc (device-zeroed content unchanged, ~27µs/layer
+  sync gone); the static split-K attention now bounds `n_chunks ≤ 1024` (was an
+  OOB `attn_combine wexp[1024]` write above ~524k keys — the fix is proven
+  identical to the old formula for all realistic spans); `GatedAct::Silu`
+  rejects a strided gate instead of computing silently-wrong; cross-dtype
+  `Op::Copy` with `src_off!=0` returns `Err` instead of panicking;
+  `INFR_FLASH_MIN_ROWS` is read once; and
+  `split_k_plan`/`native_warp_gemm`/`with_padded_dst` de-duplicate the three
+  GEMM tiers (identical tile/split decisions).
 
 ### Highest-priority (production default paths)
 
-| #      | Sev | Location                              | Issue                                                                                                                       |
-| ------ | --- | ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| ~~1~~  | ✅  | `infr-hub`                            | ~~Downloaded blob never sha256-verified~~ — **FIXED** (`1263bcc`, + full hub slice).                                        |
-| ~~2~~  | ✅  | `infr-llama chat/mod.rs`              | ~~Generate error orphans the user turn~~ — **FIXED** (`Err` arm pops the user turn).                                        |
-| ~~3~~  | ✅  | `infr-server lib.rs`                  | ~~Streaming swallows errors as `stop`~~ — **FIXED** (error frame + panic-safe `DoneGuard`).                                 |
-| ~~4~~  | ✅  | `infr-server lib.rs`                  | ~~No per-request cancellation~~ — **FIXED** (cancel latch → `req.abort()` frees the slot).                                  |
-| ~~5~~  | ✅  | `infr-llama runner.rs`                | ~~Prefix-cache records unmaterialized KV rows~~ — **FIXED** (`last_written` tracker + `resident_after_gen`).                |
-| 6      | 🟠  | `infr-vulkan adapter.rs:2997`         | Static split-K attn bounds chunk _size_ not _count_ → `n_chunks>1024` **overruns `attn_combine` `wexp[1024]`** at huge ctx. |
-| 7      | 🟠  | `infr-vulkan ops.rs:229`              | Kernel-cache double-checked lock **double-compiles + leaks a pipeline** under concurrent first use.                         |
-| ~~8~~  | ✅  | `infr-llama sampling.rs`              | ~~Repeat penalty per-occurrence~~ — **FIXED** (`70bbe4e`; now per-distinct-token).                                          |
-| 9      | 🟠  | `infr-vulkan shaders dg_eb_sample:61` | argmax reduce **drops the lower-index tie-break** → diverges from host on ties (feeds diffusion goldens).                   |
-| ~~10~~ | ✅  | `infr-gguf lib.rs`                    | ~~Corrupt GGUF `pos+n` overflow panic~~ — **FIXED** (`checked_add`/`checked_mul` → `Error::Loader`).                        |
-| ~~11~~ | ✅  | `infr-cli main.rs`                    | ~~`--dev` can't override inherited backend env~~ — **FIXED** (clears siblings; unified precedence).                         |
-| 12     | 🟠  | `infr-metal exec.rs:2836`             | `Op::Rope` snapshots positions on the replay tape → **frozen RoPE after token 0** (llama-family Metal decode).              |
+| #      | Sev | Location                              | Issue                                                                                                          |
+| ------ | --- | ------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| ~~1~~  | ✅  | `infr-hub`                            | ~~Downloaded blob never sha256-verified~~ — **FIXED** (`1263bcc`, + full hub slice).                           |
+| ~~2~~  | ✅  | `infr-llama chat/mod.rs`              | ~~Generate error orphans the user turn~~ — **FIXED** (`Err` arm pops the user turn).                           |
+| ~~3~~  | ✅  | `infr-server lib.rs`                  | ~~Streaming swallows errors as `stop`~~ — **FIXED** (error frame + panic-safe `DoneGuard`).                    |
+| ~~4~~  | ✅  | `infr-server lib.rs`                  | ~~No per-request cancellation~~ — **FIXED** (cancel latch → `req.abort()` frees the slot).                     |
+| ~~5~~  | ✅  | `infr-llama runner.rs`                | ~~Prefix-cache records unmaterialized KV rows~~ — **FIXED** (`last_written` tracker + `resident_after_gen`).   |
+| ~~6~~  | ✅  | `infr-vulkan adapter.rs`              | ~~Static split-K `n_chunks>1024` overruns `wexp[1024]`~~ — **FIXED** (bounds `n_chunks ≤ 1024`).               |
+| 7      | 🟠  | `infr-vulkan ops.rs:229`              | Kernel-cache double-checked lock **double-compiles + leaks a pipeline** under concurrent first use.            |
+| ~~8~~  | ✅  | `infr-llama sampling.rs`              | ~~Repeat penalty per-occurrence~~ — **FIXED** (`70bbe4e`; now per-distinct-token).                             |
+| 9      | 🟠  | `infr-vulkan shaders dg_eb_sample:61` | argmax reduce **drops the lower-index tie-break** → diverges from host on ties (feeds diffusion goldens).      |
+| ~~10~~ | ✅  | `infr-gguf lib.rs`                    | ~~Corrupt GGUF `pos+n` overflow panic~~ — **FIXED** (`checked_add`/`checked_mul` → `Error::Loader`).           |
+| ~~11~~ | ✅  | `infr-cli main.rs`                    | ~~`--dev` can't override inherited backend env~~ — **FIXED** (clears siblings; unified precedence).            |
+| 12     | 🟠  | `infr-metal exec.rs:2836`             | `Op::Rope` snapshots positions on the replay tape → **frozen RoPE after token 0** (llama-family Metal decode). |
 
 The remaining 🟠 majors are all in **infr-vulkan** and **infr-metal**:
 host-hot-path churn (recorder per-dispatch `env::var` + `Vec` allocs; adapter
@@ -203,47 +215,6 @@ detail per module below.
   CLI).
 
 <!-- SLICES APPENDED BELOW AS THEY ARE VERIFIED -->
-
-## infr-vulkan/src/adapter.rs
-
-1. **🟠 `adapter.rs:3794` — batched-MoE `counts` is host-blocking calloc'd then
-   re-zeroed on device.** `counts = al(n_expert_local)?` uses the zeroing
-   `alloc` (one-shot submit + `queue_wait_idle` ≈27µs) — its own comment says
-   "zeroed below" — then `rec.zero(counts,…)` at `3853` zeroes it again on-GPU
-   before `moe_bucket_count`. Every sibling buffer uses non-blocking `alu`. One
-   pointless full host sync per MoE layer ≈ ~1.3ms/forward on a 48-layer chunk.
-   _Fix:_ allocate `counts` with `alu`; drop the single-use `al` closure.
-2. **🟡 `adapter.rs:2997,3121` — static split-K attention bounds chunk _size_,
-   not chunk _count_, so `n_chunks` can exceed `attn_combine.comp`'s
-   `shared float wexp[1024]`.** `chunk=(span/32).clamp(64,512)`,
-   `n_chunks=span.div_ceil(chunk)`; for `span>512*1024` (≈524k keys)
-   `n_chunks>1024` → OOB shared-mem write (`wexp[c]=…`, combine shader L37). The
-   Dynamic path (`2531`) scales chunk by `cap_rows.div_ceil(1024)` to prevent
-   exactly this; the static path (all ineligible decode + prefill, reachable
-   under `INFR_KV_OVERFLOW` huge ctx) doesn't. _Fix:_ bound count too, e.g.
-   `chunk = (span/32).clamp(64,512).max(span.div_ceil(1024))`.
-3. **🟡 `adapter.rs:2019` — `GatedAct::Silu` silently ignores `gate_stride`/
-   `gate_block_width`.** It guards `up_off`/`up_stride` then calls contiguous
-   `rec.silu_mul`, dropping the gate stride fields — the adjacent `Sigmoid` arm
-   honors them via `mul_sigmoid`. A strided-gate `Silu` (shape-legal) computes
-   silently wrong instead of erroring. _Fix:_ honor them, or add the same `Err`
-   guard the `up_*` cases have.
-4. **🟡 `adapter.rs:1933` — cross-dtype `Op::Copy` uses
-   `assert_eq!(*src_off,0)`, panicking the process** on a structurally-valid IR
-   (`store_f16` has no source offset) where every other unsupported-shape case
-   in `lower_op` returns a recoverable `be(...)`. _Fix:_ replace the assert with
-   an `if …{ return Err(be(…)) }`.
-5. **🟡 `adapter.rs:2720 & 2813` — `INFR_FLASH_MIN_ROWS` read twice** into
-   `flash_min_rows_env` (feeds `flash_geom`) and `flash_min_rows` (feeds
-   `nc_fa_ok`); they must stay equal for the row-floor logic to agree — a latent
-   divergence trap + redundant getenv per attention op. _Fix:_ read once, share.
-6. **🟡 `adapter.rs:4959 & 1621/1676/5004` — `streamed_prefill_gemm`
-   re-implements the resident GEMM tile-selection**; the identical
-   `narrow_grid`/`splits` split-K block is copy-pasted three times, and the
-   padded-dst temp+copy dance (`1715`/`1383`/`4977`) three more. The fn's own
-   doc warns resident & streamed "must track exactly." _Fix:_ extract one
-   tile-selection helper (param'd over a `w_addr: u64`) + a `with_padded_dst`
-   helper; call from all tiers.
 
 ## infr-vulkan/src/lib.rs + pcache.rs
 
