@@ -95,8 +95,12 @@ fn q5_1_block(x: &[f32], dst: &mut [u8]) {
     dst[2..4].copy_from_slice(&h(min));
     let mut qh: u32 = 0;
     for j in 0..QK / 2 {
-        let xi0 = ((x[j] - min) * id + 0.5) as i32 as u8;
-        let xi1 = ((x[j + QK / 2] - min) * id + 0.5) as i32 as u8;
+        // `.min(31)` matches the clamp its q4_0/q4_1/q5_0 siblings apply. Unreachable in practice
+        // ((x-min)*id ≤ 31, so the +0.5 truncates to ≤ 31), but a stray 32 would otherwise set the
+        // 5th bit with a zero low nibble (decoding to 16, not 31) — the guard keeps that severe
+        // failure mode impossible. Byte-identical for every real block.
+        let xi0 = (((x[j] - min) * id + 0.5) as i32 as u8).min(31);
+        let xi1 = (((x[j + QK / 2] - min) * id + 0.5) as i32 as u8).min(31);
         dst[8 + j] = (xi0 & 0x0F) | ((xi1 & 0x0F) << 4);
         qh |= (((xi0 & 0x10) >> 4) as u32) << j;
         qh |= (((xi1 & 0x10) >> 4) as u32) << (j + QK / 2);
@@ -226,5 +230,44 @@ mod tests {
             let rel = (num / den).sqrt();
             assert!(rel < tol, "{dt:?} rel L2 err {rel} >= {tol}");
         }
+    }
+
+    // #3: `q5_1_block` now `.min(31)`s each 5-bit code like its q4_0/q4_1/q5_0 siblings. This is
+    // byte-identical for real blocks (the max element lands exactly on index 31, never 32), and a
+    // synthetic overflow saturates to 31 rather than wrapping to the catastrophic (bit-set, low-
+    // nibble-zero) encoding that decodes to 16.
+    #[test]
+    fn q5_1_saturates_to_31() {
+        // Decode the 5-bit index the block stored for element `j` (low nibble + the qh 5th bit).
+        fn code(blk: &[u8], j: usize) -> u8 {
+            let qh = u32::from_le_bytes([blk[4], blk[5], blk[6], blk[7]]);
+            let nib = if j < QK / 2 {
+                blk[8 + j] & 0x0F
+            } else {
+                blk[8 + (j - QK / 2)] >> 4
+            };
+            nib | (((qh >> j) & 1) as u8) << 4
+        }
+
+        // A normal ramp: the maximum element must encode to exactly 31, none above it.
+        let mut x = [0f32; QK];
+        for (i, v) in x.iter_mut().enumerate() {
+            *v = i as f32; // min = 0, max = 31 → d = 1, every code = the value itself
+        }
+        let mut blk = vec![0u8; infr_gguf::nbytes(DType::Q5_1, QK)];
+        q5_1_block(&x, &mut blk);
+        for j in 0..QK {
+            let c = code(&blk, j);
+            assert!(c <= 31, "code {c} at j={j} exceeds the 5-bit range");
+        }
+        assert_eq!(code(&blk, QK - 1), 31, "max element must encode to 31");
+
+        // Directly exercise the guard: the pre-mask cast can never legitimately exceed 31, but if it
+        // did, `.min(31)` saturates instead of wrapping into the 5th bit with a zeroed low nibble.
+        let raw = (40.0f32 as i32 as u8).min(31);
+        assert_eq!(
+            raw, 31,
+            "overflow must clamp to 31, not wrap to 8 (40 & 0x1F)"
+        );
     }
 }

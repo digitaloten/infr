@@ -18,6 +18,30 @@ pub(crate) type RepackCacheState = (HashMap<(usize, usize), Arc<Q4kPack>>, usize
 
 pub(crate) type Repack6CacheState = (HashMap<(usize, usize), Arc<Q6kPack>>, usize);
 
+/// Insert `pack` under `key` if still absent, then return the *resident* `Arc` — the caller holds
+/// the cache lock. This closes the check-then-insert race in `q4k_pack_for`/`q6k_pack_for`: the lock
+/// drops between the fast-path miss and the (expensive) build, so a second thread may have inserted
+/// the same key meanwhile. Re-checking under the lock means only the first insertion counts the
+/// bytes (against `budget`) and only one entry lands — the loser returns the winner's pack and drops
+/// its own build. Byte accounting happens ONLY on a genuine insert.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub(crate) fn cache_insert_if_absent<P>(
+    state: &mut (HashMap<(usize, usize), Arc<P>>, usize),
+    key: (usize, usize),
+    pack: Arc<P>,
+    bytes: usize,
+    budget: usize,
+) -> Arc<P> {
+    if let Some(p) = state.0.get(&key) {
+        return p.clone();
+    }
+    if state.1 + bytes <= budget {
+        state.1 += bytes;
+        state.0.insert(key, pack.clone());
+    }
+    pack
+}
+
 // Only the x86 ilv kernels read these — plain data everywhere else (aarch64 CI builds with
 // -D warnings, so the not-x86 dead-code must be explicitly allowed rather than cfg'd away:
 // the types appear in cross-target signatures like `expert_matvec_batch`).
@@ -360,5 +384,42 @@ pub(crate) unsafe fn q6k_gemm_group(pg: &Q6kPackGroup, nb: usize, q8s: &[Q8], co
             // SAFETY: row < 8, r < m, cols.len() == 8*m (asserted above).
             *cols_p.add(row * m + r) = lanes[j];
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // #4: `cache_insert_if_absent` closes the check-then-insert race — the re-check under the lock
+    // must (a) insert + count bytes exactly once for a fresh key, (b) NOT re-count or overwrite when
+    // the key is already resident (the race loser gets the winner's Arc), and (c) respect the budget.
+    #[test]
+    fn cache_insert_if_absent_is_idempotent_and_budgeted() {
+        let mut state: (HashMap<(usize, usize), Arc<u32>>, usize) = (HashMap::new(), 0);
+        let budget = 100usize;
+
+        // First insert of a fresh key: lands, counts its bytes.
+        let win = cache_insert_if_absent(&mut state, (1, 2), Arc::new(42), 10, budget);
+        assert_eq!(*win, 42);
+        assert_eq!(state.1, 10, "bytes counted once");
+        assert_eq!(state.0.len(), 1);
+
+        // Simulated race: a second builder reaches the lock with the SAME key but its own Arc. It
+        // must get the RESIDENT Arc back (Arc::ptr_eq the winner) and must NOT double-count bytes.
+        let resident = state.0.get(&(1, 2)).unwrap().clone();
+        let loser = cache_insert_if_absent(&mut state, (1, 2), Arc::new(999), 10, budget);
+        assert!(
+            Arc::ptr_eq(&loser, &resident),
+            "loser gets the resident pack"
+        );
+        assert_eq!(state.1, 10, "no double byte accounting on a re-check hit");
+        assert_eq!(state.0.len(), 1);
+
+        // A pack that would blow the budget is built-and-returned but NOT inserted/counted.
+        let big = cache_insert_if_absent(&mut state, (3, 4), Arc::new(7), 1_000, budget);
+        assert_eq!(*big, 7, "over-budget pack still usable, just transient");
+        assert_eq!(state.1, 10, "over-budget insert must not count bytes");
+        assert_eq!(state.0.len(), 1, "over-budget key not inserted");
     }
 }

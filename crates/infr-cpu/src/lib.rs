@@ -39,6 +39,9 @@ use quant::{quantize_q8, quantize_q8_32, Q8x32, Q8};
 use repack::{q4k_pack, q6k_gemm_group, q6k_pack, Q6kPack};
 use repack::{Q4kPack, Repack6CacheState, RepackCacheState};
 
+/// Dequantized-weight cache: `(buffer address, byte-len, dtype) -> Arc<f32>`. See `weight_cache`.
+type WeightCache = HashMap<(usize, usize, DType), Arc<Vec<f32>>>;
+
 // ─── Q8_0 integer dot kernels ─────────────────────────────────────────────────
 //
 // Q8_0 weight layout: 34 bytes / 32 elements.  Bytes 0..2 = f16 scale `d`; bytes 2..34 = i8 qs.
@@ -161,11 +164,14 @@ impl Buffer for CpuBuffer {
 
 #[derive(Default)]
 pub struct CpuBackend {
-    /// Dequantized-weight cache keyed by the bound buffer's address (weights are bound the same
-    /// every step, so dequant once and reuse). Only the small norm weights (`RmsNorm` / `QkNorm`)
-    /// land here — the large `Op::Linear` weights are streamed row-by-row instead (see that arm),
-    /// so this never holds the whole model in f32.
-    weight_cache: Mutex<HashMap<usize, Arc<Vec<f32>>>>,
+    /// Dequantized-weight cache keyed by the bound buffer's `(address, byte-len, dtype)` (weights
+    /// are bound the same every step, so dequant once and reuse). Only the small norm weights
+    /// (`RmsNorm` / `QkNorm`) land here — the large `Op::Linear` weights are streamed row-by-row
+    /// instead (see that arm), so this never holds the whole model in f32. Keying on len+dtype (not
+    /// the raw address alone) guards a reused `CpuBackend` (serve model reload): a freed weight's
+    /// address can be reallocated to a *different* weight, and a bare-address key would then hand
+    /// back the previous model's f32 — the len/dtype discriminates the two.
+    weight_cache: Mutex<WeightCache>,
     /// (layer, expert)-granular repack cache for the interleaved-x8 Q4_K GEMM ([`Q4kPack`]):
     /// keyed by the expert weight slice's (address, length) — stable for the mmap'd/upload-once
     /// weight buffers this backend binds (same lifetime argument as `weight_cache`). ggml pays
@@ -209,12 +215,9 @@ impl CpuBackend {
             .and_then(|v| v.parse().ok())
             .unwrap_or(4096);
         let bytes = pack.bytes();
+        // Re-check under the lock: another thread may have inserted `key` between our miss and here.
         let mut guard = self.repack_cache.lock().unwrap();
-        if guard.1 + bytes <= budget_mb * 1024 * 1024 {
-            guard.1 += bytes;
-            guard.0.insert(key, pack.clone());
-        }
-        pack
+        repack::cache_insert_if_absent(&mut guard, key, pack, bytes, budget_mb * 1024 * 1024)
     }
 
     /// Fetch-or-build the [`Q6kPack`] for one weight bank slice — `q4k_pack_for`'s Q6_K sibling.
@@ -230,17 +233,26 @@ impl CpuBackend {
             .and_then(|v| v.parse().ok())
             .unwrap_or(4096);
         let bytes = pack.bytes();
+        // Re-check under the lock: another thread may have inserted `key` between our miss and here.
         let mut guard = self.repack6_cache.lock().unwrap();
-        if guard.1 + bytes <= budget_mb * 1024 * 1024 {
-            guard.1 += bytes;
-            guard.0.insert(key, pack.clone());
-        }
-        pack
+        repack::cache_insert_if_absent(&mut guard, key, pack, bytes, budget_mb * 1024 * 1024)
     }
 
     /// Wrap a zero-copy GGUF mmap view as a read-only weight buffer (no allocation, no `memcpy`).
     pub fn map_weight(&self, bytes: TensorBytes) -> Box<dyn Buffer> {
         Box::new(CpuBuffer::Mapped(bytes))
+    }
+
+    /// Fetch-or-build a dequantized weight from `weight_cache` under its `(addr, len, dtype)` key.
+    /// The key's len+dtype ensure a reload that re-uses a freed weight's address can't collide
+    /// with the stale entry (see `weight_cache`'s doc). `bytes` is dequantized per `key.2` on a miss.
+    pub(crate) fn cached_weight(&self, key: (usize, usize, DType), bytes: &[u8]) -> Arc<Vec<f32>> {
+        if let Some(w) = self.weight_cache.lock().unwrap().get(&key) {
+            return w.clone();
+        }
+        let w = Arc::new(bytes_to_f32(bytes, key.2));
+        self.weight_cache.lock().unwrap().insert(key, w.clone());
+        w
     }
 }
 
@@ -260,6 +272,20 @@ pub(crate) fn bytes_to_f32(bytes: &[u8], dtype: DType) -> Vec<f32> {
             .collect(),
         // F16 / Bf16 / all quant + codebook types go through the shared host dequant.
         other => dequant_block(other, bytes).expect("cpu backend: host dequant"),
+    }
+}
+
+/// Borrow two *distinct* elements of a slice as `(&a, &mut b)` — used by `Op::Copy`/`CopyStrided`
+/// to read the source in place instead of cloning the whole tensor. Panics if `a == b` (callers
+/// handle the aliasing case separately with a temp).
+fn borrow_two_mut<T>(v: &mut [T], a: usize, b: usize) -> (&T, &mut T) {
+    assert_ne!(a, b, "borrow_two_mut requires distinct indices");
+    if a < b {
+        let (lo, hi) = v.split_at_mut(b);
+        (&lo[a], &mut hi[0])
+    } else {
+        let (lo, hi) = v.split_at_mut(a);
+        (&hi[0], &mut lo[b])
     }
 }
 
@@ -285,6 +311,62 @@ pub(crate) fn dequant_prefix_q8_0(bytes: &[u8], need: usize) -> Vec<f32> {
         }
     }
     out
+}
+
+/// Device-side stochastic sampling reference (see `Op::Sample`) — IDENTICAL order of operations to
+/// the host `sample_logits` (top-k select desc, softmax(temp), nucleus, CDF walk) with the uniform
+/// draw `uu` factored out. `top_k == 0` is the "disable top-k" sentinel → NO truncation (`k == len`);
+/// any `top_k >= 1` truncates to `min(top_k, len)`. Returns the sampled token index.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn sample_token(logits: &[f32], uu: f32, top_k: usize, temp: f32, top_p: f32) -> u32 {
+    // top_k == 0 disables truncation; otherwise cap at the vocab length. Guarding here keeps the
+    // `select_nth_unstable_by(k - 1)` below from underflowing when top_k == 0 (k would be 0).
+    let k = if top_k == 0 {
+        logits.len()
+    } else {
+        top_k.min(logits.len())
+    };
+    let cmp = |a: &usize, b: &usize| {
+        logits[*b]
+            .partial_cmp(&logits[*a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    };
+    let mut idx: Vec<usize> = (0..logits.len()).collect();
+    if k < logits.len() {
+        idx.select_nth_unstable_by(k - 1, cmp);
+        idx.truncate(k);
+    }
+    idx.sort_unstable_by(cmp);
+    let maxl = logits[idx[0]];
+    let mut probs: Vec<f32> = idx
+        .iter()
+        .map(|&i| ((logits[i] - maxl) / temp).exp())
+        .collect();
+    let sum: f32 = probs.iter().sum();
+    for p in probs.iter_mut() {
+        *p /= sum;
+    }
+    let mut cum = 0.0;
+    let mut cutoff = probs.len();
+    for (j, &p) in probs.iter().enumerate() {
+        cum += p;
+        if cum >= top_p {
+            cutoff = j + 1;
+            break;
+        }
+    }
+    let total: f32 = probs[..cutoff].iter().sum();
+    let r = uu * total;
+    let mut tok = idx[cutoff - 1] as u32;
+    let mut acc = 0.0;
+    for j in 0..cutoff {
+        acc += probs[j];
+        if r <= acc {
+            tok = idx[j] as u32;
+            break;
+        }
+    }
+    tok
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -410,14 +492,13 @@ impl Backend for CpuBackend {
         // Fetch a (cached) dequantized weight.
         let weight = |id: TensorId| -> Arc<Vec<f32>> {
             let buf = bindings.get(id).expect("cpu backend: unbound Weight");
-            let key = cpu_buf(buf) as *const CpuBuffer as usize;
+            let addr = cpu_buf(buf) as *const CpuBuffer as usize;
+            let key = (addr, buf.len_bytes(), g.desc(id).dtype);
             if let Some(w) = self.weight_cache.lock().unwrap().get(&key) {
                 return w.clone();
             }
             let bytes = cpu_buf(buf).read();
-            let w = Arc::new(bytes_to_f32(&bytes, g.desc(id).dtype));
-            self.weight_cache.lock().unwrap().insert(key, w.clone());
-            w
+            self.cached_weight(key, &bytes)
         };
 
         let prof_ops = std::env::var("INFR_PROF_OPS").is_ok();
@@ -823,9 +904,12 @@ impl Backend for CpuBackend {
                         head_dim as usize,
                         rope_dim as usize,
                     );
-                    let xs = vals[x.0 as usize].clone();
-                    let pos = vals[positions.0 as usize].clone();
-                    let ff = freq_factors.map(|f| vals[f.0 as usize].clone());
+                    // Borrow the inputs (no clone) — `out` is the single owned copy we mutate and
+                    // then move into `vals[dst]`; the borrows end before that write (NLL). If
+                    // dst == x this still holds: `out` is an independent Vec.
+                    let xs = &vals[x.0 as usize];
+                    let pos = &vals[positions.0 as usize];
+                    let ff = freq_factors.map(|f| &vals[f.0 as usize]);
                     let mut out = xs.clone(); // dims beyond rope_dim pass through unchanged
                                               // Op::Rope is the no-qk-norm (llama-family) rotation: INTERLEAVED pairs
                                               // (2p, 2p+1) — llama.cpp's ROPE_TYPE_NORM, matching the Vulkan `rope` kernel
@@ -973,7 +1057,15 @@ impl Backend for CpuBackend {
                             }
                             DType::Q8_0 => {
                                 // Q8_0 blocks (34 B / 32 elems): d = amax/127 (stored f16), q =
-                                // round(x/d) — the llama.cpp quantize_row_q8_0 reference formula.
+                                // round(x/d) via `round_ties_even`. NOTE: llama.cpp's
+                                // quantize_row_q8_0 uses `roundf` (half-away-from-zero) and the GPU
+                                // `store_q8.comp` uses GLSL `round()` (halfway is impl-defined), so
+                                // this backend deliberately differs on exact-halfway activations.
+                                // That is intentional and safe: no path pins the CPU KV Q8 bytes
+                                // bit-for-bit — the CPU/GPU KV Q8 tests are all coherence/tolerance
+                                // checks (kv_q8_roundtrip err<0.02, gpu_seam_kv_q8_coherent), never
+                                // exact-byte goldens — and halfway ties are vanishingly rare, so the
+                                // <0.5 LSB difference never changes a decoded token.
                                 // `base`/`n` are element counts and rows are 32-aligned (the runner
                                 // gates on it), so blocks never straddle a write.
                                 debug_assert!(base % 32 == 0 && n % 32 == 0);
@@ -1382,52 +1474,11 @@ impl Backend for CpuBackend {
                     temp,
                     top_p,
                 } => {
-                    // Device-side stochastic sampling — IDENTICAL order of operations to the host
-                    // `sample_logits` (top-k select desc, softmax(temp), nucleus, CDF walk) with
-                    // the uniform draw factored out into the 1-float `u` input.
+                    // Device-side stochastic sampling — see `sample_token` (top_k == 0 = no
+                    // truncation; the uniform draw is factored out into the 1-float `u` input).
                     let logits = &vals[x.0 as usize][..n as usize];
                     let uu = vals[u.0 as usize][0];
-                    let k = (top_k as usize).min(logits.len());
-                    let cmp = |a: &usize, b: &usize| {
-                        logits[*b]
-                            .partial_cmp(&logits[*a])
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    };
-                    let mut idx: Vec<usize> = (0..logits.len()).collect();
-                    if k < logits.len() {
-                        idx.select_nth_unstable_by(k - 1, cmp);
-                        idx.truncate(k);
-                    }
-                    idx.sort_unstable_by(cmp);
-                    let maxl = logits[idx[0]];
-                    let mut probs: Vec<f32> = idx
-                        .iter()
-                        .map(|&i| ((logits[i] - maxl) / temp).exp())
-                        .collect();
-                    let sum: f32 = probs.iter().sum();
-                    for p in probs.iter_mut() {
-                        *p /= sum;
-                    }
-                    let mut cum = 0.0;
-                    let mut cutoff = probs.len();
-                    for (j, &p) in probs.iter().enumerate() {
-                        cum += p;
-                        if cum >= top_p {
-                            cutoff = j + 1;
-                            break;
-                        }
-                    }
-                    let total: f32 = probs[..cutoff].iter().sum();
-                    let r = uu * total;
-                    let mut tok = idx[cutoff - 1] as u32;
-                    let mut acc = 0.0;
-                    for j in 0..cutoff {
-                        acc += probs[j];
-                        if r <= acc {
-                            tok = idx[j] as u32;
-                            break;
-                        }
-                    }
+                    let tok = sample_token(logits, uu, top_k as usize, temp, top_p);
                     vals[dst.0 as usize] = vec![f32::from_bits(tok)];
                 }
                 Op::Argmax { x, dst, n, rows } => {
@@ -1483,8 +1534,15 @@ impl Backend for CpuBackend {
                     n,
                 } => {
                     let (so, dof, n) = (src_off as usize, dst_off as usize, n as usize);
-                    let s = vals[src.0 as usize].clone();
-                    vals[dst.0 as usize][dof..dof + n].copy_from_slice(&s[so..so + n]);
+                    if src.0 == dst.0 {
+                        // Aliasing copy within one tensor: a temp is required (can't borrow the
+                        // same Vec mutably and immutably). Clone only the read window.
+                        let s = vals[src.0 as usize][so..so + n].to_vec();
+                        vals[dst.0 as usize][dof..dof + n].copy_from_slice(&s);
+                    } else {
+                        let (s, d) = borrow_two_mut(&mut vals, src.0 as usize, dst.0 as usize);
+                        d[dof..dof + n].copy_from_slice(&s[so..so + n]);
+                    }
                 }
                 Op::CopyStrided {
                     src,
@@ -1503,11 +1561,21 @@ impl Backend for CpuBackend {
                         dst_stride as usize,
                         n as usize,
                     );
-                    let s = vals[src.0 as usize].clone();
-                    let d = &mut vals[dst.0 as usize];
-                    for r in 0..rows as usize {
-                        d[dof + r * ds..dof + r * ds + n]
-                            .copy_from_slice(&s[so + r * ss..so + r * ss + n]);
+                    if src.0 == dst.0 {
+                        // Aliasing strided copy: clone the source rows (can't hold &s and &mut d on
+                        // one Vec). Rare — kept correct rather than fast.
+                        let s = vals[src.0 as usize].clone();
+                        let d = &mut vals[dst.0 as usize];
+                        for r in 0..rows as usize {
+                            d[dof + r * ds..dof + r * ds + n]
+                                .copy_from_slice(&s[so + r * ss..so + r * ss + n]);
+                        }
+                    } else {
+                        let (s, d) = borrow_two_mut(&mut vals, src.0 as usize, dst.0 as usize);
+                        for r in 0..rows as usize {
+                            d[dof + r * ds..dof + r * ds + n]
+                                .copy_from_slice(&s[so + r * ss..so + r * ss + n]);
+                        }
                     }
                 }
                 Op::MoeFfn {
@@ -2146,10 +2214,10 @@ impl Backend for CpuBackend {
                         head_v as usize,
                     );
                     let qf_raw = vals[q.0 as usize].clone();
-                    let kf_raw = vals[k.0 as usize].clone();
-                    let vf_raw = vals[v.0 as usize].clone();
                     let src_stride = src_stride as usize;
-                    // For strided DeltaNet, q/k/v share one buffer; extract packed arrays.
+                    // For strided DeltaNet, q/k/v share one buffer; extract packed arrays. Only
+                    // `qf_raw` is read on that path — defer the k/v clones to the non-strided branch
+                    // that actually consumes them.
                     let (qf, kf, vf) = if src_stride > 0 {
                         let mut qv = vec![0f32; rr * nk * kd];
                         let mut kv = vec![0f32; rr * nk * kd];
@@ -2166,6 +2234,8 @@ impl Backend for CpuBackend {
                         }
                         (qv, kv, vv)
                     } else {
+                        let kf_raw = vals[k.0 as usize].clone();
+                        let vf_raw = vals[v.0 as usize].clone();
                         (qf_raw, kf_raw, vf_raw)
                     };
                     // [rows, nk*kd], [rows, nk*kd], [rows, nv*vd]
@@ -2274,5 +2344,91 @@ impl Backend for CpuBackend {
 
     fn sync(&self) -> Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // #1: `sample_token` must not panic when top_k == 0 (the "disable top-k" sentinel) and must
+    // return a valid in-range token. Regression for the `select_nth_unstable_by(k - 1)` underflow.
+    #[test]
+    fn sample_top_k_zero_no_panic() {
+        let logits = [0.1f32, 3.0, 0.2, 2.0, 0.05];
+        // top_k == 0 => no truncation. Greedy-ish draw (u≈0) should land on the argmax (index 1).
+        let tok = sample_token(&logits, 0.0, 0, 1.0, 1.0);
+        assert!((tok as usize) < logits.len(), "token {tok} out of range");
+        assert_eq!(tok, 1, "u≈0 with full softmax picks the max-logit index");
+        // u≈1 walks the CDF to the last (sorted) entry — still a valid index.
+        let tok_hi = sample_token(&logits, 0.999_999, 0, 1.0, 1.0);
+        assert!((tok_hi as usize) < logits.len());
+    }
+
+    // #1: top_k == 0 (no truncation) and top_k == len must agree — both consider every logit.
+    #[test]
+    fn sample_top_k_zero_equals_full_k() {
+        let logits = [1.0f32, 5.0, 2.0, 4.0, 3.0, 0.5];
+        for &u in &[0.0f32, 0.25, 0.5, 0.75, 0.999] {
+            let a = sample_token(&logits, u, 0, 0.8, 0.95);
+            let b = sample_token(&logits, u, logits.len(), 0.8, 0.95);
+            assert_eq!(a, b, "top_k==0 must match top_k==len at u={u}");
+        }
+    }
+
+    // #1: a normal top_k >= 1 still truncates and returns a valid token (path unchanged).
+    #[test]
+    fn sample_top_k_truncates() {
+        let logits = [0.0f32, 9.0, 1.0, 8.0, 2.0];
+        let tok = sample_token(&logits, 0.0, 2, 1.0, 1.0);
+        // Only indices {1,3} survive top_k=2; u≈0 picks the larger (index 1).
+        assert_eq!(tok, 1);
+    }
+
+    // #2: `cached_weight` keys on (addr, len, dtype). Same key returns the CACHED value (even if the
+    // bytes changed — proves it dedups); a key differing in len or dtype MISSES and dequants fresh
+    // (proves a reused address can't collide with a stale, differently-shaped weight).
+    #[test]
+    fn cached_weight_keys_on_addr_len_dtype() {
+        let be = CpuBackend::new();
+        let a = [1.0f32, 2.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>();
+        let key = (0xDEAD_BEEF, a.len(), DType::F32);
+        let w1 = be.cached_weight(key, &a);
+        assert_eq!(&**w1, &[1.0, 2.0]);
+
+        // Same key, DIFFERENT bytes => returns the cached f32 (not re-dequantized).
+        let b = [9.0f32, 9.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>();
+        let w2 = be.cached_weight(key, &b);
+        assert_eq!(&**w2, &[1.0, 2.0], "same key must hit the cache");
+
+        // Same address+len but a DIFFERENT dtype => distinct key => fresh dequant (no collision).
+        let c: Vec<u8> = [3i32, 4].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let key_i32 = (0xDEAD_BEEF, c.len(), DType::I32);
+        let w3 = be.cached_weight(key_i32, &c);
+        assert_eq!(
+            &**w3,
+            &[3.0, 4.0],
+            "different dtype must miss and dequant fresh"
+        );
+
+        // Same address+dtype but a DIFFERENT byte-len => distinct key => fresh (simulates a reload
+        // that reused a freed weight's address for a longer weight).
+        let d = [7.0f32, 8.0, 9.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>();
+        let key_len = (0xDEAD_BEEF, d.len(), DType::F32);
+        let w4 = be.cached_weight(key_len, &d);
+        assert_eq!(
+            &**w4,
+            &[7.0, 8.0, 9.0],
+            "different len must miss and dequant fresh"
+        );
     }
 }
