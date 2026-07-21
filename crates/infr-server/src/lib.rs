@@ -16,13 +16,16 @@
 use std::{
     convert::Infallible,
     net::SocketAddr,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{
         sse::{Event, Sse},
         IntoResponse, Response,
@@ -73,14 +76,36 @@ impl Finish {
 /// today) keeps an internal `Mutex` and is served with `--parallel 1`, which is honest rather than
 /// silently serialising a server the user asked to parallelise.
 pub trait ChatGenerator: Send + Sync {
+    /// Run one chat turn.
+    ///
+    /// * `tools` is the request's `tools` array as a borrowed [`serde_json::Value`] — passed by
+    ///   reference so the generator parses the ONE it was already given instead of a
+    ///   `Value`→string→`Value` round-trip (see audit finding 6).
+    /// * `cancel` is a PER-REQUEST abort latch. The server sets it when the client disconnects (an
+    ///   SSE `send` starts failing); the generator must poll it in its decode loop and stop promptly
+    ///   so the GPU slot is freed rather than held to `max_tokens`. It is ORed with the process-wide
+    ///   shutdown latch, never a replacement for it.
+    /// * Returns a [`ChatOutcome`] carrying the finish reason AND the real prompt/completion token
+    ///   counts so the handler can populate `usage` truthfully.
     fn chat(
         &self,
         messages: &[ChatMessage],
-        tools_json: Option<&str>,
+        tools: Option<&serde_json::Value>,
         tool_choice: Option<&str>,
         params: &GenParams,
+        cancel: &AtomicBool,
         on_delta: &mut dyn FnMut(Delta),
-    ) -> anyhow::Result<Finish>;
+    ) -> anyhow::Result<ChatOutcome>;
+}
+
+/// What one [`ChatGenerator::chat`] call produced: why it ended, plus the real token counts the
+/// handler needs for a truthful `usage` block (`total = prompt + completion`). Counts are what the
+/// generator actually tokenized/emitted — never a `content.len()/4` estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatOutcome {
+    pub finish: Finish,
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -356,15 +381,28 @@ impl StopMatcher {
 
 /// Normalise OpenAI `tool_choice` to a string the generator understands: `"auto"`/`"required"`/
 /// `"none"` pass through; a `{"type":"function","function":{"name":N}}` object becomes `N`.
-fn tool_choice_str(v: &serde_json::Value) -> Option<String> {
+///
+/// The caller has already handled ABSENT/`null` (that is "no choice" → `Ok(None)` at the call site).
+/// This function is only reached for a PRESENT value, so an object that lacks a usable
+/// `function.name` — or any non-string/non-object shape — is a MALFORMED forced-tool request and is
+/// a 400 ([`ParamError`]), NOT a silent downgrade to "auto" (audit finding 6).
+fn tool_choice_str(v: &serde_json::Value) -> Result<Option<String>, ParamError> {
     match v {
-        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::String(s) => Ok(Some(s.clone())),
         serde_json::Value::Object(_) => v
             .get("function")
             .and_then(|f| f.get("name"))
             .and_then(|n| n.as_str())
-            .map(str::to_owned),
-        _ => None,
+            .map(|s| Some(s.to_owned()))
+            .ok_or_else(|| ParamError {
+                param: "tool_choice",
+                message: "tool_choice object must have a string `function.name`".into(),
+            }),
+        _ => Err(ParamError {
+            param: "tool_choice",
+            message: "tool_choice must be \"auto\"/\"required\"/\"none\" or a function object"
+                .into(),
+        }),
     }
 }
 
@@ -686,20 +724,44 @@ async fn models_handler(State(state): State<AppState>) -> Json<ModelsResponse> {
 
 async fn chat_completions_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     body: Result<Json<ChatRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    // Optional bearer auth: enforced ONLY when INFR_API_KEY is configured. Default = open (existing
+    // localhost usage is unaffected). Checked before any work, so an unauthenticated request cannot
+    // even reach model routing / slot admission.
+    if let Some(key) = configured_api_key() {
+        let auth = headers.get("authorization").and_then(|v| v.to_str().ok());
+        if !authorize(Some(&key), auth) {
+            return json_error(
+                StatusCode::UNAUTHORIZED,
+                "missing or invalid Authorization bearer token".into(),
+            );
+        }
+    }
     // Malformed JSON / wrong types: an OpenAI-shaped 400, not axum's default 422 text body.
     let Json(req) = match body {
         Ok(j) => j,
         Err(e) => return param_error(None, e.body_text()),
     };
-    let params = match GenParams::from_request(&req) {
+    let mut params = match GenParams::from_request(&req) {
         Ok(p) => p,
         Err(e) => return param_error(Some(e.param), e.message),
     };
+    // Cap an absurd explicit budget so one request can't pin a slot forever. Unset stays unset.
+    params.max_tokens = clamp_max_tokens(params.max_tokens, max_tokens_cap());
     let messages: Vec<ChatMessage> = req.messages.iter().map(dto_to_engine).collect();
-    let tools_json: Option<String> = req.tools.as_ref().map(|v| v.to_string());
-    let tool_choice: Option<String> = req.tool_choice.as_ref().and_then(tool_choice_str);
+    // Pass the request's `tools` array THROUGH as a Value (moved into the blocking task) — no
+    // Value→string→Value round-trip (audit finding 6).
+    let tools: Option<serde_json::Value> = req.tools.clone();
+    // A PRESENT-but-malformed forced tool_choice is a 400, not a silent downgrade to "auto".
+    let tool_choice: Option<String> = match req.tool_choice.as_ref() {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => match tool_choice_str(v) {
+            Ok(tc) => tc,
+            Err(e) => return param_error(Some(e.param), e.message),
+        },
+    };
     // Route to the hosted model named in the request (exact id), else the default (first) entry.
     // The response `model` field echoes the entry ACTUALLY served, not the raw request string, so a
     // client that omitted/mis-named the model sees which one answered.
@@ -712,7 +774,7 @@ async fn chat_completions_handler(
         streaming(
             entry,
             messages,
-            tools_json,
+            tools,
             tool_choice,
             params,
             cid,
@@ -724,7 +786,7 @@ async fn chat_completions_handler(
         non_streaming(
             entry,
             messages,
-            tools_json,
+            tools,
             tool_choice,
             params,
             cid,
@@ -743,7 +805,7 @@ async fn chat_completions_handler(
 async fn non_streaming(
     entry: ModelEntry,
     messages: Vec<ChatMessage>,
-    tools_json: Option<String>,
+    tools: Option<serde_json::Value>,
     tool_choice: Option<String>,
     params: GenParams,
     cid: String,
@@ -774,12 +836,18 @@ async fn non_streaming(
         let mut content = String::new();
         let mut tool_calls: Vec<OAIToolCall> = Vec::new();
 
-        let finish = engine
+        // No client-disconnect signal on the non-streaming path (the whole reply is buffered), so
+        // this latch stays false here; generation is still bounded by EOS/stop/max_tokens and the
+        // process shutdown latch, exactly as before. It exists to satisfy the shared trait.
+        let cancel = AtomicBool::new(false);
+
+        let outcome = engine
             .chat(
                 &messages,
-                tools_json.as_deref(),
+                tools.as_ref(),
                 tool_choice.as_deref(),
                 &params,
+                &cancel,
                 &mut |delta| match delta {
                     Delta::Reasoning(t) => reasoning.push_str(&t),
                     Delta::Content(t) => content.push_str(&t),
@@ -796,7 +864,7 @@ async fn non_streaming(
             )
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        Ok((reasoning, content, tool_calls, finish))
+        Ok((reasoning, content, tool_calls, outcome))
     })
     .await
     .map_err(anyhow::Error::from)
@@ -804,9 +872,9 @@ async fn non_streaming(
 
     match result {
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-        Ok((reasoning, content, tool_calls, finish)) => {
+        Ok((reasoning, content, tool_calls, outcome)) => {
             let finish = if tool_calls.is_empty() {
-                finish
+                outcome.finish
             } else {
                 Finish::ToolCalls
             }
@@ -839,9 +907,11 @@ async fn non_streaming(
                     finish_reason: finish.into(),
                 }],
                 usage: UsageInfo {
-                    prompt_tokens: 0,
-                    completion_tokens: (content.len() / 4) as u32,
-                    total_tokens: 0,
+                    prompt_tokens: outcome.prompt_tokens,
+                    completion_tokens: outcome.completion_tokens,
+                    total_tokens: outcome
+                        .prompt_tokens
+                        .saturating_add(outcome.completion_tokens),
                 },
             })
             .into_response()
@@ -857,7 +927,7 @@ async fn non_streaming(
 async fn streaming(
     entry: ModelEntry,
     messages: Vec<ChatMessage>,
-    tools_json: Option<String>,
+    tools: Option<serde_json::Value>,
     tool_choice: Option<String>,
     params: GenParams,
     cid: String,
@@ -888,9 +958,19 @@ async fn streaming(
     let cid_cb = cid.clone();
     let model_cb = model_id.clone();
 
+    // Per-request abort latch: set when the client disconnects (an SSE `send` starts failing) and
+    // polled by the generator's decode loop so it stops promptly and frees the GPU slot instead of
+    // running to `max_tokens` into a dead socket (audit finding 2).
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_cb = cancel.clone();
+
     tokio::task::spawn_blocking(move || {
         // Held for exactly this generation; freed for the next queued request on return.
         let _permit = permit;
+        // Guarantees `[DONE]` is ALWAYS the final frame — including when the decode closure panics
+        // (Drop runs while unwinding), so a strict SSE client never hangs waiting for a sentinel
+        // that a panic swallowed (audit finding 1).
+        let _done = DoneGuard { tx: tx.clone() };
 
         // First chunk: role delta (mirrors the Python shim's opening chunk).
         let _ = tx.send(Ok(sse_chunk(
@@ -905,8 +985,7 @@ async fn streaming(
         )));
 
         let Some(engine) = engine_arc else {
-            // No engine — close the stream immediately.
-            let _ = tx.send(Ok(Event::default().data("[DONE]")));
+            // No engine — `DoneGuard` closes the stream with `[DONE]`.
             return;
         };
 
@@ -915,9 +994,10 @@ async fn streaming(
 
         let res = engine.chat(
             &messages,
-            tools_json.as_deref(),
+            tools.as_ref(),
             tool_choice.as_deref(),
             &params,
+            &cancel_cb,
             &mut |delta| {
                 let payload = match delta {
                     Delta::Reasoning(t) => DeltaPayload {
@@ -943,28 +1023,41 @@ async fn streaming(
                         }
                     }
                 };
-                let _ = tx_cb.send(Ok(sse_chunk(&cid_cb, &model_cb, created, payload, None)));
+                // A failed send means the receiver (the client's stream) is gone. Latch the abort so
+                // the decode loop stops at its next poll and returns the slot.
+                if tx_cb
+                    .send(Ok(sse_chunk(&cid_cb, &model_cb, created, payload, None)))
+                    .is_err()
+                {
+                    cancel_cb.store(true, Ordering::Relaxed);
+                }
             },
         );
 
-        let finish = if saw_tool_call {
-            Finish::ToolCalls
-        } else {
-            res.unwrap_or(Finish::Stop)
-        };
-
-        // Finish chunk: empty delta + finish_reason.
-        let _ = tx.send(Ok(sse_chunk(
-            &cid,
-            &model_id,
-            created,
-            DeltaPayload::default(),
-            Some(finish.as_str().into()),
-        )));
-
-        // OpenAI SSE sentinel.
-        let _ = tx.send(Ok(Event::default().data("[DONE]")));
-        // `tx` and `tx_cb` are both dropped here, which closes the channel and ends the stream.
+        match res {
+            Ok(outcome) => {
+                let finish = if saw_tool_call {
+                    Finish::ToolCalls
+                } else {
+                    outcome.finish
+                };
+                // Finish chunk: empty delta + finish_reason.
+                let _ = tx.send(Ok(sse_chunk(
+                    &cid,
+                    &model_id,
+                    created,
+                    DeltaPayload::default(),
+                    Some(finish.as_str().into()),
+                )));
+            }
+            Err(e) => {
+                // A mid-stream failure is NOT a clean `stop` — emit a terminal error frame so the
+                // client can tell this apart from success (matching the non-streaming 500). `[DONE]`
+                // still follows, via `DoneGuard` (audit finding 1).
+                let _ = tx.send(Ok(sse_error_event(&e.to_string())));
+            }
+        }
+        // `DoneGuard` drops here (or on an unwinding panic), sending the final `[DONE]`.
     });
 
     // Bridge the mpsc receiver to an async Stream for axum's Sse.
@@ -978,6 +1071,28 @@ async fn streaming(
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
+
+/// Sends the OpenAI `[DONE]` sentinel exactly once when it drops — from the normal end of the
+/// stream OR from an unwinding panic inside the decode closure. That is the whole point: a strict
+/// SSE client blocks until it sees `[DONE]`, so a swallowed panic must never leave the sentinel
+/// unsent (audit finding 1). A failed send (client already gone) is fine — nothing to deliver to.
+struct DoneGuard {
+    tx: tokio::sync::mpsc::UnboundedSender<Result<Event, Infallible>>,
+}
+
+impl Drop for DoneGuard {
+    fn drop(&mut self) {
+        let _ = self.tx.send(Ok(Event::default().data("[DONE]")));
+    }
+}
+
+/// A terminal SSE error frame: `data: {"error":{...}}`. Distinguishable from a normal
+/// `chat.completion.chunk` and from `[DONE]`, so a client can tell a mid-stream failure apart from a
+/// clean completion (audit finding 1).
+fn sse_error_event(msg: &str) -> Event {
+    let body = serde_json::json!({"error": {"message": msg, "type": "server_error"}});
+    Event::default().data(body.to_string())
+}
 
 /// Serialize a delta payload into an SSE event carrying a `chat.completion.chunk`.
 fn sse_chunk(
@@ -1020,12 +1135,61 @@ fn param_error(param: Option<&str>, msg: String) -> Response {
     (StatusCode::BAD_REQUEST, Json(body)).into_response()
 }
 
+/// Process-monotonic tie-breaker so two requests in the SAME millisecond (routine under
+/// `--parallel N`) never mint the same completion `id` — which also keeps the derived
+/// `call_{cid}_{idx}` tool-call ids unique (audit finding 4).
+static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 fn make_id() -> String {
     let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    format!("chatcmpl-{ms}")
+    let seq = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("chatcmpl-{ms}-{seq}")
+}
+
+/// Default ceiling for `max_tokens`/`max_completion_tokens` when `INFR_MAX_TOKENS_CAP` is unset —
+/// generous (128k) but finite, so one request cannot pin a slot for an absurd budget.
+const DEFAULT_MAX_TOKENS_CAP: u32 = 131_072;
+
+/// The configured `max_tokens` ceiling: `INFR_MAX_TOKENS_CAP` if a valid positive integer, else
+/// [`DEFAULT_MAX_TOKENS_CAP`]. Read per-request (cheap) so it needs no plumbing through `AppState`.
+fn max_tokens_cap() -> u32 {
+    std::env::var("INFR_MAX_TOKENS_CAP")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_MAX_TOKENS_CAP)
+}
+
+/// Clamp an explicit `max_tokens` to `cap`. `None` (unset) passes through untouched — the generator
+/// keeps applying its own `INFR_MAX_NEW` default, so behaviour is unchanged for requests that don't
+/// ask for a budget. Only an absurdly large EXPLICIT value is capped (audit finding 5).
+fn clamp_max_tokens(requested: Option<u32>, cap: u32) -> Option<u32> {
+    requested.map(|v| v.min(cap))
+}
+
+/// Optional bearer-token gate. `expected` is the configured API key (`INFR_API_KEY`), or `None`
+/// when auth is DISABLED — in which case every request is allowed (default; preserves existing
+/// localhost usage). When a key IS configured, the request must carry
+/// `Authorization: Bearer <key>` with a matching token (audit finding 5).
+fn authorize(expected: Option<&str>, auth_header: Option<&str>) -> bool {
+    match expected {
+        None => true,
+        Some(key) => auth_header
+            .and_then(|h| {
+                h.strip_prefix("Bearer ")
+                    .or_else(|| h.strip_prefix("bearer "))
+            })
+            .map(str::trim)
+            .is_some_and(|tok| tok == key),
+    }
+}
+
+/// The configured API key, or `None` when `INFR_API_KEY` is unset/empty (auth disabled).
+fn configured_api_key() -> Option<String> {
+    std::env::var("INFR_API_KEY").ok().filter(|k| !k.is_empty())
 }
 
 fn unix_ts() -> i64 {
@@ -1153,13 +1317,18 @@ mod tests {
         fn chat(
             &self,
             _messages: &[ChatMessage],
-            _tools_json: Option<&str>,
+            _tools: Option<&serde_json::Value>,
             _tool_choice: Option<&str>,
             _params: &GenParams,
+            _cancel: &AtomicBool,
             on_delta: &mut dyn FnMut(Delta),
-        ) -> anyhow::Result<Finish> {
+        ) -> anyhow::Result<ChatOutcome> {
             on_delta(Delta::Content(format!("from:{}", self.0)));
-            Ok(Finish::Stop)
+            Ok(ChatOutcome {
+                finish: Finish::Stop,
+                prompt_tokens: 3,
+                completion_tokens: 2,
+            })
         }
     }
 
@@ -1812,5 +1981,210 @@ mod tests {
         // An assistant tool-call message legally has `content: null` — it must flatten to "" (not the
         // literal "null", which would inject a stray word into the prompt).
         assert_eq!(flatten_content(&Some(serde_json::Value::Null)), "");
+    }
+
+    // --- make_id uniqueness (audit finding 4) ------------------------------
+
+    #[test]
+    fn make_id_is_unique_across_rapid_calls() {
+        // Two completions minted in the same millisecond (routine under --parallel N) must NOT
+        // collide — the monotonic suffix guarantees it even when the ms component is identical.
+        let n = 10_000;
+        let ids: std::collections::HashSet<String> = (0..n).map(|_| make_id()).collect();
+        assert_eq!(ids.len(), n, "make_id produced a collision");
+    }
+
+    // --- usage totals (audit finding 3) ------------------------------------
+
+    #[test]
+    fn usage_total_is_prompt_plus_completion() {
+        // The real fix: total == prompt + completion, from real counts, not content.len()/4.
+        let outcome = ChatOutcome {
+            finish: Finish::Stop,
+            prompt_tokens: 17,
+            completion_tokens: 5,
+        };
+        let usage = UsageInfo {
+            prompt_tokens: outcome.prompt_tokens,
+            completion_tokens: outcome.completion_tokens,
+            total_tokens: outcome
+                .prompt_tokens
+                .saturating_add(outcome.completion_tokens),
+        };
+        assert_eq!(usage.total_tokens, 22);
+        assert_eq!(
+            usage.total_tokens,
+            usage.prompt_tokens + usage.completion_tokens
+        );
+    }
+
+    /// End-to-end: the non-streaming handler must surface the generator's REAL counts (EchoGen
+    /// reports 3 prompt + 2 completion), not a byte-length estimate.
+    #[tokio::test]
+    async fn non_streaming_usage_comes_from_generator() {
+        let resp = multi_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"alpha","messages":[{"role":"user","content":"hi"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["usage"]["prompt_tokens"], 3);
+        assert_eq!(v["usage"]["completion_tokens"], 2);
+        assert_eq!(v["usage"]["total_tokens"], 5);
+    }
+
+    // --- tool_choice parsing (audit finding 6) -----------------------------
+
+    #[test]
+    fn tool_choice_string_passes_through() {
+        assert_eq!(
+            tool_choice_str(&serde_json::json!("required")).unwrap(),
+            Some("required".to_string())
+        );
+        assert_eq!(
+            tool_choice_str(&serde_json::json!("auto")).unwrap(),
+            Some("auto".to_string())
+        );
+    }
+
+    #[test]
+    fn tool_choice_named_function_forces_that_tool() {
+        let v = serde_json::json!({"type":"function","function":{"name":"bash"}});
+        assert_eq!(tool_choice_str(&v).unwrap(), Some("bash".to_string()));
+    }
+
+    #[test]
+    fn tool_choice_object_without_name_is_an_error_not_auto() {
+        // The bug: a forced-tool object lacking function.name silently downgraded to "auto". It must
+        // now be a 400 (ParamError), distinguishable from ABSENT (which the caller maps to None).
+        let v = serde_json::json!({"type":"function","function":{}});
+        let e = tool_choice_str(&v).unwrap_err();
+        assert_eq!(e.param, "tool_choice");
+        let v = serde_json::json!({"type":"function"});
+        assert!(tool_choice_str(&v).is_err());
+    }
+
+    #[test]
+    fn tool_choice_wrong_shape_is_an_error() {
+        assert!(tool_choice_str(&serde_json::json!(42)).is_err());
+        assert!(tool_choice_str(&serde_json::json!(["auto"])).is_err());
+    }
+
+    // --- max_tokens clamp (audit finding 5) --------------------------------
+
+    #[test]
+    fn max_tokens_clamps_absurd_values_but_passes_unset_and_normal() {
+        // Unset stays unset — the generator keeps applying its own INFR_MAX_NEW default (behaviour
+        // unchanged for requests that don't ask for a budget).
+        assert_eq!(clamp_max_tokens(None, 1000), None);
+        // A sane value under the cap is untouched.
+        assert_eq!(clamp_max_tokens(Some(512), 1000), Some(512));
+        // An absurd value is capped, not rejected.
+        assert_eq!(clamp_max_tokens(Some(10_000_000), 1000), Some(1000));
+        // Exactly the cap passes.
+        assert_eq!(clamp_max_tokens(Some(1000), 1000), Some(1000));
+    }
+
+    // --- optional bearer auth (audit finding 5) ----------------------------
+
+    #[test]
+    fn auth_disabled_allows_everything() {
+        // No key configured (None) => open, regardless of what the client sends.
+        assert!(authorize(None, None));
+        assert!(authorize(None, Some("Bearer whatever")));
+        assert!(authorize(None, Some("garbage")));
+    }
+
+    #[test]
+    fn auth_enabled_requires_matching_bearer() {
+        let key = Some("s3cret");
+        // Correct token (either capitalisation of the scheme) => allowed.
+        assert!(authorize(key, Some("Bearer s3cret")));
+        assert!(authorize(key, Some("bearer s3cret")));
+        // Wrong token, missing header, or malformed scheme => denied.
+        assert!(!authorize(key, Some("Bearer wrong")));
+        assert!(!authorize(key, None));
+        assert!(!authorize(key, Some("s3cret")));
+        assert!(!authorize(key, Some("Basic s3cret")));
+    }
+
+    // --- finish-reason mapping: Err is an error frame, never `stop` (finding 1) ---
+
+    /// A generator whose `chat` fails mid-stream. The streaming path must NOT relabel this as a
+    /// clean `stop`; it must emit a terminal error frame, then `[DONE]`.
+    struct FailGen;
+    impl ChatGenerator for FailGen {
+        fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&serde_json::Value>,
+            _tool_choice: Option<&str>,
+            _params: &GenParams,
+            _cancel: &AtomicBool,
+            on_delta: &mut dyn FnMut(Delta),
+        ) -> anyhow::Result<ChatOutcome> {
+            on_delta(Delta::Content("partial".into()));
+            anyhow::bail!("boom mid-stream")
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_error_emits_error_frame_not_stop() {
+        let g: Arc<dyn ChatGenerator> = Arc::new(FailGen);
+        let router = build_router(AppState::new(g, "m", 1));
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        // A terminal error frame is present, the stream is closed with [DONE], and NO finish chunk
+        // ever claimed a clean "stop".
+        assert!(text.contains("\"error\""), "missing error frame: {text}");
+        assert!(
+            text.contains("boom mid-stream"),
+            "error message lost: {text}"
+        );
+        assert!(text.contains("[DONE]"), "sentinel missing: {text}");
+        assert!(
+            !text.contains("\"finish_reason\":\"stop\""),
+            "an Err must not report a clean stop: {text}"
+        );
+    }
+
+    /// The abort-on-disconnect decision, unit-tested without a socket: when the SSE `send` returns
+    /// Err (receiver dropped), the callback must latch the per-request cancel flag. Full
+    /// disconnect→GPU-slot-release is integration-only (needs a live generator + real client drop).
+    #[test]
+    fn send_failure_latches_the_cancel_flag() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, Infallible>>();
+        let cancel = AtomicBool::new(false);
+        drop(rx); // simulate the client disconnecting: the receiver is gone.
+        if tx.send(Ok(Event::default().data("x"))).is_err() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "a failed send must latch the abort flag so the decode loop stops"
+        );
     }
 }

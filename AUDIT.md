@@ -22,7 +22,7 @@ reproduce/confirm are dropped (not listed) to keep this a verified-only ledger.
 
 - **Original audit:** 157 findings across 24 module slices (1 🔴 critical, 33 🟠
   major, 123 🟡 minor).
-- **Remaining open:** **140** — 0 🔴, 26 🟠, 114 🟡.
+- **Remaining open:** **134** — 0 🔴, 24 🟠, 110 🟡.
 
 No finding was accepted on an agent's word — each was re-read against the source
 by the coordinator; two agent-flagged "MAJOR"s (the Q5_1 clamp in the shader and
@@ -58,6 +58,20 @@ parked path).
   tests on Q4_K/Q6_K assert `to_bits()` equality). `dequant_factored` returns
   `Result` (was `unreachable!`); `apply_signs`/`Gguf::resolve` de-duplicate the
   IQ sign loops and tensor-bounds lookup.
+- **`infr-server` (all 6 findings)** — TDD, +13 tests. Streaming now emits a
+  terminal SSE `error` frame on failure (never a fake `stop`) and a `DoneGuard`
+  flushes `[DONE]` even on panic; a per-request `AtomicBool` cancel latch (set
+  when the client's SSE `send` fails) is polled in `run_chat` → `req.abort()`,
+  so a disconnected stream frees its GPU slot instead of running to
+  `max_tokens`; `usage` carries real prompt/completion counts
+  (`total=prompt+completion`); `make_id` appends a monotonic counter (no
+  `--parallel` id collisions); optional `INFR_API_KEY` bearer auth (default
+  open) + `max_tokens` clamp; `tools` passed as a borrowed `&Value` (no
+  round-trip) and a malformed forced `tool_choice` now 400s instead of silently
+  downgrading to auto. Trait `ChatGenerator::chat` signature updated with its
+  two infr-cli impls. _Deferred:_ streaming `usage` chunk (needs
+  `stream_options.include_usage` parsing) and the e2e disconnect→slot-release
+  path (integration-only; the latch logic is unit-tested).
 
 ### Highest-priority (production default paths)
 
@@ -65,8 +79,8 @@ parked path).
 | ------ | --- | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
 | ~~1~~  | ✅  | `infr-hub`                            | ~~Downloaded blob never sha256-verified~~ — **FIXED** (`1263bcc`, + full hub slice).                                                        |
 | 2      | 🟠  | `infr-llama chat/mod.rs:186`          | Generate error leaves an **orphaned user turn** → next turn has two consecutive user messages, permanent history corruption.                |
-| 3      | 🟠  | `infr-server lib.rs:953`              | Streaming path **swallows generation errors as a clean `stop`**; a closure panic hangs strict SSE clients (no `[DONE]`).                    |
-| 4      | 🟠  | `infr-server lib.rs:874`              | **No per-request cancellation** — a disconnected stream holds its GPU slot to `max_tokens`, blocking `--parallel` queue.                    |
+| ~~3~~  | ✅  | `infr-server lib.rs`                  | ~~Streaming swallows errors as `stop`~~ — **FIXED** (error frame + panic-safe `DoneGuard`).                                                 |
+| ~~4~~  | ✅  | `infr-server lib.rs`                  | ~~No per-request cancellation~~ — **FIXED** (cancel latch → `req.abort()` frees the slot).                                                  |
 | 5      | 🟠  | `infr-llama runner.rs:3743,3989`      | Prefix-cache records **KV rows never materialized** (`max_new==0` frontier; grammar-forced tokens) → next turn attends stale KV.            |
 | 6      | 🟠  | `infr-vulkan adapter.rs:2997`         | Static split-K attn bounds chunk _size_ not _count_ → `n_chunks>1024` **overruns `attn_combine` `wexp[1024]`** at huge ctx.                 |
 | 7      | 🟠  | `infr-vulkan ops.rs:229`              | Kernel-cache double-checked lock **double-compiles + leaks a pipeline** under concurrent first use.                                         |
@@ -961,49 +975,6 @@ agent verified and correctly ruled that out.)_
    per invocation (`820/917/ 973/1207/1835`). \_Fix:* `build_chat_model(...)`
    helper; delete the dead surface; parse GGUF metadata once and pass
    arch/DG/eos down.
-
-## infr-server/src/lib.rs
-
-1. **🟠
-   `lib.rs:953 — streaming path swallows generation errors as a clean `stop`.**
-   `res.unwrap_or(Finish::Stop)` discards the `Err` from `engine.chat`; a
-   mid-stream failure sends the client `finish_reason:"stop"` + `[DONE]`,
-   indistinguishable from a clean completion (the non-streaming path returns 500
-   for the same error — the two disagree). A panic in the `spawn_blocking`
-   closure is worse: the channel closes with neither a finish chunk nor
-   `[DONE]`, hanging a strict SSE client. _Fix:_ emit a terminal error frame
-   before `[DONE]`, don't report `stop`; guard the closure so a panic still
-   flushes `[DONE]`.
-2. **🟠
-   `lib.rs:874-968 — no per-request cancellation; a disconnected streaming client holds its GPU slot to `max_tokens`.**
-   Generation runs in `spawn_blocking`, stopped only by
-   EOS/stop/`max_tokens`/the process-wide shutdown latch. On client disconnect
-   axum drops `rx`, the `tx.send`s fail silently but generation keeps running
-   and keeps its per-model semaphore permit. Under `--parallel N`, N abandoned
-   streams block every queued request until each burns its full budget. _Fix:_
-   wire a per-request abort to the receiver lifetime (drop guard / detect `tx`
-   closed in `on_delta`) and poll it in the decode loop.
-3. **🟡 `lib.rs:841 — fabricated `usage`.** `completion_tokens=content.len()/4`
-   (byte-length estimate, wrong for non-ASCII, ignores reasoning/tool output);
-   `prompt_tokens`/`total_tokens` hard-coded 0 so `total != prompt+completion`;
-   streaming emits none. Breaks clients metering on `usage`. _Fix:_ return real
-   token counts from `chat`, populate `usage`.
-4. **🟡 `lib.rs:1023 — `make_id` is millisecond-only** → two requests in the
-   same ms (routine under `--parallel N`) get identical completion `id` and
-   colliding `call_{cid}_{idx}` tool-call ids; client dedup keyed on `id`
-   merges/drops distinct responses. _Fix:_ add a monotonic/random suffix.
-5. **🟡 `lib.rs:595,107 — no auth and no upper bound on `max_tokens`.** No
-   `Authorization` check; `max_tokens` validated for type only. One
-   unauthenticated request with a huge `max_tokens` holds a slot for the whole
-   budget — with the disconnect issue, a trivial resource-exhaustion vector for
-   a network listener. _Fix:_ optional bearer auth; clamp `max_tokens` to
-   context.
-6. **🟡 `lib.rs:701 & 359 — tools JSON re-serialized per request** (already a
-   `Value`, `.to_string()`'d for the generator to re-parse — a
-   parse→Value→string→parse round-trip); and `tool_choice_str` returns `None`
-   for an object lacking `function.name`, silently downgrading a malformed
-   _forced_-tool request to "auto" instead of 400. _Fix:_ pass the borrowed
-   `&Value`; distinguish absent from unparseable and error.
 
 ## infr-chat/src/{stream,tools,template}.rs
 

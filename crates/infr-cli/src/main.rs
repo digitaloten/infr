@@ -1539,12 +1539,13 @@ impl infr_server::ChatGenerator for SeamGenerator {
     fn chat(
         &self,
         messages: &[infr_engine::ChatMessage],
-        tools_json: Option<&str>,
+        tools: Option<&serde_json::Value>,
         tool_choice: Option<&str>,
         params: &infr_server::GenParams,
+        cancel: &std::sync::atomic::AtomicBool,
         on_delta: &mut dyn FnMut(infr_engine::Delta),
-    ) -> anyhow::Result<infr_server::Finish> {
-        run_chat(self, messages, tools_json, tool_choice, params, on_delta)
+    ) -> anyhow::Result<infr_server::ChatOutcome> {
+        run_chat(self, messages, tools, tool_choice, params, cancel, on_delta)
     }
 }
 
@@ -1552,12 +1553,13 @@ impl infr_server::ChatGenerator for ParallelGenerator {
     fn chat(
         &self,
         messages: &[infr_engine::ChatMessage],
-        tools_json: Option<&str>,
+        tools: Option<&serde_json::Value>,
         tool_choice: Option<&str>,
         params: &infr_server::GenParams,
+        cancel: &std::sync::atomic::AtomicBool,
         on_delta: &mut dyn FnMut(infr_engine::Delta),
-    ) -> anyhow::Result<infr_server::Finish> {
-        run_chat(self, messages, tools_json, tool_choice, params, on_delta)
+    ) -> anyhow::Result<infr_server::ChatOutcome> {
+        run_chat(self, messages, tools, tool_choice, params, cancel, on_delta)
     }
 }
 
@@ -1573,17 +1575,15 @@ impl infr_server::ChatGenerator for ParallelGenerator {
 fn run_chat(
     be: &dyn GenBackend,
     messages: &[infr_engine::ChatMessage],
-    tools_json: Option<&str>,
+    tools: Option<&serde_json::Value>,
     tool_choice: Option<&str>,
     params: &infr_server::GenParams,
+    cancel: &std::sync::atomic::AtomicBool,
     on_delta: &mut dyn FnMut(infr_engine::Delta),
-) -> anyhow::Result<infr_server::Finish> {
+) -> anyhow::Result<infr_server::ChatOutcome> {
     {
-        let tools: Option<serde_json::Value> = tools_json
-            .map(serde_json::from_str)
-            .transpose()
-            .context("parsing request `tools`")?;
-        let prompt = be.renderer().render(messages, tools.as_ref())?;
+        // `tools` arrives already parsed (a borrowed Value) — no Value→string→Value round-trip.
+        let prompt = be.renderer().render(messages, tools)?;
         // The request's `max_tokens`/`max_completion_tokens` wins; INFR_MAX_NEW (default 2048) is
         // the server-side default for requests that don't set one.
         let max_new = params.max_tokens.map(|v| v as usize).unwrap_or_else(|| {
@@ -1600,17 +1600,25 @@ fn run_chat(
         // llguidance machinery as the bespoke path — grammar::constrained_step runs inside the
         // seam decode). Prime the assistant turn with the <tool_call> opener and parse the
         // constrained JSON; on any failure fall back to unconstrained (mirrors LlamaGenerator).
-        if let Some(mut constraint) = be.renderer().tool_constraint(tools.as_ref(), tool_choice)? {
+        if let Some(mut constraint) = be.renderer().tool_constraint(tools, tool_choice)? {
             let primed = format!("{prompt}<tool_call>\n");
             let mut body = String::new();
+            let mut tokens = (0u32, 0u32);
             let emitted = match be.generate(
                 &primed,
                 max_new,
                 Some(&mut constraint),
                 &req,
-                &mut |p: &str| body.push_str(p),
+                &mut |p: &str| {
+                    body.push_str(p);
+                    // Client disconnected (server latched `cancel`): stop this constrained decode.
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        req.abort();
+                    }
+                },
             ) {
-                Ok(_) => {
+                Ok(gstats) => {
+                    tokens = (gstats.n_prompt as u32, gstats.n_gen as u32);
                     let body = body.trim().trim_end_matches("</tool_call>").trim();
                     match serde_json::from_str::<serde_json::Value>(body) {
                         Ok(val) => val.get("name").and_then(|v| v.as_str()).map(|name| {
@@ -1634,7 +1642,11 @@ fn run_chat(
                 }
             };
             if emitted {
-                return Ok(infr_server::Finish::ToolCalls);
+                return Ok(infr_server::ChatOutcome {
+                    finish: infr_server::Finish::ToolCalls,
+                    prompt_tokens: tokens.0,
+                    completion_tokens: tokens.1,
+                });
             }
             eprintln!(
                 "[tools] forced tool call produced no parseable call; falling back to unconstrained"
@@ -1661,7 +1673,9 @@ fn run_chat(
                 if !safe.is_empty() {
                     stream.push(&safe, &mut *od);
                 }
-                if stops.hit() {
+                // A stop sequence hit OR a client disconnect (the server latched `cancel`) both
+                // abort THIS sequence's decode at its next poll, freeing the GPU slot promptly.
+                if stops.hit() || cancel.load(std::sync::atomic::Ordering::Relaxed) {
                     req.abort();
                 }
             })?;
@@ -1673,13 +1687,18 @@ fn run_chat(
             stats
         };
         stream.finish(on_delta);
-        Ok(if stops.hit() {
+        let finish = if stops.hit() {
             infr_server::Finish::Stop
         } else if stats.n_gen >= max_new {
             // The budget was exhausted (EOS would have broken the loop earlier).
             infr_server::Finish::Length
         } else {
             infr_server::Finish::Stop
+        };
+        Ok(infr_server::ChatOutcome {
+            finish,
+            prompt_tokens: stats.n_prompt as u32,
+            completion_tokens: stats.n_gen as u32,
         })
     }
 }
