@@ -22,7 +22,7 @@ reproduce/confirm are dropped (not listed) to keep this a verified-only ledger.
 
 - **Original audit:** 157 findings across 24 module slices (1 🔴 critical, 33 🟠
   major, 123 🟡 minor).
-- **Remaining open:** **32** — 0 🔴, 6 🟠, 26 🟡. (4 findings are explicitly
+- **Remaining open:** **27** — 0 🔴, 6 🟠, 21 🟡. (4 findings are explicitly
   **deferred**, not open work: the 🟠 `make_compute_kernel` OOM→Result and three
   🟡 shader/dp4a DRY refactors — each risks the byte-identity gate or the
   recorded stream; see their sections.)
@@ -268,6 +268,18 @@ parked path).
   Q8 rounding comment is corrected (no golden pins those bytes). _Deferred:_
   skipping the execute-prologue zero-fill (needs a per-tensor read-before-write
   dataflow pass — `CopyStrided`/`RmsNormAdd` dsts require it).
+- **`infr-cpu` kernels (all 5 findings)** — TDD, +4 tests;
+  `gpu_seam_bf16_matches_cpu` stays token-identical + `cpu_golden_qwen3`
+  unaffected. `dot_bf16` now uses the same 8-independent-accumulator structure
+  as `dot`/ `dot_f16` (was a latency-bound serial chain — the one intended
+  bit-for-bit float reorder, within the bf16 golden's tolerance);
+  `debug_assert`s catch a non-256-multiple `in_f` on the ten K-quant dispatchers
+  and unequal lengths in `dot` (were silent wrong-answers);
+  `vec_dot_q6k_batch_avx512bw` is renamed `_vnni` (it requires VNNI); the
+  144-byte Q4*K decode block is extracted to a shared `q4k_decode_row`
+  (bit-identical, verified through the real AVX512BW path); the Q6_K maddubs
+  comment is corrected. **infr-cpu is fully cleared.** \_Deferred:* the
+  batch-kernel per-call scratch-alloc reduction (a dedicated perf change).
 
 ### Highest-priority (production default paths)
 
@@ -508,41 +520,6 @@ items below are latent acceptance-rate/perf bugs, not output corruption._
    And `2200` the Linear arm allocates `dev_dst` up front that the
    fused-residual peephole leaves dead. _Fix:_ one `(base → {suffix → kernel})`
    table so a miss is a registry error; defer `dev_dst` past the fused check.
-
-## infr-cpu/src/kernels.rs
-
-_(No CRITICAL/MAJOR: the integer quant math is bit-identity tested, and the
-`abs`/`sign` maddubs trick is exact given the `[-127,127]` activation clamp —
-agent verified and correctly ruled that out.)_
-
-1. **🟡 `kernels.rs:2917 — `dot_bf16` uses a single serial accumulator**, unlike
-   `dot`/`dot_f16` which use 8 independent lanes (doc `2926`) to avoid a
-   latency-bound FMA chain → several× slower on the bf16-weight GEMM/attention
-   hot path, no numerical reason. _Fix:_ mirror the 8-accumulator chunked
-   structure.
-2. **🟡 `kernels.rs:32,2933 — silent wrong-answer on shape mismatch.** Every
-   256-block K-quant kernel computes `nb=in_f/256` and drops the tail with no
-   assert if `in_f%256!=0`; `dot` truncates to `a.len().min(b.len())` masking
-   unequal-length caller bugs. Both return a plausible-but-wrong scalar (wrong
-   attention score / dot) with no signal — the worst inference failure mode.
-   _Fix:_ `debug_assert_eq!(in_f%256,0)` / `debug_assert_eq!(a.len(),b.len())`.
-3. **🟡 `kernels.rs:1819 — `vec_dot_q6k_batch_avx512bw` is misnamed** — it's
-   `target_feature(avx512bw,avx512vnni)` and built on `_mm512_dpbusd_epi32`
-   (VNNI), dispatched only when VNNI is present. An AVX512BW-without-VNNI CPU
-   falls to the AVX2 path (256-bit) for Q6*K batch (unlike Q4_K/Q5_K/Q8_0). Name
-   misleads dispatch reasoning. \_Fix:* rename `_vnni`; add a real avx512bw Q6_K
-   path if that HW matters.
-4. **🟡 `kernels.rs:835,1642 — DRY + per-call scratch allocs.** The
-   144-byte-block decode/nibble-unpack sequence is copy-pasted ~10× across the
-   Q4*K batch kernels (and Q5_K/Q6_K analogs); each
-   `\_batch*`call heap-allocates fresh`d_arr`/`sc_arr`/`*\_flat`(+`ilv=vec![0u8;nb*2048]`) — churn inside the matmul row loop that dominates at small `m`(decode). \_Fix:*`#[inline]` `q4k_decode_row(...)` helper; caller-provided/thread-local reusable scratch (or route small-`m`
-   to the single-token kernels).
-5. **🟡
-   `kernels.rs:312 (doc) — Q6_K maddubs pair-sum bound comment says `±8001`**
-   but `maddubs` sums two adjacent products → true bound `2·63·127=16002`
-   (`-16128`). No bug (still < i16 max) but the comment records half the real
-   headroom, misleading anyone re-deriving the no-overflow guarantee (the Q4*K
-   analog `100` is correct). \_Fix:* correct to `16002`/`-16128`.
 
 ## infr-core/iquant_grids.rs · infr-engine · infr-prof · infr-prof-rt
 
