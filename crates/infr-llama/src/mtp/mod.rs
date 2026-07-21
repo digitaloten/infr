@@ -379,11 +379,13 @@ struct MtpHandles {
     /// The 16 weight handles, in [`upload_mtp_head_bufs`]'s push order (index-parallel with
     /// `MtpHeadSession::wbufs`).
     weights: Vec<TensorId>,
-    /// The lm_head GEMM's output. An `Output` (host-downloadable) tensor when `fuse_prob` was
-    /// `false`; an `Internal` (device-only scratch, never bound) tensor when `fuse_prob` was `true`
-    /// — the fused variant reads it straight into `Op::ArgmaxProb` and never sends the row to the
-    /// host at all (see [`build_mtp_graph`]'s doc).
-    logits: TensorId,
+    /// The lm_head GEMM's output, or `None` when built with `want_logits == false` (the catch-up
+    /// path — AUDIT #2): a KV-only forward omits the lm_head `Op::Linear` + its `[rows*vocab]`
+    /// readback entirely, since catch_up discards the logits. When present it's an `Output`
+    /// (host-downloadable) tensor for `fuse_prob == false`, or an `Internal` (device-only scratch,
+    /// never bound) tensor for `fuse_prob == true` — the fused variant reads it straight into
+    /// `Op::ArgmaxProb` and never sends the row to the host at all (see [`build_mtp_graph`]'s doc).
+    logits: Option<TensorId>,
     h_mtp: TensorId,
     /// `Some((id, prob))` only when built with `fuse_prob == true` — the two 1-element `Output`s
     /// `Op::ArgmaxProb` writes (issue #33 follow-up: 8 bytes instead of the `[vocab]` logits row).
@@ -427,6 +429,14 @@ struct MtpHandles {
 /// argmax/softmax scan that used to consume it). Requires `rows == 1` (the draft loop's own shape;
 /// `Op::ArgmaxProb` is single-row only, see its doc) — callers with `rows > 1` (catch_up, verify
 /// priming) must pass `fuse_prob = false`.
+///
+/// `want_logits` (AUDIT #2): when `false`, the lm_head `Op::Linear` (a `[rows, vocab]` GEMM over the
+/// 151936-token vocab) and its `Output` logits tensor are OMITTED — the graph stops at the KV writes
+/// and the `h_mtp` norm. The catch-up path (`catch_up` → `forward(want_logits = false)`) only needs
+/// the `WriteKv` ops to re-sync the head's KV; it discards the logits every cycle, so computing and
+/// downloading a full vocab-wide row was pure waste. The retained ops (through the `WriteKv`s) are
+/// byte-identical to the `want_logits == true` build. `fuse_prob == true` forces logits on (the
+/// `Op::ArgmaxProb` reads them).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn build_mtp_graph(
     cfg: &crate::Config,
@@ -435,11 +445,14 @@ fn build_mtp_graph(
     rows: usize,
     start_pos: usize,
     fuse_prob: bool,
+    want_logits: bool,
 ) -> (Graph, MtpHandles) {
     debug_assert!(
         !fuse_prob || rows == 1,
         "build_mtp_graph: fuse_prob requires rows == 1 (Op::ArgmaxProb is single-row only)"
     );
+    // fuse_prob needs the logits row to reduce; it always implies want_logits.
+    let want_logits = want_logits || fuse_prob;
     let ne = cfg.n_embd;
     let nh = cfg.n_head;
     let nkv = cfg.n_kv;
@@ -506,12 +519,15 @@ fn build_mtp_graph(
         w_lm_head,
     ];
 
+    // `logits`: omitted entirely on the KV-only catch-up path (`want_logits == false` — AUDIT #2).
     // Fused variant: `logits` never leaves the device (Internal scratch, read straight into
-    // Op::ArgmaxProb below) — see this fn's doc on `fuse_prob`.
-    let logits = if fuse_prob {
-        g.internal(f32d(rows * cfg.vocab))
+    // Op::ArgmaxProb below) — see this fn's doc on `fuse_prob`/`want_logits`.
+    let logits = if !want_logits {
+        None
+    } else if fuse_prob {
+        Some(g.internal(f32d(rows * cfg.vocab)))
     } else {
-        g.output(f32d(rows * cfg.vocab))
+        Some(g.output(f32d(rows * cfg.vocab)))
     };
     let h_mtp = g.output(f32d(rows * ne));
     let id_prob = fuse_prob.then(|| (g.output(f32d(1)), g.output(f32d(1))));
@@ -801,27 +817,30 @@ fn build_mtp_graph(
         dim: ne as u32,
         eps,
     });
-    // logits = lm_head @ h_mtp — qwen35.cpp:633-642.
-    g.push(Op::Linear {
-        x: h_mtp,
-        weight: w_lm_head,
-        dst: logits,
-        m: rows as u32,
-        in_f: ne as u32,
-        out_f: cfg.vocab as u32,
-        w_off: 0,
-    });
-    // Fused draft-loop accept (issue #33 follow-up, de35727's deferred DRAFT-side twin): argmax +
-    // softmax top-1 probability computed on-device, straight off the Internal `logits` this
-    // Linear just wrote — 8 bytes cross the bus instead of the whole `[vocab]` row. See
-    // `Op::ArgmaxProb`'s doc for the tie-break/numerics contract.
-    if let Some((id_out, prob_out)) = id_prob {
-        g.push(Op::ArgmaxProb {
-            x: logits,
-            dst_id: id_out,
-            dst_prob: prob_out,
-            n: cfg.vocab as u32,
+    // logits = lm_head @ h_mtp — qwen35.cpp:633-642. Skipped on the KV-only catch-up path
+    // (`logits == None`, AUDIT #2): the vocab-wide GEMM + readback is dead work there.
+    if let Some(logits) = logits {
+        g.push(Op::Linear {
+            x: h_mtp,
+            weight: w_lm_head,
+            dst: logits,
+            m: rows as u32,
+            in_f: ne as u32,
+            out_f: cfg.vocab as u32,
+            w_off: 0,
         });
+        // Fused draft-loop accept (issue #33 follow-up, de35727's deferred DRAFT-side twin): argmax
+        // + softmax top-1 probability computed on-device, straight off the Internal `logits` this
+        // Linear just wrote — 8 bytes cross the bus instead of the whole `[vocab]` row. See
+        // `Op::ArgmaxProb`'s doc for the tie-break/numerics contract.
+        if let Some((id_out, prob_out)) = id_prob {
+            g.push(Op::ArgmaxProb {
+                x: logits,
+                dst_id: id_out,
+                dst_prob: prob_out,
+                n: cfg.vocab as u32,
+            });
+        }
     }
 
     (
@@ -1490,6 +1509,7 @@ impl<'a> MtpHeadSession<'a> {
         tokens: &[u32],
         h_rows: &[f32],
         start_pos: usize,
+        want_logits: bool,
     ) -> Result<(Vec<f32>, Vec<f32>)> {
         let rows = tokens.len();
         let ne = self.cfg.n_embd;
@@ -1520,6 +1540,7 @@ impl<'a> MtpHeadSession<'a> {
             rows,
             start_pos,
             false,
+            want_logits,
         );
         let plan = self.be.compile(&graph).map_err(|e| anyhow!("{e}"))?;
         self.build_secs += t_build.elapsed().as_secs_f64();
@@ -1537,10 +1558,15 @@ impl<'a> MtpHeadSession<'a> {
             .be
             .alloc(rows * 4, BufferUsage::Staging)
             .map_err(|e| anyhow!("{e}"))?;
-        let logits_buf = self
-            .be
-            .alloc(rows * self.cfg.vocab * 4, BufferUsage::Readback)
-            .map_err(|e| anyhow!("{e}"))?;
+        // KV-only catch-up (`want_logits == false`, AUDIT #2): no lm_head output to read back.
+        let logits_buf = match h.logits {
+            Some(_) => Some(
+                self.be
+                    .alloc(rows * self.cfg.vocab * 4, BufferUsage::Readback)
+                    .map_err(|e| anyhow!("{e}"))?,
+            ),
+            None => None,
+        };
         let hmtp_buf = self
             .be
             .alloc(rows * ne * 4, BufferUsage::Readback)
@@ -1565,17 +1591,22 @@ impl<'a> MtpHeadSession<'a> {
         for (i, wid) in h.weights.iter().enumerate() {
             b.bind(*wid, self.wbufs[i].as_ref());
         }
-        b.bind(h.logits, logits_buf.as_ref());
+        if let (Some(lid), Some(lbuf)) = (h.logits, logits_buf.as_ref()) {
+            b.bind(lid, lbuf.as_ref());
+        }
         b.bind(h.h_mtp, hmtp_buf.as_ref());
 
         self.be
             .execute(plan.as_ref(), &b)
             .map_err(|e| anyhow!("{e}"))?;
 
-        let mut logits = vec![0f32; rows * self.cfg.vocab];
-        self.be
-            .download(logits_buf.as_ref(), bytemuck::cast_slice_mut(&mut logits))
-            .map_err(|e| anyhow!("{e}"))?;
+        let mut logits = Vec::new();
+        if let Some(lbuf) = logits_buf.as_ref() {
+            logits = vec![0f32; rows * self.cfg.vocab];
+            self.be
+                .download(lbuf.as_ref(), bytemuck::cast_slice_mut(&mut logits))
+                .map_err(|e| anyhow!("{e}"))?;
+        }
         let mut h_mtp = vec![0f32; rows * ne];
         self.be
             .download(hmtp_buf.as_ref(), bytemuck::cast_slice_mut(&mut h_mtp))
@@ -1605,7 +1636,7 @@ impl<'a> MtpHeadSession<'a> {
         pos: usize,
     ) -> Result<(u32, f32, Vec<f32>)> {
         if !self.gpu_draft_prob_enabled() {
-            let (logits, h_mtp) = self.forward(&[tok], h_row, pos)?;
+            let (logits, h_mtp) = self.forward(&[tok], h_row, pos, true)?;
             let (id, p) = top1_softmax(&logits);
             return Ok((id, p, h_mtp));
         }
@@ -1627,7 +1658,7 @@ impl<'a> MtpHeadSession<'a> {
         let positions = [pos as i32];
 
         let t_build = std::time::Instant::now();
-        let (graph, h) = build_mtp_graph(&self.cfg, &self.wspecs, self.max_ctx, 1, pos, true);
+        let (graph, h) = build_mtp_graph(&self.cfg, &self.wspecs, self.max_ctx, 1, pos, true, true);
         let plan = self.be.compile(&graph).map_err(|e| anyhow!("{e}"))?;
         self.build_secs += t_build.elapsed().as_secs_f64();
 
@@ -1878,7 +1909,9 @@ pub const DEFAULT_P_MIN: f32 = 0.0;
 /// memcpy + `set_h`), so this primitive stays a plain "forward these `R` `(token, h)` pairs at
 /// `start_pos`, discard the logits" call with no special-casing of the first row. The head's own KV
 /// rows `start_pos..start_pos+tokens.len()` are (over)written — see `forward`'s doc on the
-/// overwrite semantics a re-draft relies on.
+/// overwrite semantics a re-draft relies on. Runs the KV-only forward (`want_logits == false`,
+/// AUDIT #2): only the `WriteKv` ops matter here, so the lm_head `[rows*vocab]` GEMM + its readback
+/// are omitted — catch_up discarded that logits row every call.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn catch_up(
     sess: &mut MtpHeadSession,
@@ -1886,7 +1919,7 @@ pub fn catch_up(
     h_rows: &[f32],
     start_pos: usize,
 ) -> Result<()> {
-    sess.forward(tokens, h_rows, start_pos)?;
+    sess.forward(tokens, h_rows, start_pos, false)?;
     Ok(())
 }
 
@@ -1962,7 +1995,7 @@ fn draft_stochastic(
     let mut tok = id_last;
     let mut h = pending_h.to_vec();
     for pos in n_past..n_past + n_max {
-        let (logits, h_mtp) = sess.forward(&[tok], &h, pos)?;
+        let (logits, h_mtp) = sess.forward(&[tok], &h, pos, true)?;
         let dist = crate::sampling::truncated_dist(&logits, sampler);
         let id = crate::sampling::sample_from_dist(&dist, rng);
         result.push((id, dist));
@@ -2226,6 +2259,48 @@ impl MtpTiming {
     }
 }
 
+/// The base row of the NON-leading verify branch (`generate_mtp_spec_core`'s cycle-2+ path): the
+/// verify feed is `committed ++ cand`, and after a re-prefill the trunk returns `m` rows whose LAST
+/// `cand.len() + 1` are the real leading row (position `n_past-1`, re-confirming `cand[0]`) followed
+/// by the `cand.len()` draft rows — so the leading row sits at `base = m - (cand.len() + 1)`.
+///
+/// AUDIT #4: guards the `usize` subtraction. The `debug_assert_eq!(m, cand.len())` on the LEADING
+/// branches never covers this one; a state edge with `m < cand.len() + 1` would wrap to a huge index
+/// and panic on the subsequent slice. Return an `Err` instead of underflowing.
+fn nonleading_base(m: usize, cand_len: usize) -> Result<usize> {
+    anyhow::ensure!(
+        m > cand_len,
+        "mtp verify: got {m} row(s) but the non-leading branch needs at least cand.len()+1 = {} \
+         (leading row + {cand_len} draft rows)",
+        cand_len + 1
+    );
+    Ok(m - (cand_len + 1))
+}
+
+/// The cycle-1 (and post-reprime) VIRTUAL leading row (`generate_mtp_spec_core`'s doc + `backends.rs`'s
+/// "The `+1` leading row" section): the row that re-confirms/predicts a cycle's `cand[0]`, absent from
+/// the verify feed because the prime/reprime already cached it, spliced in so the SAME accept/catch-up
+/// code handles cycle 1 like every later cycle.
+///
+/// AUDIT #5: bundling `h` with its prediction into one `Option<Leading>` enforces the present-or-absent
+/// lock-step the three former `leading_{h,id,dist}` Options had to maintain by hand — `h` is ALWAYS
+/// present when a leading row exists, and EXACTLY one of the greedy `Id` / stochastic `Dist`
+/// predictions is (matching the `stochastic` flag), instead of two independently-`Option`al fields a
+/// future edit could desync.
+struct Leading {
+    /// The leading row's target hidden (position `n_past-1`) — row 0 of `catchup_h_all`.
+    h: Vec<f32>,
+    /// The leading row's prediction, in the flavor the accept rule for this run consumes.
+    pred: LeadingPred,
+}
+
+/// The leading row's prediction — greedy hands back just the argmax id (GPU-resident verify, issue
+/// #31); the stochastic accept rule needs the full truncated proposal distribution instead.
+enum LeadingPred {
+    Id(u32),
+    Dist(Vec<(u32, f32)>),
+}
+
 /// Greedy argmax over one `[vocab]` logits row (unlike [`top1_softmax`], no probability needed —
 /// `spec_accept`/the verify-round check only reads the winning id).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -2376,15 +2451,22 @@ fn generate_mtp_spec_core(
     let mut pending_h = h_rows0[(p - 1) * ne..].to_vec();
     let mut n_past = p;
 
-    // Cycle 1's virtual leading row (see this fn's doc) — `None` from cycle 2 on, once consumed.
-    // Greedy only needs the row's ARGMAX ID (the GPU-resident verify accept, issue #31, hands back
-    // just the ids); the stochastic path needs the row's full truncated distribution instead
-    // (`leading_dist`), built from the prime verify's full logits row.
-    let mut leading_id: Option<u32> = (!stochastic).then(|| ids0[p - 1]);
-    let mut leading_dist: Option<Vec<(u32, f32)>> = stochastic.then(|| {
-        crate::sampling::truncated_dist(&logits0[(p - 1) * cfg.vocab..p * cfg.vocab], sampler)
+    // Cycle 1's virtual leading row (see this fn's doc + `Leading`'s doc) — `None` from cycle 2 on,
+    // once consumed. Greedy carries the row's ARGMAX ID (the GPU-resident verify accept, issue #31,
+    // hands back just the ids); the stochastic path carries the row's full truncated distribution
+    // instead, built from the prime verify's full logits row. AUDIT #5: one `Option<Leading>` keeps
+    // `h` and the prediction present-or-absent in lock-step.
+    let mut leading: Option<Leading> = Some(Leading {
+        h: pending_h.clone(),
+        pred: if stochastic {
+            LeadingPred::Dist(crate::sampling::truncated_dist(
+                &logits0[(p - 1) * cfg.vocab..p * cfg.vocab],
+                sampler,
+            ))
+        } else {
+            LeadingPred::Id(ids0[p - 1])
+        },
     });
-    let mut leading_h: Option<Vec<f32>> = Some(pending_h.clone());
 
     let mut acc: Vec<u32> = Vec::new();
     let mut printed = 0usize;
@@ -2475,12 +2557,16 @@ fn generate_mtp_spec_core(
         let verify_secs = t_verify.elapsed().as_secs_f64();
         let m = h_rows.len() / ne;
 
-        // `leading_h` tracks cycle-1-vs-later for BOTH flavors (only one of leading_id/leading_dist
-        // is ever populated, matching `stochastic`); read it before either gets `.take()`n below.
-        let has_leading = leading_h.is_some();
+        // Consume the leading row ONCE (AUDIT #5: `Leading` bundles `h` + prediction in lock-step).
+        // The accept rule below reads the prediction; the catch-up block reads `h` — split the taken
+        // value so each gets its half and the state auto-clears for cycle 2+ (`None` until reprime).
+        let (leading_h, leading_pred) = match leading.take() {
+            Some(Leading { h, pred }) => (Some(h), Some(pred)),
+            None => (None, None),
+        };
         let (accepted, next_tok) = if stochastic {
             let vocab = cfg.vocab;
-            let p_rows: Vec<Vec<(u32, f32)>> = if let Some(ld) = leading_dist.take() {
+            let p_rows: Vec<Vec<(u32, f32)>> = if let Some(LeadingPred::Dist(ld)) = leading_pred {
                 debug_assert_eq!(m, cand.len(), "cycle 1 verify carries no leading row");
                 let mut v = Vec::with_capacity(m + 1);
                 v.push(ld);
@@ -2489,7 +2575,7 @@ fn generate_mtp_spec_core(
                 }));
                 v
             } else {
-                let base = m - (cand.len() + 1);
+                let base = nonleading_base(m, cand.len())?;
                 (base..m)
                     .map(|j| {
                         crate::sampling::truncated_dist(
@@ -2501,11 +2587,11 @@ fn generate_mtp_spec_core(
             };
             crate::seam::model::spec_accept_stochastic(&cand, &q_dists, &p_rows, &mut rng)
         } else {
-            let varg: Vec<u32> = if let (Some(lid), Some(_)) = (leading_id, &leading_h) {
+            let varg: Vec<u32> = if let Some(LeadingPred::Id(lid)) = leading_pred {
                 debug_assert_eq!(m, cand.len(), "cycle 1 verify carries no leading row");
                 std::iter::once(lid).chain(vids.iter().copied()).collect()
             } else {
-                let base = m - (cand.len() + 1);
+                let base = nonleading_base(m, cand.len())?;
                 vids[base..].to_vec()
             };
             crate::seam::model::spec_accept(&cand, &varg)
@@ -2539,13 +2625,12 @@ fn generate_mtp_spec_core(
 
         // The (accepted+1) rows of `h` to catch the head's KV up to — row 0 is the virtual/real
         // leading row, rows 1.. are this cycle's own verify output (see this fn's doc).
-        let catchup_h_all: Vec<f32> = if has_leading {
-            let mut v = leading_h.take().expect("has_leading implies Some");
-            leading_id = None;
+        let catchup_h_all: Vec<f32> = if let Some(lh) = leading_h {
+            let mut v = lh;
             v.extend_from_slice(&h_rows);
             v
         } else {
-            let base = m - (cand.len() + 1);
+            let base = nonleading_base(m, cand.len())?;
             h_rows[base * ne..].to_vec()
         };
         let mut catchup_tokens: Vec<u32> = cand[..accepted].to_vec();
@@ -2553,8 +2638,25 @@ fn generate_mtp_spec_core(
         let catchup_h = &catchup_h_all[..(accepted + 1) * ne];
 
         let t_catchup = std::time::Instant::now();
-        catch_up(head_sess, &catchup_tokens, catchup_h, n_past + 1)?;
+        // AUDIT #1: catch up at `n_past`, NOT `n_past + 1`. The draft appended its rows at absolute
+        // positions `n_past + s` (`draft`/`forward_draft`, matching `speculative.cpp`'s
+        // `dp.n_past + i`), so the committed tokens `[cand[..accepted] | next_tok]` occupy positions
+        // `n_past .. n_past + accepted` and MUST overwrite the head's KV at exactly those rows —
+        // `start_pos = n_past`. `catchup_h[0]` (= the leading row's h, target hidden at position
+        // `n_past-1`) pairs with token position `n_past` under the head's `(t_pos, h_{pos-1})`
+        // convention (see prime's `catch_up(..., 0)` with `shifted_h[i] = h_{i-1}`). The old `+1`
+        // stored every (token, h) pair one row too high (wrong RoPE position + a stale h) and left
+        // the draft's own stale row at `n_past` un-rewritten, corrupting the KV the NEXT cycle's
+        // attention reads (an acceptance-rate bug; token-identity is VERIFY-guarded either way).
+        catch_up(head_sess, &catchup_tokens, catchup_h, n_past)?;
         let catchup_secs = t_catchup.elapsed().as_secs_f64();
+        // AUDIT #3: `pending_h` here is `h_{n_past+accepted-1}` — the target hidden that PREDICTED
+        // `next_tok`, i.e. one step behind `next_tok`'s OWN hidden `h_{n_past+accepted}` that the
+        // convention wants for the next draft's row-0 (position `n_past_new-1`). `next_tok` is
+        // deferred through the trunk (it "never went through the trunk this cycle"), so its own
+        // hidden is NOT computed here — the row at position `n_past+accepted` was fed the REJECTED
+        // draft token, not `next_tok`. This one-step-stale handoff is the best available on the
+        // common path; the reprime branch below, which DOES re-decode `next_tok`, corrects it.
         pending_h = catchup_h[accepted * ne..].to_vec();
         sum_draft_secs += draft_secs;
         sum_verify_secs += verify_secs;
@@ -2618,8 +2720,9 @@ fn generate_mtp_spec_core(
         // hand the last row to the next cycle as its leading row exactly like the prompt prime
         // does for cycle 1. Timed into the catchup bucket: it's committed-boundary maintenance,
         // not verify work. Uses [`run_prime_last`], NOT [`run_verify`]/[`run_verify_full`]: only
-        // the LAST row's id/logits/h is ever read below (`leading_id`/`leading_dist`/`leading_h`),
-        // so a full VERIFY's per-row lm_head here would compute up to `MTP_REPRIME_MAX_M`-1 rows
+        // the LAST row's id/logits/h is ever read below (it becomes the next cycle's [`Leading`] +
+        // `pending_h` — AUDIT #3), so a full VERIFY's per-row lm_head here would compute up to
+        // `MTP_REPRIME_MAX_M`-1 rows
         // of vocab-wide GEMM that are immediately thrown away — see `run_prime_last`'s doc.
         if restored && mtp_reprime && (committed.len() - boundary) + n_max > MTP_REPRIME_MAX_M {
             let t_reprime = std::time::Instant::now();
@@ -2634,18 +2737,25 @@ fn generate_mtp_spec_core(
                 max_ctx,
                 stochastic,
             )?;
-            if stochastic {
+            let pred = if stochastic {
                 anyhow::ensure!(
                     rlogits.len() == cfg.vocab,
                     "mtp reprime: expected {} logits, got {}",
                     cfg.vocab,
                     rlogits.len()
                 );
-                leading_dist = Some(crate::sampling::truncated_dist(&rlogits, sampler));
+                LeadingPred::Dist(crate::sampling::truncated_dist(&rlogits, sampler))
             } else {
-                leading_id = Some(rid);
-            }
-            leading_h = Some(rh);
+                LeadingPred::Id(rid)
+            };
+            // AUDIT #3: the reprime pass re-decoded `next_tok` (committed's last row), so `rh` is
+            // `next_tok`'s OWN hidden `h_{n_past_new-1}` — exactly the row-0 `h` the next draft wants
+            // (position `n_past_new`, convention `(t_pos, h_{pos-1})`). Refresh `pending_h` with it,
+            // replacing the one-step-stale predicting-hidden the common-path handoff left above. (On
+            // the non-reprime path `next_tok`'s own hidden isn't computed until the next verify, so
+            // the stale handoff stands there — see the `pending_h` comment after `catch_up`.)
+            pending_h = rh.clone();
+            leading = Some(Leading { h: rh, pred });
             if let Some(st) = trunk_state.as_mut() {
                 st.mtp_snapshot_delta(be, cfg)?;
             }
@@ -2679,4 +2789,24 @@ fn generate_mtp_spec_core(
         },
         timing,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::nonleading_base;
+
+    /// AUDIT #4: the non-leading `base = m - (cand.len()+1)` subtraction must return an `Err` (not
+    /// wrap `usize` and panic on the subsequent slice) when the trunk hands back too few rows.
+    #[test]
+    fn nonleading_base_guards_underflow() {
+        // Normal cycle-2+ shape: m = cand.len() + 1 (leading row + the drafted rows).
+        assert_eq!(nonleading_base(7, 6).unwrap(), 0);
+        // Re-prefilled window: extra committed rows precede the leading row.
+        assert_eq!(nonleading_base(13, 6).unwrap(), 6);
+        assert_eq!(nonleading_base(1, 0).unwrap(), 0);
+        // Underflow edge (m < cand.len()+1) -> Err, NOT a wrapped huge index / slice panic.
+        assert!(nonleading_base(6, 6).is_err());
+        assert!(nonleading_base(0, 0).is_err());
+        assert!(nonleading_base(3, 6).is_err());
+    }
 }
