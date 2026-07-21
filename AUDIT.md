@@ -22,13 +22,12 @@ reproduce/confirm are dropped (not listed) to keep this a verified-only ledger.
 
 - **Original audit:** 157 findings across 24 module slices (1 🔴 critical, 33 🟠
   major, 123 🟡 minor).
-- **Remaining open:** **18** — 0 🔴, 6 🟠, 12 🟡, essentially all in the gated
-  multi-GPU and the parked MTP (plus one Mac-verify latent metal item + 4
-  deferred DRY refactors). The 🟠s: the deferred `make_compute_kernel`
-  OOM→Result, the Mac-only latent metal wrong-kernel dispatch, the gated
-  multi-GPU `p2p`/all-reduce pair, and the parked-MTP `catch_up`/logits pair.
-  The 4 deferred 🟡s are shader/dp4a DRY refactors that risk the byte-identity
-  gate — see their sections.
+- **Remaining open:** **10** — 0 🔴, 4 🟠, 6 🟡. The only OPEN feature work is
+  the **parked MTP** slice (2 🟠 + 3 🟡, `INFR_MTP`, off by default). The other
+  4 are: a Mac-only latent metal wrong-kernel dispatch (🟠, needs an Apple GPU),
+  the deferred `make_compute_kernel` OOM→Result (🟠), and 3 deferred shader/dp4a
+  DRY refactors (🟡) — each risks the byte-identity gate / recorded stream, kept
+  as documented deferrals.
 
 No finding was accepted on an agent's word — each was re-read against the source
 by the coordinator; two agent-flagged "MAJOR"s (the Q5_1 clamp in the shader and
@@ -306,6 +305,20 @@ parked path).
   base is a loud `Err`; a test enumerates all 16×4 == the old arms). _Surfaced a
   new latent bug_ (iq4xs/iq4nl wrong-kernel default) — preserved + flagged for
   Mac verification (see the metal section).
+- **`infr-vulkan` gated multi-GPU (all 8 findings)** — TDD, +7 tests, **the
+  synthetic 2-device parity tests pass token-identical** on the RX 7900 XTX +
+  iGPU (`tensor_parallel`/`ep`/`pipeline_matches_single_device`). P2P
+  cross-device dma-buf buffers emit `VK_QUEUE_FAMILY_EXTERNAL` release/acquire
+  ownership transfers (each backend has one queue family, so
+  `EXCLUSIVE`+transfer is the spec-correct fix, not `CONCURRENT`); `AllReduce`
+  carries the boundary dtype and cleanly rejects a non-f32 boundary (the add
+  shader is f32-only); the per-rank KV decl is shrunk to `numel/W`; the pipeline
+  residual handoff copies from the device that last _wrote_ each tensor;
+  `tp_sem` frees command buffers on every error path; the host-bounce reduce
+  downloads each producer once (was W−1×); `dtype_bytes` is one helper, boundary
+  sizes are asserted equal, and OpaqueFd threads the exporter's memory-type
+  index. Reduce arithmetic unchanged → parity holds. _Deferred:_ a true f16
+  all-reduce (needs an f16 add shader).
 
 ### Highest-priority (production default paths)
 
@@ -324,11 +337,9 @@ parked path).
 | ~~11~~ | ✅  | `infr-cli main.rs`                 | ~~`--dev` can't override inherited backend env~~ — **FIXED** (clears siblings; unified precedence).          |
 | ~~12~~ | ✅  | `infr-metal exec.rs`               | ~~`Op::Rope` frozen RoPE on the replay tape~~ — **FIXED** (excluded from replay).                            |
 
-The 6 remaining 🟠 majors: the metal `Op::Rope` replay-tape bug (#12, the last
-open production major); the gated multi-GPU `p2p` `EXCLUSIVE` sharing + F32-only
-all-reduce; the parked-MTP `catch_up` off-by-one + wasted-logits; and the
-deferred `make_compute_kernel` OOM→Result. Everything else below is 🟡. Full
-detail per module.
+The 4 remaining 🟠 majors: the parked-MTP `catch_up` off-by-one + wasted-logits
+(off by default); a Mac-only latent metal wrong-kernel dispatch; and the
+deferred `make_compute_kernel` OOM→Result. Full detail per module.
 
 ### Cross-cutting themes
 
@@ -359,66 +370,6 @@ _6 of 7 findings fixed (see Resolved log); the one below is **DEFERRED**._
    disproportionate to a rare OOM path. Interim: the panic messages now name the
    kernel + flag it as a recoverable alloc failure. A full `Result`-ification of
    the recorder dispatch surface is its own focused effort.
-
-## infr-vulkan/src/{tp,tp_allreduce,tp_sem,pipeline,ep,p2p}.rs (gated multi-GPU)
-
-_All default-OFF experimental features; correctness + resource-leak issues
-weighted highest._
-
-1. **🟠 `p2p.rs:168,284` — cross-device dma-buf buffers created
-   `SharingMode::EXCLUSIVE` with no queue-family ownership transfer.** Written
-   by device A's queue, read by device B's (different family/device); the spec
-   requires an EXTERNAL/FOREIGN release+acquire for EXCLUSIVE cross-family
-   sharing. The host-fence path hides it via `queue_wait_idle`, but the whole
-   point of `tp_sem.rs` is to drop those fences — the transfer barrier is still
-   missing → formally UB, driver-fragile. _Fix:_ `CONCURRENT` over the
-   participating families, or emit `VK_QUEUE_FAMILY_EXTERNAL` buffer barriers
-   around the publish/gather copies.
-2. **🟠 `tp_allreduce.rs:444` — all-reduce hardwired to `DType::F32`**
-   (`elems= bytes/4`), while `tp.rs:613`/`ep.rs:92` `dtype_bytes` + comments
-   advertise "f32/f16" boundaries. An f16 boundary makes `numel != bytes/4` →
-   every all-reduce hard-errors; if the guard were loosened it would sum f16
-   bytes as f32 garbage. _Fix:_ carry boundary dtype into
-   `AllReduce`/`build_reduce_graph`, or explicitly reject non-f32 + drop the
-   misleading f16 generality.
-3. **🟡 `tp.rs:477` — TP never resizes the KV-cache tensor _decl_, so
-   `desc.numel()/row_stride` reports W× the real per-rank capacity.** Each rank
-   gets a `bytes/W` buffer and strides are rewritten, but the decl numel stays
-   full; any KV-capacity/overflow-to-host guard reading that value mis-fires
-   (believes W× the room exists). Benign only because the runner never drives
-   past true `ctx`. _Fix:_ shrink the KV decl to `numel/W` in the decl-shrink
-   pass.
-4. **🟡 `pipeline.rs:349` — residual handoff always copies the replica from
-   `prev` (last segment's device), not the device that last wrote it.** Unsound
-   for any replicated op-written tensor produced, skipped a segment, then read
-   later — consumer gets stale bytes. Safe today only because `hidden` is
-   touched every layer. _Fix:_ track per-cut-tensor last-writer device, hand off
-   from it.
-5. **🟡 `tp_sem.rs:166,226 + reduce loop — command buffers leak / GPU work
-   abandoned on error paths.** `tp_record_copies`/`tp_submit_*` return `Err`
-   without `free_command_buffers`; a mid-loop `?` in `reduce_p2p_semaphore`
-   drops already-collected `pub_cmds`/`gat_cmds` unwaited. Shared long-lived
-   pool. _Fix:_ RAII/explicit free in each error branch; free+await accumulated
-   cmds before propagating.
-6. **🟡
-   `tp_allreduce.rs:399,416 — host-bounce reduce re-downloads each producer W−1×; the semaphore reduce still does serial per-rank `device_wait_idle`.**
-   The former multiplies the dominant PCIe read by W−1 (download once into a
-   per-producer host buffer instead); the latter serializes independent devices
-   (submit all ranks, then wait once / single fence set).
-7. **🟡 `p2p.rs:135` — `external_semaphore_supported` doc says the semaphore
-   path is gated OFF ("v1 returns false"), but the body returns
-   `external_semaphore_fd.is_some()`** — the untested GPU-ordering path
-   activates automatically whenever the extension loads. Misleads a reviewer
-   about whether the risky path runs. _Fix:_ correct the doc or actually gate
-   it.
-8. **🟡 `tp.rs:613 & ep.rs:92` — byte-identical `dtype_bytes` duplicated;
-   `tp.rs:557` sizes one AllReduce to the `max` boundary but `reduce` requires
-   `elems==self.elems` exactly** — holds only because both boundaries are
-   `[tokens,n_embd]`; a model with differing row-parallel widths silently
-   breaks. `p2p.rs:303` OpaqueFd import picks the lowest memory-type bit, not
-   the exporter's (can spuriously reject). _Fix:_ hoist the helper; assert equal
-   boundary sizes (or per-size transport); thread the exporter's memory-type
-   index through `P2pExport`.
 
 ## infr-vulkan/shaders — attention / flash / KV / softmax
 
