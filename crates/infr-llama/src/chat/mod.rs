@@ -78,6 +78,14 @@ pub trait ChatModel {
         None
     }
 
+    /// Drop any persistent KV-session state so the NEXT `generate` re-prefills its prompt from
+    /// scratch. The serve-side forced-tool fallback uses this: after a constrained attempt has
+    /// advanced the session past the primed `<tool_call>` opener, resetting before the unconstrained
+    /// retry guarantees the retry can never inherit that divergent state (rather than relying on the
+    /// seam's common-prefix rewind to unwind it). Default: no-op — stateless backends (CPU/Metal
+    /// reference) re-prefill the full prompt every call and have nothing to reset.
+    fn reset_kv(&mut self) {}
+
     /// Run a tiny throwaway generation through the real forward so every lazily-built pipeline
     /// compiles NOW instead of on the first user request (a cold Vulkan seam pays seconds of
     /// pipeline builds otherwise). INFR_PROF2 is suppressed for the duration — recorders read it

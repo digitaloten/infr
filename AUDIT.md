@@ -22,7 +22,7 @@ reproduce/confirm are dropped (not listed) to keep this a verified-only ledger.
 
 - **Original audit:** 157 findings across 24 module slices (1 🔴 critical, 33 🟠
   major, 123 🟡 minor).
-- **Remaining open:** **134** — 0 🔴, 24 🟠, 110 🟡.
+- **Remaining open:** **128** — 0 🔴, 23 🟠, 105 🟡.
 
 No finding was accepted on an agent's word — each was re-read against the source
 by the coordinator; two agent-flagged "MAJOR"s (the Q5_1 clamp in the shader and
@@ -72,23 +72,36 @@ parked path).
   two infr-cli impls. _Deferred:_ streaming `usage` chunk (needs
   `stream_options.include_usage` parsing) and the e2e disconnect→slot-release
   path (integration-only; the latch logic is unit-tested).
+- **`infr-cli` (all 6 findings)** — TDD, +7 tests; dead-code `#![allow]`
+  removed. `--dev` now `remove_var`s the sibling backend envs (an inherited
+  `INFR_CPU` can't shadow it) via a pure `resolve_backend` + one unified
+  `selected_backend()` reader (consistent METAL>CPU>Vulkan precedence); model
+  `resolve` only treats an existing `.gguf` FILE as local (mistyped paths give a
+  clear error, not a network pull); the sweep sort is NaN-safe (`total_cmp`);
+  the spurious "`--parallel` ignored" note fires only when explicitly set
+  (`Option<usize>`); the DG→Metal→CPU→Vulkan funnel is one `build_chat_model`
+  (was duplicated in run+serve); dead
+  `ResolvedDevice`/`print_run_stats`/`bench -b`/`tg64@d` branch deleted. `#2`
+  forced-tool retry now `reset_kv`s the session first (new no-op default
+  `ChatModel::reset_kv` + Vulkan/Metal overrides). _Deferred:_ parse-GGUF- once
+  (a large cross-crate API change, out of proportion to a 🟡).
 
 ### Highest-priority (production default paths)
 
-| #      | Sev | Location                              | Issue                                                                                                                                       |
-| ------ | --- | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| ~~1~~  | ✅  | `infr-hub`                            | ~~Downloaded blob never sha256-verified~~ — **FIXED** (`1263bcc`, + full hub slice).                                                        |
-| 2      | 🟠  | `infr-llama chat/mod.rs:186`          | Generate error leaves an **orphaned user turn** → next turn has two consecutive user messages, permanent history corruption.                |
-| ~~3~~  | ✅  | `infr-server lib.rs`                  | ~~Streaming swallows errors as `stop`~~ — **FIXED** (error frame + panic-safe `DoneGuard`).                                                 |
-| ~~4~~  | ✅  | `infr-server lib.rs`                  | ~~No per-request cancellation~~ — **FIXED** (cancel latch → `req.abort()` frees the slot).                                                  |
-| 5      | 🟠  | `infr-llama runner.rs:3743,3989`      | Prefix-cache records **KV rows never materialized** (`max_new==0` frontier; grammar-forced tokens) → next turn attends stale KV.            |
-| 6      | 🟠  | `infr-vulkan adapter.rs:2997`         | Static split-K attn bounds chunk _size_ not _count_ → `n_chunks>1024` **overruns `attn_combine` `wexp[1024]`** at huge ctx.                 |
-| 7      | 🟠  | `infr-vulkan ops.rs:229`              | Kernel-cache double-checked lock **double-compiles + leaks a pipeline** under concurrent first use.                                         |
-| ~~8~~  | ✅  | `infr-llama sampling.rs`              | ~~Repeat penalty per-occurrence~~ — **FIXED** (`70bbe4e`; now per-distinct-token).                                                          |
-| 9      | 🟠  | `infr-vulkan shaders dg_eb_sample:61` | argmax reduce **drops the lower-index tie-break** → diverges from host on ties (feeds diffusion goldens).                                   |
-| ~~10~~ | ✅  | `infr-gguf lib.rs`                    | ~~Corrupt GGUF `pos+n` overflow panic~~ — **FIXED** (`checked_add`/`checked_mul` → `Error::Loader`).                                        |
-| 11     | 🟠  | `infr-cli main.rs:120`                | `--dev` **can't override an inherited `INFR_CPU`/`INFR_METAL`** → silent wrong-device runs; reader precedence inconsistent across commands. |
-| 12     | 🟠  | `infr-metal exec.rs:2836`             | `Op::Rope` snapshots positions on the replay tape → **frozen RoPE after token 0** (llama-family Metal decode).                              |
+| #      | Sev | Location                              | Issue                                                                                                                            |
+| ------ | --- | ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| ~~1~~  | ✅  | `infr-hub`                            | ~~Downloaded blob never sha256-verified~~ — **FIXED** (`1263bcc`, + full hub slice).                                             |
+| 2      | 🟠  | `infr-llama chat/mod.rs:186`          | Generate error leaves an **orphaned user turn** → next turn has two consecutive user messages, permanent history corruption.     |
+| ~~3~~  | ✅  | `infr-server lib.rs`                  | ~~Streaming swallows errors as `stop`~~ — **FIXED** (error frame + panic-safe `DoneGuard`).                                      |
+| ~~4~~  | ✅  | `infr-server lib.rs`                  | ~~No per-request cancellation~~ — **FIXED** (cancel latch → `req.abort()` frees the slot).                                       |
+| 5      | 🟠  | `infr-llama runner.rs:3743,3989`      | Prefix-cache records **KV rows never materialized** (`max_new==0` frontier; grammar-forced tokens) → next turn attends stale KV. |
+| 6      | 🟠  | `infr-vulkan adapter.rs:2997`         | Static split-K attn bounds chunk _size_ not _count_ → `n_chunks>1024` **overruns `attn_combine` `wexp[1024]`** at huge ctx.      |
+| 7      | 🟠  | `infr-vulkan ops.rs:229`              | Kernel-cache double-checked lock **double-compiles + leaks a pipeline** under concurrent first use.                              |
+| ~~8~~  | ✅  | `infr-llama sampling.rs`              | ~~Repeat penalty per-occurrence~~ — **FIXED** (`70bbe4e`; now per-distinct-token).                                               |
+| 9      | 🟠  | `infr-vulkan shaders dg_eb_sample:61` | argmax reduce **drops the lower-index tie-break** → diverges from host on ties (feeds diffusion goldens).                        |
+| ~~10~~ | ✅  | `infr-gguf lib.rs`                    | ~~Corrupt GGUF `pos+n` overflow panic~~ — **FIXED** (`checked_add`/`checked_mul` → `Error::Loader`).                             |
+| ~~11~~ | ✅  | `infr-cli main.rs`                    | ~~`--dev` can't override inherited backend env~~ — **FIXED** (clears siblings; unified precedence).                              |
+| 12     | 🟠  | `infr-metal exec.rs:2836`             | `Op::Rope` snapshots positions on the replay tape → **frozen RoPE after token 0** (llama-family Metal decode).                   |
 
 Other 🟠 majors span host-hot-path churn (recorder per-dispatch `env::var` +
 `Vec` allocs; adapter MoE `counts` double-zero), prefill perf (`gemm_proj`
@@ -928,53 +941,6 @@ agent verified and correctly ruled that out.)_
    `u32` index** (a `Vec<Option<&dyn Buffer>>` gives hash-free O(1), relevant
    since decode rebinds every step). _Fix:_ query capabilities once/build (or
    return `&Capabilities`); back `Bindings` with a `Vec` indexed by `id.0`.
-
-## infr-cli/src/main.rs
-
-1. **🟠
-   `main.rs:120-141 — `--dev`cannot override an inherited`INFR_CPU`/`INFR_METAL`/`INFR_DEV`,
-   and reader precedence is inconsistent.** `DeviceOpts::resolve` only
-   `set_var`s the chosen backend, never clearing the siblings; so
-   `run model --dev vulkan0` under an inherited `INFR_CPU=1` sets `INFR_DEV` but
-   `cmd_run` (checks METAL→CPU→Vulkan) still runs on CPU. And precedence differs
-   across commands (`cmd_run`/`cmd_serve` METAL→CPU→Vulkan vs `cmd_bench`
-   `1724/1745/1760` CPU→METAL→Vulkan). The doc "`--dev` can only ever narrow
-   behavior" is false. _Fix:_ on an explicit `--dev`, `remove_var` the other two
-   before setting the chosen one; unify reader precedence.
-2. **🟡 `main.rs:1659 — forced-tool fallback runs a second full generation on
-   the same serialised session.** When a forced `tool_choice` yields no
-   parseable call, `run_chat` calls `be.generate(&prompt,…)` again after the
-   constrained `be.generate(&primed,…)`; for `SeamGenerator` (one Mutex-guarded
-   persistent KV session already advanced by the primed prompt) re-prefilling
-   the shorter divergent `prompt` re-does a full gen and risks KV-prefix-diff
-   divergence. _Fix:_ reset/rewind the session before the retry (or skip the
-   primer when falling back).
-3. **🟡 `main.rs:620 — `resolve` treats any existing path as the GGUF and sends
-   mistyped local paths to HuggingFace.** `Path::new(model).exists()` matches
-   dirs / non-`.gguf` files (a cwd entry colliding with an `org/repo` ref
-   shadows the HF pull), while a typo'd local path that doesn't exist falls
-   through to a confusing network pull. _Fix:_ require an existing `.gguf`
-   _file_ before treating it as local; else clearer "not a file, not a valid
-   ref" error.
-4. **🟡 `main.rs:2462 & 2402 — `partial_cmp(...).unwrap()` panics on a NaN
-   ratio** in the sweep summary sort (a malformed subprocess-JSON infr value →
-   NaN aborts the whole sweep, discarding all results); and the `tg64@d`
-   special-case (`2402`, retry `2410`) rebuilds args identical to the `runs`
-   table. _Fix:_ `total_cmp`; drop the dead `tg64@d` branch.
-5. **🟡 `main.rs:275,3327 — CPU/Metal/DG serve always prints "`--parallel`
-   ignored"** because `--parallel` has `default_value_t=4` (never "unset") and
-   the guard is `parallel>1`. _Fix:_ warn only when explicitly set
-   (`Option`/clap `value_source`).
-6. **🟡 DRY/YAGNI —
-   `main.rs:918/3341 the DG→Metal→CPU→Vulkan `Box<dyn ChatModel>` funnel is
-   written twice** (the 3341 comment even says "same selection as cmd*run") —
-   exactly where the precedence bug can diverge; `Backend`/
-   `ResolvedDevice`/`resolve`'s whole return (`61`), `print_run_stats` (`767`),
-   and `bench -b/--batch-size` (`339`) are all dead, masked by
-   `#![allow(dead_code)]`/ `unused_variables`; and the GGUF header is parsed ~5×
-   per invocation (`820/917/ 973/1207/1835`). \_Fix:* `build_chat_model(...)`
-   helper; delete the dead surface; parse GGUF metadata once and pass
-   arch/DG/eos down.
 
 ## infr-chat/src/{stream,tools,template}.rs
 

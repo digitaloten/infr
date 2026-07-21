@@ -1,6 +1,5 @@
 //! `infr` CLI — `pull` / `run` / `serve`, all over the same engine + backend.
 //! See docs/PLAN.md "Product surface".
-#![allow(dead_code, unused_variables)]
 
 use clap::{Parser, Subcommand};
 
@@ -55,9 +54,10 @@ impl CompletionShell {
     }
 }
 
-/// The backend `--dev` resolved to. Returned by [`DeviceOpts::resolve`] so a caller that forwards
-/// to `llama-bench` still has the concrete pick; `run`/`serve` ignore it (the env vars `resolve`
-/// sets are the whole channel their deep backend construction reads).
+/// The backend selected for a forward. Produced by the ONE decision function [`resolve_backend`]
+/// (from `--dev` + the inherited env) and by the ONE reader [`selected_backend`] (from the env
+/// alone) — so `--dev`, [`DeviceOpts::resolve`]'s env publishing, and every command's backend
+/// funnel (`run`/`serve`/`bench`) can never disagree on the pick.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Backend {
     /// A Vulkan GPU. `Some("Vulkan1")` pins a device (published as `INFR_DEV`); `None` = the
@@ -67,6 +67,72 @@ enum Backend {
     Metal,
     /// The CPU reference backend (`INFR_CPU`).
     Cpu,
+}
+
+/// A snapshot of the three process-global env vars that select a reference backend, so the backend
+/// DECISION ([`resolve_backend`]/[`selected_backend`]) is a pure, unit-testable function of its
+/// inputs rather than a scatter of ad-hoc `std::env::var` reads with drifting precedence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct BackendEnv {
+    metal: bool,
+    cpu: bool,
+}
+
+impl BackendEnv {
+    /// Read the live process env (`INFR_METAL`/`INFR_CPU`).
+    fn current() -> Self {
+        Self {
+            metal: std::env::var_os("INFR_METAL").is_some(),
+            cpu: std::env::var_os("INFR_CPU").is_some(),
+        }
+    }
+}
+
+/// The SINGLE backend decision, shared by `--dev` resolution and the per-command readers.
+///
+/// An explicit `--dev` fully determines the pick (`vulkan*`/`metal`/`cpu`, case-insensitive) and
+/// wins over any inherited env — [`DeviceOpts::resolve`] clears the sibling vars so it does.
+/// Without `--dev` the pick falls to the inherited env with ONE fixed precedence, `METAL > CPU >
+/// Vulkan`, so `run`/`serve`/`bench` stop disagreeing (bench used to read CPU before METAL).
+fn resolve_backend(dev: Option<&str>, env: BackendEnv) -> anyhow::Result<Backend> {
+    match dev {
+        None => Ok(if env.metal {
+            Backend::Metal
+        } else if env.cpu {
+            Backend::Cpu
+        } else {
+            Backend::Vulkan(None)
+        }),
+        Some(d) => {
+            let lower = d.to_ascii_lowercase();
+            if lower.starts_with("vulkan") {
+                Ok(Backend::Vulkan(Some(d.to_string())))
+            } else if lower == "metal" {
+                Ok(Backend::Metal)
+            } else if lower == "cpu" {
+                Ok(Backend::Cpu)
+            } else {
+                anyhow::bail!(
+                    "invalid --dev `{d}` (expected a Vulkan GPU like `Vulkan0`/`Vulkan1`, \
+                     `metal`, or `cpu`)"
+                );
+            }
+        }
+    }
+}
+
+/// The backend the current process env selects — the ONE reader precedence for `run`/`serve`/
+/// `bench`'s backend funnels. Equivalent to `resolve_backend(None, BackendEnv::current())`; the
+/// `None` arg never errors.
+fn selected_backend() -> Backend {
+    resolve_backend(None, BackendEnv::current()).expect("resolve_backend(None, _) is infallible")
+}
+
+/// Total-order comparison of two f64 ratios for the sweep's worst-first ranking. `total_cmp` never
+/// panics (unlike `partial_cmp().unwrap()`) and puts any NaN at the `Greater` end, so a malformed
+/// subprocess-JSON value can't abort the whole sweep summary. Ascending order = worst ratio first.
+fn nan_safe_ratio_cmp(a: f64, b: f64) -> std::cmp::Ordering {
+    a.total_cmp(&b)
 }
 
 /// The shared device/config flags for `run`/`serve`/`bench`. Every field funnels through a
@@ -97,48 +163,31 @@ struct DeviceOpts {
     threads: Option<usize>,
 }
 
-/// The concrete values [`DeviceOpts::resolve`] published, for a caller that needs them after the
-/// envs are set (e.g. forwarding to `llama-bench`). `run`/`serve`/`bench` read the envs directly and
-/// can ignore this.
-struct ResolvedDevice {
-    backend: Backend,
-    ctx: Option<String>,
-    ubatch: Option<usize>,
-    threads: Option<usize>,
-}
-
 impl DeviceOpts {
-    /// Publish the flags to the process-global env vars the backends read, and report the resolved
-    /// [`Backend`]. Called once, up front, before the model loads (so `RAYON_NUM_THREADS` lands
-    /// before any parallel work spins the rayon pool up, and `INFR_DEV`/`INFR_METAL`/`INFR_CPU`
-    /// before the session seam constructs a backend).
+    /// Publish the flags to the process-global env vars the backends read. Called once, up front,
+    /// before the model loads (so `RAYON_NUM_THREADS` lands before any parallel work spins the
+    /// rayon pool up, and `INFR_DEV`/`INFR_METAL`/`INFR_CPU` before the session seam constructs a
+    /// backend).
     ///
-    /// `--dev` is parsed case-insensitively: `vulkan*` → `INFR_DEV`; `metal` → `INFR_METAL`; `cpu`
-    /// → `INFR_CPU`; anything else bails with the accepted forms. Unset leaves all three unset,
-    /// preserving the default "first discrete GPU, else device 0" — so `--dev` can only ever narrow
-    /// behavior.
-    fn resolve(&self) -> anyhow::Result<ResolvedDevice> {
-        let backend = match self.dev.as_deref() {
-            None => Backend::Vulkan(None),
-            Some(d) => {
-                let lower = d.to_ascii_lowercase();
-                if lower.starts_with("vulkan") {
-                    std::env::set_var("INFR_DEV", d);
-                    Backend::Vulkan(Some(d.to_string()))
-                } else if lower == "metal" {
-                    std::env::set_var("INFR_METAL", "1");
-                    Backend::Metal
-                } else if lower == "cpu" {
-                    std::env::set_var("INFR_CPU", "1");
-                    Backend::Cpu
-                } else {
-                    anyhow::bail!(
-                        "invalid --dev `{d}` (expected a Vulkan GPU like `Vulkan0`/`Vulkan1`, \
-                         `metal`, or `cpu`)"
-                    );
-                }
+    /// An explicit `--dev` OVERRIDES an inherited backend env: it clears all three of
+    /// `INFR_DEV`/`INFR_METAL`/`INFR_CPU` and then sets only the chosen one, so
+    /// `run … --dev vulkan0` under an inherited `INFR_CPU=1` actually runs on Vulkan. `--dev`
+    /// itself is parsed by [`resolve_backend`] (`vulkan*`/`metal`/`cpu`, case-insensitive). Unset
+    /// leaves the inherited env untouched — the default "first discrete GPU, else device 0".
+    fn resolve(&self) -> anyhow::Result<()> {
+        let backend = resolve_backend(self.dev.as_deref(), BackendEnv::current())?;
+        // Only an EXPLICIT --dev mutates the backend env; unset preserves whatever was inherited.
+        if self.dev.is_some() {
+            std::env::remove_var("INFR_DEV");
+            std::env::remove_var("INFR_METAL");
+            std::env::remove_var("INFR_CPU");
+            match &backend {
+                Backend::Vulkan(Some(d)) => std::env::set_var("INFR_DEV", d),
+                Backend::Vulkan(None) => {}
+                Backend::Metal => std::env::set_var("INFR_METAL", "1"),
+                Backend::Cpu => std::env::set_var("INFR_CPU", "1"),
             }
-        };
+        }
         // `--ctx` shares the size grammar (`8192`, `256k`, `50%`) with INFR_CTX, which it sets; a
         // typo fails fast here (the check `cmd_serve` used to own).
         if let Some(c) = &self.ctx {
@@ -155,12 +204,7 @@ impl DeviceOpts {
         if let Some(t) = self.threads {
             std::env::set_var("RAYON_NUM_THREADS", t.to_string());
         }
-        Ok(ResolvedDevice {
-            backend,
-            ctx: self.ctx.clone(),
-            ubatch: self.ubatch,
-            threads: self.threads,
-        })
+        Ok(())
     }
 }
 
@@ -268,14 +312,12 @@ enum Cmd {
         /// fit, and the Vulkan budget guard will say so if it doesn't).
         /// `--np` is accepted as an alias (llama-server spells this `-np`; clap shorts are a single
         /// character, so `-n` is the short form and `--np` the familiar long one).
-        #[arg(
-            long = "parallel",
-            visible_alias = "np",
-            short = 'n',
-            default_value_t = 4,
-            value_name = "N"
-        )]
-        parallel: usize,
+        ///
+        /// Unset defaults to 4 slots on the Vulkan seam. `Option` (rather than a `default_value_t`)
+        /// so the CPU/Metal/diffusion serialised backends can tell an EXPLICIT `--parallel` (worth
+        /// a "no multi-slot engine, ignored" note) from the default (silent).
+        #[arg(long = "parallel", visible_alias = "np", short = 'n', value_name = "N")]
+        parallel: Option<usize>,
         /// `--ctx` here is the PER-SLOT window (divided from the VRAM fit by `--parallel` when
         /// unset); see the shared `DeviceOpts` flags below.
         #[command(flatten)]
@@ -334,10 +376,6 @@ enum Cmd {
         /// result, then emit a reply). Overrides -p/-n when set.
         #[arg(long = "pg")]
         pg: Option<String>,
-        /// Logical batch size (matches llama-bench -b). Accepted for flag-parity; the engine
-        /// chunks by ubatch, so only -ub affects per-forward work.
-        #[arg(short = 'b', long = "batch-size", default_value_t = 2048)]
-        batch: usize,
         /// Repetitions (reported value is the average).
         #[arg(short = 'r', long, default_value_t = 3)]
         reps: usize,
@@ -552,7 +590,6 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
             n_gen,
             depth,
             pg,
-            batch,
             reps,
             ngl,
             json,
@@ -613,16 +650,45 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
 use anyhow::{anyhow, Context};
 use std::path::{Path, PathBuf};
 
+/// Is `path` a usable LOCAL model: an existing regular FILE whose extension is `.gguf`
+/// (case-insensitive)? A directory, a wrong-extension file, or a missing path is NOT local — the
+/// gate that keeps `resolve` from treating a cwd entry that merely collides with an `org/repo` ref
+/// as the model, and from sending a typo'd local path to a confusing network pull. Split out so the
+/// classification is unit-testable without the network.
+fn is_local_gguf(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
+}
+
 /// Resolve a model arg to (gguf_path, optional tokenizer_json_path).
-/// Accept a path to a `.gguf` or an `org/repo[:quant]` HuggingFace ref resolved via infr-hub. The
-/// tokenizer is the `tokenizer.json` beside the GGUF if present, else `None` → derived from the
+/// Accept a path to a `.gguf` FILE or an `org/repo[:quant]` HuggingFace ref resolved via infr-hub.
+/// The tokenizer is the `tokenizer.json` beside the GGUF if present, else `None` → derived from the
 /// GGUF's embedded vocab (HF Hub blobs are content-addressed with no sidecar).
 fn resolve(model: &str) -> anyhow::Result<(PathBuf, Option<PathBuf>)> {
-    let gguf = if Path::new(model).exists() {
+    let p = Path::new(model);
+    let gguf = if is_local_gguf(p) {
         PathBuf::from(model)
     } else {
-        let r = infr_hub::ModelRef::parse(model).map_err(|e| anyhow!("{e}"))?;
-        infr_hub::ensure(&r).map_err(|e| anyhow!("{e}"))?
+        // Not an existing `.gguf` file → treat as an HF ref. A ref parse failure here means the arg
+        // is neither: give a message that names both cases (a typo'd local path, or a directory /
+        // non-`.gguf` file that happens to exist) instead of a bare parse error dressed as a
+        // network pull.
+        match infr_hub::ModelRef::parse(model) {
+            Ok(r) => infr_hub::ensure(&r).map_err(|e| anyhow!("{e}"))?,
+            Err(e) if p.exists() => {
+                anyhow::bail!(
+                    "`{model}` exists but is not a `.gguf` file — pass a path to a `.gguf`, or an \
+                     `org/repo[:quant]` HuggingFace ref ({e})"
+                );
+            }
+            Err(e) => {
+                anyhow::bail!(
+                    "`{model}` is not a `.gguf` file and not a valid `org/repo[:quant]` ref ({e})"
+                );
+            }
+        }
     };
     let tok = gguf
         .parent()
@@ -760,50 +826,80 @@ impl ThinkRender {
     }
 }
 
-/// Print prefill / decode rates separately (like `ollama run --verbose`), splitting at the
-/// first emitted token. `prefill` = prompt tokens over time-to-first-token; `decode` = the
-/// remaining tokens over the time after the first. This avoids the misleading single amortized
-/// rate, which folds prefill into decode and tanks for short generations.
-fn print_run_stats(
-    t0: std::time::Instant,
-    t_first: Option<std::time::Instant>,
-    n_gen: usize,
-    prompt_toks: usize,
-    ctx: Option<(usize, usize)>,
-) {
-    let now = std::time::Instant::now();
-    let ttft = t_first.unwrap_or(now).duration_since(t0).as_secs_f32();
-    let decode_dt = now.duration_since(t_first.unwrap_or(now)).as_secs_f32();
-    let decode_n = n_gen.saturating_sub(1); // tokens produced after the first
-    let pf_rate = if ttft > 0.0 {
-        prompt_toks as f32 / ttft
-    } else {
-        0.0
-    };
-    let dec_rate = if decode_dt > 0.0 {
-        decode_n as f32 / decode_dt
-    } else {
-        0.0
-    };
-    let ctxs = ctx
-        .map(|(c, m)| format!(" | ctx {c}/{m}"))
-        .unwrap_or_default();
-    eprintln!(
-        "[prefill {prompt_toks} tok @ {pf_rate:.0} tok/s ({:.0} ms) | decode {n_gen} tok @ {dec_rate:.1} tok/s{ctxs}]",
-        ttft * 1000.0,
-    );
+/// Build the per-backend generation primitive (`ChatModel`) for run AND serve, from the backend the
+/// process env selects ([`selected_backend`]) and the cheap diffusion-gemma arch peek the caller
+/// already did. ONE funnel so `cmd_run` and `cmd_serve` can never disagree on how a backend is
+/// constructed (the DG→Metal→CPU→Vulkan selection used to be copy-pasted in both). The backend
+/// banner goes to stderr on both surfaces.
+fn build_chat_model(
+    gguf: &Path,
+    tok: Option<&Path>,
+    is_dg: bool,
+) -> anyhow::Result<Box<dyn infr_llama::chat::ChatModel + Send>> {
+    let backend = selected_backend();
+    if is_dg {
+        // diffusion-gemma (Phase 3/D, docs/DIFFUSIONGEMMA.md): the entropy-bound block-diffusion
+        // loop over a persistent session — Vulkan by default, CPU under INFR_CPU, Metal under
+        // INFR_METAL (the non-macOS build still compiles the Metal arm; `DiffusionGemmaChat::generate`
+        // errors clearly at runtime there).
+        eprintln!(
+            "[{} — diffusion-gemma entropy-bound block decode]",
+            match backend {
+                Backend::Cpu => "cpu backend",
+                Backend::Metal => "metal backend",
+                Backend::Vulkan(_) => "vulkan seam",
+            }
+        );
+        let loaded = infr_llama::SeamModel::load(gguf, tok)?;
+        return Ok(match backend {
+            Backend::Cpu => Box::new(infr_llama::chat::DiffusionGemmaChat::new_cpu(loaded)),
+            Backend::Metal => Box::new(infr_llama::chat::DiffusionGemmaChat::new_metal(loaded)),
+            Backend::Vulkan(_) => Box::new(infr_llama::chat::DiffusionGemmaChat::new(loaded)),
+        });
+    }
+    match backend {
+        Backend::Metal => {
+            eprintln!(
+                "[metal backend — dense/MoE forward on Apple GPU via the agnostic compute graph, persistent KV session]"
+            );
+            #[cfg(target_os = "macos")]
+            {
+                metal_chat_model(gguf, tok)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Ok(Box::new(infr_llama::chat::CpuDenseChat::new_metal(
+                    infr_llama::SeamModel::load(gguf, tok)?,
+                )))
+            }
+        }
+        Backend::Cpu => {
+            eprintln!(
+                "[cpu backend — dense/MoE forward on CPU via the agnostic compute graph, no GPU]"
+            );
+            Ok(Box::new(infr_llama::chat::CpuDenseChat::new(
+                infr_llama::SeamModel::load(gguf, tok)?,
+            )))
+        }
+        // The default: dense/MoE on the VULKAN agnostic seam — persistent multi-slot KV sessions
+        // (per-turn suffix-only prefill), record-once decode replay, MoE expert auto-fit. qwen35
+        // (Qwen3.5) lands here too (same seam, `Config::from_gguf` + `MixerW::DeltaNet`), as does
+        // llama4 Scout (its Q2_K bank runs on the paged expert cache).
+        Backend::Vulkan(_) => {
+            eprintln!(
+                "[vulkan seam — dense/MoE on the agnostic compute graph, persistent KV session]"
+            );
+            Ok(Box::new(infr_llama::chat::DenseSeamChat::new(
+                infr_llama::SeamModel::load(gguf, tok)?,
+            )))
+        }
+    }
 }
 
 fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     use std::io::Write;
     // Context window: the model's trained context by default; INFR_CTX overrides (shared size
     // grammar — tokens, `256k`, or `%` of the free-VRAM KV capacity), read by the chat sessions.
-    let envf = |k: &str, d: f32| {
-        std::env::var(k)
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(d)
-    };
     let envu = |k: &str, d: usize| {
         std::env::var(k)
             .ok()
@@ -901,79 +997,14 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Build the per-backend generation primitive (`ChatModel`), then wrap it in the ONE shared `Chat`
-    // (infr_llama::model) that owns history + `<think>`-stripping and drives the single REPL below:
-    // INFR_CPU (dense/MoE/qwen35 on the agnostic compute graph, no Vulkan/VRAM), Vulkan/Metal GPU,
-    // qwen3moe, dense Qwen3/Llama/Gemma. Every backend now does history-based multi-turn — no
-    // per-arch one-shot special-case. The CLI owns the Llama; the boxed trait object borrows it (so
-    // the borrow-based dense `ChatSession` needs no ownership change).
-    // qwen35 (Qwen3.5) runs through the SAME standard `ChatModel` structs as every other arch below
-    // — `SeamModel::load` + the CPU/Vulkan/Metal sessions drive any `Config` arch (including
-    // `MixerW::DeltaNet`) — so there is no qwen35-only branch (the old bespoke seam and its
-    // env-gated escape hatch were deleted once the unified path was validated; issue #30).
-    // Model-aware chat sampling for every backend (arch-family table + generation_config sibling;
-    // a user `--temp`/`--top-k`/`--top-p` already in the env wins). The bespoke branch reads the
-    // same envs below.
+    // Build the per-backend generation primitive (`ChatModel`) — the ONE `build_chat_model` funnel
+    // shared with `cmd_serve` (DG→Metal→CPU→Vulkan by the env-selected backend) — then wrap it in
+    // the ONE shared `Chat` (infr_llama::model) that owns history + `<think>`-stripping and drives
+    // the single REPL below. Every backend does history-based multi-turn; qwen35 (Qwen3.5) rides
+    // the SAME standard `ChatModel` structs (issue #30). Model-aware chat sampling first (arch-family
+    // table + generation_config sibling; a user `--temp`/`--top-k`/`--top-p` already in the env wins).
     apply_model_sampling_defaults(&gguf);
-    let model: Box<dyn infr_llama::chat::ChatModel + '_> = if is_dg {
-        // diffusion-gemma (Phase 3/D): the entropy-bound block-diffusion loop
-        // (`infr_llama::diffusion`) over a persistent session — Vulkan by default, CPU under
-        // INFR_CPU, Metal under INFR_METAL (Phase D added the Metal DG session; macOS only — the
-        // non-macOS build still compiles this arm, `DiffusionGemmaChat::generate` errors clearly
-        // at runtime there instead, matching every other INFR_METAL arm's convention).
-        let cpu = std::env::var("INFR_CPU").is_ok();
-        let metal = std::env::var("INFR_METAL").is_ok();
-        eprintln!(
-            "[{} — diffusion-gemma entropy-bound block decode]",
-            if cpu {
-                "cpu backend"
-            } else if metal {
-                "metal backend"
-            } else {
-                "vulkan seam"
-            }
-        );
-        let loaded = infr_llama::SeamModel::load(&gguf, tok.as_deref())?;
-        Box::new(if cpu {
-            infr_llama::chat::DiffusionGemmaChat::new_cpu(loaded)
-        } else if metal {
-            infr_llama::chat::DiffusionGemmaChat::new_metal(loaded)
-        } else {
-            infr_llama::chat::DiffusionGemmaChat::new(loaded)
-        })
-    } else if std::env::var("INFR_METAL").is_ok() {
-        eprintln!(
-            "[metal backend — dense/MoE forward on Apple GPU via the agnostic compute graph, persistent KV session]"
-        );
-        #[cfg(target_os = "macos")]
-        {
-            metal_chat_model(&gguf, tok.as_deref())?
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            Box::new(infr_llama::chat::CpuDenseChat::new_metal(
-                infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
-            ))
-        }
-    } else if std::env::var("INFR_CPU").is_ok() {
-        eprintln!(
-            "[cpu backend — dense/MoE forward on CPU via the agnostic compute graph, no GPU]"
-        );
-        Box::new(infr_llama::chat::CpuDenseChat::new(
-            infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
-        ))
-    } else {
-        // The default: dense/MoE on the VULKAN agnostic seam — persistent multi-slot KV sessions
-        // (per-turn suffix-only prefill), record-once decode replay, MoE expert auto-fit (fully
-        // resident when experts fit; the paged expert cache — INFR_CACHE — otherwise). qwen35 (Qwen3.5) lands here too — same seam, same `Config::from_gguf` +
-        // `MixerW::DeltaNet` unified runner (see `unified_qwen35_*` tests). llama4 (Scout) lands
-        // here too now: the paged expert cache lets its 37 GB Q2_K bank run on a 24 GB card.
-        eprintln!("[vulkan seam — dense/MoE on the agnostic compute graph, persistent KV session]");
-        Box::new(infr_llama::chat::DenseSeamChat::new(
-            infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
-        ))
-    };
-    let mut model = model;
+    let mut model = build_chat_model(&gguf, tok.as_deref(), is_dg)?;
     // Compile the lazily-built pipelines NOW (like `serve` does before its first request) so the
     // first turn's reported prefill rate measures prefill, not one-time pipeline builds — a cold
     // diffusion-gemma prefill measured 26 t/s vs 1424 t/s warm, all compile.
@@ -1462,6 +1493,12 @@ trait GenBackend: Send + Sync {
         req: &infr_llama::sampling::RequestCtx,
         on_piece: &mut dyn FnMut(&str),
     ) -> anyhow::Result<infr_llama::GenStats>;
+
+    /// Drop the serialised session's persistent KV so the NEXT `generate` re-prefills from scratch.
+    /// The forced-tool fallback calls this before its unconstrained retry so the retry can never
+    /// inherit the constrained attempt's primed `<tool_call>` state. Default no-op: the multi-slot
+    /// engine hands each request a fresh best-prefix slot, so there is nothing serialised to reset.
+    fn reset(&self) {}
 }
 
 impl GenBackend for SeamGenerator {
@@ -1491,6 +1528,13 @@ impl GenBackend for SeamGenerator {
             Some(c) => model.generate_constrained(prompt, max_new, c, Some(req), on_piece),
             None => model.generate(prompt, max_new, Some(req), on_piece),
         }
+    }
+
+    fn reset(&self) {
+        self.model
+            .lock()
+            .expect("serve generator poisoned")
+            .reset_kv();
     }
 }
 
@@ -1648,6 +1692,12 @@ fn run_chat(
                     completion_tokens: tokens.1,
                 });
             }
+            // The constrained attempt advanced the serialised session past the primed `<tool_call>`
+            // opener + the (unparseable) body. Reset it so the unconstrained retry below re-prefills
+            // the clean `prompt` from scratch, instead of inheriting that divergent KV state and
+            // relying on the seam's common-prefix rewind to unwind it. No-op on the multi-slot
+            // engine (each request already gets a fresh best-prefix slot).
+            be.reset();
             eprintln!(
                 "[tools] forced tool call produced no parseable call; falling back to unconstrained"
             );
@@ -1732,15 +1782,20 @@ fn cmd_bench(
         })
         .transpose()?;
     let (gguf, tok) = resolve(model)?;
+    // ONE backend reader shared with `cmd_run`/`cmd_serve` ([`selected_backend`], METAL > CPU >
+    // Vulkan) — bench used to read CPU before METAL, disagreeing with run/serve. `-ngl 0` is bench's
+    // own extra "force the CPU reference backend" gate (llama-bench semantics), so it wins first.
+    let backend = if ngl == 0 {
+        Backend::Cpu
+    } else {
+        selected_backend()
+    };
     // diffusion-gemma (Phase 4/D, docs/DIFFUSIONGEMMA.md): llama-bench has no diffusion mode, so
     // `infr bench` measures infr's OWN decode shape (block prefill + canvas denoise, see
     // `cmd_bench_diffusion_gemma`'s doc) instead of routing through the AR pp/tg arms below.
-    // Backend selection mirrors `cmd_run`/`cmd_serve`: -ngl 0 or INFR_CPU picks the CPU reference
-    // session; INFR_METAL (set by `--dev metal` or a raw env) picks the Metal session (Phase D —
-    // macOS only, see `cmd_bench_diffusion_gemma`'s own cfg-gated dispatch).
     if infr_llama::diffusion::is_diffusion_gemma(&gguf) {
-        let metal = std::env::var("INFR_METAL").is_ok();
-        let cpu = ngl == 0 || std::env::var("INFR_CPU").is_ok();
+        let metal = matches!(backend, Backend::Metal);
+        let cpu = matches!(backend, Backend::Cpu);
         return cmd_bench_diffusion_gemma(
             &gguf,
             tok.as_deref(),
@@ -1761,7 +1816,7 @@ fn cmd_bench(
     // -ngl 0 (or `--dev cpu` → INFR_CPU): run on the CPU reference backend (no GPU), comparable to
     // `llama-bench -ngl 0`. llama4 benches through the standard Vulkan arm below like every other
     // model now (the paged expert cache) — only these force it onto this CPU arm.
-    if ngl == 0 || std::env::var("INFR_CPU").is_ok() {
+    if matches!(backend, Backend::Cpu) {
         return cmd_bench_cpu(
             &gguf,
             tok.as_deref(),
@@ -1776,7 +1831,7 @@ fn cmd_bench(
     // INFR_METAL=1 (set by `--dev metal` or a raw env): bench the dense forward on the Metal backend
     // through the agnostic seam — same pp/tg/pg + depth methodology as the CPU arm, directly
     // comparable to `llama-bench` on the Metal build.
-    if std::env::var("INFR_METAL").is_ok() {
+    if matches!(backend, Backend::Metal) {
         return cmd_bench_metal(
             &gguf,
             tok.as_deref(),
@@ -2418,19 +2473,11 @@ fn cmd_compare_sweep(
                 std::thread::sleep(std::time::Duration::from_secs(3));
                 iv = mb.infr(&args);
             }
-            let mut lv = if metric == "tg64@d" {
-                mb.llama(np, ng, &["-p", "0", "-n", "64", "-d", &ds])
-            } else {
-                mb.llama(np, ng, &args)
-            };
+            let mut lv = mb.llama(np, ng, &args);
             if lv.is_none() {
                 eprintln!("llama-bench failed ({short} {metric_label}), retrying once");
                 std::thread::sleep(std::time::Duration::from_secs(3));
-                lv = if metric == "tg64@d" {
-                    mb.llama(np, ng, &["-p", "0", "-n", "64", "-d", &ds])
-                } else {
-                    mb.llama(np, ng, &args)
-                };
+                lv = mb.llama(np, ng, &args);
             }
             let is = iv.as_ref().map(|v| format!("{v:.0}")).unwrap_or_else(|e| {
                 eprintln!("infr bench failed ({short} {metric_label}): {e:#}");
@@ -2477,8 +2524,10 @@ fn cmd_compare_sweep(
             );
         }
     }
-    // Worst-first: the top of this list is the next perf target.
-    rows.sort_by(|a, b| (a.2 / a.3).partial_cmp(&(b.2 / b.3)).unwrap());
+    // Worst-first: the top of this list is the next perf target. NaN-safe (`total_cmp`) so a single
+    // malformed subprocess-JSON value (→ a NaN ratio) sorts to the end instead of panicking the
+    // `partial_cmp().unwrap()` and discarding the whole sweep's results.
+    rows.sort_by(|a, b| nan_safe_ratio_cmp(a.2 / a.3, b.2 / b.3));
     println!("\nBIGGEST GAPS (infr/llama, worst first):");
     for (m, metric, i, l) in rows.iter().take(10) {
         println!("  {:>5.2}x  {m:<22} {metric:<10} ({i:.0} vs {l:.0})", i / l);
@@ -3291,7 +3340,7 @@ fn apply_model_sampling_defaults(gguf: &std::path::Path) {
     );
 }
 
-fn cmd_serve(model: &str, addr: &str, parallel: usize) -> anyhow::Result<()> {
+fn cmd_serve(model: &str, addr: &str, parallel: Option<usize>) -> anyhow::Result<()> {
     let (gguf, tok) = resolve(model)?;
     let model_id = gguf
         .file_stem()
@@ -3299,7 +3348,9 @@ fn cmd_serve(model: &str, addr: &str, parallel: usize) -> anyhow::Result<()> {
         .unwrap_or("model")
         .to_string();
     let sockaddr: std::net::SocketAddr = addr.parse().context("invalid --addr")?;
-    let parallel = parallel.max(1);
+    // `--parallel` was EXPLICITLY set iff `Some`; the concurrent-path slot count defaults to 4.
+    let parallel_explicit = parallel;
+    let parallel = parallel.unwrap_or(4).max(1);
 
     // `--ctx` is the PER-SLOT context. `DeviceOpts::resolve` already validated it and published it
     // as INFR_CTX (shared size grammar `8192`/`256k`/`50%`); the ParallelSeam below reads INFR_CTX
@@ -3342,57 +3393,24 @@ fn cmd_serve(model: &str, addr: &str, parallel: usize) -> anyhow::Result<()> {
 
     // ── the SERIALISED path: CPU / Metal / diffusion-gemma ──────────────────────────────────────
     // These have no multi-slot engine (one `&mut` ChatModel, one KV session), so concurrent
-    // requests would only queue behind a Mutex. Say so rather than pretending to parallelise.
-    if parallel > 1 {
+    // requests would only queue behind a Mutex. Warn ONLY when the user EXPLICITLY asked for
+    // parallelism (`--parallel N>1`) — the default (unset) must stay silent, since every
+    // CPU/Metal/diffusion serve would otherwise print a spurious "ignored" note.
+    if matches!(parallel_explicit, Some(n) if n > 1) {
         eprintln!(
-            "note: --parallel {parallel} ignored on the CPU/Metal/diffusion backends (no \
-             multi-slot engine); serving 1 request at a time. The Vulkan seam is the concurrent \
-             engine."
+            "note: --parallel {} ignored on the CPU/Metal/diffusion backends (no multi-slot \
+             engine); serving 1 request at a time. The Vulkan seam is the concurrent engine.",
+            parallel_explicit.unwrap()
         );
     }
 
-    // Seam-backed serve — the ONE engine: the SAME ChatModel + multi-slot session `infr run`
-    // uses, so serve gets per-request suffix-only prefill and cross-conversation prefix seeding
-    // for free. INFR_CPU / INFR_METAL select the reference backends; Vulkan is the default.
-    // qwen35 shares the SAME selection funnel as every other arch below — see the matching
-    // comment in `cmd_run` (the old standalone `Qwen35Chat` branch + its env-gated escape hatch
-    // were deleted once the unified path was validated; issue #30).
-    let mut m: Box<dyn infr_llama::chat::ChatModel + Send> = if is_dg {
-        // diffusion-gemma (Phase 3/D): same selection as `cmd_run` — see its matching comment.
-        let cpu = std::env::var("INFR_CPU").is_ok();
-        let metal = std::env::var("INFR_METAL").is_ok();
-        let loaded = infr_llama::SeamModel::load(&gguf, tok.as_deref())?;
-        Box::new(if cpu {
-            infr_llama::chat::DiffusionGemmaChat::new_cpu(loaded)
-        } else if metal {
-            infr_llama::chat::DiffusionGemmaChat::new_metal(loaded)
-        } else {
-            infr_llama::chat::DiffusionGemmaChat::new(loaded)
-        })
-    } else if std::env::var("INFR_METAL").is_ok() {
-        // Metal: the SAME selection funnel as `infr run` — persistent-session seam chat, or
-        // speculative decoding with INFR_SPEC_DRAFT (serve requests then decode through the
-        // draft-verify driver; greedy-only). Stateless reference wrapper elsewhere (the arm is
-        // unreachable off-macOS anyway).
-        #[cfg(target_os = "macos")]
-        {
-            metal_chat_model(&gguf, tok.as_deref())?
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            Box::new(infr_llama::chat::CpuDenseChat::new_metal(
-                infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
-            ))
-        }
-    } else if std::env::var("INFR_CPU").is_ok() {
-        Box::new(infr_llama::chat::CpuDenseChat::new(
-            infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
-        ))
-    } else {
-        Box::new(infr_llama::chat::DenseSeamChat::new(
-            infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
-        ))
-    };
+    // Seam-backed serve — the ONE engine: the SAME ChatModel + multi-slot session `infr run` uses
+    // (built through the SAME `build_chat_model` funnel), so serve gets per-request suffix-only
+    // prefill and cross-conversation prefix seeding for free. INFR_CPU / INFR_METAL select the
+    // reference backends; Vulkan is the default. qwen35 shares the SAME funnel as every other arch
+    // (issue #30). Metal also honours INFR_SPEC_DRAFT (draft-verify speculative decode) via
+    // `metal_chat_model` inside the funnel.
+    let mut m = build_chat_model(&gguf, tok.as_deref(), is_dg)?;
     {
         // Compile every lazily-built pipeline NOW (a tiny throwaway generation) so the first
         // request doesn't pay seconds of pipeline builds on top of its own prefill.
@@ -3583,6 +3601,118 @@ mod tests {
             parse_model_spec("org/repo@main").unwrap(),
             ("org/repo@main", None)
         );
+    }
+
+    // ── finding 1: unified backend decision (resolve_backend / selected_backend) ────────────────
+    #[test]
+    fn explicit_dev_overrides_inherited_backend_env() {
+        // `--dev vulkan0` under an inherited INFR_CPU=1 must resolve to Vulkan (the flag wins), not
+        // CPU — the bug where an inherited env shadowed `--dev`. Pure decision, no process env.
+        let env = BackendEnv {
+            cpu: true,
+            metal: true,
+        };
+        assert_eq!(
+            resolve_backend(Some("vulkan0"), env).unwrap(),
+            Backend::Vulkan(Some("vulkan0".to_string()))
+        );
+        assert_eq!(resolve_backend(Some("metal"), env).unwrap(), Backend::Metal);
+        assert_eq!(resolve_backend(Some("cpu"), env).unwrap(), Backend::Cpu);
+        // Case-insensitive, and the original casing is preserved for INFR_DEV.
+        assert_eq!(
+            resolve_backend(Some("Vulkan1"), BackendEnv::default()).unwrap(),
+            Backend::Vulkan(Some("Vulkan1".to_string()))
+        );
+        // A bogus --dev is rejected with the accepted forms.
+        assert!(resolve_backend(Some("gpu9"), BackendEnv::default()).is_err());
+    }
+
+    #[test]
+    fn env_backend_precedence_is_metal_then_cpu_then_vulkan() {
+        // The ONE reader precedence shared by run/serve/bench (bench used to read CPU before METAL).
+        let m = |metal, cpu| resolve_backend(None, BackendEnv { metal, cpu }).unwrap();
+        assert_eq!(m(true, true), Backend::Metal); // METAL wins over CPU
+        assert_eq!(m(true, false), Backend::Metal);
+        assert_eq!(m(false, true), Backend::Cpu);
+        assert_eq!(m(false, false), Backend::Vulkan(None)); // default: first discrete GPU
+    }
+
+    // Serialise the few tests that must touch the real process env (env is process-global).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn device_resolve_clears_sibling_backend_envs() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // Inherit a stale INFR_CPU, then pass `--dev vulkan0`: resolve must clear INFR_CPU/INFR_METAL
+        // and publish only INFR_DEV, so the reader can't pick the stale CPU backend.
+        std::env::set_var("INFR_CPU", "1");
+        std::env::remove_var("INFR_METAL");
+        std::env::remove_var("INFR_DEV");
+        let opts = DeviceOpts {
+            dev: Some("vulkan0".to_string()),
+            ctx: None,
+            ubatch: None,
+            threads: None,
+        };
+        opts.resolve().unwrap();
+        assert_eq!(std::env::var("INFR_DEV").ok().as_deref(), Some("vulkan0"));
+        assert!(std::env::var_os("INFR_CPU").is_none());
+        assert!(std::env::var_os("INFR_METAL").is_none());
+        assert_eq!(selected_backend(), Backend::Vulkan(None)); // reader agrees: not CPU
+        std::env::remove_var("INFR_DEV");
+    }
+
+    // ── finding 3: local `.gguf` FILE vs HF ref classifier ──────────────────────────────────────
+    #[test]
+    fn is_local_gguf_requires_an_existing_gguf_file() {
+        // Unique scratch dir (no tempfile dep); cleaned at the end.
+        let dir = std::env::temp_dir().join(format!(
+            "infr-cli-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let gguf = dir.join("model.gguf");
+        std::fs::write(&gguf, b"x").unwrap();
+        assert!(is_local_gguf(&gguf), "an existing .gguf file is local");
+        // Case-insensitive extension.
+        let gguf_up = dir.join("model.GGUF");
+        std::fs::write(&gguf_up, b"x").unwrap();
+        assert!(is_local_gguf(&gguf_up));
+
+        // A directory (even named `*.gguf`) is NOT local → falls through to the HF ref path.
+        let dir_gguf = dir.join("weights.gguf");
+        std::fs::create_dir_all(&dir_gguf).unwrap();
+        assert!(!is_local_gguf(&dir_gguf));
+        // A non-.gguf file is not local.
+        let bin = dir.join("model.bin");
+        std::fs::write(&bin, b"x").unwrap();
+        assert!(!is_local_gguf(&bin));
+        // A missing path is not local (a typo'd path → clearer error, not a network pull).
+        assert!(!is_local_gguf(&dir.join("nope.gguf")));
+        // An `org/repo` HF ref is obviously not a local file.
+        assert!(!is_local_gguf(Path::new("qwen/Qwen3-8B")));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── finding 4: NaN-safe sweep ranking ───────────────────────────────────────────────────────
+    #[test]
+    fn nan_safe_ratio_cmp_does_not_panic_and_sinks_nan() {
+        use std::cmp::Ordering;
+        assert_eq!(nan_safe_ratio_cmp(0.5, 1.5), Ordering::Less);
+        assert_eq!(nan_safe_ratio_cmp(2.0, 1.0), Ordering::Greater);
+        // A malformed value (0.0/0.0 = NaN) must NOT panic the sort and must sort to the end.
+        let mut v = [1.0f64, f64::NAN, 0.5, 2.0];
+        v.sort_by(|a, b| nan_safe_ratio_cmp(*a, *b));
+        assert_eq!(v[0], 0.5);
+        assert_eq!(v[1], 1.0);
+        assert_eq!(v[2], 2.0);
+        assert!(v[3].is_nan(), "NaN sinks to the end instead of aborting");
     }
 
     #[test]

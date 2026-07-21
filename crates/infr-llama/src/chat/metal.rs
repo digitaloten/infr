@@ -78,6 +78,12 @@ impl ChatModel for MetalSeamChat {
         self.model.render_chat_messages(messages)
     }
 
+    fn reset_kv(&mut self) {
+        if let Some(s) = &mut self.session {
+            s.reset_cache();
+        }
+    }
+
     fn warmup(&mut self) -> Result<()> {
         // (No INFR_METAL_PROFILE suppression: the Metal backend reads it at CONSTRUCTION —
         // which happens inside this first generate — so unsetting it here would disable

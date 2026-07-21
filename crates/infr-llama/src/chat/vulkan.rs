@@ -146,6 +146,12 @@ impl ChatModel for DenseSeamChat {
         self.model.render_chat_messages(messages)
     }
 
+    fn reset_kv(&mut self) {
+        if let Some(s) = &mut self.session {
+            s.reset_cache();
+        }
+    }
+
     fn warmup(&mut self) -> Result<()> {
         let prof2 = std::env::var_os("INFR_PROF2");
         if prof2.is_some() {
