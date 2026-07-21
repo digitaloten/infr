@@ -22,7 +22,7 @@ reproduce/confirm are dropped (not listed) to keep this a verified-only ledger.
 
 - **Original audit:** 157 findings across 24 module slices (1 🔴 critical, 33 🟠
   major, 123 🟡 minor).
-- **Remaining open:** **145** — 0 🔴, 28 🟠, 117 🟡.
+- **Remaining open:** **140** — 0 🔴, 26 🟠, 114 🟡.
 
 No finding was accepted on an agent's word — each was re-read against the source
 by the coordinator; two agent-flagged "MAJOR"s (the Q5_1 clamp in the shader and
@@ -50,23 +50,31 @@ parked path).
   instead of a ~150K full sort; `truncated_dist`/`sample_logits` share one
   `truncated_softmax` helper. _Follow-up noted:_ `seed_rng()` (INFR_SEED path)
   has the same latent `|1` — deferred to avoid perturbing INFR_SEED determinism.
+- **`infr-gguf` (all 5 findings)** — TDD, +9 tests. Corrupt/truncated GGUFs now
+  return `Error::Loader` instead of panicking (`checked_add`/`checked_mul` in
+  `ensure`/shape/offsets; `with_capacity` clamped to remaining bytes;
+  non-pow2/zero `alignment` rejected). Host affine dequant is a single fused
+  pass (no `sc`/`mn` materialization) — **bit-identical** (characterization
+  tests on Q4_K/Q6_K assert `to_bits()` equality). `dequant_factored` returns
+  `Result` (was `unreachable!`); `apply_signs`/`Gguf::resolve` de-duplicate the
+  IQ sign loops and tensor-bounds lookup.
 
 ### Highest-priority (production default paths)
 
-| #     | Sev | Location                              | Issue                                                                                                                                       |
-| ----- | --- | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| ~~1~~ | ✅  | `infr-hub`                            | ~~Downloaded blob never sha256-verified~~ — **FIXED** (`1263bcc`, + full hub slice).                                                        |
-| 2     | 🟠  | `infr-llama chat/mod.rs:186`          | Generate error leaves an **orphaned user turn** → next turn has two consecutive user messages, permanent history corruption.                |
-| 3     | 🟠  | `infr-server lib.rs:953`              | Streaming path **swallows generation errors as a clean `stop`**; a closure panic hangs strict SSE clients (no `[DONE]`).                    |
-| 4     | 🟠  | `infr-server lib.rs:874`              | **No per-request cancellation** — a disconnected stream holds its GPU slot to `max_tokens`, blocking `--parallel` queue.                    |
-| 5     | 🟠  | `infr-llama runner.rs:3743,3989`      | Prefix-cache records **KV rows never materialized** (`max_new==0` frontier; grammar-forced tokens) → next turn attends stale KV.            |
-| 6     | 🟠  | `infr-vulkan adapter.rs:2997`         | Static split-K attn bounds chunk _size_ not _count_ → `n_chunks>1024` **overruns `attn_combine` `wexp[1024]`** at huge ctx.                 |
-| 7     | 🟠  | `infr-vulkan ops.rs:229`              | Kernel-cache double-checked lock **double-compiles + leaks a pipeline** under concurrent first use.                                         |
-| ~~8~~ | ✅  | `infr-llama sampling.rs`              | ~~Repeat penalty per-occurrence~~ — **FIXED** (`70bbe4e`; now per-distinct-token).                                                          |
-| 9     | 🟠  | `infr-vulkan shaders dg_eb_sample:61` | argmax reduce **drops the lower-index tie-break** → diverges from host on ties (feeds diffusion goldens).                                   |
-| 10    | 🟠  | `infr-gguf lib.rs:80`                 | Corrupt GGUF length prefix → **`pos+n` overflow panics** instead of a clean loader error (untrusted input).                                 |
-| 11    | 🟠  | `infr-cli main.rs:120`                | `--dev` **can't override an inherited `INFR_CPU`/`INFR_METAL`** → silent wrong-device runs; reader precedence inconsistent across commands. |
-| 12    | 🟠  | `infr-metal exec.rs:2836`             | `Op::Rope` snapshots positions on the replay tape → **frozen RoPE after token 0** (llama-family Metal decode).                              |
+| #      | Sev | Location                              | Issue                                                                                                                                       |
+| ------ | --- | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| ~~1~~  | ✅  | `infr-hub`                            | ~~Downloaded blob never sha256-verified~~ — **FIXED** (`1263bcc`, + full hub slice).                                                        |
+| 2      | 🟠  | `infr-llama chat/mod.rs:186`          | Generate error leaves an **orphaned user turn** → next turn has two consecutive user messages, permanent history corruption.                |
+| 3      | 🟠  | `infr-server lib.rs:953`              | Streaming path **swallows generation errors as a clean `stop`**; a closure panic hangs strict SSE clients (no `[DONE]`).                    |
+| 4      | 🟠  | `infr-server lib.rs:874`              | **No per-request cancellation** — a disconnected stream holds its GPU slot to `max_tokens`, blocking `--parallel` queue.                    |
+| 5      | 🟠  | `infr-llama runner.rs:3743,3989`      | Prefix-cache records **KV rows never materialized** (`max_new==0` frontier; grammar-forced tokens) → next turn attends stale KV.            |
+| 6      | 🟠  | `infr-vulkan adapter.rs:2997`         | Static split-K attn bounds chunk _size_ not _count_ → `n_chunks>1024` **overruns `attn_combine` `wexp[1024]`** at huge ctx.                 |
+| 7      | 🟠  | `infr-vulkan ops.rs:229`              | Kernel-cache double-checked lock **double-compiles + leaks a pipeline** under concurrent first use.                                         |
+| ~~8~~  | ✅  | `infr-llama sampling.rs`              | ~~Repeat penalty per-occurrence~~ — **FIXED** (`70bbe4e`; now per-distinct-token).                                                          |
+| 9      | 🟠  | `infr-vulkan shaders dg_eb_sample:61` | argmax reduce **drops the lower-index tie-break** → diverges from host on ties (feeds diffusion goldens).                                   |
+| ~~10~~ | ✅  | `infr-gguf lib.rs`                    | ~~Corrupt GGUF `pos+n` overflow panic~~ — **FIXED** (`checked_add`/`checked_mul` → `Error::Loader`).                                        |
+| 11     | 🟠  | `infr-cli main.rs:120`                | `--dev` **can't override an inherited `INFR_CPU`/`INFR_METAL`** → silent wrong-device runs; reader precedence inconsistent across commands. |
+| 12     | 🟠  | `infr-metal exec.rs:2836`             | `Op::Rope` snapshots positions on the replay tape → **frozen RoPE after token 0** (llama-family Metal decode).                              |
 
 Other 🟠 majors span host-hot-path churn (recorder per-dispatch `env::var` +
 `Vec` allocs; adapter MoE `counts` double-zero), prefill perf (`gemm_proj`
@@ -953,44 +961,6 @@ agent verified and correctly ruled that out.)_
    per invocation (`820/917/ 973/1207/1835`). \_Fix:* `build_chat_model(...)`
    helper; delete the dead surface; parse GGUF metadata once and pass
    arch/DG/eos down.
-
-## infr-gguf/src/{lib,dequant}.rs
-
-1. **🟠 `lib.rs:80-90,155 — GGUF parse uses unchecked `self.pos + n`, so a
-   corrupt length prefix panics instead of erroring.** `read_gguf_str` reads a
-   u64 length and calls `ensure(len)`, whose check `self.pos + n > buf.len()`
-   overflows for a bogus near-`usize::MAX` length → debug panic / release
-   wrap-to-small → `ensure` returns Ok → the `&buf[pos..pos+len]` slice panics.
-   GGUFs are downloaded/possibly-truncated inputs (the project tracks "verify
-   GGUF downloads") → DoS/robustness bug; the loader must return
-   `Error::Loader`, never panic. _Fix:_ `self.pos.checked_add(n)` (+ same for
-   every length/offset add, `shape.product()`,
-   `data_region_start+offset+nbytes`).
-2. **🟠 `dequant.rs:23-28 — host affine dequant does 3 full-tensor passes + ~3
-   numel-sized allocs.** `dequant_block` → `dequant_factored` (fills
-   `codes`/`scm`/ `dd`) → `dequant_unified` (allocs `sc`+`mn` `Vec<f32>`, loops
-   numel with two f16→f32 + two muls each) → a third numel loop for `sc*qv+mn`;
-   the same f16 super-scale is re-converted 256× per K-quant block. The
-   factored/unified split exists for the GPU compact path but the CPU host path
-   (model load / token*embd dequant, `infr-cpu/lib.rs:262`) pays it all. \_Fix:*
-   a direct single-pass affine expansion hoisting `dd.to_f32()` per dblk + `scm`
-   per 16-block, no `sc`/`mn` materialization.
-3. **🟡 `lib.rs:186,364,382,396,402 — malformed-header hardening.** Attacker-
-   controlled `tensor_count`/`kv_count`/array `count` drive `with_capacity`
-   before validation (multi-GB reservation → abort on a few-byte file);
-   `general.alignment == 0` makes `pos.div_ceil(alignment)` panic (div-by-zero).
-   _Fix:_ clamp reservations to remaining bytes; reject non-power-of-two
-   alignment with `Error::Loader`.
-4. **🟡
-   `dequant.rs:113,126,387 — `dequant_factored`/`dequant_unified`are`pub`but`unreachable!()`
-   on any non-affine dtype** (F16/Iq4Nl) → hard panic if a caller doesn't
-   pre-filter with `is_quant`. _Fix:_ gate to `is_quant` entry only, or return
-   `Result`.
-5. **🟡 DRY — `dequant.rs` IQ sign-application block copy-pasted across IQ2_XXS/
-   IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S (`566-806`) + the Q4/Q5 nibble unpack (`145-208`);
-   `lib.rs:427 vs 466` `tensor_bytes_arc`/`tensor_bytes` duplicate lookup+bounds
-   check** (a one-sided overflow fix leaves the other unsound). _Fix:_
-   `apply_signs(...)`/nibble helper; a shared `resolve(name)->(off,len)`.
 
 ## infr-server/src/lib.rs
 

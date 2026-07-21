@@ -77,8 +77,22 @@ impl<'a> Reader<'a> {
         Self { buf, pos: 0 }
     }
 
+    /// Bytes left to read from the current cursor. Used to clamp attacker-controlled
+    /// `with_capacity` reservations to a sane upper bound (each element needs ≥1 byte).
+    fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
+    }
+
     fn ensure(&self, n: usize) -> Result<()> {
-        if self.pos + n > self.buf.len() {
+        // `checked_add`: a bogus near-`usize::MAX` length prefix must error, never
+        // overflow `pos + n` (debug panic / release wrap → out-of-bounds slice panic).
+        let end = self.pos.checked_add(n).ok_or_else(|| {
+            Error::Loader(format!(
+                "GGUF: length {n} at offset {} overflows usize",
+                self.pos
+            ))
+        })?;
+        if end > self.buf.len() {
             Err(Error::Loader(format!(
                 "GGUF: unexpected EOF at offset {} (need {n} more bytes, file is {} bytes)",
                 self.pos,
@@ -183,7 +197,9 @@ impl<'a> Reader<'a> {
                 // ARRAY: u32 elem_type, u64 count, then count × elem
                 let elem_type = self.read_u32()?;
                 let count = self.read_u64()? as usize;
-                let mut arr = Vec::with_capacity(count);
+                // Clamp the reservation: an attacker-controlled `count` on a tiny file
+                // must not trigger a multi-GB `with_capacity` abort before we read.
+                let mut arr = Vec::with_capacity(count.min(self.remaining()));
                 for _ in 0..count {
                     arr.push(self.read_meta_value(elem_type)?);
                 }
@@ -361,7 +377,10 @@ impl Gguf {
             let kv_count = r.read_u64()? as usize;
 
             // ── metadata KV pairs ─────────────────────────────────────────────
-            let mut kv: HashMap<String, MetaValue> = HashMap::with_capacity(kv_count);
+            // Clamp the reservation to the bytes actually left in the file so a bogus
+            // `kv_count` can't force a huge allocation before the parse fails on EOF.
+            let mut kv: HashMap<String, MetaValue> =
+                HashMap::with_capacity(kv_count.min(r.remaining()));
             for _ in 0..kv_count {
                 let key = r.read_gguf_str()?;
                 let vtype = r.read_u32()?;
@@ -370,20 +389,29 @@ impl Gguf {
             }
             let metadata = Metadata { kv };
 
-            // alignment from metadata, defaulting to GGUF_DEFAULT_ALIGNMENT (32)
+            // alignment from metadata, defaulting to GGUF_DEFAULT_ALIGNMENT (32).
+            // Reject non-positive / non-power-of-two: `general.alignment == 0` would make
+            // `pos.div_ceil(alignment)` panic with a div-by-zero, and GGUF requires a
+            // power-of-two alignment.
             let alignment = metadata
                 .u64("general.alignment")
                 .unwrap_or(DEFAULT_ALIGNMENT as u64) as usize;
+            if alignment == 0 || !alignment.is_power_of_two() {
+                return Err(Error::Loader(format!(
+                    "GGUF: invalid general.alignment {alignment} (must be a positive power of two)"
+                )));
+            }
 
             // ── tensor info entries ───────────────────────────────────────────
             // Collect raw fields first (name, shape, ggml_type, offset); then
             // convert after parsing so errors are reported before we consume the
             // remaining header bytes.
-            let mut raw: Vec<(String, Vec<usize>, u32, u64)> = Vec::with_capacity(tensor_count);
+            let mut raw: Vec<(String, Vec<usize>, u32, u64)> =
+                Vec::with_capacity(tensor_count.min(r.remaining()));
             for _ in 0..tensor_count {
                 let name = r.read_gguf_str()?;
                 let n_dims = r.read_u32()? as usize;
-                let mut shape = Vec::with_capacity(n_dims);
+                let mut shape = Vec::with_capacity(n_dims.min(r.remaining()));
                 for _ in 0..n_dims {
                     shape.push(r.read_u64()? as usize);
                 }
@@ -396,10 +424,18 @@ impl Gguf {
             let data_region_start = r.pos.div_ceil(alignment) * alignment;
 
             // ── convert raw tensor entries to TensorInfo ─────────────────────
-            let mut tensors: Vec<TensorInfo> = Vec::with_capacity(tensor_count);
+            let mut tensors: Vec<TensorInfo> = Vec::with_capacity(raw.len());
             for (name, shape, ggml_type, offset) in raw {
                 let dtype = ggml_type_to_dtype(ggml_type)?;
-                let numel: usize = shape.iter().product();
+                // `checked_mul`: a crafted shape must error, not overflow the product.
+                let numel: usize = shape
+                    .iter()
+                    .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+                    .ok_or_else(|| {
+                        Error::Loader(format!(
+                            "GGUF: tensor '{name}' shape {shape:?} overflows usize"
+                        ))
+                    })?;
                 let nbytes = tensor_nbytes(dtype, numel);
                 tensors.push(TensorInfo {
                     name,
@@ -425,25 +461,39 @@ impl Gguf {
     /// [`WeightSource::tensor_bytes`] the result is not borrow-bound to `&self`, so a backend can hold
     /// it as a weight buffer and read straight from the mapping — no `memcpy` into owned RAM.
     pub fn tensor_bytes_arc(&self, name: &str) -> Result<TensorBytes> {
-        let info = self
-            .tensors
-            .iter()
-            .find(|t| t.name == name)
-            .ok_or_else(|| Error::Loader(format!("tensor not found: '{name}'")))?;
-        let off = self.data_region_start + info.offset as usize;
-        let len = info.nbytes;
-        if off + len > self.mmap.len() {
-            return Err(Error::Loader(format!(
-                "tensor '{name}' byte range {off}..{} exceeds file size {}",
-                off + len,
-                self.mmap.len()
-            )));
-        }
+        let (off, len) = self.resolve(name)?;
         Ok(TensorBytes {
             mmap: Arc::clone(&self.mmap),
             off,
             len,
         })
+    }
+
+    /// Look up a tensor by name and return its `(absolute_offset, len)` in the mmap,
+    /// bounds-checked against the file size with `checked_add` so a crafted
+    /// offset/length can't overflow. Shared by [`Self::tensor_bytes_arc`] and
+    /// [`WeightSource::tensor_bytes`] so the lookup + overflow-safe bounds check lives
+    /// in exactly one place.
+    fn resolve(&self, name: &str) -> Result<(usize, usize)> {
+        let info = self
+            .tensors
+            .iter()
+            .find(|t| t.name == name)
+            .ok_or_else(|| Error::Loader(format!("tensor not found: '{name}'")))?;
+        let off = self
+            .data_region_start
+            .checked_add(info.offset as usize)
+            .ok_or_else(|| Error::Loader(format!("tensor '{name}' offset overflows usize")))?;
+        let end = off
+            .checked_add(info.nbytes)
+            .ok_or_else(|| Error::Loader(format!("tensor '{name}' byte range overflows usize")))?;
+        if end > self.mmap.len() {
+            return Err(Error::Loader(format!(
+                "tensor '{name}' byte range {off}..{end} exceeds file size {}",
+                self.mmap.len()
+            )));
+        }
+        Ok((off, info.nbytes))
     }
 }
 
@@ -464,24 +514,8 @@ impl WeightSource for Gguf {
     /// The slice lifetime is tied to `&self` (i.e. the `Gguf` struct keeps
     /// the `Mmap` alive).
     fn tensor_bytes(&self, name: &str) -> Result<&[u8]> {
-        let info = self
-            .tensors
-            .iter()
-            .find(|t| t.name == name)
-            .ok_or_else(|| Error::Loader(format!("tensor not found: '{name}'")))?;
-
-        let start = self.data_region_start + info.offset as usize;
-        let end = start + info.nbytes;
-        let buf: &[u8] = &self.mmap;
-
-        if end > buf.len() {
-            return Err(Error::Loader(format!(
-                "tensor '{name}' byte range {start}..{end} exceeds file size {}",
-                buf.len()
-            )));
-        }
-
-        Ok(&buf[start..end])
+        let (start, len) = self.resolve(name)?;
+        Ok(&self.mmap[start..start + len])
     }
 
     fn chat_template(&self) -> Option<&str> {
@@ -600,6 +634,98 @@ mod tests {
 
         // chat_template absent → None
         assert!(gguf.chat_template().is_none());
+    }
+
+    // ── malformed / truncated header hardening ────────────────────────────────
+
+    /// A bogus near-`usize::MAX` string length prefix must surface as `Error::Loader`,
+    /// never overflow `pos + n` (debug panic / release wrap → slice panic).
+    #[test]
+    fn oversized_string_length_errors() {
+        let mut b: Vec<u8> = Vec::new();
+        push_u32(&mut b, GGUF_MAGIC);
+        push_u32(&mut b, 3); // version
+        push_u64(&mut b, 0); // tensor_count
+        push_u64(&mut b, 1); // kv_count
+        push_u64(&mut b, u64::MAX); // key string length = absurd
+        let tmp = write_temp_gguf(&b);
+        let err = Gguf::open(tmp.path()).map(|_| ());
+        assert!(
+            matches!(err, Err(Error::Loader(_))),
+            "oversized string length should be Error::Loader, got {err:?}"
+        );
+    }
+
+    /// `general.alignment == 0` must be rejected, not cause a div-by-zero panic in
+    /// `pos.div_ceil(alignment)`.
+    #[test]
+    fn zero_alignment_errors() {
+        let mut b: Vec<u8> = Vec::new();
+        push_u32(&mut b, GGUF_MAGIC);
+        push_u32(&mut b, 3); // version
+        push_u64(&mut b, 0); // tensor_count
+        push_u64(&mut b, 1); // kv_count
+        push_gguf_str(&mut b, "general.alignment");
+        push_u32(&mut b, 4); // GGUF_TYPE_UINT32
+        push_u32(&mut b, 0); // alignment = 0
+        let tmp = write_temp_gguf(&b);
+        let err = Gguf::open(tmp.path()).map(|_| ());
+        assert!(
+            matches!(err, Err(Error::Loader(_))),
+            "zero alignment should be Error::Loader, got {err:?}"
+        );
+    }
+
+    /// A non-power-of-two alignment must be rejected.
+    #[test]
+    fn non_pow2_alignment_errors() {
+        let mut b: Vec<u8> = Vec::new();
+        push_u32(&mut b, GGUF_MAGIC);
+        push_u32(&mut b, 3);
+        push_u64(&mut b, 0);
+        push_u64(&mut b, 1);
+        push_gguf_str(&mut b, "general.alignment");
+        push_u32(&mut b, 4);
+        push_u32(&mut b, 33); // not a power of two
+        let tmp = write_temp_gguf(&b);
+        let err = Gguf::open(tmp.path()).map(|_| ());
+        assert!(
+            matches!(err, Err(Error::Loader(_))),
+            "non-pow2 alignment should be Error::Loader, got {err:?}"
+        );
+    }
+
+    /// A huge `tensor_count` on a tiny file must error gracefully — no multi-GB
+    /// `with_capacity` reservation / capacity-overflow abort.
+    #[test]
+    fn huge_tensor_count_errors_gracefully() {
+        let mut b: Vec<u8> = Vec::new();
+        push_u32(&mut b, GGUF_MAGIC);
+        push_u32(&mut b, 3); // version
+        push_u64(&mut b, u64::MAX); // tensor_count = absurd
+        push_u64(&mut b, 0); // kv_count
+        let tmp = write_temp_gguf(&b);
+        let err = Gguf::open(tmp.path()).map(|_| ());
+        assert!(
+            matches!(err, Err(Error::Loader(_))),
+            "huge tensor_count should be Error::Loader, got {err:?}"
+        );
+    }
+
+    /// A huge `kv_count` on a tiny file must error gracefully.
+    #[test]
+    fn huge_kv_count_errors_gracefully() {
+        let mut b: Vec<u8> = Vec::new();
+        push_u32(&mut b, GGUF_MAGIC);
+        push_u32(&mut b, 3); // version
+        push_u64(&mut b, 0); // tensor_count
+        push_u64(&mut b, u64::MAX); // kv_count = absurd
+        let tmp = write_temp_gguf(&b);
+        let err = Gguf::open(tmp.path()).map(|_| ());
+        assert!(
+            matches!(err, Err(Error::Loader(_))),
+            "huge kv_count should be Error::Loader, got {err:?}"
+        );
     }
 
     // ── gated real-model test (skipped offline) ───────────────────────────────

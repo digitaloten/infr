@@ -5,7 +5,7 @@
 use anyhow::{bail, Result};
 
 /// Dequantize a tensor's raw `bytes` of `dtype` into host f32. Handles plain floats
-/// (F32/F16/BF16), affine quants (via [`dequant_unified`]), and codebook quants (via
+/// (F32/F16/BF16), affine quants (via [`dequant_factored`]), and codebook quants (via
 /// [`dequant_codebook`]). The single host-side dequant entry point.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn dequant_block(dtype: infr_core::DType, bytes: &[u8]) -> Result<Vec<f32>> {
@@ -20,11 +20,30 @@ pub fn dequant_block(dtype: infr_core::DType, bytes: &[u8]) -> Result<Vec<f32>> 
             .chunks_exact(2)
             .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
             .collect(),
+        // Affine quants: decode once into the compact factored form, then expand in a
+        // single fused pass — hoist the f16 super-scale `dd.to_f32()` out to once per
+        // `dblk` and the `(sc, m)` multipliers to once per 16-element block, writing
+        // straight into the output. Bit-identical to the old
+        // factored→unified(materialize sc/mn)→expand chain: the arithmetic
+        // `(dd·sc)·code + (dd·m)` and its evaluation order are unchanged, only the
+        // redundant per-element f16→f32 reconversions and the two numel-sized `sc`/`mn`
+        // allocations are removed.
         d if is_quant(d) => {
-            let (qv, sc, mn) = dequant_unified(d, bytes);
-            (0..qv.len())
-                .map(|g| sc[g] * qv[g] as f32 + mn[g])
-                .collect()
+            let f = dequant_factored(d, bytes)?;
+            let mut out = vec![0f32; f.codes.len()];
+            let n16 = out.len() / 16;
+            for b16 in 0..n16 {
+                let base = b16 * 16;
+                let db = base / f.dblk; // dblk is a multiple of 16 → constant over the block
+                let dsc = f.dd[2 * db].to_f32();
+                let dmn = f.dd[2 * db + 1].to_f32();
+                let sc = dsc * f.scm[2 * b16] as f32;
+                let mn = dmn * f.scm[2 * b16 + 1] as f32;
+                for g in 0..16 {
+                    out[base + g] = sc * f.codes[base + g] as f32 + mn;
+                }
+            }
+            out
         }
         d if is_codebook_quant(d) => dequant_codebook(d, bytes),
         other => bail!("unsupported dtype {other:?} (host dequant wants F16/F32/BF16/quant)"),
@@ -67,7 +86,7 @@ pub fn k4(j: usize, q: &[u8]) -> (u32, u32) {
 /// `code` per element, one `(sc, m)` i16 pair per consecutive 16-element block, and one `(d, dmin)`
 /// f16 pair per `dblk` elements (32 for the legacy formats, 256 for K-quants) — the two-level
 /// scale structure every affine GGUF quant actually has. Recomputing `f32(d) * f32(sc)` yields
-/// [`dequant_unified`]'s per-block f32 scale bit-for-bit (it is the same f32 multiply; sign flips
+/// [`dequant_block`]'s per-block f32 scale bit-for-bit (it is the same f32 multiply; sign flips
 /// and the ×4/×32 factors folded into `m` are exact power-of-two scalings), so a consumer keeping
 /// this compact form reconstructs the exact dequant reference while reading ~2 bits/elem of scale
 /// metadata instead of 64.
@@ -82,23 +101,6 @@ pub struct Factored {
     pub dblk: usize,
 }
 
-/// Dequant any supported quant into the UNIFIED form: per-element u8 index + per-element
-/// (scale, min) such that `weight = scale*u8 + min` (filled in natural tensor order). Scale/min are
-/// constant across each consecutive 16-element block, which the kernel exploits. Expanded from
-/// [`dequant_factored`] — the single decoder for all affine formats.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub fn dequant_unified(dtype: infr_core::DType, bytes: &[u8]) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
-    let f = dequant_factored(dtype, bytes);
-    let n = f.codes.len();
-    let (mut sc, mut mn) = (vec![0f32; n], vec![0f32; n]);
-    for g in 0..n {
-        let (b, db) = (g / 16, g / f.dblk);
-        sc[g] = f.dd[2 * db].to_f32() * f.scm[2 * b] as f32;
-        mn[g] = f.dd[2 * db + 1].to_f32() * f.scm[2 * b + 1] as f32;
-    }
-    (f.codes, sc, mn)
-}
-
 // per-call leaf, too small to probe (see docs/PERF.md)
 #[cfg_attr(infr_profile, infr_prof::skip)]
 fn rf16(b: &[u8]) -> half::f16 {
@@ -110,8 +112,10 @@ fn rf16(b: &[u8]) -> half::f16 {
 /// records the format's own structure: the f16 super scale(s) per block and the small integer
 /// multipliers per 16-element sub-block.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub fn dequant_factored(dtype: infr_core::DType, bytes: &[u8]) -> Factored {
+pub fn dequant_factored(dtype: infr_core::DType, bytes: &[u8]) -> Result<Factored> {
     use infr_core::DType::*;
+    // Only affine quants have a factored form; a non-affine dtype (F16/Iq*/Tq*/fp4)
+    // must error, never panic — callers can pass an untrusted-model dtype here.
     let (qpb, bpb) = match dtype {
         Q4_0 => (32, 18),
         Q4_1 => (32, 20),
@@ -123,7 +127,7 @@ pub fn dequant_factored(dtype: infr_core::DType, bytes: &[u8]) -> Factored {
         Q4K => (256, 144),
         Q5K => (256, 176),
         Q6K => (256, 210),
-        _ => unreachable!(),
+        other => bail!("dequant_factored: unsupported (non-affine) dtype {other:?}"),
     };
     let nblk = bytes.len() / bpb;
     let numel = nblk * qpb;
@@ -387,12 +391,12 @@ pub fn dequant_factored(dtype: infr_core::DType, bytes: &[u8]) -> Factored {
             _ => unreachable!(),
         }
     }
-    Factored {
+    Ok(Factored {
         codes,
         scm,
         dd,
         dblk,
-    }
+    })
 }
 
 // ─── codebook (non-affine) dequant ───────────────────────────────────────────
@@ -461,6 +465,26 @@ pub fn is_codebook_quant(d: infr_core::DType) -> bool {
             | Mxfp4
             | Nvfp4
     )
+}
+
+/// Shared IQ sign+scale expansion: for `n` elements, decode signed byte `j` from the
+/// packed `grid`, negate it per `KMASK_IQ2XS[sign_off + j]`, scale by `db`, and write
+/// into `out[..n]`. Factors the sign-application block that was copy-pasted across
+/// IQ2_XXS / IQ2_XS / IQ2_S (n=8, sign_off=0) and IQ3_XXS / IQ3_S (two n=4 halves,
+/// sign_off 0 and 4). The multiply order `db * gv * sign` is unchanged from the inlined
+/// versions.
+#[inline]
+fn apply_signs(out: &mut [f32], grid: u64, signs: u8, sign_off: usize, n: usize, db: f32) {
+    use infr_core::iquant_grids::KMASK_IQ2XS;
+    for j in 0..n {
+        let gv = ((grid >> (8 * j)) & 0xFF) as i8 as f32;
+        let sign = if signs & KMASK_IQ2XS[sign_off + j] != 0 {
+            -1.0
+        } else {
+            1.0
+        };
+        out[j] = db * gv * sign;
+    }
 }
 
 /// Dequantize a codebook (non-affine) quant to f32. Ported from llama.cpp `ggml-quants.c`.
@@ -539,7 +563,7 @@ pub fn dequant_codebook(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
         //   y[j] = db * grid[j] * (if ksigns[sign_idx] & (1<<j) { -1 } else { 1 })
         // Ref: llama.cpp dequantize_row_iq2_xxs (ggml-quants.c l.2416)
         Iq2Xxs => {
-            use infr_core::iquant_grids::{IQ2XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
+            use infr_core::iquant_grids::{IQ2XXS_GRID, KSIGNS_IQ2XS};
             let bpb = 66usize; // 2 + 32*2
             let nblk = bytes.len() / bpb;
             let mut out = vec![0.0f32; nblk * 256];
@@ -563,15 +587,7 @@ pub fn dequant_codebook(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
                         let sign_idx = ((aux1 >> (7 * l)) & 127) as usize;
                         let grid_u64 = IQ2XXS_GRID[grid_idx];
                         let signs = KSIGNS_IQ2XS[sign_idx];
-                        for j in 0..8usize {
-                            let gv = ((grid_u64 >> (8 * j)) & 0xFF) as i8;
-                            let sign = if signs & KMASK_IQ2XS[j] != 0 {
-                                -1.0
-                            } else {
-                                1.0
-                            };
-                            out[base + outoff + j] = db * gv as f32 * sign;
-                        }
+                        apply_signs(&mut out[base + outoff..], grid_u64, signs, 0, 8, db);
                         outoff += 8;
                     }
                 }
@@ -587,7 +603,7 @@ pub fn dequant_codebook(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
         //                  dl = db[l/2]
         // Ref: llama.cpp dequantize_row_iq2_xs (ggml-quants.c l.2444)
         Iq2Xs => {
-            use infr_core::iquant_grids::{IQ2XS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
+            use infr_core::iquant_grids::{IQ2XS_GRID, KSIGNS_IQ2XS};
             let bpb = 74usize; // 2 + 32*2 + 8
             let nblk = bytes.len() / bpb;
             let mut out = vec![0.0f32; nblk * 256];
@@ -611,15 +627,7 @@ pub fn dequant_codebook(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
                         let grid_u64 = IQ2XS_GRID[grid_idx];
                         let signs = KSIGNS_IQ2XS[sign_idx];
                         let dl = if l < 2 { db0 } else { db1 };
-                        for j in 0..8usize {
-                            let gv = ((grid_u64 >> (8 * j)) & 0xFF) as i8;
-                            let sign = if signs & KMASK_IQ2XS[j] != 0 {
-                                -1.0
-                            } else {
-                                1.0
-                            };
-                            out[base + outoff + j] = dl * gv as f32 * sign;
-                        }
+                        apply_signs(&mut out[base + outoff..], grid_u64, signs, 0, 8, dl);
                         outoff += 8;
                     }
                 }
@@ -632,7 +640,7 @@ pub fn dequant_codebook(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
         //   grid_idx = qs[l] | ((qh[ib32] << (8-2*l)) & 0x300)  (10-bit → iq2s_grid[1024])
         // Ref: llama.cpp dequantize_row_iq2_s (ggml-quants.c l.2471)
         Iq2S => {
-            use infr_core::iquant_grids::{IQ2S_GRID, KMASK_IQ2XS};
+            use infr_core::iquant_grids::IQ2S_GRID;
             let bpb = 82usize; // 2 + 64 + 8 + 8
             let nblk = bytes.len() / bpb;
             let mut out = vec![0.0f32; nblk * 256];
@@ -659,15 +667,7 @@ pub fn dequant_codebook(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
                         let grid_idx = (qs_byte as usize) | (hi as usize);
                         let grid_u64 = IQ2S_GRID[grid_idx];
                         let dl = if l < 2 { db0 } else { db1 };
-                        for j in 0..8usize {
-                            let gv = ((grid_u64 >> (8 * j)) & 0xFF) as i8;
-                            let sign = if sign_byte & KMASK_IQ2XS[j] != 0 {
-                                -1.0
-                            } else {
-                                1.0
-                            };
-                            out[base + outoff + j] = dl * gv as f32 * sign;
-                        }
+                        apply_signs(&mut out[base + outoff..], grid_u64, sign_byte, 0, 8, dl);
                         outoff += 8;
                     }
                 }
@@ -683,7 +683,7 @@ pub fn dequant_codebook(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
         //     y[j+0] = db * grid1[j] * sign;  y[j+4] = db * grid2[j] * sign
         // Ref: llama.cpp dequantize_row_iq3_xxs (ggml-quants.c l.2503)
         Iq3Xxs => {
-            use infr_core::iquant_grids::{IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
+            use infr_core::iquant_grids::{IQ3XXS_GRID, KSIGNS_IQ2XS};
             let bpb = 98usize; // 2 + 96
             let nblk = bytes.len() / bpb;
             let mut out = vec![0.0f32; nblk * 256];
@@ -703,22 +703,8 @@ pub fn dequant_codebook(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
                         let signs = KSIGNS_IQ2XS[sign_idx];
                         let g1 = IQ3XXS_GRID[qs[qs_off + 2 * l] as usize];
                         let g2 = IQ3XXS_GRID[qs[qs_off + 2 * l + 1] as usize];
-                        for j in 0..4usize {
-                            let s1 = if signs & KMASK_IQ2XS[j] != 0 {
-                                -1.0
-                            } else {
-                                1.0
-                            };
-                            let s2 = if signs & KMASK_IQ2XS[j + 4] != 0 {
-                                -1.0
-                            } else {
-                                1.0
-                            };
-                            let gv1 = ((g1 >> (8 * j)) & 0xFF) as i8;
-                            let gv2 = ((g2 >> (8 * j)) & 0xFF) as i8;
-                            out[base + outoff + j] = db * gv1 as f32 * s1;
-                            out[base + outoff + j + 4] = db * gv2 as f32 * s2;
-                        }
+                        apply_signs(&mut out[base + outoff..], g1 as u64, signs, 0, 4, db);
+                        apply_signs(&mut out[base + outoff + 4..], g2 as u64, signs, 4, 4, db);
                         outoff += 8;
                     }
                     qs_off += 8;
@@ -736,7 +722,7 @@ pub fn dequant_codebook(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
         //   For second group (l in 0..4, using qh[1], db2): similarly
         // Ref: llama.cpp dequantize_row_iq3_s (ggml-quants.c l.2535)
         Iq3S => {
-            use infr_core::iquant_grids::{IQ3S_GRID, KMASK_IQ2XS};
+            use infr_core::iquant_grids::IQ3S_GRID;
             let bpb = 110usize; // 2 + 64 + 8 + 32 + 4
             let nblk = bytes.len() / bpb;
             let mut out = vec![0.0f32; nblk * 256];
@@ -766,18 +752,8 @@ pub fn dequant_codebook(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
                         let g1 = IQ3S_GRID[g1_idx];
                         let g2 = IQ3S_GRID[g2_idx];
                         let sb = signs_arr[signs_off + l];
-                        for j in 0..4usize {
-                            let s1 = if sb & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
-                            let s2 = if sb & KMASK_IQ2XS[j + 4] != 0 {
-                                -1.0
-                            } else {
-                                1.0
-                            };
-                            out[base + outoff + j] =
-                                db1 * ((g1 >> (8 * j)) & 0xFF) as i8 as f32 * s1;
-                            out[base + outoff + j + 4] =
-                                db1 * ((g2 >> (8 * j)) & 0xFF) as i8 as f32 * s2;
-                        }
+                        apply_signs(&mut out[base + outoff..], g1 as u64, sb, 0, 4, db1);
+                        apply_signs(&mut out[base + outoff + 4..], g2 as u64, sb, 4, 4, db1);
                         outoff += 8;
                     }
                     qs_off += 8;
@@ -792,18 +768,8 @@ pub fn dequant_codebook(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
                         let g1 = IQ3S_GRID[g1_idx];
                         let g2 = IQ3S_GRID[g2_idx];
                         let sb = signs_arr[signs_off + l];
-                        for j in 0..4usize {
-                            let s1 = if sb & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
-                            let s2 = if sb & KMASK_IQ2XS[j + 4] != 0 {
-                                -1.0
-                            } else {
-                                1.0
-                            };
-                            out[base + outoff + j] =
-                                db2 * ((g1 >> (8 * j)) & 0xFF) as i8 as f32 * s1;
-                            out[base + outoff + j + 4] =
-                                db2 * ((g2 >> (8 * j)) & 0xFF) as i8 as f32 * s2;
-                        }
+                        apply_signs(&mut out[base + outoff..], g1 as u64, sb, 0, 4, db2);
+                        apply_signs(&mut out[base + outoff + 4..], g2 as u64, sb, 4, 4, db2);
                         outoff += 8;
                     }
                     qh_off += 2;
@@ -1125,6 +1091,110 @@ pub fn is_quant(d: infr_core::DType) -> bool {
 #[cfg(test)]
 mod dequant_tests {
     use super::*;
+
+    // ── factored fn hardening: non-affine dtype must error, not panic ──────────
+    // `dequant_factored` is `pub` and used by infr-metal; passing a non-affine dtype
+    // (F16 / codebook quant) previously hit `unreachable!()`. It must now return Err.
+    #[test]
+    fn dequant_factored_non_affine_errors() {
+        for d in [
+            infr_core::DType::F16,
+            infr_core::DType::Iq4Nl,
+            infr_core::DType::Iq2Xxs,
+            infr_core::DType::Tq1_0,
+        ] {
+            assert!(
+                dequant_factored(d, &[0u8; 256]).is_err(),
+                "dequant_factored({d:?}) must be Err, not panic/unreachable"
+            );
+        }
+    }
+
+    // ── bit-identity characterization for the single-pass affine expansion ──────
+    // Reproduces the exact pre-refactor path (dequant_factored → materialize sc/mn →
+    // expand `sc*code + mn`) and asserts the new fused `dequant_block` matches it
+    // bit-for-bit (compare `to_bits()`, so any rounding/ordering drift fails).
+    fn old_affine_expand(d: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
+        let f = dequant_factored(d, bytes).unwrap();
+        let n = f.codes.len();
+        let (mut sc, mut mn) = (vec![0f32; n], vec![0f32; n]);
+        for g in 0..n {
+            let (b, db) = (g / 16, g / f.dblk);
+            sc[g] = f.dd[2 * db].to_f32() * f.scm[2 * b] as f32;
+            mn[g] = f.dd[2 * db + 1].to_f32() * f.scm[2 * b + 1] as f32;
+        }
+        (0..n).map(|g| sc[g] * f.codes[g] as f32 + mn[g]).collect()
+    }
+
+    fn assert_bit_identical(d: infr_core::DType, bytes: &[u8]) {
+        let expected = old_affine_expand(d, bytes);
+        let got = dequant_block(d, bytes).unwrap();
+        assert_eq!(got.len(), expected.len(), "{d:?} length mismatch");
+        for (i, (a, b)) in got.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "{d:?} element {i} not bit-identical: got {a} ({:#010x}) vs expected {b} ({:#010x})",
+                a.to_bits(),
+                b.to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn affine_single_pass_bit_identical_q4k() {
+        // Two full Q4_K blocks (144 bytes each) of patterned bytes; f16 scale slots
+        // overwritten with finite values so codes span the full range.
+        let mut bytes = vec![0u8; 144 * 2];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = ((i * 37 + 11) & 0xFF) as u8;
+        }
+        for blk in 0..2 {
+            let base = blk * 144;
+            bytes[base..base + 2].copy_from_slice(&half::f16::from_f32(0.375).to_le_bytes());
+            bytes[base + 2..base + 4].copy_from_slice(&half::f16::from_f32(-0.125).to_le_bytes());
+        }
+        assert_bit_identical(infr_core::DType::Q4K, &bytes);
+    }
+
+    #[test]
+    fn affine_single_pass_bit_identical_q6k() {
+        // Two full Q6_K blocks (210 bytes each) of patterned bytes; f16 super-scale slot
+        // (bytes 208..210) set to a finite value.
+        let mut bytes = vec![0u8; 210 * 2];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = ((i * 53 + 7) & 0xFF) as u8;
+        }
+        for blk in 0..2 {
+            let base = blk * 210;
+            bytes[base + 208..base + 210].copy_from_slice(&half::f16::from_f32(0.05).to_le_bytes());
+        }
+        assert_bit_identical(infr_core::DType::Q6K, &bytes);
+    }
+
+    // Cover every affine format's single-pass path against the old expansion.
+    #[test]
+    fn affine_single_pass_bit_identical_all_formats() {
+        use infr_core::DType::*;
+        for (d, bpb) in [
+            (Q4_0, 18usize),
+            (Q4_1, 20),
+            (Q5_0, 22),
+            (Q5_1, 24),
+            (Q8_0, 34),
+            (Q2K, 84),
+            (Q3K, 110),
+            (Q4K, 144),
+            (Q5K, 176),
+            (Q6K, 210),
+        ] {
+            let mut bytes = vec![0u8; bpb * 2];
+            for (i, b) in bytes.iter_mut().enumerate() {
+                *b = ((i * 29 + 3) & 0xFF) as u8;
+            }
+            assert_bit_identical(d, &bytes);
+        }
+    }
 
     // ── IQ4_NL ──────────────────────────────────────────────────────────────────
     // Block: [half d][uint8 qs[16]], 32 elements, 18 bytes

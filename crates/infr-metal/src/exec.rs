@@ -1882,7 +1882,8 @@ impl MetalBackend {
             return w;
         }
         let bytes = Self::read_bytes(buf);
-        let f = infr_gguf::dequant::dequant_factored(g.desc(id).dtype, &bytes);
+        let f = infr_gguf::dequant::dequant_factored(g.desc(id).dtype, &bytes)
+            .expect("infr-metal: dequant_factored on an unsupported (non-affine) dtype");
         let maxcode = f.codes.iter().copied().max().unwrap_or(0);
         let (kern, codes_bytes): (&'static str, Vec<u8>) = if maxcode < 16 {
             // two codes per byte, low nibble first
