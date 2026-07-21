@@ -3914,13 +3914,11 @@ fn lower_op(
                     );
                 }
                 rec.zero(counts.as_ref(), n_expert_local);
+                // Clear the scatter's `fill` counters here (independent of `counts`) so the parallel
+                // clear overlaps the count/scan rather than riding the 1-lane serial scan.
+                rec.zero(fill.as_ref(), n_expert_local);
                 rec.moe_bucket_count(ids.as_ref(), counts.as_ref(), n_pairs);
-                rec.moe_bucket_scan(
-                    counts.as_ref(),
-                    offsets.as_ref(),
-                    fill.as_ref(),
-                    n_expert_local,
-                );
+                rec.moe_bucket_scan(counts.as_ref(), offsets.as_ref(), n_expert_local);
                 // Per-expert down_scale (diffusion-gemma) is baked into `bucket_wts` HERE (the
                 // scatter already has the expert id in hand to index it) rather than as a separate
                 // post-GEMM pass — `moe_scatter_reduce` then needs no changes at all, and the
@@ -5410,13 +5408,11 @@ fn execute_paged_moe<'a>(
             let rec2 = rec.as_ref().expect("segment always Some between ops");
             let xb = r(*x)?;
             rec2.zero(pool[&counts].as_ref(), n_expert);
+            // Clear the scatter's `fill` counters here (independent of `counts`) so the parallel
+            // clear overlaps the count/scan rather than riding the 1-lane serial scan.
+            rec2.zero(pool[&fill].as_ref(), n_expert);
             rec2.moe_bucket_count(pool[&ids_key].as_ref(), pool[&counts].as_ref(), n_pairs);
-            rec2.moe_bucket_scan(
-                pool[&counts].as_ref(),
-                pool[&offsets].as_ref(),
-                pool[&fill].as_ref(),
-                n_expert,
-            );
+            rec2.moe_bucket_scan(pool[&counts].as_ref(), pool[&offsets].as_ref(), n_expert);
             let dsb: Option<&dyn Buffer> = match down_scale {
                 Some(ds) => Some(r(*ds)?),
                 None => None,

@@ -54,10 +54,13 @@ void main() {
 #endif
     uint base = idx * pc.hd;
     uint obase = out_base * pc.nheads * pc.hd + base;
+    // Passthrough only the un-rotated tail [rope_dim, hd); the rotated loop below overwrites
+    // [0, rope_dim), so copying it here too just doubled the store traffic (into the KV cache
+    // under KV_BDA). Final bytes are identical (as in qk_norm_rope.comp's partial-RoPE tail).
 #ifdef OUT_F16
-    for (uint i = 0u; i < pc.hd; i++) { KVWH(obase + i, x[base + i]); }
+    for (uint i = pc.rope_dim; i < pc.hd; i++) { KVWH(obase + i, x[base + i]); }
 #else
-    for (uint i = 0u; i < pc.hd; i++) { y[obase + i] = x[base + i]; }
+    for (uint i = pc.rope_dim; i < pc.hd; i++) { y[obase + i] = x[base + i]; }
 #endif
     uint hf = pc.rope_dim / 2u;
     for (uint i = 0u; i < hf; i++) {

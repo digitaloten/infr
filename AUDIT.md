@@ -22,9 +22,9 @@ reproduce/confirm are dropped (not listed) to keep this a verified-only ledger.
 
 - **Original audit:** 157 findings across 24 module slices (1 🔴 critical, 33 🟠
   major, 123 🟡 minor).
-- **Remaining open:** **64** — 0 🔴, 10 🟠, 54 🟡. (1 🟠 — `make_compute_kernel`
-  OOM→Result — is explicitly **deferred**, not open work; see the ops.rs
-  section.)
+- **Remaining open:** **58** — 0 🔴, 9 🟠, 49 🟡. (2 findings are explicitly
+  **deferred**, not open work: the 🟠 `make_compute_kernel` OOM→Result — see the
+  ops.rs section — and a 🟡 shader-pair DRY merge — see the shaders section.)
 
 No finding was accepted on an agent's word — each was re-read against the source
 by the coordinator; two agent-flagged "MAJOR"s (the Q5_1 clamp in the shader and
@@ -211,23 +211,34 @@ parked path).
   contract); the no-op `v!` macro and the re-inlined `spv_words` are removed;
   `moe_expert_floor_covers_dense_set` derives from `native_dense_dtypes()` (+ an
   exhaustive-`DType` guard).
+- **`infr-vulkan` misc shaders (6 of 7; #6 DRY deferred)** — TDD, **gpu_seam
+  verified** (`dg_eb_sample`, `chunked_delta_math`, `sample_topk`, MoE mmq/id +
+  ragged-bucket `pager_mmq`/`weight_addr`, `add_bias` all pass). `dg_eb_sample`
+  argmax now carries the lower-index tie-break (matches host/`argmax.comp` — the
+  golden passes unchanged, no re-bless needed); `rope.comp` writes only the
+  un-rotated tail (halves KV-store traffic, byte-identical); the `-1.0/0.0`
+  `-inf` sentinel is `-1e30`; `part[8]` cross-subgroup arrays sized to
+  `part[16]`; `embed_gather` gets a host `ne%32==0` guard; `deltanet_gates` uses
+  `subgroupInclusiveAdd` (sg32-pinned, within tolerance); `moe_bucket_scan`
+  drops the fused `fill[]=0` (zeroed by a separate overlapping dispatch — MoE
+  goldens byte-identical).
 
 ### Highest-priority (production default paths)
 
-| #      | Sev | Location                              | Issue                                                                                                          |
-| ------ | --- | ------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| ~~1~~  | ✅  | `infr-hub`                            | ~~Downloaded blob never sha256-verified~~ — **FIXED** (`1263bcc`, + full hub slice).                           |
-| ~~2~~  | ✅  | `infr-llama chat/mod.rs`              | ~~Generate error orphans the user turn~~ — **FIXED** (`Err` arm pops the user turn).                           |
-| ~~3~~  | ✅  | `infr-server lib.rs`                  | ~~Streaming swallows errors as `stop`~~ — **FIXED** (error frame + panic-safe `DoneGuard`).                    |
-| ~~4~~  | ✅  | `infr-server lib.rs`                  | ~~No per-request cancellation~~ — **FIXED** (cancel latch → `req.abort()` frees the slot).                     |
-| ~~5~~  | ✅  | `infr-llama runner.rs`                | ~~Prefix-cache records unmaterialized KV rows~~ — **FIXED** (`last_written` tracker + `resident_after_gen`).   |
-| ~~6~~  | ✅  | `infr-vulkan adapter.rs`              | ~~Static split-K `n_chunks>1024` overruns `wexp[1024]`~~ — **FIXED** (bounds `n_chunks ≤ 1024`).               |
-| ~~7~~  | ✅  | `infr-vulkan ops.rs`                  | ~~Kernel-cache double-checked lock double-compiles + leaks~~ — **FIXED** (single-lock `or_insert_with`).       |
-| ~~8~~  | ✅  | `infr-llama sampling.rs`              | ~~Repeat penalty per-occurrence~~ — **FIXED** (`70bbe4e`; now per-distinct-token).                             |
-| 9      | 🟠  | `infr-vulkan shaders dg_eb_sample:61` | argmax reduce **drops the lower-index tie-break** → diverges from host on ties (feeds diffusion goldens).      |
-| ~~10~~ | ✅  | `infr-gguf lib.rs`                    | ~~Corrupt GGUF `pos+n` overflow panic~~ — **FIXED** (`checked_add`/`checked_mul` → `Error::Loader`).           |
-| ~~11~~ | ✅  | `infr-cli main.rs`                    | ~~`--dev` can't override inherited backend env~~ — **FIXED** (clears siblings; unified precedence).            |
-| 12     | 🟠  | `infr-metal exec.rs:2836`             | `Op::Rope` snapshots positions on the replay tape → **frozen RoPE after token 0** (llama-family Metal decode). |
+| #      | Sev | Location                           | Issue                                                                                                          |
+| ------ | --- | ---------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| ~~1~~  | ✅  | `infr-hub`                         | ~~Downloaded blob never sha256-verified~~ — **FIXED** (`1263bcc`, + full hub slice).                           |
+| ~~2~~  | ✅  | `infr-llama chat/mod.rs`           | ~~Generate error orphans the user turn~~ — **FIXED** (`Err` arm pops the user turn).                           |
+| ~~3~~  | ✅  | `infr-server lib.rs`               | ~~Streaming swallows errors as `stop`~~ — **FIXED** (error frame + panic-safe `DoneGuard`).                    |
+| ~~4~~  | ✅  | `infr-server lib.rs`               | ~~No per-request cancellation~~ — **FIXED** (cancel latch → `req.abort()` frees the slot).                     |
+| ~~5~~  | ✅  | `infr-llama runner.rs`             | ~~Prefix-cache records unmaterialized KV rows~~ — **FIXED** (`last_written` tracker + `resident_after_gen`).   |
+| ~~6~~  | ✅  | `infr-vulkan adapter.rs`           | ~~Static split-K `n_chunks>1024` overruns `wexp[1024]`~~ — **FIXED** (bounds `n_chunks ≤ 1024`).               |
+| ~~7~~  | ✅  | `infr-vulkan ops.rs`               | ~~Kernel-cache double-checked lock double-compiles + leaks~~ — **FIXED** (single-lock `or_insert_with`).       |
+| ~~8~~  | ✅  | `infr-llama sampling.rs`           | ~~Repeat penalty per-occurrence~~ — **FIXED** (`70bbe4e`; now per-distinct-token).                             |
+| ~~9~~  | ✅  | `infr-vulkan shaders dg_eb_sample` | ~~argmax reduce drops the lower-index tie-break~~ — **FIXED** (matches host/`argmax.comp` on ties).            |
+| ~~10~~ | ✅  | `infr-gguf lib.rs`                 | ~~Corrupt GGUF `pos+n` overflow panic~~ — **FIXED** (`checked_add`/`checked_mul` → `Error::Loader`).           |
+| ~~11~~ | ✅  | `infr-cli main.rs`                 | ~~`--dev` can't override inherited backend env~~ — **FIXED** (clears siblings; unified precedence).            |
+| 12     | 🟠  | `infr-metal exec.rs:2836`          | `Op::Rope` snapshots positions on the replay tape → **frozen RoPE after token 0** (llama-family Metal decode). |
 
 The remaining 🟠 majors are all in **infr-vulkan** and **infr-metal**:
 host-hot-path churn (recorder per-dispatch `env::var` + `Vec` allocs; adapter
@@ -440,48 +451,18 @@ weighted highest._
 
 ## infr-vulkan/shaders — norm / rope / activation / sampling / MoE-routing / misc
 
-1. **🟠 `dg_eb_sample.comp:61 — argmax tree-reduce drops the lower-index
-   tie-break, diverging from the host on exact ties.** The per-thread scan uses
-   strict `>`, but the workgroup reduce is bare `sval[t+s]>sval[t]` with NO
-   `sidx` tie-break — even though the comment at `50` claims it matches
-   `argmax.comp`, whose reduce (`47`) carries
-   `|| (sval[t+s]==sval[t] && sidx[t+s]<sidx[t])`. On equal logits at indices 5
-   and 256 the host returns 5, this returns 256 — silently violating the
-   "exactly like the host" invariant that feeds the entropy-bound scheduler +
-   the diffusion goldens. _Fix:_ add the same tie-break compare.
-2. **🟡 `rope.comp:57-77 — first `rope_dim` outputs written twice** (passthrough
-   copy of `[0,hd)` then rotated overwrite of `[0,rope_dim)`). For
-   `rope_dim==hd` the whole vector is stored twice, and under `KV_BDA` the
-   redundant stores hit the KV cache (`kv_store_half`) — doubling write traffic
-   on the path this kernel feeds. _Fix:_ restrict the passthrough to the tail
-   `[rope_dim,hd)` (as `qk_norm_rope.comp:110`).
-3. **🟡 `embed_gather.comp:33 — tail elements dropped when `ne % 32 != 0`.**
-   `nsub=ne/32` and both branches iterate whole 32-sub-blocks, so the final
-   `ne%32` outputs of every gathered row are never written → partially
-   uninitialized embeddings, silently. _Fix:_ host-assert `ne%32==0` or mask a
-   ragged tail block.
-4. **🟡
-   `softmax.comp:41 & dg_eb_sample.comp:52 — `-1.0/0.0`compile-time div-by-zero to synthesize`-inf`**
-   (UB in GLSL; a stricter SPIR-V toolchain could fold to NaN / error and
-   corrupt the max reduction). The rest of the tree uses the finite `-1e30`.
-   _Fix:_ `-1e30` or `intBitsToFloat(0xFF800000)`.
-5. **🟡
-   `softmax.comp:28 & dg_eb_sample.comp:37 — `part[8]`cross-subgroup array assumes exactly 8 subgroups with no`requiredSubgroupSize`**
-   — a 16-lane dispatch overruns write+read. `rmsnorm.comp:21` sizes `NSGMAX` +
-   pins sg32 for exactly this. _Fix:_ size by `256/MIN_SG` and/or pin sg32.
-6. **🟡 DRY — three duplicated shader pairs.** `qk_norm_rope.comp` vs
-   `qk_norm_rope_interleaved.comp` are byte-identical except
-   `in_base`/`src_stride`; `sample_topk.comp` vs `moe_sample.comp` carry
-   independent copies of the radix select + gather + sort + softmax +
-   inverse-CDF (subtle sampler math mirrored by hand). _Fix:_ fold each pair
-   into one shader selected by a `-DINTERLEAVED` define / accessor-macro include
-   (the `native_decode.glsl`/`kv_addr.glsl` pattern).
-7. **🟡 perf — avoidable serialization.** `deltanet_gates.comp:34` runs the
-   ≤32-entry prefix scan on lane 0 only (31 lanes idle) — replace with
-   `subgroupInclusiveAdd`. `moe_bucket_scan.comp:5` fuses the
-   embarrassingly-parallel `fill[]=0` reset into the 1-lane scan kernel, forcing
-   the scatter pass to wait on the scan for a zero it doesn't depend on — split
-   the reset out (parallel clear / `vkCmdFillBuffer`).
+_6 of 7 findings fixed (see Resolved log); the one below is **DEFERRED**._
+
+1. **🟡 DRY — two shader pairs (`qk_norm_rope` vs `_interleaved`, `sample_topk`
+   vs `moe_sample`) look duplicated but aren't cleanly mergeable.** On
+   inspection they differ by more than the audit assumed: `qk_norm_rope` carries
+   an extra `kcap` push-constant + the SWA ring-modulo its interleaved twin
+   lacks (different PC layout); `sample_topk` is two-stage (`PASS1`/`PASS2` + a
+   `CHAIN` variant, buffer-sourced `u`) while `moe_sample` is single-stage with
+   `u` in the push constant (different binding layouts). _Deferred:_ folding via
+   `-DINTERLEAVED` would have to reconcile the PC/binding structs and the
+   build.rs compile list, risking the recorded push-constant/descriptor stream
+   for a 🟡 DRY gain.
 
 ## infr-llama/src/mtp/{mod,backends}.rs (MTP spec-decode, parked/opt-in)
 

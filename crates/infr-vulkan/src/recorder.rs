@@ -3670,6 +3670,17 @@ impl<'a> Recorder<'a> {
         scale: f32,
         row_bytes: u32,
     ) {
+        // The shader gathers in whole 32-element sub-blocks (`nsub = ne / 32`); a ragged tail of
+        // `ne % 32` elements would be left unwritten (uninitialized embedding rows). Every current
+        // model's row width is a multiple of 32 (quant block sizes are 32/256; f16/f32 dims are
+        // 32-aligned), so guard the invariant rather than emit a masked tail block.
+        debug_assert_eq!(
+            ne % 32,
+            0,
+            "embed_gather: row width ne={ne} is not a multiple of 32; the whole-32-block gather \
+             would drop the final {} elements",
+            ne % 32
+        );
         let (name, spv) = crate::gemm::embed_gather_spv(dtype).expect("embed_gather streamed spv");
         let k = self.be.kernel(name, spv, 3, 24);
         let mut push = [0u8; 24];
@@ -6843,10 +6854,16 @@ impl<'a> Recorder<'a> {
             &p1,
             (nchunk * nk) as u32,
         );
-        // pass 2: gates — (chunk, value-head) grid
-        let kg = self
-            .be
-            .kernel("deltanet_gates", crate::gemm::deltanet_gates_spv(), 6, 8);
+        // pass 2: gates — (chunk, value-head) grid. Pinned to requiredSubgroupSize=32 (like the
+        // rest of the DeltaNet family) so the 32-lane workgroup is exactly one subgroup and the
+        // prefix log-decay scan can use subgroupInclusiveAdd.
+        let kg = self.be.kernel_sg(
+            "deltanet_gates",
+            crate::gemm::deltanet_gates_spv(),
+            6,
+            8,
+            32,
+        );
         let mut p2 = [0u8; 8];
         p2[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         p2[4..8].copy_from_slice(&(nv as u32).to_ne_bytes());
@@ -7711,21 +7728,17 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// MoE bucketing pass 2 (scan): exclusive prefix sum `counts → offsets`, and reset `fill` to 0.
-    pub fn moe_bucket_scan(
-        &self,
-        counts: &dyn Buffer,
-        offsets: &dyn Buffer,
-        fill: &dyn Buffer,
-        n_expert: usize,
-    ) {
+    /// MoE bucketing pass 2 (scan): exclusive prefix sum `counts → offsets`. The scatter's `fill`
+    /// counters are zeroed separately (`rec.zero`) so the clear overlaps the count/scan instead of
+    /// riding this 1-lane serial pass.
+    pub fn moe_bucket_scan(&self, counts: &dyn Buffer, offsets: &dyn Buffer, n_expert: usize) {
         let k = self
             .be
-            .kernel("moe_bucket_scan", crate::gemm::moe_bucket_scan_spv(), 3, 4);
+            .kernel("moe_bucket_scan", crate::gemm::moe_bucket_scan_spv(), 2, 4);
         self.dispatch(
             k,
-            &[Self::vkb(counts), Self::vkb(offsets), Self::vkb(fill)],
-            2,
+            &[Self::vkb(counts), Self::vkb(offsets)],
+            1,
             &(n_expert as u32).to_ne_bytes(),
             1,
         );
