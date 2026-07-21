@@ -69,6 +69,46 @@ fn be(s: impl std::fmt::Display) -> Error {
     Error::backend(s)
 }
 
+/// Resolve an `INFR_DEV` value to a Vulkan physical-device index (`None` = "use the discrete
+/// default"). `INFR_DEV` is the SINGLE device-selection env, sharing the CLI's `--dev` grammar, so
+/// it can hold a non-Vulkan spec:
+///   * `None` / empty / whitespace → `None` (discrete default),
+///   * `metal` / `cpu` (case-insensitive) → `None` — TOLERATED, not an error: a process only
+///     reaches the Vulkan constructor when it actually built a Vulkan backend (e.g. a non-macOS
+///     build), so a leftover non-Vulkan spec must not hard-fail device selection,
+///   * anything else is treated as a Vulkan index (`VulkanN`, `vulkanN`, or a bare `N`): parsed,
+///     and range-checked against `device_names.len()`. An unparseable or out-of-range value is a
+///     HARD ERROR — silently running on a different GPU than asked produces plausible-but-wrong
+///     numbers, so a typo must fail loudly. `device_names` (`"Vulkan0=<name>"`, …) feeds the
+///     "no such device" message.
+fn resolve_infr_dev_index(spec: Option<&str>, device_names: &[String]) -> Result<Option<usize>> {
+    let Some(spec) = spec else {
+        return Ok(None);
+    };
+    let s = spec.trim();
+    if s.is_empty() {
+        return Ok(None);
+    }
+    let lower = s.to_ascii_lowercase();
+    if lower == "metal" || lower == "cpu" {
+        return Ok(None);
+    }
+    let idx_str = lower.strip_prefix("vulkan").unwrap_or(&lower);
+    let idx: usize = idx_str.parse().map_err(|_| {
+        be(format!(
+            "INFR_DEV/--dev: expected `VulkanN` (e.g. Vulkan0, Vulkan1), got `{spec}`"
+        ))
+    })?;
+    if idx >= device_names.len() {
+        return Err(be(format!(
+            "INFR_DEV/--dev `{spec}`: no such Vulkan device (this system has {}: {})",
+            device_names.len(),
+            device_names.join(", ")
+        )));
+    }
+    Ok(Some(idx))
+}
+
 /// Downcast `&dyn Buffer` → `&VkBuffer`.
 ///
 /// # Safety
@@ -965,8 +1005,8 @@ impl VulkanBackend {
     fn reject_on_apple() -> Result<()> {
         Err(be(
             "Vulkan is not supported on Apple. Use the native Metal backend: it is the default on \
-             macOS, or select it explicitly with `--dev metal` (or INFR_METAL=1). (The only Vulkan \
-             on Apple is MoltenVK, which this backend deliberately does not target.)",
+             macOS, or select it explicitly with `--dev metal` (or INFR_DEV=metal). (The only \
+             Vulkan on Apple is MoltenVK, which this backend deliberately does not target.)",
         ))
     }
     #[cfg(not(target_os = "macos"))]
@@ -974,46 +1014,37 @@ impl VulkanBackend {
         Ok(())
     }
 
-    /// The historical default-device rule, EXACTLY preserved: honor `INFR_DEV=VulkanN` (the CLI's
-    /// `--dev`, matching llama.cpp's naming) if set, else the first `DISCRETE_GPU`, else device 0.
-    /// An out-of-range / unparseable `INFR_DEV` is a hard error (silently running on a different GPU
-    /// than asked produces plausible-but-wrong numbers). Split out of `new()` so `new_on` can bypass
-    /// it, and so the behavior is a single named unit.
+    /// The historical default-device rule, EXACTLY preserved for the Vulkan case: honor
+    /// `INFR_DEV=VulkanN` (the CLI's `--dev`, matching llama.cpp's naming) if set, else the first
+    /// `DISCRETE_GPU`, else device 0. An out-of-range / unparseable Vulkan index is a hard error
+    /// (silently running on a different GPU than asked produces plausible-but-wrong numbers).
+    ///
+    /// `INFR_DEV` is now the SINGLE device-selection env, so it can also hold `metal`/`cpu` (the
+    /// non-Vulkan backends). The index resolver ([`resolve_infr_dev_index`]) TOLERATES those — a
+    /// `metal`/`cpu` (or empty/unset) value falls back to the discrete default rather than erroring
+    /// — since a process that reaches this Vulkan constructor built a Vulkan backend regardless.
+    /// Split out of `new()` so `new_on` can bypass it, and so the behavior is a single named unit.
     fn pick_default_device(
         instance: &ash::Instance,
         pdevices: &[vk::PhysicalDevice],
     ) -> Result<vk::PhysicalDevice> {
-        match std::env::var("INFR_DEV") {
-            Ok(spec) => {
-                let s = spec.trim();
-                let idx_str = s
-                    .strip_prefix("Vulkan")
-                    .or_else(|| s.strip_prefix("vulkan"));
-                let idx: usize = idx_str.unwrap_or(s).parse().map_err(|_| {
-                    be(format!(
-                        "INFR_DEV/--dev: expected `VulkanN` (e.g. Vulkan0, Vulkan1), got `{spec}`"
-                    ))
-                })?;
-                pdevices.get(idx).copied().ok_or_else(|| {
-                    let names: Vec<String> = pdevices
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &pd)| {
-                            let p = unsafe { instance.get_physical_device_properties(pd) };
-                            let n = unsafe { CStr::from_ptr(p.device_name.as_ptr()) }
-                                .to_string_lossy()
-                                .into_owned();
-                            format!("Vulkan{i}={n}")
-                        })
-                        .collect();
-                    be(format!(
-                        "INFR_DEV/--dev `{spec}`: no such Vulkan device (this system has {}: {})",
-                        pdevices.len(),
-                        names.join(", ")
-                    ))
-                })
-            }
-            Err(_) => Ok(pdevices
+        let spec = std::env::var("INFR_DEV").ok();
+        // A pinned Vulkan index needs the device names for the "no such device" message; build them
+        // once (cold init path, a handful of devices).
+        let names: Vec<String> = pdevices
+            .iter()
+            .enumerate()
+            .map(|(i, &pd)| {
+                let p = unsafe { instance.get_physical_device_properties(pd) };
+                let n = unsafe { CStr::from_ptr(p.device_name.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned();
+                format!("Vulkan{i}={n}")
+            })
+            .collect();
+        match resolve_infr_dev_index(spec.as_deref(), &names)? {
+            Some(idx) => Ok(pdevices[idx]), // range already checked by the resolver
+            None => Ok(pdevices
                 .iter()
                 .copied()
                 .find(|&pd| {
@@ -2233,7 +2264,7 @@ impl VulkanBackend {
                  cleanly — the driver evicts (weights get read back over the bus) or the device is \
                  lost (TDR) mid-inference. Use a smaller context (INFR_CTX), a smaller/more- \
                  quantized model, close other GPU processes, or run on the CPU backend \
-                 (INFR_CPU=1). INFR_NO_VRAM_GUARD=1 overrides at your own risk.",
+                 (INFR_DEV=cpu). INFR_NO_VRAM_GUARD=1 overrides at your own risk.",
             if v.uma { "Unified-memory" } else { "VRAM" },
             fmt_bytes(want),
             fmt_bytes(used),
@@ -3359,6 +3390,38 @@ fn select_coopmat_shape(
 mod tests {
     use super::*;
     use infr_core::Backend;
+
+    /// `INFR_DEV` index resolution (no GPU needed). Now the SINGLE device-selection env, it can hold
+    /// `metal`/`cpu` — the Vulkan reader must TOLERATE those (fall back to the discrete default,
+    /// `None`) rather than hard-erroring — while still hard-erroring on an out-of-range/garbage
+    /// Vulkan index (typo protection preserved).
+    #[test]
+    fn infr_dev_index_tolerates_non_vulkan_specs() {
+        let names: Vec<String> = vec!["Vulkan0=A".into(), "Vulkan1=B".into()];
+        // Unset / empty → discrete default.
+        assert_eq!(resolve_infr_dev_index(None, &names).unwrap(), None);
+        assert_eq!(resolve_infr_dev_index(Some(""), &names).unwrap(), None);
+        assert_eq!(resolve_infr_dev_index(Some("  "), &names).unwrap(), None);
+        // metal / cpu (case-insensitive) → tolerated, discrete default (NOT an error).
+        assert_eq!(resolve_infr_dev_index(Some("metal"), &names).unwrap(), None);
+        assert_eq!(resolve_infr_dev_index(Some("cpu"), &names).unwrap(), None);
+        assert_eq!(resolve_infr_dev_index(Some("Metal"), &names).unwrap(), None);
+        assert_eq!(resolve_infr_dev_index(Some("CPU"), &names).unwrap(), None);
+        // Valid Vulkan indices (VulkanN / bare N), case-insensitive.
+        assert_eq!(
+            resolve_infr_dev_index(Some("Vulkan0"), &names).unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            resolve_infr_dev_index(Some("vulkan1"), &names).unwrap(),
+            Some(1)
+        );
+        assert_eq!(resolve_infr_dev_index(Some("1"), &names).unwrap(), Some(1));
+        // Out-of-range → HARD ERROR (typo protection).
+        assert!(resolve_infr_dev_index(Some("Vulkan99"), &names).is_err());
+        // Unparseable Vulkan spec → HARD ERROR.
+        assert!(resolve_infr_dev_index(Some("VulkanX"), &names).is_err());
+    }
 
     /// Shape selection over synthetic property lists (no GPU needed) — the caps-table core of the
     /// shape-aware coopmat gate. RADV-like (16x16x16 present, plus the other shapes RADV

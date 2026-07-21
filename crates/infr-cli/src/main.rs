@@ -60,72 +60,107 @@ impl CompletionShell {
 /// funnel (`run`/`serve`/`bench`) can never disagree on the pick.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Backend {
-    /// A Vulkan GPU. `Some("Vulkan1")` pins a device (published as `INFR_DEV`); `None` = the
-    /// default "first discrete GPU, else device 0".
+    /// A Vulkan GPU. `Some("Vulkan1")` pins a device (published as `INFR_DEV=VulkanN`); `None` =
+    /// the default "first discrete GPU, else device 0".
     Vulkan(Option<String>),
-    /// The Apple GPU (`INFR_METAL`).
+    /// The Apple GPU (`INFR_DEV=metal`).
     Metal,
-    /// The CPU reference backend (`INFR_CPU`).
+    /// The CPU reference backend (`INFR_DEV=cpu`).
     Cpu,
 }
 
-/// A snapshot of the three process-global env vars that select a reference backend, so the backend
-/// DECISION ([`resolve_backend`]/[`selected_backend`]) is a pure, unit-testable function of its
-/// inputs rather than a scatter of ad-hoc `std::env::var` reads with drifting precedence.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// A snapshot of the process-global env vars that select a backend, so the backend DECISION
+/// ([`resolve_backend`]/[`selected_backend`]) is a pure, unit-testable function of its inputs rather
+/// than a scatter of ad-hoc `std::env::var` reads with drifting precedence.
+///
+/// `INFR_DEV` is the SINGLE canonical device-selection env (same grammar as `--dev`). `metal`/`cpu`
+/// mirror the DEPRECATED `INFR_METAL=1`/`INFR_CPU=1` aliases, honoured only when `INFR_DEV` is unset.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct BackendEnv {
+    /// `INFR_DEV` (the canonical device spec — `VulkanN`/`metal`/`cpu`), if non-empty.
+    dev: Option<String>,
+    /// Deprecated `INFR_METAL` alias (present-or-not).
     metal: bool,
+    /// Deprecated `INFR_CPU` alias (present-or-not).
     cpu: bool,
 }
 
 impl BackendEnv {
-    /// Read the live process env (`INFR_METAL`/`INFR_CPU`).
+    /// Read the live process env (`INFR_DEV`, plus the deprecated `INFR_METAL`/`INFR_CPU`).
     fn current() -> Self {
         Self {
+            dev: std::env::var("INFR_DEV")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
             metal: std::env::var_os("INFR_METAL").is_some(),
             cpu: std::env::var_os("INFR_CPU").is_some(),
         }
     }
 }
 
+/// Parse a device spec (from `--dev` OR `INFR_DEV`) — the ONE grammar: a Vulkan GPU
+/// (`Vulkan0`/`Vulkan1`/…), `metal`, or `cpu`, case-insensitive. The original casing is preserved
+/// for the Vulkan spec (the deep reader re-parses it). Errors carry only the "expected forms" tail;
+/// the caller wraps it with which source (`--dev` vs `INFR_DEV`) was bad.
+fn parse_dev_spec(d: &str) -> anyhow::Result<Backend> {
+    let lower = d.trim().to_ascii_lowercase();
+    if lower.starts_with("vulkan") {
+        Ok(Backend::Vulkan(Some(d.trim().to_string())))
+    } else if lower == "metal" {
+        Ok(Backend::Metal)
+    } else if lower == "cpu" {
+        Ok(Backend::Cpu)
+    } else {
+        anyhow::bail!("expected a Vulkan GPU like `Vulkan0`/`Vulkan1`, `metal`, or `cpu`");
+    }
+}
+
+/// Emit a ONE-TIME deprecation warning for a legacy backend-selection env, steering the user to the
+/// canonical `INFR_DEV`. Idempotent across the process (a `Once`), so a long-lived `serve` doesn't
+/// spam it per resolve.
+fn warn_deprecated_backend_env(var: &str, spec: &str) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            "{var} is deprecated; use INFR_DEV={spec} instead \
+             (INFR_DEV is the single device-selection env, same grammar as --dev)"
+        );
+    });
+}
+
 /// The SINGLE backend decision, shared by `--dev` resolution and the per-command readers.
 ///
-/// An explicit `--dev` fully determines the pick (`vulkan*`/`metal`/`cpu`, case-insensitive) and
-/// wins over any inherited env — [`DeviceOpts::resolve`] clears the sibling vars so it does.
-/// Without `--dev` the pick falls to the inherited env with ONE fixed precedence, `METAL > CPU >
-/// Vulkan`, so `run`/`serve`/`bench` stop disagreeing (bench used to read CPU before METAL).
+/// Precedence (mirrors how `--ctx`/`-u`/`-t` relate to their envs): the `--dev` flag > the
+/// `INFR_DEV` env (SAME grammar/parser as `--dev`) > the DEPRECATED `INFR_METAL`/`INFR_CPU` aliases
+/// (honoured only when `INFR_DEV` is unset, with a one-time deprecation warning) > the default
+/// (`Vulkan(None)` = first discrete GPU, else device 0). A garbage `--dev`/`INFR_DEV` errors early.
 fn resolve_backend(dev: Option<&str>, env: BackendEnv) -> anyhow::Result<Backend> {
-    match dev {
-        None => Ok(if env.metal {
-            Backend::Metal
-        } else if env.cpu {
-            Backend::Cpu
-        } else {
-            Backend::Vulkan(None)
-        }),
-        Some(d) => {
-            let lower = d.to_ascii_lowercase();
-            if lower.starts_with("vulkan") {
-                Ok(Backend::Vulkan(Some(d.to_string())))
-            } else if lower == "metal" {
-                Ok(Backend::Metal)
-            } else if lower == "cpu" {
-                Ok(Backend::Cpu)
-            } else {
-                anyhow::bail!(
-                    "invalid --dev `{d}` (expected a Vulkan GPU like `Vulkan0`/`Vulkan1`, \
-                     `metal`, or `cpu`)"
-                );
-            }
-        }
+    // 1. an explicit `--dev` flag wins outright.
+    if let Some(d) = dev {
+        return parse_dev_spec(d).with_context(|| format!("invalid --dev `{d}`"));
     }
+    // 2. `INFR_DEV` — the canonical env, same grammar as `--dev`.
+    if let Some(d) = env.dev.as_deref() {
+        return parse_dev_spec(d).with_context(|| format!("invalid INFR_DEV `{d}`"));
+    }
+    // 3. deprecated `INFR_METAL`/`INFR_CPU` — only when `INFR_DEV` is unset. `METAL > CPU`.
+    if env.metal {
+        warn_deprecated_backend_env("INFR_METAL", "metal");
+        return Ok(Backend::Metal);
+    }
+    if env.cpu {
+        warn_deprecated_backend_env("INFR_CPU", "cpu");
+        return Ok(Backend::Cpu);
+    }
+    // 4. default: the first discrete Vulkan GPU.
+    Ok(Backend::Vulkan(None))
 }
 
 /// The backend the current process env selects — the ONE reader precedence for `run`/`serve`/
 /// `bench`'s backend funnels. Equivalent to `resolve_backend(None, BackendEnv::current())`; the
-/// `None` arg never errors.
-fn selected_backend() -> Backend {
-    resolve_backend(None, BackendEnv::current()).expect("resolve_backend(None, _) is infallible")
+/// `None` arg never errors on a well-formed env, but a garbage `INFR_DEV` DOES surface here.
+fn selected_backend() -> anyhow::Result<Backend> {
+    resolve_backend(None, BackendEnv::current())
 }
 
 /// Total-order comparison of two f64 ratios for the sweep's worst-first ranking. `total_cmp` never
@@ -166,26 +201,26 @@ struct DeviceOpts {
 impl DeviceOpts {
     /// Publish the flags to the process-global env vars the backends read. Called once, up front,
     /// before the model loads (so `RAYON_NUM_THREADS` lands before any parallel work spins the
-    /// rayon pool up, and `INFR_DEV`/`INFR_METAL`/`INFR_CPU` before the session seam constructs a
-    /// backend).
+    /// rayon pool up, and `INFR_DEV` before the session seam constructs a backend).
     ///
-    /// An explicit `--dev` OVERRIDES an inherited backend env: it clears all three of
-    /// `INFR_DEV`/`INFR_METAL`/`INFR_CPU` and then sets only the chosen one, so
-    /// `run … --dev vulkan0` under an inherited `INFR_CPU=1` actually runs on Vulkan. `--dev`
-    /// itself is parsed by [`resolve_backend`] (`vulkan*`/`metal`/`cpu`, case-insensitive). Unset
-    /// leaves the inherited env untouched — the default "first discrete GPU, else device 0".
+    /// `INFR_DEV` is the SINGLE device-selection env. An explicit `--dev` OVERRIDES an inherited
+    /// `INFR_DEV` (`set_var` overwrites, so the flag naturally wins) and publishes the chosen spec
+    /// so both the CLI reader ([`selected_backend`]) and the deep Vulkan reader agree: a specific
+    /// Vulkan device is published as `INFR_DEV=VulkanN`, `metal`/`cpu` leave `INFR_DEV` holding that
+    /// spec (the deep Vulkan reader tolerates it), and the Vulkan-default clears `INFR_DEV`. It no
+    /// longer writes the deprecated `INFR_METAL`/`INFR_CPU` (which now lose to `INFR_DEV` anyway).
+    /// `--dev`/`INFR_DEV` share the ONE parser ([`parse_dev_spec`], `vulkan*`/`metal`/`cpu`,
+    /// case-insensitive). Unset `--dev` leaves the inherited env untouched — the default "first
+    /// discrete GPU, else device 0".
     fn resolve(&self) -> anyhow::Result<()> {
         let backend = resolve_backend(self.dev.as_deref(), BackendEnv::current())?;
         // Only an EXPLICIT --dev mutates the backend env; unset preserves whatever was inherited.
         if self.dev.is_some() {
-            std::env::remove_var("INFR_DEV");
-            std::env::remove_var("INFR_METAL");
-            std::env::remove_var("INFR_CPU");
             match &backend {
                 Backend::Vulkan(Some(d)) => std::env::set_var("INFR_DEV", d),
-                Backend::Vulkan(None) => {}
-                Backend::Metal => std::env::set_var("INFR_METAL", "1"),
-                Backend::Cpu => std::env::set_var("INFR_CPU", "1"),
+                Backend::Vulkan(None) => std::env::remove_var("INFR_DEV"),
+                Backend::Metal => std::env::set_var("INFR_DEV", "metal"),
+                Backend::Cpu => std::env::set_var("INFR_DEV", "cpu"),
             }
         }
         // `--ctx` shares the size grammar (`8192`, `256k`, `50%`) with INFR_CTX, which it sets; a
@@ -332,7 +367,7 @@ enum Cmd {
     /// dispatched to the generator on that model's device. Each spec is `MODEL[@VulkanN]` (a `.gguf`
     /// path or an `org/repo[:quant]` HF ref, optionally with a device suffix); omit `@VulkanN` to
     /// round-robin the specs across the enumerated Vulkan devices. Vulkan seam only (the concurrent
-    /// engine) — `INFR_CPU`/`INFR_METAL`/diffusion-gemma models aren't hosted here.
+    /// engine) — `INFR_DEV=cpu`/`INFR_DEV=metal`/diffusion-gemma models aren't hosted here.
     Multi {
         /// Model specs `MODEL[@VulkanN]`, one per hosted model. At least one; devices without a
         /// suffix are assigned round-robin over the enumerated GPUs.
@@ -836,11 +871,11 @@ fn build_chat_model(
     tok: Option<&Path>,
     is_dg: bool,
 ) -> anyhow::Result<Box<dyn infr_llama::chat::ChatModel + Send>> {
-    let backend = selected_backend();
+    let backend = selected_backend()?;
     if is_dg {
         // diffusion-gemma (Phase 3/D, docs/DIFFUSIONGEMMA.md): the entropy-bound block-diffusion
-        // loop over a persistent session — Vulkan by default, CPU under INFR_CPU, Metal under
-        // INFR_METAL (the non-macOS build still compiles the Metal arm; `DiffusionGemmaChat::generate`
+        // loop over a persistent session — Vulkan by default, CPU under INFR_DEV=cpu, Metal under
+        // INFR_DEV=metal (the non-macOS build still compiles the Metal arm; `DiffusionGemmaChat::generate`
         // errors clearly at runtime there).
         eprintln!(
             "[{} — diffusion-gemma entropy-bound block decode]",
@@ -930,11 +965,8 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
                  INFR_PIPELINE=Vulkan0,Vulkan1 infr run {model} \"your prompt\""
             );
         };
-        if is_dg
-            || std::env::var_os("INFR_CPU").is_some()
-            || std::env::var_os("INFR_METAL").is_some()
-        {
-            anyhow::bail!("INFR_PIPELINE is a Vulkan dense path — not compatible with INFR_CPU / INFR_METAL / diffusion-gemma");
+        if is_dg || !matches!(selected_backend()?, Backend::Vulkan(_)) {
+            anyhow::bail!("INFR_PIPELINE is a Vulkan dense path — not compatible with INFR_DEV=cpu / INFR_DEV=metal / diffusion-gemma");
         }
         apply_model_sampling_defaults(&gguf);
         let loaded = infr_llama::SeamModel::load(&gguf, tok.as_deref())?;
@@ -956,11 +988,8 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
                  INFR_TENSOR_PARALLEL=Vulkan0,Vulkan1 infr run {model} \"your prompt\""
             );
         };
-        if is_dg
-            || std::env::var_os("INFR_CPU").is_some()
-            || std::env::var_os("INFR_METAL").is_some()
-        {
-            anyhow::bail!("INFR_TENSOR_PARALLEL is a Vulkan dense path — not compatible with INFR_CPU / INFR_METAL / diffusion-gemma");
+        if is_dg || !matches!(selected_backend()?, Backend::Vulkan(_)) {
+            anyhow::bail!("INFR_TENSOR_PARALLEL is a Vulkan dense path — not compatible with INFR_DEV=cpu / INFR_DEV=metal / diffusion-gemma");
         }
         apply_model_sampling_defaults(&gguf);
         let loaded = infr_llama::SeamModel::load(&gguf, tok.as_deref())?;
@@ -983,11 +1012,8 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
                  INFR_EXPERT_PARALLEL=Vulkan0,Vulkan1 infr run {model} \"your prompt\""
             );
         };
-        if is_dg
-            || std::env::var_os("INFR_CPU").is_some()
-            || std::env::var_os("INFR_METAL").is_some()
-        {
-            anyhow::bail!("INFR_EXPERT_PARALLEL is a Vulkan MoE path — not compatible with INFR_CPU / INFR_METAL / diffusion-gemma");
+        if is_dg || !matches!(selected_backend()?, Backend::Vulkan(_)) {
+            anyhow::bail!("INFR_EXPERT_PARALLEL is a Vulkan MoE path — not compatible with INFR_DEV=cpu / INFR_DEV=metal / diffusion-gemma");
         }
         apply_model_sampling_defaults(&gguf);
         let loaded = infr_llama::SeamModel::load(&gguf, tok.as_deref())?;
@@ -1767,10 +1793,10 @@ fn cmd_bench(
     ngl: usize,
     json: bool,
 ) -> anyhow::Result<()> {
-    // `--dev`/`-u`/`-t` were already published to the process-global envs (INFR_DEV / INFR_METAL /
-    // INFR_CPU, INFR_UBATCH, RAYON_NUM_THREADS) by `DeviceOpts::resolve` in `dispatch`, before the
-    // model loads — the backend picks and thread pool read them there. So `--dev metal`/`--dev cpu`
-    // now route here through those envs, same as a raw `INFR_METAL=1`/`INFR_CPU=1` invocation.
+    // `--dev`/`-u`/`-t` were already published to the process-global envs (INFR_DEV, INFR_UBATCH,
+    // RAYON_NUM_THREADS) by `DeviceOpts::resolve` in `dispatch`, before the model loads — the
+    // backend picks and thread pool read them there. So `--dev metal`/`--dev cpu` now route here
+    // through INFR_DEV, same as a raw `INFR_DEV=metal`/`INFR_DEV=cpu` invocation.
     // Benchmarks decode a FIXED token count (llama-bench semantics): never stop at EOS — a model
     // that emits EOS instantly on the dummy context would otherwise report fictional tok/s.
     std::env::set_var("INFR_IGNORE_EOS", "1");
@@ -1788,7 +1814,7 @@ fn cmd_bench(
     let backend = if ngl == 0 {
         Backend::Cpu
     } else {
-        selected_backend()
+        selected_backend()?
     };
     // diffusion-gemma (Phase 4/D, docs/DIFFUSIONGEMMA.md): llama-bench has no diffusion mode, so
     // `infr bench` measures infr's OWN decode shape (block prefill + canvas denoise, see
@@ -1813,7 +1839,7 @@ fn cmd_bench(
     // `bench_vulkan` / `cmd_bench_metal`) — `SeamModel::load` drives it through the unified runner
     // (`Config::from_gguf` + `MixerW::DeltaNet`), reusing the exact same pp/tg/depth methodology
     // every other arch gets (no more qwen35-only bench arm or depth-accounting artifacts).
-    // -ngl 0 (or `--dev cpu` → INFR_CPU): run on the CPU reference backend (no GPU), comparable to
+    // -ngl 0 (or `--dev cpu` → INFR_DEV=cpu): run on the CPU reference backend (no GPU), comparable to
     // `llama-bench -ngl 0`. llama4 benches through the standard Vulkan arm below like every other
     // model now (the paged expert cache) — only these force it onto this CPU arm.
     if matches!(backend, Backend::Cpu) {
@@ -1828,7 +1854,7 @@ fn cmd_bench(
             json,
         );
     }
-    // INFR_METAL=1 (set by `--dev metal` or a raw env): bench the dense forward on the Metal backend
+    // Metal (set by `--dev metal` or `INFR_DEV=metal`): bench the dense forward on the Metal backend
     // through the agnostic seam — same pp/tg/pg + depth methodology as the CPU arm, directly
     // comparable to `llama-bench` on the Metal build.
     if matches!(backend, Backend::Metal) {
@@ -1843,7 +1869,7 @@ fn cmd_bench(
             json,
         );
     }
-    // `--dev VulkanN` was already published to the backend as INFR_DEV by `DeviceOpts::resolve`;
+    // `--dev VulkanN` was already published to the backend as INFR_DEV=VulkanN by `DeviceOpts::resolve`;
     // `VulkanBackend::new()` reads it when picking the physical device, and the prefill chunk
     // (`-u`/INFR_UBATCH) landed there too. Nothing to set here — straight to the Vulkan seam.
     let model = infr_llama::SeamModel::load(&gguf, tok.as_deref())?;
@@ -1911,10 +1937,11 @@ fn bench_mtp_tg(
     let prompt = MTP_SENTENCE.repeat(want.div_ceil(10));
     let mut samples = Vec::with_capacity(reps.max(1));
     let mut timing = infr_llama::mtp::MtpTiming::default();
-    // Backend selection mirrors the rest of the CLI: INFR_METAL routes the MTP driver onto the
-    // Apple-GPU trunk+head (issue #39 — measuring Metal's accept rate needs the Metal timed path,
-    // not Vulkan's), everything else stays on Vulkan. The two timed fns share a signature.
-    let use_metal = std::env::var("INFR_METAL").is_ok();
+    // Backend selection mirrors the rest of the CLI: a Metal pick (`--dev metal` / `INFR_DEV=metal`)
+    // routes the MTP driver onto the Apple-GPU trunk+head (issue #39 — measuring Metal's accept rate
+    // needs the Metal timed path, not Vulkan's), everything else stays on Vulkan. Timed fns share a
+    // signature.
+    let use_metal = matches!(selected_backend()?, Backend::Metal);
     for _ in 0..reps.max(1) {
         let (stats, t) = if use_metal {
             #[cfg(target_os = "macos")]
@@ -1929,7 +1956,7 @@ fn bench_mtp_tg(
             }
             #[cfg(not(target_os = "macos"))]
             {
-                anyhow::bail!("INFR_METAL MTP bench requires macOS");
+                anyhow::bail!("the Metal MTP bench (INFR_DEV=metal) requires macOS");
             }
         } else {
             infr_llama::mtp::generate_mtp_spec_vulkan_timed(model, &head, &prompt, n_gen, |_| {})?
@@ -2067,8 +2094,8 @@ fn cmd_bench_metal(
         };
         // MTP arm (issue #33/#39): twin of the Vulkan path's arm — a model shipping an MTP head
         // gets its self-speculative Metal decode (accept rate + phase split) measured alongside the
-        // baseline tg above. `bench_mtp_tg` reads INFR_METAL (set here) to route onto the Metal
-        // timed driver. Models without a head keep `mtp = None` → byte-identical to the old output.
+        // baseline tg above. `bench_mtp_tg` reads the resolved backend (Metal here, via INFR_DEV) to
+        // route onto the Metal timed driver. Models without a head keep `mtp = None` → byte-identical.
         let mtp = if infr_llama::mtp::mtp_enabled()
             && pg.is_none()
             && n_gen > 0
@@ -3356,8 +3383,7 @@ fn cmd_serve(model: &str, addr: &str, parallel: Option<usize>) -> anyhow::Result
     // as INFR_CTX (shared size grammar `8192`/`256k`/`50%`); the ParallelSeam below reads INFR_CTX
     // and divides it across the slots. One grammar, one meaning (`infr_core::parse_size`).
     let is_dg = infr_llama::diffusion::is_diffusion_gemma(&gguf);
-    let is_vulkan =
-        !is_dg && std::env::var("INFR_METAL").is_err() && std::env::var("INFR_CPU").is_err();
+    let is_vulkan = !is_dg && matches!(selected_backend()?, Backend::Vulkan(_));
 
     apply_model_sampling_defaults(&gguf);
 
@@ -3406,8 +3432,8 @@ fn cmd_serve(model: &str, addr: &str, parallel: Option<usize>) -> anyhow::Result
 
     // Seam-backed serve — the ONE engine: the SAME ChatModel + multi-slot session `infr run` uses
     // (built through the SAME `build_chat_model` funnel), so serve gets per-request suffix-only
-    // prefill and cross-conversation prefix seeding for free. INFR_CPU / INFR_METAL select the
-    // reference backends; Vulkan is the default. qwen35 shares the SAME funnel as every other arch
+    // prefill and cross-conversation prefix seeding for free. INFR_DEV=cpu / INFR_DEV=metal select
+    // the reference backends; Vulkan is the default. qwen35 shares the SAME funnel as every other arch
     // (issue #30). Metal also honours INFR_SPEC_DRAFT (draft-verify speculative decode) via
     // `metal_chat_model` inside the funnel.
     let mut m = build_chat_model(&gguf, tok.as_deref(), is_dg)?;
@@ -3468,9 +3494,9 @@ fn cmd_multi(
     // `infr multi` is the VULKAN concurrent engine only — the reference backends have no multi-slot
     // engine and no device pool to spread across. Refuse the reference-backend envs up front rather
     // than silently ignoring them.
-    if std::env::var("INFR_CPU").is_ok() || std::env::var("INFR_METAL").is_ok() {
+    if !matches!(selected_backend()?, Backend::Vulkan(_)) {
         anyhow::bail!(
-            "`infr multi` hosts models on the Vulkan device pool; unset INFR_CPU/INFR_METAL \
+            "`infr multi` hosts models on the Vulkan device pool; drop INFR_DEV=cpu/INFR_DEV=metal \
              (the CPU/Metal reference backends have no multi-slot engine)"
         );
     }
@@ -3604,47 +3630,99 @@ mod tests {
     }
 
     // ── finding 1: unified backend decision (resolve_backend / selected_backend) ────────────────
+
+    /// Build a `BackendEnv` from an `INFR_DEV` value + the two deprecated aliases, for pure
+    /// decision tests (no process env).
+    fn env(dev: Option<&str>, metal: bool, cpu: bool) -> BackendEnv {
+        BackendEnv {
+            dev: dev.map(str::to_string),
+            metal,
+            cpu,
+        }
+    }
+
     #[test]
-    fn explicit_dev_overrides_inherited_backend_env() {
-        // `--dev vulkan0` under an inherited INFR_CPU=1 must resolve to Vulkan (the flag wins), not
-        // CPU — the bug where an inherited env shadowed `--dev`. Pure decision, no process env.
-        let env = BackendEnv {
-            cpu: true,
-            metal: true,
-        };
+    fn dev_flag_beats_infr_dev_env() {
+        // The `--dev` flag wins over INFR_DEV: `--dev metal` under `INFR_DEV=cpu` resolves to Metal.
         assert_eq!(
-            resolve_backend(Some("vulkan0"), env).unwrap(),
+            resolve_backend(Some("metal"), env(Some("cpu"), false, false)).unwrap(),
+            Backend::Metal
+        );
+        // The flag also wins over the deprecated aliases.
+        assert_eq!(
+            resolve_backend(Some("vulkan0"), env(None, true, true)).unwrap(),
             Backend::Vulkan(Some("vulkan0".to_string()))
         );
-        assert_eq!(resolve_backend(Some("metal"), env).unwrap(), Backend::Metal);
-        assert_eq!(resolve_backend(Some("cpu"), env).unwrap(), Backend::Cpu);
-        // Case-insensitive, and the original casing is preserved for INFR_DEV.
+        assert_eq!(
+            resolve_backend(Some("cpu"), env(None, true, false)).unwrap(),
+            Backend::Cpu
+        );
+        // Case-insensitive; the original casing is preserved for the Vulkan spec.
         assert_eq!(
             resolve_backend(Some("Vulkan1"), BackendEnv::default()).unwrap(),
             Backend::Vulkan(Some("Vulkan1".to_string()))
         );
-        // A bogus --dev is rejected with the accepted forms.
+        // A bogus --dev is rejected.
         assert!(resolve_backend(Some("gpu9"), BackendEnv::default()).is_err());
     }
 
     #[test]
-    fn env_backend_precedence_is_metal_then_cpu_then_vulkan() {
-        // The ONE reader precedence shared by run/serve/bench (bench used to read CPU before METAL).
-        let m = |metal, cpu| resolve_backend(None, BackendEnv { metal, cpu }).unwrap();
-        assert_eq!(m(true, true), Backend::Metal); // METAL wins over CPU
-        assert_eq!(m(true, false), Backend::Metal);
-        assert_eq!(m(false, true), Backend::Cpu);
-        assert_eq!(m(false, false), Backend::Vulkan(None)); // default: first discrete GPU
+    fn infr_dev_env_parses_same_grammar_as_dev_flag() {
+        // No flag: INFR_DEV drives the pick, same grammar as `--dev`.
+        assert_eq!(
+            resolve_backend(None, env(Some("Vulkan1"), false, false)).unwrap(),
+            Backend::Vulkan(Some("Vulkan1".to_string()))
+        );
+        assert_eq!(
+            resolve_backend(None, env(Some("cpu"), false, false)).unwrap(),
+            Backend::Cpu
+        );
+        assert_eq!(
+            resolve_backend(None, env(Some("metal"), false, false)).unwrap(),
+            Backend::Metal
+        );
+        // Garbage INFR_DEV errors early with a clear message (typo protection).
+        let e = resolve_backend(None, env(Some("foo"), false, false)).unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(msg.contains("INFR_DEV"), "message names the source: {msg}");
+        assert!(msg.contains("foo"), "message echoes the bad value: {msg}");
+    }
+
+    #[test]
+    fn deprecated_aliases_honoured_only_when_infr_dev_unset() {
+        // INFR_DEV unset: the deprecated INFR_CPU/INFR_METAL still work, METAL > CPU.
+        assert_eq!(
+            resolve_backend(None, env(None, false, true)).unwrap(),
+            Backend::Cpu
+        );
+        assert_eq!(
+            resolve_backend(None, env(None, true, false)).unwrap(),
+            Backend::Metal
+        );
+        assert_eq!(
+            resolve_backend(None, env(None, true, true)).unwrap(),
+            Backend::Metal
+        );
+        // INFR_DEV set: it WINS over the deprecated aliases (INFR_DEV=metal beats INFR_CPU=1).
+        assert_eq!(
+            resolve_backend(None, env(Some("metal"), false, true)).unwrap(),
+            Backend::Metal
+        );
+        // Default: no env at all → first discrete Vulkan GPU.
+        assert_eq!(
+            resolve_backend(None, BackendEnv::default()).unwrap(),
+            Backend::Vulkan(None)
+        );
     }
 
     // Serialise the few tests that must touch the real process env (env is process-global).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
-    fn device_resolve_clears_sibling_backend_envs() {
+    fn device_resolve_publishes_infr_dev_and_wins_over_stale_alias() {
         let _g = ENV_LOCK.lock().unwrap();
-        // Inherit a stale INFR_CPU, then pass `--dev vulkan0`: resolve must clear INFR_CPU/INFR_METAL
-        // and publish only INFR_DEV, so the reader can't pick the stale CPU backend.
+        // Inherit a stale INFR_CPU, then pass `--dev vulkan0`: resolve publishes INFR_DEV (the flag
+        // wins), and the reader must pick Vulkan despite the stale INFR_CPU (INFR_DEV > deprecated).
         std::env::set_var("INFR_CPU", "1");
         std::env::remove_var("INFR_METAL");
         std::env::remove_var("INFR_DEV");
@@ -3656,10 +3734,25 @@ mod tests {
         };
         opts.resolve().unwrap();
         assert_eq!(std::env::var("INFR_DEV").ok().as_deref(), Some("vulkan0"));
-        assert!(std::env::var_os("INFR_CPU").is_none());
-        assert!(std::env::var_os("INFR_METAL").is_none());
-        assert_eq!(selected_backend(), Backend::Vulkan(None)); // reader agrees: not CPU
+        assert_eq!(
+            selected_backend().unwrap(),
+            Backend::Vulkan(Some("vulkan0".to_string()))
+        ); // reader agrees: not CPU
+
+        // `--dev metal` publishes INFR_DEV=metal (no INFR_METAL write), still winning the reader.
+        let opts = DeviceOpts {
+            dev: Some("metal".to_string()),
+            ctx: None,
+            ubatch: None,
+            threads: None,
+        };
+        opts.resolve().unwrap();
+        assert_eq!(std::env::var("INFR_DEV").ok().as_deref(), Some("metal"));
+        assert!(std::env::var_os("INFR_METAL").is_none()); // no longer written
+        assert_eq!(selected_backend().unwrap(), Backend::Metal);
+
         std::env::remove_var("INFR_DEV");
+        std::env::remove_var("INFR_CPU");
     }
 
     // ── finding 3: local `.gguf` FILE vs HF ref classifier ──────────────────────────────────────

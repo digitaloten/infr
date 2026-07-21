@@ -1807,7 +1807,7 @@ impl MetalBackend {
                  {dt:?} has no native Metal kernel, so its weights are cached at f32 (4-8x the \
                  quantized size) and the total no longer fits — proceeding would corrupt \
                  silently. Use a natively-supported quantization (Q4_K_M / Q6_K / Q8_0 / Q5_0 / \
-                 Q4_0) or run this checkpoint on the CPU backend (INFR_CPU=1).",
+                 Q4_0) or run this checkpoint on the CPU backend (INFR_DEV=cpu).",
                 used as f64 / (1u64 << 30) as f64,
                 want as f64 / (1u64 << 30) as f64,
                 budget as f64 / (1u64 << 30) as f64,

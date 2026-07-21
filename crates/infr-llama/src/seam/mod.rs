@@ -571,7 +571,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     return Err(anyhow!(
                         "this MoE model's dense weights ({:.2} GB) + KV cache ({:.2} GB) exceed \
                          available VRAM ({:.2} GB) — dense layer streaming does not cover MoE \
-                         models' dense parts; reduce ctx or run on the CPU backend (INFR_CPU=1)",
+                         models' dense parts; reduce ctx or run on the CPU backend (INFR_DEV=cpu)",
                         fp.dense as f64 / 1e9,
                         kv_bytes as f64 / 1e9,
                         vram.available as f64 / 1e9,
@@ -1053,7 +1053,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 return Err(anyhow!(
                     "dense weights exceed VRAM and the leftover budget ({:.2} GB) can't hold \
                      even the streaming floor ({:.2} GB) — reduce ctx or run on the CPU backend \
-                     (INFR_CPU=1)",
+                     (INFR_DEV=cpu)",
                     budget as f64 / 1e9,
                     alloc as f64 / 1e9,
                 ));
