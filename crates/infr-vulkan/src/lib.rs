@@ -21,12 +21,14 @@ pub mod pipeline;
 mod recorder;
 pub mod tp;
 pub mod tp_allreduce;
+pub mod tp_sem;
 
 pub use p2p::{P2pExport, P2pHandleType};
 pub use pipeline::{PipelineBackend, PipelineBuffer};
 pub use recorder::{FlashStage, RecordedCmd, Recorder};
 pub use tp::{TensorParallelBackend, TpBuffer, TpRole};
 pub use tp_allreduce::{AllReduce, AllReduceMode};
+pub use tp_sem::{TpExportSemaphore, TpImportSemaphore};
 
 /// Shared-memory bytes consumed per query row of a flash-attention prefill tile
 /// (`Ss` + `Ps` + `Os` + softmax state, at `BN=64` / `HD=128`). The tile height is chosen so
@@ -1246,6 +1248,15 @@ impl VulkanBackend {
         // default single-device path is untouched, and no P2P handle type is offered.
         let has_ext_mem_fd = has_ext(c"VK_KHR_external_memory_fd");
         let has_ext_mem_dma_buf = has_ext(c"VK_EXT_external_memory_dma_buf");
+        // External SEMAPHORE fd — the tensor-parallel all-reduce orders a peer's cross-device read
+        // after this device's GPU-side signal with NO host round-trip: export a timeline semaphore as
+        // an fd here, import it on the peer, signal a value on this device's submit and wait it on the
+        // peer's (see `tp_sem.rs`). `VK_KHR_external_semaphore` is core in Vulkan 1.1, so only the fd
+        // op extension needs enabling; the timeline-semaphore feature (core 1.2) is probed + enabled
+        // below. GATED: a device lacking either reports no support and the all-reduce falls back to
+        // the host fence. `VK_EXT_external_semaphore_fd` uses OPAQUE_FD (same-driver cross-device,
+        // which the dGPU+iGPU pair here both being RADV satisfies).
+        let has_ext_sem_fd = has_ext(c"VK_KHR_external_semaphore_fd");
         // Lets every dispatch bind its buffers with one `cmd_push_descriptor_set` recorded
         // straight into the command buffer instead of `alloc_set` (pool allocate) +
         // `update_descriptor_sets` (a separate driver call) + `cmd_bind_descriptor_sets` per op —
@@ -1275,13 +1286,18 @@ impl VulkanBackend {
         // VRAM as the budget allows, addressed by a raw pointer. Core in Vulkan 1.2, so it is
         // hard-required below (not an opt-in ladder like coopmat).
         let mut bda_feat = vk::PhysicalDeviceBufferDeviceAddressFeatures::default();
+        // Timeline semaphore (core 1.2) — required by the tensor-parallel external-semaphore
+        // all-reduce (a shared timeline signalled on one device, waited on another). Probed so we
+        // never try to enable it where absent (which would fail create_device).
+        let mut timeline_feat = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
         let mut feat2 = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut f16_feat)
             .push_next(&mut memmodel_feat)
             .push_next(&mut sgsize_feat)
             .push_next(&mut coopmat_feat)
             .push_next(&mut intdot_feat)
-            .push_next(&mut bda_feat);
+            .push_next(&mut bda_feat)
+            .push_next(&mut timeline_feat);
         unsafe { instance.get_physical_device_features2(physical_device, &mut feat2) };
         // Core Vulkan 1.0 feature (no extension struct — `get_physical_device_features2` always
         // populates the chain's base `.features`). Several KV-cache dequant/attention shaders
@@ -1305,6 +1321,9 @@ impl VulkanBackend {
         // pushed feature struct (incl. `bda_feat`) until its last use, so the pushed structs can
         // only be read once `feat2` itself is done being touched.
         let has_bda = bda_feat.buffer_device_address != 0;
+        // The external-semaphore all-reduce needs BOTH the fd extension and the timeline feature
+        // (read here, after `feat2`'s last use, for the same borrow reason as `has_bda`).
+        let has_ext_sem = has_ext_sem_fd && timeline_feat.timeline_semaphore != 0;
         // Hard requirement, not a fallback: the paged-MoE arena is addressed by a 64-bit device
         // pointer, so a device that cannot hand out one has no 64-bit address space for infr to
         // use. bufferDeviceAddress is core in Vulkan 1.2 and this backend targets 1.3, so on any
@@ -1578,6 +1597,12 @@ impl VulkanBackend {
         if has_ext_mem_dma_buf {
             ext_ptrs.push(c"VK_EXT_external_memory_dma_buf".as_ptr());
         }
+        // External-semaphore fd ops for the tensor-parallel all-reduce's GPU-side cross-device sync
+        // (gated). `VK_KHR_external_semaphore` is core in 1.1 (no enable); the timeline-semaphore
+        // feature is enabled via `timeline_sem_ci` chained into `device_ci` below.
+        if has_ext_sem {
+            ext_ptrs.push(c"VK_KHR_external_semaphore_fd".as_ptr());
+        }
         // A portability (layered) device REQUIRES VK_KHR_portability_subset to be enabled when
         // it advertises it (Vulkan valid-usage rule); MoltenVK does.
         if has_ext(c"VK_KHR_portability_subset") {
@@ -1618,6 +1643,10 @@ impl VulkanBackend {
         // so it needs no device extension on a 1.3 device — only the feature enable.
         let mut bda_ci =
             vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(true);
+        // Timeline semaphore — enabled only when the external-semaphore all-reduce path is available
+        // (chained below when `has_ext_sem`).
+        let mut timeline_sem_ci =
+            vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
 
         // Core 1.0 features (shaderInt16 — see the probe comment above): passed via
         // `enabled_features`, NOT a pNext-chained `PhysicalDeviceFeatures2` (the two are mutually
@@ -1642,6 +1671,9 @@ impl VulkanBackend {
         }
         if has_coop_matrix {
             device_ci = device_ci.push_next(&mut coopmat_ci);
+        }
+        if has_ext_sem {
+            device_ci = device_ci.push_next(&mut timeline_sem_ci);
         }
 
         let device = unsafe { instance.create_device(physical_device, &device_ci, None) }
@@ -1943,6 +1975,11 @@ impl VulkanBackend {
         // checks (`p2p.rs`); `None` = this backend offers no host-less cross-device transport.
         let external_memory_fd =
             has_ext_mem_fd.then(|| ash::khr::external_memory_fd::Device::new(&instance, &device));
+        // External-semaphore fd loader (`vkGetSemaphoreFdKHR`/`vkImportSemaphoreFdKHR`) — the gate for
+        // the tensor-parallel GPU-side all-reduce sync. `Some` only when the fd ext AND the timeline
+        // feature are both present (both enabled above); else the all-reduce uses the host fence.
+        let external_semaphore_fd =
+            has_ext_sem.then(|| ash::khr::external_semaphore_fd::Device::new(&instance, &device));
 
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
         // Probed for UMA parts ONLY — on a discrete card the non-device-local heap is host RAM
@@ -1974,9 +2011,7 @@ impl VulkanBackend {
                 push_descriptor,
                 external_memory_fd,
                 has_dma_buf: has_ext_mem_dma_buf,
-                // v1: not yet enabled at device creation — the all-reduce uses the host fence. Phase 2
-                // enables VK_KHR_external_semaphore(+_fd) and builds this loader for the zero-stall path.
-                external_semaphore_fd: None,
+                external_semaphore_fd,
                 kernels: Mutex::new(HashMap::new()),
                 pipeline_cache,
                 pcache,

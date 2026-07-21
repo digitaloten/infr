@@ -30,12 +30,15 @@
 //! reads `W-1` peers into `W-1` scratches, an all-to-all-ish exchange of `O(W²)` total bandwidth).
 //! A ring/tree schedule (`O(W)` bandwidth) is the >2-device throughput optimization, deferred.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use ash::vk;
 use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Plan};
 use infr_core::error::Result;
 use infr_core::graph::{Graph, Op};
 use infr_core::tensor::{DType, TensorDesc, TensorId};
 
-use crate::{be, P2pExport, P2pHandleType, VulkanBackend};
+use crate::{be, P2pExport, P2pHandleType, TpExportSemaphore, TpImportSemaphore, VulkanBackend};
 
 /// How the all-reduce moves + orders data across the device pair (for the report).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +68,15 @@ pub struct AllReduce {
     /// `scratch[r][p]` — rank `r`'s local buffer holding peer `p`'s partial before the sum
     /// (`None` at `p==r`).
     scratch: Vec<Vec<Option<Box<dyn Buffer>>>>,
+    /// Rank `p`'s exported timeline semaphore (`Some` in `P2pSemaphore` mode). Signalled `value` on
+    /// `p`'s publish submit; peers wait it on their gather submit. Indexed by producer rank.
+    export_sems: Vec<Option<TpExportSemaphore>>,
+    /// `import_sems[r][p]` — rank `r`'s import of rank `p`'s timeline semaphore (`p != r`; shared
+    /// payload). Only populated in `P2pSemaphore` mode.
+    import_sems: Vec<Vec<Option<TpImportSemaphore>>>,
+    /// Monotonic timeline value: incremented each all-reduce so every semaphore signal is strictly
+    /// increasing (a timeline requirement).
+    step: AtomicU64,
     /// Per-rank compiled Add-chain plan (`own += Σ peers`).
     reduce_plans: Vec<Box<dyn Plan>>,
     /// The reduce graph's tensor handles: `sub` (own partial, in/out) + one scratch input per peer.
@@ -146,17 +158,59 @@ impl AllReduce {
             imported = (0..w).map(|_| (0..w).map(|_| None).collect()).collect();
         }
 
-        // The external-semaphore ordering rides on the P2P data path. It is attempted (and the mode
-        // set to P2pSemaphore) only when the P2P path is live AND every rank can export/import a
-        // semaphore fd; otherwise the P2P path uses the host fence.
-        let mode = if p2p_ok {
-            if ranks.iter().all(|b| b.external_semaphore_supported()) {
-                AllReduceMode::P2pSemaphore
-            } else {
-                AllReduceMode::P2pHostFence
+        // The external-semaphore ordering rides on the P2P data path. Attempt it (mode
+        // P2pSemaphore) only when the P2P path is live AND every rank supports the fd; if any
+        // cross-device semaphore import is rejected (a valid hardware finding), fall back to the
+        // host fence and report the exact failure.
+        let mut export_sems: Vec<Option<TpExportSemaphore>> = (0..w).map(|_| None).collect();
+        let mut import_sems: Vec<Vec<Option<TpImportSemaphore>>> =
+            (0..w).map(|_| (0..w).map(|_| None).collect()).collect();
+        let mut sem_ok = p2p_ok && w > 1 && ranks.iter().all(|b| b.external_semaphore_supported());
+        if sem_ok {
+            for (p, es) in export_sems.iter_mut().enumerate() {
+                match ranks[p].tp_export_timeline() {
+                    Ok(e) => *es = Some(e),
+                    Err(e) => {
+                        eprintln!(
+                            "tp all-reduce: semaphore export on rank {p} failed ({e}); host-fence"
+                        );
+                        sem_ok = false;
+                        break;
+                    }
+                }
             }
-        } else {
+        }
+        if sem_ok {
+            'outer: for r in 0..w {
+                for p in 0..w {
+                    if p == r {
+                        continue;
+                    }
+                    let exp = export_sems[p].as_ref().expect("export sem set");
+                    match ranks[r].tp_import_timeline(exp) {
+                        Ok(imp) => import_sems[r][p] = Some(imp),
+                        Err(e) => {
+                            eprintln!(
+                                "tp all-reduce: cross-device semaphore import rank{p}->rank{r} \
+                                 rejected ({e}); host-fence"
+                            );
+                            sem_ok = false;
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+        if !sem_ok {
+            export_sems = (0..w).map(|_| None).collect();
+            import_sems = (0..w).map(|_| (0..w).map(|_| None).collect()).collect();
+        }
+        let mode = if !p2p_ok {
             AllReduceMode::Host
+        } else if sem_ok {
+            AllReduceMode::P2pSemaphore
+        } else {
+            AllReduceMode::P2pHostFence
         };
         if w > 1 {
             let sync = match mode {
@@ -200,6 +254,9 @@ impl AllReduce {
             exports,
             imported,
             scratch,
+            export_sems,
+            import_sems,
+            step: AtomicU64::new(0),
             reduce_plans,
             sub_tid,
             scratch_tids,
@@ -228,16 +285,90 @@ impl AllReduce {
             return Ok(()); // world=1: the partial IS the full sum, nothing to reduce.
         }
         match self.mode {
-            AllReduceMode::P2pSemaphore | AllReduceMode::P2pHostFence => {
-                self.reduce_p2p(ranks, bufs)
-            }
+            AllReduceMode::P2pSemaphore => self.reduce_p2p_semaphore(ranks, bufs),
+            AllReduceMode::P2pHostFence => self.reduce_p2p_hostfence(ranks, bufs),
             AllReduceMode::Host => self.reduce_host(ranks, bufs),
         }
     }
 
-    /// P2P data path. v1 orders with the host fence (each `copy_buffer`/`sync` fences); the
-    /// `P2pSemaphore` mode replaces those fences with cross-device semaphore waits (Phase 2).
-    fn reduce_p2p(&self, ranks: &[VulkanBackend], bufs: &[Box<dyn Buffer>]) -> Result<()> {
+    /// P2P data path with GPU-side cross-device ordering (`VK_KHR_external_semaphore_fd`): the host
+    /// issues every rank's publish (signal) and gather (wait) submit back-to-back WITHOUT waiting on a
+    /// peer's GPU — the timeline semaphores enforce publish→gather ordering on the devices, so the
+    /// GPUs pipeline. The ONLY host waits are a single `queue_wait_idle` per rank after the gather (a
+    /// memory barrier so the reduce dispatch safely reads scratch) plus the reduce's own sync — no
+    /// cross-device host round-trip. Eliminates the host-fence path's serial "wait producer, then let
+    /// consumer read" stall (its dominant per-layer cost).
+    fn reduce_p2p_semaphore(
+        &self,
+        ranks: &[VulkanBackend],
+        bufs: &[Box<dyn Buffer>],
+    ) -> Result<()> {
+        let w = ranks.len();
+        // Strictly-increasing timeline value for this all-reduce (first call = 1 > initial 0).
+        let v = self.step.fetch_add(1, Ordering::SeqCst) + 1;
+
+        // ── PUBLISH (no host wait): each rank copies its partial → its export buffer, signalling its
+        //    timeline semaphore = v when the copy completes. ──────────────────────────────────────
+        let mut pub_cmds: Vec<(usize, vk::CommandBuffer)> = Vec::with_capacity(w);
+        for p in 0..w {
+            let ex = self.exports[p].as_ref().expect("p2p export");
+            let sem = self.export_sems[p].as_ref().expect("export sem");
+            let cmd = ranks[p].tp_submit_copy_signal(
+                bufs[p].as_ref(),
+                ex.buffer(),
+                self.bytes,
+                sem,
+                v,
+            )?;
+            pub_cmds.push((p, cmd));
+        }
+
+        // ── GATHER (no host wait): each rank copies every peer's export → its scratch, its submit
+        //    WAITING GPU-side on the peer's semaphore ≥ v (so it can't read a partial before it is
+        //    published). ──────────────────────────────────────────────────────────────────────────
+        let mut gat_cmds: Vec<(usize, vk::CommandBuffer)> = Vec::with_capacity(w);
+        #[allow(clippy::needless_range_loop)]
+        // r indexes ranks, imported[r]/scratch[r]/import_sems[r]
+        for r in 0..w {
+            let mut copies: Vec<(&dyn Buffer, &dyn Buffer, usize)> = Vec::with_capacity(w - 1);
+            let mut waits: Vec<(&TpImportSemaphore, u64)> = Vec::with_capacity(w - 1);
+            for p in 0..w {
+                if p == r {
+                    continue;
+                }
+                let imp = self.imported[r][p].as_ref().expect("p2p import");
+                let sc = self.scratch[r][p].as_ref().expect("scratch");
+                copies.push((imp.as_ref(), sc.as_ref(), self.bytes));
+                waits.push((self.import_sems[r][p].as_ref().expect("import sem"), v));
+            }
+            let cmd = ranks[r].tp_submit_copies_wait(&copies, &waits)?;
+            gat_cmds.push((r, cmd));
+        }
+
+        // ── residual host wait: one queue_wait_idle per rank (the memory barrier for the reduce
+        //    read). All cross-device ordering already happened GPU-side above. ─────────────────────
+        for rank in ranks {
+            rank.tp_queue_wait_idle()?;
+        }
+        for (p, cmd) in pub_cmds {
+            ranks[p].tp_free_cmds(&[cmd]);
+        }
+        for (r, cmd) in gat_cmds {
+            ranks[r].tp_free_cmds(&[cmd]);
+        }
+
+        // ── reduce: each rank sums own + all peers' scratches into its own partial. ──────────────
+        self.run_reduce_plans(ranks, bufs)
+    }
+
+    /// P2P data path ordered by the HOST fence (`queue_wait_idle`) — correct but the host serializes
+    /// "wait producer, then let consumer read" per exchange (the per-layer stall the semaphore path
+    /// removes). Used when the device pair can't share an external semaphore.
+    fn reduce_p2p_hostfence(
+        &self,
+        ranks: &[VulkanBackend],
+        bufs: &[Box<dyn Buffer>],
+    ) -> Result<()> {
         let w = ranks.len();
         // ── publish: each rank copies its partial into its exported buffer ─────────────────────
         for p in 0..w {
