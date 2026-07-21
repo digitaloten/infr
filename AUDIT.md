@@ -22,11 +22,13 @@ reproduce/confirm are dropped (not listed) to keep this a verified-only ledger.
 
 - **Original audit:** 157 findings across 24 module slices (1 🔴 critical, 33 🟠
   major, 123 🟡 minor).
-- **Remaining open:** **23** — 0 🔴, 6 🟠, 17 🟡, in just 3 modules
-  (`infr-metal` `exec.rs`, the gated multi-GPU, and the parked MTP). (4 findings
-  are explicitly **deferred**, not open work: the 🟠 `make_compute_kernel`
-  OOM→Result and three 🟡 shader/dp4a DRY refactors — each risks the
-  byte-identity gate or the recorded stream; see their sections.)
+- **Remaining open:** **18** — 0 🔴, 6 🟠, 12 🟡, essentially all in the gated
+  multi-GPU and the parked MTP (plus one Mac-verify latent metal item + 4
+  deferred DRY refactors). The 🟠s: the deferred `make_compute_kernel`
+  OOM→Result, the Mac-only latent metal wrong-kernel dispatch, the gated
+  multi-GPU `p2p`/all-reduce pair, and the parked-MTP `catch_up`/logits pair.
+  The 4 deferred 🟡s are shader/dp4a DRY refactors that risk the byte-identity
+  gate — see their sections.
 
 No finding was accepted on an agent's word — each was re-read against the source
 by the coordinator; two agent-flagged "MAJOR"s (the Q5_1 clamp in the shader and
@@ -291,23 +293,36 @@ parked path).
   sites; the intentional per-thread-table retention is documented.
   (`iquant_grids.rs` + `infr-engine` were audited **clean** — pure tables / a
   re-export shim.)
+- **`infr-metal` exec.rs (all 6 findings)** — verified via
+  `cargo check`/`clippy` against `x86_64-apple-darwin` (the crate is
+  macOS-gated; no Apple GPU here to run it). `Op::Rope` is excluded from the
+  decode-replay tape so a llama-family graph no longer replays token-0's frozen
+  RoPE angle (there's no i32 `rope_f32` variant to live-bind like `qknormrope`,
+  so exclude-from-replay is the safe pure-Rust fix); `sample_split` packs the
+  same `top_k.min(64)` it sizes (was an OOB write); `Op::Softmax` gates on the
+  threadgroup cap with a host scalar fallback; the 5 per-op transient buffers
+  use `scratch_buf`; redundant per-dispatch PSO double-lookups fetch once; and
+  the 4 parallel quik8 kernel-name tables collapse to one registry (a missing
+  base is a loud `Err`; a test enumerates all 16×4 == the old arms). _Surfaced a
+  new latent bug_ (iq4xs/iq4nl wrong-kernel default) — preserved + flagged for
+  Mac verification (see the metal section).
 
 ### Highest-priority (production default paths)
 
-| #      | Sev | Location                           | Issue                                                                                                          |
-| ------ | --- | ---------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| ~~1~~  | ✅  | `infr-hub`                         | ~~Downloaded blob never sha256-verified~~ — **FIXED** (`1263bcc`, + full hub slice).                           |
-| ~~2~~  | ✅  | `infr-llama chat/mod.rs`           | ~~Generate error orphans the user turn~~ — **FIXED** (`Err` arm pops the user turn).                           |
-| ~~3~~  | ✅  | `infr-server lib.rs`               | ~~Streaming swallows errors as `stop`~~ — **FIXED** (error frame + panic-safe `DoneGuard`).                    |
-| ~~4~~  | ✅  | `infr-server lib.rs`               | ~~No per-request cancellation~~ — **FIXED** (cancel latch → `req.abort()` frees the slot).                     |
-| ~~5~~  | ✅  | `infr-llama runner.rs`             | ~~Prefix-cache records unmaterialized KV rows~~ — **FIXED** (`last_written` tracker + `resident_after_gen`).   |
-| ~~6~~  | ✅  | `infr-vulkan adapter.rs`           | ~~Static split-K `n_chunks>1024` overruns `wexp[1024]`~~ — **FIXED** (bounds `n_chunks ≤ 1024`).               |
-| ~~7~~  | ✅  | `infr-vulkan ops.rs`               | ~~Kernel-cache double-checked lock double-compiles + leaks~~ — **FIXED** (single-lock `or_insert_with`).       |
-| ~~8~~  | ✅  | `infr-llama sampling.rs`           | ~~Repeat penalty per-occurrence~~ — **FIXED** (`70bbe4e`; now per-distinct-token).                             |
-| ~~9~~  | ✅  | `infr-vulkan shaders dg_eb_sample` | ~~argmax reduce drops the lower-index tie-break~~ — **FIXED** (matches host/`argmax.comp` on ties).            |
-| ~~10~~ | ✅  | `infr-gguf lib.rs`                 | ~~Corrupt GGUF `pos+n` overflow panic~~ — **FIXED** (`checked_add`/`checked_mul` → `Error::Loader`).           |
-| ~~11~~ | ✅  | `infr-cli main.rs`                 | ~~`--dev` can't override inherited backend env~~ — **FIXED** (clears siblings; unified precedence).            |
-| 12     | 🟠  | `infr-metal exec.rs:2836`          | `Op::Rope` snapshots positions on the replay tape → **frozen RoPE after token 0** (llama-family Metal decode). |
+| #      | Sev | Location                           | Issue                                                                                                        |
+| ------ | --- | ---------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| ~~1~~  | ✅  | `infr-hub`                         | ~~Downloaded blob never sha256-verified~~ — **FIXED** (`1263bcc`, + full hub slice).                         |
+| ~~2~~  | ✅  | `infr-llama chat/mod.rs`           | ~~Generate error orphans the user turn~~ — **FIXED** (`Err` arm pops the user turn).                         |
+| ~~3~~  | ✅  | `infr-server lib.rs`               | ~~Streaming swallows errors as `stop`~~ — **FIXED** (error frame + panic-safe `DoneGuard`).                  |
+| ~~4~~  | ✅  | `infr-server lib.rs`               | ~~No per-request cancellation~~ — **FIXED** (cancel latch → `req.abort()` frees the slot).                   |
+| ~~5~~  | ✅  | `infr-llama runner.rs`             | ~~Prefix-cache records unmaterialized KV rows~~ — **FIXED** (`last_written` tracker + `resident_after_gen`). |
+| ~~6~~  | ✅  | `infr-vulkan adapter.rs`           | ~~Static split-K `n_chunks>1024` overruns `wexp[1024]`~~ — **FIXED** (bounds `n_chunks ≤ 1024`).             |
+| ~~7~~  | ✅  | `infr-vulkan ops.rs`               | ~~Kernel-cache double-checked lock double-compiles + leaks~~ — **FIXED** (single-lock `or_insert_with`).     |
+| ~~8~~  | ✅  | `infr-llama sampling.rs`           | ~~Repeat penalty per-occurrence~~ — **FIXED** (`70bbe4e`; now per-distinct-token).                           |
+| ~~9~~  | ✅  | `infr-vulkan shaders dg_eb_sample` | ~~argmax reduce drops the lower-index tie-break~~ — **FIXED** (matches host/`argmax.comp` on ties).          |
+| ~~10~~ | ✅  | `infr-gguf lib.rs`                 | ~~Corrupt GGUF `pos+n` overflow panic~~ — **FIXED** (`checked_add`/`checked_mul` → `Error::Loader`).         |
+| ~~11~~ | ✅  | `infr-cli main.rs`                 | ~~`--dev` can't override inherited backend env~~ — **FIXED** (clears siblings; unified precedence).          |
+| ~~12~~ | ✅  | `infr-metal exec.rs`               | ~~`Op::Rope` frozen RoPE on the replay tape~~ — **FIXED** (excluded from replay).                            |
 
 The 6 remaining 🟠 majors: the metal `Op::Rope` replay-tape bug (#12, the last
 open production major); the gated multi-GPU `p2p` `EXCLUSIVE` sharing + F32-only
@@ -487,47 +502,16 @@ items below are latent acceptance-rate/perf bugs, not output corruption._
    upload/bind helper, per-backend `mtp_bind_weight(be)`, and a single
    `Option<Leading{…}>` enum for the leading state.
 
-## infr-metal/src/exec.rs (Metal backend — audited by reading; not runnable here)
+## infr-metal/src/exec.rs (Metal backend — not runnable on this Linux box)
 
-1. **🟠 `exec.rs:2836 — plain `Op::Rope` captures a stale positions snapshot on
-   the decode-replay tape → frozen RoPE after token 0.** The Rope arm binds
-   positions via `ensure_device` (allocates a _new_ f32 buffer widened from the
-   host mirror), so the replay `TapeEntry` retains the record-time value; the
-   seam rewrites the live i32 positions buffer between tokens, but the recorded
-   dispatch keeps reading token-0's angle. `Op::QkNormRope` (`2881`)
-   deliberately binds the _live_ buffer with an explicit "replay tape stays
-   valid" comment — the exact fix. `replay_shape` admits `Op::Rope` (`802`) and
-   the position finder matches both, so a llama-family decode graph (plain
-   Rope + f16 KV, hd 64/128/256) qualifies for replay and silently rotates every
-   token by position 0. _Fix:_ bind the live i32 positions buffer in the Rope
-   arm (i32 `rope_f32` variant, like QkNormRope), or exclude plain `Op::Rope`
-   from `replay_shape`.
-2. **🟡
-   `exec.rs:743,3044 — `sample_split_shape`sizes scratch with`top_k.min(64)`but packs the raw`top_k`for`sample_f32_stage1`.**
-   A `top_k>64` caller makes stage-1 write `top_k` candidates/group into a
-   64-per-group buffer → OOB device write; nothing clamps `top_k` before here.
-   _Fix:_ clamp once, use it for both sizing and the param (or assert `≤64`).
-3. **🟡 `exec.rs:3105 — `Op::Softmax`launches`softmax_wide_f32` at tg=256 with
-   no threadgroup-cap gate/fallback** (unlike RmsNorm/QkNormRope/attention
-   tiers). `encode_tg_w` silently clamps `tgw=tg.min(cap)`, so on a
-   capacity-capped device the wide cross-lane reduction runs with <256 lanes and
-   reads uninitialized threadgroup slots → wrong result, no error (arm flagged
-   UNVERIFIED on real HW). _Fix:_ gate on the cap, fall back to scalar softmax /
-   error loudly.
-4. **🟡 `exec.rs:3565,3629,2484 — per-op transient device buffers `new_buffer`'d
-   fresh instead of pooled.** The KV f16 dequant scratch `ks`/`vs`, q-cast `qh`,
-   and HGEMM `xh` allocate `kv_len*n_kv*hd*2`-byte buffers per layer per token
-   on the decoupled-quant KV path, growing with depth, while the `scratch_buf`
-   pool that exists to amortize this goes unused. _Fix:_ route through
-   `scratch_buf` keyed by (size, tag).
-5. **🟡 `exec.rs:2317 — pipeline-state cache looked up twice per dispatch**
-   (cap-check `get(kern)` then encode `get(kern)`: cmm/hmm/rmsnorm/qknormrope +
-   every attention `fits(...)`), each locking the cache mutex + hashing +
-   retaining the PSO — redundant on the prefill hot path. _Fix:_ fetch once,
-   read cap off it, reuse.
-6. **🟡 DRY/YAGNI — `exec.rs:2267` ~7 parallel 15-arm `qw.kern → "…suffix"`
-   match tables** (`_hmm`/`_cmm`/`_cmm_ks`/`_rt`/m==1 `_ks`/`_add`); a missed
-   arm falls through a `_ => "linear_quik8_*"` default (wrong kernel, no error).
-   And `2200` the Linear arm allocates `dev_dst` up front that the
-   fused-residual peephole leaves dead. _Fix:_ one `(base → {suffix → kernel})`
-   table so a miss is a registry error; defer `dev_dst` past the fused check.
+_All 6 original findings fixed (see Resolved log). The one below is a **new,
+pre-existing** latent bug surfaced while unifying the kernel tables — preserved
+byte-for-byte in the fix and flagged for a Mac to verify+fix._
+
+1. **🟠 (Mac-verify) iq4xs/iq4nl reach the `cmm_ks` default that dispatches
+   `linear_quik8_cmm_ks`, though their own `linear_iq4xs_cmm_ks`/
+   `linear_iq4nl_cmm_ks` kernels exist** — so at m≥2/m≥5 with deep-k and
+   `out_f%64==0` the wrong (quik8) kernel decodes their codes. Latent +
+   Metal-only
+   - preserved (not a regression); needs an Apple GPU to confirm and re-point
+     the two registry cells to the correct kernels.
