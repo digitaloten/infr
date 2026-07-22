@@ -4,6 +4,26 @@ Findings and a prioritized worklist for the `infr-cpu` reference backend,
 aggregated from the CPU perf review. Ordered **low → high implementation
 difficulty** so we land the cheap, high-certainty wins first.
 
+## Results snapshot
+
+Landed so far (bit-identical unless noted; precision-flip slices
+coherence-checked token-identical to the independent Vulkan int8 path before
+acceptance):
+
+| Slice                              | Model / quant     | Decode       | Prefill (pp512)   |
+| ---------------------------------- | ----------------- | ------------ | ----------------- |
+| conv1d parallel (`ac9c228`)        | Qwen3.5-9B Q4_K_M | —            | flat (GEMM-bound) |
+| mmap madvise (`5ed932a`)           | Qwen3.5-9B Q4_K_M | neutral      | neutral           |
+| DeltaNet head-parallel (`9595bf3`) | Qwen3.5-9B Q4_K_M | flat         | 67→110 t/s (+63%) |
+| native int8 **Q4_0** (`6e7decd`)   | Qwen3-0.6B Q4_0   | +142% (2.4×) | +239% (3.4×)      |
+| native int8 **IQ4_XS** (`304dd42`) | Qwen3-0.6B IQ4_XS | +156% (2.6×) | +320% (4.2×)      |
+| native int8 **Q2_K** (`1e90613`)   | Qwen3-0.6B Q2_K   | +29%         | +71%              |
+
+Deferred: #3 (DeltaNet clones — measured ~0.1%, negligible). Follow-ups: the
+rest of the quant coverage (#6 Q3_K, #7 IQ2/IQ3 + Q4_1/Q5_1 — pattern proven,
+gated on local models), #8 (f16/bf16, low priority), #9 (blocked on `perf`), #10
+(fusion, structural).
+
 ## Context: two regimes, two different bottlenecks
 
 CPU inference splits hard by batch size, and the cache/bandwidth story is
@@ -178,7 +198,14 @@ produced in a way that looks like garbage is a bug, not a precision flip.
 - The remaining uncovered formats; codebook/grid decode is fiddlier. Land as a
   mini-campaign, one dtype per slice, only after #4–#6 prove the pattern.
 - **Precision:** precision-flip re-bless per dtype.
-- **Status:** TODO
+- **Status:** TODO (follow-up). The pattern is now **proven across all three
+  quant families** — legacy-round (Q4*0), IQ-codebook (IQ4_XS), and K-quant
+  affine (Q2_K) — so each remaining format is a mechanical clone of the nearest
+  landed kernel: `Q4_1`/`Q5_1` → Q4_0/Q5_0 (affine legacy); `IQ4_NL` → IQ4_XS
+  (same codebook, 32-block);
+  `IQ2*_`/`IQ3\__`→ the grid-codebook decoders in`infr-gguf` + the IQ4_XS
+  signed-dot skeleton. Gated on having a local GGUF per format for the coherence
+  check (the dev box lacks Q3_K / IQ2 / IQ3 models).
 
 ### 8. f16 / bf16 native AVX-512-FP16/BF16 dot — _medium_
 
