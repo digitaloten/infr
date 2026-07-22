@@ -150,7 +150,14 @@ produced in a way that looks like garbage is a bug, not a precision flip.
 - Same treatment as Q4_0, for the common small-model format IQ4_XS (local
   Qwen3-0.6B has one). GPU reference exists (quant-cliff-warp).
 - **Precision:** precision-flip re-bless as in #4.
-- **Status:** TODO
+- **Status:** DONE (`304dd42`). `vec_dot_iq4xs` / `_batch` (scalar + AVX2 +
+  AVX-512BW single-token), modeled on Q6_K but with a `KVALUES_IQ4NL` codebook
+  `pshufb` lookup and Q8_0's abs/sign signed-dot trick. Coherent +
+  token-identical to Vulkan int8 ("…is **Paris**"); no golden changed; SIMD
+  bit-identical to scalar. **Qwen3-0.6B IQ4_XS CPU: decode 37.8→96.6 t/s
+  (+156%), prefill 129.7→544.8 t/s (+320%).** Follow-up: no AVX-512-VNNI
+  **batch** variant yet (batch runs AVX2) — a `dpbusd` batch path can lift
+  prefill further on VNNI hosts (this box has `avx512_vnni`).
 
 ### 6. Native int8 dot: **Q2_K, Q3_K** — _medium–high_
 
