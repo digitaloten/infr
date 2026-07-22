@@ -55,12 +55,13 @@ GPU native path; `IQ2_XXS` matches leading tokens; the 1-bit `IQ1_S`/`IQ1_M` are
 chaotic at the noise floor (int8/f32/CPU/GPU all diverge — the 1e-3 math check
 is the correctness gate).
 
-**CPU now natively handles every weight quant except ternary**
-(`TQ1_0`/`TQ2_0`).
+**CPU now natively handles EVERY weight quant format** — including ternary
+`TQ1_0` (`b7a4201`) / `TQ2_0` (`6336df3`), fold `(digit−1)` into signed i8 +
+single-scale int dot. Full parity with Vulkan's native set.
 
-Deferred: #3 (DeltaNet clones — measured ~0.1%, negligible). Remaining: `TQ1_0`/
-`TQ2_0` (CPU), #8 (f16/bf16, low priority), #9 (blocked on `perf`), #10
-(fusion), VNNI batch for IQ4_XS.
+Deferred: #3 (DeltaNet clones — measured ~0.1%, negligible). Remaining: #8
+(f16/bf16, low priority), #9 (blocked on `perf`), #10 (fusion), VNNI batch for
+IQ4_XS. **Metal** is the only backend with quant gaps (see audit).
 
 ## Cross-backend fast-kernel coverage audit
 
@@ -79,10 +80,12 @@ weight quant format. ✅ = native fast path, ❌ = falls back to dequant.
 | IQ1_S IQ1_M          | ✅  |   ✅   |  ❌   |
 | MXFP4 NVFP4          | ✅  |   ✅   |  ❌   |
 | Q2_0 (ternary-ish)   | ✅  |   ✅   |  ❌   |
-| TQ1_0 TQ2_0          | ❌  |   ✅   |  ❌   |
+| TQ1_0 TQ2_0          | ✅  |   ✅   |  ❌   |
 
+- **CPU: complete** — native for every weight quant format (ternary `TQ1_0`
+  `6336df3`/`b7a4201` closed the last gap; TriLM-3.9B TQ2_0 prefill 16.5→131.9
+  t/s ≈ 8×).
 - **Vulkan: complete** — native for every weight quant format.
-- **CPU: only ternary left** — `TQ1_0`/`TQ2_0` (BitNet/TriLM-style) fall to f32.
 - **Metal: 11 formats on dequant→f16** — most impactful are **`Q2_K`/`Q3_K`**
   (common small-model quants), then `Q4_1`/`Q5_1`, `IQ1_S`/`IQ1_M`, `MXFP4`/
   `NVFP4`, `Q2_0`. (Float `F16`/`F32`/`BF16` are native on all three.)
