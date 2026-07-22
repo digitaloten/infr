@@ -3050,6 +3050,116 @@ pub(crate) fn vec_dot_tq2_0_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut
     }
 }
 
+/// Expand a whole TQ1_0 weight row (54 bytes / 256 elems per super-block) to signed `i8` ternary
+/// weights ONCE, alongside the per-256 `d` scale — mirrors `dequant_block(DType::Tq1_0)` (dequant.rs)
+/// EXACTLY. TQ1_0 (BitNet/TriLM 1.6-bit ternary) is the base-3-PACKED sibling of TQ2_0: ONE f16 scale
+/// `d` per 256-block, no sub-block scales, no grid, no signs; each ternary digit `digit ∈ 0..2`
+/// dequants to `y = (digit − 1)·d`. Folding the `−1` into the stored i8 weight (`(digit − 1) ∈
+/// {−1,0,1}`) means the dot needs NO offset/bsum correction term — a plain signed int dot × `d` ×
+/// `q8.d[b]`. Digit extraction packs 5 ternary digits per byte: for byte `b` and digit index `n`,
+/// `q = b·POW3[n]` (wrapping u8), `digit = ((q as u16)·3) >> 8`. Element order mirrors the dequant's
+/// `outoff` progression EXACTLY — THREE segments: (1) `qs[0..32]`, 5 digit passes → 160 elems
+/// (`n*32 + m`); (2) `qs[32..48]`, 5 digit passes → 80 elems (`160 + n*16 + m`); (3) `qh[0..4]`, 4
+/// digit passes → 16 elems (`240 + n*4 + j`). Block = 54 bytes: `[u8 qs[48]]`, `[u8 qh[4]]`,
+/// `[f16 d]`. `in_f` must be a multiple of 256; `ds[b]` is the block's `d`.
+fn tq1_0_expand_row(row: &[u8], in_f: usize) -> (Vec<i8>, Vec<f32>) {
+    const POW3: [u8; 6] = [1, 3, 9, 27, 81, 243];
+    let nb = in_f / 256;
+    let mut weights = vec![0i8; nb * 256];
+    let mut ds = vec![0f32; nb];
+    for b in 0..nb {
+        let blk = &row[b * 54..b * 54 + 54];
+        let qs = &blk[0..48];
+        let qh = &blk[48..52];
+        ds[b] = rdf16(&blk[52..54]);
+        let base = b * 256;
+        // Segment 1: qs[0..32], 5 digit passes → 160 elems (outoff 0..160).
+        for n in 0..5usize {
+            let p3 = POW3[n];
+            for m in 0..32usize {
+                let q = qs[m].wrapping_mul(p3);
+                let digit = (((q as u16) * 3) >> 8) as i8; // ∈ 0..2
+                weights[base + n * 32 + m] = digit - 1; // ∈ {−1,0,1}
+            }
+        }
+        // Segment 2: qs[32..48], 5 digit passes → 80 elems (outoff 160..240).
+        for n in 0..5usize {
+            let p3 = POW3[n];
+            for m in 0..16usize {
+                let q = qs[32 + m].wrapping_mul(p3);
+                let digit = (((q as u16) * 3) >> 8) as i8; // ∈ 0..2
+                weights[base + 160 + n * 16 + m] = digit - 1; // ∈ {−1,0,1}
+            }
+        }
+        // Segment 3: qh[0..4], 4 digit passes → 16 elems (outoff 240..256).
+        for n in 0..4usize {
+            let p3 = POW3[n];
+            for j in 0..4usize {
+                let q = qh[j].wrapping_mul(p3);
+                let digit = (((q as u16) * 3) >> 8) as i8; // ∈ 0..2
+                weights[base + 240 + n * 4 + j] = digit - 1; // ∈ {−1,0,1}
+            }
+        }
+    }
+    (weights, ds)
+}
+
+/// `Σ weight·x` for one TQ1_0 row against the Q8 activation. Expands the ternary weight row to signed
+/// i8 once (`tq1_0_expand_row`, `−1` already folded in), then per 256-block runs ONE integer dot and
+/// scales by `d · q8.d[b]` — a single term per super-block, no min/bsum correction (the weights are
+/// already zero-centred). `in_f` must be a multiple of 256.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn vec_dot_tq1_0(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    debug_assert_eq!(
+        in_f % 256,
+        0,
+        "vec_dot_tq1_0: in_f must be a multiple of 256"
+    );
+    let nb = in_f / 256;
+    let (weights, ds) = tq1_0_expand_row(row, in_f);
+    let mut sumf = 0f32;
+    for b in 0..nb {
+        let w = &weights[b * 256..b * 256 + 256];
+        let a = &q8.qs[b * 256..b * 256 + 256];
+        let mut iprod = 0i32;
+        for i in 0..256usize {
+            iprod += w[i] as i32 * a[i] as i32;
+        }
+        sumf += ds[b] * q8.d[b] * iprod as f32;
+    }
+    sumf
+}
+
+/// Batched `Σ weight·x` for one TQ1_0 row against `m` Q8 activations (`out[r]`). Expands the ternary
+/// weight row to signed i8 ONCE (`tq1_0_expand_row`), then reuses it across all `m` token activations
+/// — the amortisation the single-token path can't do. Bit-identical accumulation to `vec_dot_tq1_0`
+/// (same 256-block int dot, same `d·q8.d[b]` f32 epilogue), so batch and single agree to the bit.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn vec_dot_tq1_0_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    debug_assert_eq!(
+        in_f % 256,
+        0,
+        "vec_dot_tq1_0_batch: in_f must be a multiple of 256"
+    );
+    let m = q8s.len();
+    let nb = in_f / 256;
+    let (weights, ds) = tq1_0_expand_row(row, in_f);
+    for r in 0..m {
+        let q8 = &q8s[r];
+        let mut sumf = 0f32;
+        for b in 0..nb {
+            let w = &weights[b * 256..b * 256 + 256];
+            let a = &q8.qs[b * 256..b * 256 + 256];
+            let mut iprod = 0i32;
+            for i in 0..256usize {
+                iprod += w[i] as i32 * a[i] as i32;
+            }
+            sumf += ds[b] * q8.d[b] * iprod as f32;
+        }
+        out[r] = sumf;
+    }
+}
+
 /// Expand a whole IQ1_S weight row (50 bytes / 256 elems per super-block) to signed `i8` grid
 /// weights ONCE — mirrors `dequant_block(DType::Iq1S)` (dequant.rs) EXACTLY. IQ1_S is a
 /// grid-codebook quant with a per-32 fractional `delta` that is NOT part of the signed codebook, so
@@ -7905,6 +8015,104 @@ mod kernel_tests {
                 assert!(
                     rel_err(got1, want_f) < 2e-2,
                     "tq2_0 single(full-ref) in_f={in_f} row={r}: got {got1}, want {want_f}"
+                );
+            }
+        }
+    }
+
+    /// Build `nb` random 54-byte TQ1_0 super-blocks with a fixed `d`. TQ1_0's base-3 packing places
+    /// NO constraint on `qs`/`qh`: EVERY byte value 0..255 is a legal base-3 packing (the digit
+    /// extraction `((b·POW3[n])·3 >> 8)` maps any byte to five ternary digits ∈ 0..2), so fully-random
+    /// bytes exercise all three dequant weight values (`(digit − 1) ∈ {−1,0,1}`) across the block.
+    /// Only the trailing f16 `d` is pinned.
+    fn build_tq1_0_rand(nb: usize, d: f32, seed: u64) -> Vec<u8> {
+        let mut w = det_bytes(nb * 54, seed);
+        for b in 0..nb {
+            put_f16(&mut w[b * 54 + 52..b * 54 + 54], d);
+        }
+        w
+    }
+
+    /// Batch and single-token TQ1_0 kernels share the SAME i8 expansion and f32 accumulation order,
+    /// so they must agree to the bit for every row. Fully-random blocks exercise all three ternary
+    /// digits across the base-3 packing and all three segments (qs[0..32], qs[32..48], qh[0..4]).
+    #[test]
+    fn tq1_0_batch_matches_single() {
+        for in_f in [256usize, 512] {
+            let w = build_tq1_0_rand(in_f / 256, 0.05, 90);
+            let m = 5usize;
+            let q8s: Vec<Q8> = (0..m)
+                .map(|r| quantize_q8(&det_x(in_f, 91 + r as u64)))
+                .collect();
+            let mut batch_out = vec![0f32; m];
+            vec_dot_tq1_0_batch(&w, &q8s, in_f, &mut batch_out);
+            for (r, q8) in q8s.iter().enumerate() {
+                let single = vec_dot_tq1_0(&w, q8, in_f);
+                assert_eq!(
+                    batch_out[r].to_bits(),
+                    single.to_bits(),
+                    "tq1_0 batch vs single in_f={in_f} row={r}: batch {}, single {single}",
+                    batch_out[r]
+                );
+            }
+        }
+    }
+
+    /// End-to-end tolerance-parity: the int8-activation TQ1_0 kernel must track the full-precision
+    /// dequant (`(digit − 1)·d`) · f32-activation reference. TQ1_0 ternary weights are stored EXACTLY
+    /// (the ternary digit IS the weight, no weight-quant loss beyond the shared f16 `d`), so vs the
+    /// QUANTIZED activation the kernel actually sees, the only slack is f32 accumulation order → tight
+    /// 1e-3 (this is the primary correctness proof: it isolates the base-3 digit extraction, the
+    /// 3-segment 160+80+16 element order, and the integer dot, no model available). vs the
+    /// full-precision activation the looser 2e-2 absorbs the lossy int8 activation quant; ternary
+    /// weights have far less sign cancellation than the grid quants, so the bound holds comfortably.
+    /// Covers single-row (m=1) and batch (m>1).
+    #[test]
+    fn tq1_0_matches_dequant_reference() {
+        for in_f in [256usize, 512] {
+            let w = build_tq1_0_rand(in_f / 256, 0.05, 70);
+            let wref = dequant_block(DType::Tq1_0, &w).unwrap();
+            // Sanity: reference spans all three dequant weight values → all ternary digits exercised.
+            // Targets are multiples of the f16-rounded `d` the dequant actually applies.
+            let dr = half::f16::from_f32(0.05).to_f32();
+            for target in [-dr, 0.0, dr] {
+                assert!(
+                    wref.iter().any(|&v| (v - target).abs() < 1e-6),
+                    "tq1_0 ref missing weight {target} in_f={in_f}"
+                );
+            }
+            let xs: Vec<Vec<f32>> = (0..4).map(|i| det_x(in_f, 71 + i)).collect();
+            let q8s: Vec<Q8> = xs.iter().map(|x| quantize_q8(x)).collect();
+
+            // Batch (m>1).
+            let mut got = vec![0f32; xs.len()];
+            vec_dot_tq1_0_batch(&w, &q8s, in_f, &mut got);
+            for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
+                let want_q = dot(&wref, &dequant_q8(q8));
+                assert!(
+                    rel_err(got[r], want_q) < 1e-3,
+                    "tq1_0 batch(quant-ref) in_f={in_f} row={r}: got {}, want {want_q}",
+                    got[r]
+                );
+                let want_f = dot(&wref, x);
+                assert!(
+                    rel_err(got[r], want_f) < 2e-2,
+                    "tq1_0 batch(full-ref) in_f={in_f} row={r}: got {}, want {want_f}",
+                    got[r]
+                );
+            }
+            // Single-row (m=1).
+            for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
+                let got1 = vec_dot_tq1_0(&w, q8, in_f);
+                let want_q = dot(&wref, &dequant_q8(q8));
+                assert!(
+                    rel_err(got1, want_q) < 1e-3,
+                    "tq1_0 single(quant-ref) in_f={in_f} row={r}: got {got1}, want {want_q}"
+                );
+                let want_f = dot(&wref, x);
+                assert!(
+                    rel_err(got1, want_f) < 2e-2,
+                    "tq1_0 single(full-ref) in_f={in_f} row={r}: got {got1}, want {want_f}"
                 );
             }
         }
