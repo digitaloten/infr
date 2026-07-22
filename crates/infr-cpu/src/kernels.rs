@@ -2722,6 +2722,124 @@ unsafe fn vec_dot_iq4xs_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mu
     }
 }
 
+/// Expand a whole IQ2_S weight row (82 bytes / 256 elems per super-block) to signed `i8` codebook
+/// weights ONCE, alongside the per-16-element `dl` scales — mirrors `dequant_block(DType::Iq2S)`
+/// exactly. IQ2_S is a GRID-codebook quant: each group of 8 weights is a 10-bit index into
+/// `IQ2S_GRID` (each entry packs 8 signed i8), then sign-flipped per `KMASK_IQ2XS` from a per-group
+/// sign byte. The grid gather can't be SIMD-vectorized, so the expansion is scalar here and the
+/// caller runs the int dot against the Q8 activation (amortising this decode across all `m` tokens,
+/// like `vec_dot_q6k_batch` decodes its row once). `weights[b*256 + g*8 + k]` and `dls[b*32 + g]`
+/// are in the SAME element order the dequant writes: groups iterate `ib32` (0..8) then `l` (0..4),
+/// 8 elements each. `in_f` must be a multiple of 256.
+fn iq2s_expand_row(row: &[u8], in_f: usize) -> (Vec<i8>, Vec<f32>) {
+    use infr_core::iquant_grids::{IQ2S_GRID, KMASK_IQ2XS};
+    let nb = in_f / 256;
+    let mut weights = vec![0i8; nb * 256];
+    let mut dls = vec![0f32; nb * 32];
+    for b in 0..nb {
+        let blk = &row[b * 82..b * 82 + 82];
+        let d = rdf16(&blk[0..2]);
+        let qs_all = &blk[2..66]; // 64 bytes: [0..32] grid-idx low bytes, [32..64] sign bytes
+        let qh = &blk[66..74]; // 8 bytes: 2-bit high index bits, one byte per ib32
+        let scales = &blk[74..82]; // 8 bytes: two 4-bit scales per byte
+        for ib32 in 0..8usize {
+            let sc = scales[ib32];
+            let db0 = d * (0.5 + (sc & 0xf) as f32) * 0.25;
+            let db1 = d * (0.5 + (sc >> 4) as f32) * 0.25;
+            let qh_byte = qh[ib32];
+            for l in 0..4usize {
+                let g = ib32 * 4 + l; // group index within block (0..32)
+                let qs_byte = qs_all[ib32 * 4 + l];
+                let sign_byte = qs_all[ib32 * 4 + l + 32];
+                let hi = ((qh_byte as u32).wrapping_shl((8 - 2 * l) as u32)) & 0x300;
+                let grid_idx = (qs_byte as usize) | (hi as usize);
+                let grid_u64 = IQ2S_GRID[grid_idx];
+                let dl = if l < 2 { db0 } else { db1 };
+                dls[b * 32 + g] = dl;
+                let dst = &mut weights[b * 256 + g * 8..b * 256 + g * 8 + 8];
+                for k in 0..8usize {
+                    let gv = ((grid_u64 >> (8 * k)) & 0xFF) as i8;
+                    // Negate per KMASK_IQ2XS[k], matching `apply_signs` in dequant.rs.
+                    dst[k] = if sign_byte & KMASK_IQ2XS[k] != 0 {
+                        gv.wrapping_neg()
+                    } else {
+                        gv
+                    };
+                }
+            }
+        }
+    }
+    (weights, dls)
+}
+
+/// `Σ weight·x` for one IQ2_S row against the Q8 activation. Expands the grid-codebook weight row to
+/// signed i8 once (`iq2s_expand_row`), then per group of 8 runs an integer dot scaled by the per-16
+/// `dl`; the block's `dl·iprod` terms accumulate in an f32 running sum, then ONE multiply by the
+/// super-block activation scale `q8.d[b]`. No offset/min/bsum term — grid weights are already signed
+/// and zero-centred. Same per-sub-block→super-block accumulation shape as `vec_dot_iq4xs`, minus the
+/// SIMD dot (the grid gather is inherently scalar). `in_f` must be a multiple of 256.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn vec_dot_iq2s(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    debug_assert_eq!(
+        in_f % 256,
+        0,
+        "vec_dot_iq2s: in_f must be a multiple of 256"
+    );
+    let nb = in_f / 256;
+    let (weights, dls) = iq2s_expand_row(row, in_f);
+    let mut sumf = 0f32;
+    for b in 0..nb {
+        let q8b = &q8.qs[b * 256..b * 256 + 256];
+        let mut block_sum = 0f32;
+        for g in 0..32usize {
+            let w = &weights[b * 256 + g * 8..b * 256 + g * 8 + 8];
+            let a = &q8b[g * 8..g * 8 + 8];
+            let mut iprod = 0i32;
+            for k in 0..8usize {
+                iprod += w[k] as i32 * a[k] as i32;
+            }
+            block_sum += dls[b * 32 + g] * iprod as f32;
+        }
+        sumf += q8.d[b] * block_sum;
+    }
+    sumf
+}
+
+/// Batched `Σ weight·x` for one IQ2_S row against `m` Q8 activations (`out[r]`). Expands the
+/// grid-codebook weight row to signed i8 ONCE (`iq2s_expand_row`), then reuses it across all `m`
+/// token activations — the amortisation the single-token path can't do. Bit-identical accumulation
+/// to `vec_dot_iq2s` (same group order, same f32 epilogue), so batch and single agree to the bit.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn vec_dot_iq2s_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    debug_assert_eq!(
+        in_f % 256,
+        0,
+        "vec_dot_iq2s_batch: in_f must be a multiple of 256"
+    );
+    let m = q8s.len();
+    let nb = in_f / 256;
+    let (weights, dls) = iq2s_expand_row(row, in_f);
+    for r in 0..m {
+        let q8 = &q8s[r];
+        let mut sumf = 0f32;
+        for b in 0..nb {
+            let q8b = &q8.qs[b * 256..b * 256 + 256];
+            let mut block_sum = 0f32;
+            for g in 0..32usize {
+                let w = &weights[b * 256 + g * 8..b * 256 + g * 8 + 8];
+                let a = &q8b[g * 8..g * 8 + 8];
+                let mut iprod = 0i32;
+                for k in 0..8usize {
+                    iprod += w[k] as i32 * a[k] as i32;
+                }
+                block_sum += dls[b * 32 + g] * iprod as f32;
+            }
+            sumf += q8.d[b] * block_sum;
+        }
+        out[r] = sumf;
+    }
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn vec_dot_q8_0_batch_scalar(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
     let m = q8s.len();
@@ -6566,6 +6684,123 @@ mod kernel_tests {
                 assert!(
                     rel_err(got1, want_f) < 2e-2,
                     "iq4xs single(full-ref) in_f={in_f} row={r}: got {got1}, want {want_f}"
+                );
+            }
+        }
+    }
+
+    /// Build `nb` fully-random 82-byte IQ2_S super-blocks with a fixed `d`. Every byte pattern is a
+    /// legal IQ2_S block: the grid index is 10-bit into the 1024-entry `IQ2S_GRID`, and the sign /
+    /// scale bytes are arbitrary — so random bytes exercise the full grid, all `KMASK_IQ2XS` sign
+    /// combinations, both 4-bit scale nibbles, and every 2-bit `qh` high-bit pattern.
+    fn build_iq2s_rand(nb: usize, d: f32, seed: u64) -> Vec<u8> {
+        let mut w = det_bytes(nb * 82, seed);
+        for b in 0..nb {
+            put_f16(&mut w[b * 82..b * 82 + 2], d);
+        }
+        w
+    }
+
+    /// Build well-conditioned IQ2_S blocks: scale nibbles pinned to a narrow band (uniform `dl` →
+    /// little f32 cancellation) with random grid indices / signs / high bits, so the int8-activation
+    /// dot tracks the full-precision grid dequant within a tight rel tolerance. (Fully-random blocks
+    /// can drive `dl` across an 8× range with heavy per-group cancellation, where the activation
+    /// int8-quant noise legitimately dominates — same reasoning as `build_iq4xs_wc`.)
+    fn build_iq2s_wc(nb: usize, d: f32, mut seed: u64) -> Vec<u8> {
+        let mut w = vec![0u8; nb * 82];
+        for b in 0..nb {
+            let blk = &mut w[b * 82..b * 82 + 82];
+            put_f16(&mut blk[0..2], d);
+            // qs [2..66]: grid-idx low bytes [0..32] + sign bytes [32..64], fully random.
+            // qh [66..74]: 2-bit high index bits, random for full 10-bit grid coverage.
+            for j in 0..72usize {
+                blk[2 + j] = (lcg(&mut seed) >> 33) as u8;
+            }
+            // scales [74..82]: both nibbles in a narrow band {6..9} → dl within a ~1.46× spread.
+            for j in 0..8usize {
+                let lo = 6 + (lcg(&mut seed) >> 40) % 4;
+                let hi = 6 + (lcg(&mut seed) >> 40) % 4;
+                blk[74 + j] = (lo | (hi << 4)) as u8;
+            }
+        }
+        w
+    }
+
+    /// Batch and single-token IQ2_S kernels share the SAME scalar grid expansion and f32
+    /// accumulation order, so they must agree to the bit for every row. Fully-random blocks exercise
+    /// the whole grid / all sign masks. (No SIMD variant exists — the grid gather is inherently
+    /// scalar — so this bit-identity check stands in for the SIMD-vs-scalar oracle IQ4_XS has.)
+    #[test]
+    fn iq2s_batch_matches_single() {
+        for in_f in [256usize, 512] {
+            let nb = in_f / 256;
+            let w = build_iq2s_rand(nb, 0.05, 80);
+            let m = 5usize;
+            let q8s: Vec<Q8> = (0..m)
+                .map(|r| quantize_q8(&det_x(in_f, 81 + r as u64)))
+                .collect();
+            let mut batch_out = vec![0f32; m];
+            vec_dot_iq2s_batch(&w, &q8s, in_f, &mut batch_out);
+            for (r, q8) in q8s.iter().enumerate() {
+                let single = vec_dot_iq2s(&w, q8, in_f);
+                assert_eq!(
+                    batch_out[r].to_bits(),
+                    single.to_bits(),
+                    "iq2s batch vs single in_f={in_f} row={r}: batch {}, single {single}",
+                    batch_out[r]
+                );
+            }
+        }
+    }
+
+    /// End-to-end tolerance-parity: the int8-activation IQ2_S kernel must track the FULL-PRECISION
+    /// grid dequant (`dl·signed_grid`) · f32-activation reference. IQ2_S weights are stored exactly
+    /// (the grid value IS the weight, no weight-quant loss), so vs the QUANTIZED activation the
+    /// kernel actually sees, the only slack is f32 accumulation order → tight 1e-3 (isolates the
+    /// grid+sign+scale decode AND the integer dot — this is the primary correctness proof, no model
+    /// available). vs the full-precision activation, the looser 3e-2 absorbs the lossy int8
+    /// activation quant, whose relative error the signed-grid dot's sign cancellation amplifies
+    /// beyond IQ4_XS's 2e-2. Covers single-row (m=1) and batch (m>1).
+    #[test]
+    fn iq2s_matches_dequant_reference() {
+        for in_f in [256usize, 512] {
+            let nb = in_f / 256;
+            let w = build_iq2s_wc(nb, 0.03, 70);
+            let wref = dequant_codebook(DType::Iq2S, &w);
+            // Sanity: reference spans nonzero grid values / both scale nibbles.
+            assert!(wref.iter().any(|&v| v != 0.0));
+            let xs: Vec<Vec<f32>> = (0..4).map(|i| det_x(in_f, 71 + i)).collect();
+            let q8s: Vec<Q8> = xs.iter().map(|x| quantize_q8(x)).collect();
+
+            // Batch (m>1).
+            let mut got = vec![0f32; xs.len()];
+            vec_dot_iq2s_batch(&w, &q8s, in_f, &mut got);
+            for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
+                let want_q = dot(&wref, &dequant_q8(q8));
+                assert!(
+                    rel_err(got[r], want_q) < 1e-3,
+                    "iq2s batch(quant-ref) in_f={in_f} row={r}: got {}, want {want_q}",
+                    got[r]
+                );
+                let want_f = dot(&wref, x);
+                assert!(
+                    rel_err(got[r], want_f) < 3e-2,
+                    "iq2s batch(full-ref) in_f={in_f} row={r}: got {}, want {want_f}",
+                    got[r]
+                );
+            }
+            // Single-row (m=1).
+            for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
+                let got1 = vec_dot_iq2s(&w, q8, in_f);
+                let want_q = dot(&wref, &dequant_q8(q8));
+                assert!(
+                    rel_err(got1, want_q) < 1e-3,
+                    "iq2s single(quant-ref) in_f={in_f} row={r}: got {got1}, want {want_q}"
+                );
+                let want_f = dot(&wref, x);
+                assert!(
+                    rel_err(got1, want_f) < 3e-2,
+                    "iq2s single(full-ref) in_f={in_f} row={r}: got {got1}, want {want_f}"
                 );
             }
         }
