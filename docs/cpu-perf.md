@@ -189,9 +189,13 @@ produced in a way that looks like garbage is a bug, not a precision flip.
     min-correction via the existing `q8.bsums16`. Coherent + token-identical to
     Vulkan int8 ("…is Paris."); no golden changed; SIMD bit-identical to scalar.
     **Qwen3-0.6B Q2_K CPU: decode 25.2→32.5 t/s (+29%), prefill 127.9→218.5 t/s
-    (+71%).** Q3_K **TODO** (no local Q3_K model on the box for the coherence
-    gate; Q3_K is non-affine — `d·(sc6−32)·(q3−4)`, 3-bit with hmask high bits —
-    so it templates off Q6_K's signed path, not Q4_K).
+    (+71%).** Q3_K **DONE** (`d559984`): `vec_dot_q3k` / `_batch` (scalar + AVX2
+    - AVX-512BW + VNNI), modeled on Q6_K's signed path with offset 32→4; 6-bit
+      scales via the aux bit-shuffle, 3-bit codes from qs + hmask bit-planes,
+      `−4·bsums16` correction. Coherent + token-identical to Vulkan int8
+      ("…**Paris**"); SIMD bit-identical to scalar. **Qwen3-0.6B Q3_K_M CPU:
+      decode 35.4→100.9 t/s (+185%), prefill 198.2→592.8 t/s (+199%).** With
+      this the whole **K-quant family is native** (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K).
 
 ### 7. Native int8 dot: IQ2/IQ3 family (`IQ4_NL`, `IQ2_XXS/XS/S`, `IQ3_XXS/S`) — _high (volume)_
 
@@ -203,7 +207,7 @@ produced in a way that looks like garbage is a bug, not a precision flip.
   affine (Q2_K) — so each remaining format is a mechanical clone of the nearest
   landed kernel: `Q4_1`/`Q5_1` → Q4_0/Q5_0 (affine legacy); `IQ4_NL` → IQ4_XS
   (same codebook, 32-block);
-  `IQ2*_`/`IQ3\__`→ the grid-codebook decoders in`infr-gguf` + the IQ4_XS
+  `IQ2*\_`/`IQ3\_\_`→ the grid-codebook decoders in`infr-gguf` + the IQ4_XS
   signed-dot skeleton. Gated on having a local GGUF per format for the coherence
   check (the dev box lacks Q3_K / IQ2 / IQ3 models).
 
