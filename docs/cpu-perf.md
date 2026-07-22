@@ -59,6 +59,13 @@ fusion of exact ops), tolerance-parity + a sanctioned golden re-bless where the
 math changes (int8 activation quant is lossy). One slice at a time; validate
 correctness before benching.
 
+**Re-bless discipline:** a golden only gets re-blessed after the new output is
+_verified correct/coherent_ — never blind-accept a diff. For a precision flip
+that means confirming the model still generates sane, coherent text (compare a
+short generation against the f32/GPU path) AND that the CPU result matches the
+GPU int8 result within tolerance. A golden diff that changes _which_ tokens are
+produced in a way that looks like garbage is a bug, not a precision flip.
+
 ### 1. Weight mmap `madvise` + THP hint — _easy_
 
 - **What:** on the weight mmap, advise the kernel: `MADV_HUGEPAGE` (2 MB pages
@@ -70,7 +77,12 @@ correctness before benching.
   the bandwidth reality.
 - **Impact:** small–moderate decode + weight-load win; low risk.
 - **Precision:** none (pure memory hint). Bit-identical.
-- **Status:** TODO
+- **Status:** DONE (`5ed932a`). `WillNeed` + Linux `HugePage`, best-effort, not
+  `Sequential`. Measured **neutral** on the dev box (warm page cache; THP
+  commonly a no-op on file-backed maps): 9B Q4_K_M tg64 10.2→10.1, pp512
+  67.4→67.1 (noise). Kept for cold-load / THP-enabled fs / over-RAM cases at
+  zero risk; a rigorous A/B needs `perf` counters or cold cache (see
+  Measurement).
 
 ### 2. DeltaNet head-parallelism — _easy–medium_
 
