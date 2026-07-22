@@ -4279,6 +4279,151 @@ fn vec_dot_q4_0_32_batch_scalar(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mu
     }
 }
 
+/// Batched Q4_1 dot at native 32-block granularity. Q4_1 is the AFFINE sibling of Q4_0: same
+/// 32-weight block and nibble layout, but `y = d_w·q4 + m_w` (`q4 ∈ 0..15`, NO −8 offset; a
+/// separate per-block f16 `m` min is added). Per activation block (`a_i ≈ as·qa_i`, `Q8x32` carries
+/// `as` and `bsum = Σqa_i`):
+/// `Σy·x = Σ(d_w·q4_i + m_w)·a_i = as·( d_w·Σ(q4_i·qa_i) + m_w·Σqa_i ) = as·( d_w·iprod + m_w·bsum )`.
+/// Block stride is 20 bytes (`[f16 d][f16 m][u8 qs[16]]`), not Q4_0's 18. Reuses the same `Q8x32`
+/// activation as Q4_0 unchanged; `iprod` is the identical `maddubs/dpbusd` unsigned·signed dot.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn vec_dot_q4_1_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vnni")
+            && is_x86_feature_detected!("avx512vl")
+        {
+            // SAFETY: features detected at runtime; pointer bounds checked by slice indexing.
+            return unsafe { vec_dot_q4_1_32_batch_vnni(row, q8s, in_f, out) };
+        }
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { vec_dot_q4_1_32_batch_avx2(row, q8s, in_f, out) };
+        }
+    }
+    vec_dot_q4_1_32_batch_scalar(row, q8s, in_f, out);
+}
+
+/// Expand one weight row's Q4_1 codes (4-bit, 0..15) into a flat `[nb*32]` u8 buffer ONCE per row
+/// (mirrors [`q4_0_expand_codes`] with the affine layout: `d` AND `m` per block, block stride 20,
+/// `qs` starting at byte 4). Returns `(flat, d_arr, m_arr)`; `flat[b*32 + j]` = code j of block b
+/// (j 0..15 = lo nibbles, 16..31 = hi).
+#[cfg(target_arch = "x86_64")] // only the x86 SIMD kernels call this — dead code on aarch64
+#[inline]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+fn q4_1_expand_codes(row: &[u8], nb: usize, bpr: usize) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
+    let mut flat = vec![0u8; nb * 32];
+    let mut d_arr = vec![0f32; nb];
+    let mut m_arr = vec![0f32; nb];
+    for b in 0..nb {
+        let blk = &row[b * bpr..b * bpr + bpr];
+        d_arr[b] = rdf16(&blk[0..2]);
+        m_arr[b] = rdf16(&blk[2..4]);
+        let qs = &blk[4..20];
+        let f = &mut flat[b * 32..b * 32 + 32];
+        for j in 0..16 {
+            f[j] = qs[j] & 0x0F;
+            f[j + 16] = qs[j] >> 4;
+        }
+    }
+    (flat, d_arr, m_arr)
+}
+
+/// AVX2 kernel for `vec_dot_q4_1_32_batch`: codes pre-expanded once, one `maddubs(code_u8, q8_s8)`
+/// block dot per (row, block) — codes ≤15 × |q8| ≤127 can't saturate the i16 pair sums.
+/// Bit-identical to the scalar oracle (integer dot exact; the affine per-block f32 accumulation
+/// expression `as·(d·iprod + m·bsum)` and order are unchanged). Mirrors [`vec_dot_q4_0_32_batch_avx2`]
+/// with `+m·bsum` in place of `−8·bsum`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+unsafe fn vec_dot_q4_1_32_batch_avx2(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let nb = in_f / 32;
+    let bpr = 20usize;
+    let ones = _mm256_set1_epi16(1i16);
+    let (flat, d_arr, m_arr) = q4_1_expand_codes(row, nb, bpr);
+    for (r, q8) in q8s.iter().enumerate() {
+        let mut sumf = 0f32;
+        for b in 0..nb {
+            let code = _mm256_loadu_si256(flat[b * 32..].as_ptr() as *const __m256i);
+            let q8v = _mm256_loadu_si256(q8.qs[b * 32..].as_ptr() as *const __m256i);
+            let prod = _mm256_maddubs_epi16(code, q8v);
+            let sum32 = _mm256_madd_epi16(prod, ones);
+            let iprod = hadd_i32_ymm(sum32);
+            sumf += q8.d[b] * (d_arr[b] * iprod as f32 + m_arr[b] * q8.bsum[b] as f32);
+        }
+        out[r] = sumf;
+    }
+}
+
+/// AVX512-VNNI kernel for `vec_dot_q4_1_32_batch`: two blocks per zmm, `dpbusd` in place of the
+/// maddubs+madd pair (see the AVX2 variant's bit-identity note; the two per-block f32 adds stay
+/// SEPARATE and in scalar order). Mirrors [`vec_dot_q4_0_32_batch_vnni`] with the affine form.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw,avx512vnni,avx512vl")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+unsafe fn vec_dot_q4_1_32_batch_vnni(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let nb = in_f / 32;
+    let bpr = 20usize;
+    let pairs = nb / 2;
+    let (flat, d_arr, m_arr) = q4_1_expand_codes(row, nb, bpr);
+    for (r, q8) in q8s.iter().enumerate() {
+        let mut sumf = 0f32;
+        for k in 0..pairs {
+            let (b0, b1) = (2 * k, 2 * k + 1);
+            let code_z = _mm512_loadu_si512(flat[b0 * 32..].as_ptr() as *const __m512i);
+            let qx_z = _mm512_loadu_si512(q8.qs[b0 * 32..].as_ptr() as *const __m512i);
+            let sum32_z = _mm512_dpbusd_epi32(_mm512_setzero_si512(), code_z, qx_z);
+            let lo_ymm = _mm512_castsi512_si256(sum32_z);
+            let hi_ymm = _mm512_extracti64x4_epi64::<1>(sum32_z);
+            let iprod0 = hadd_i32_ymm(lo_ymm);
+            let iprod1 = hadd_i32_ymm(hi_ymm);
+            sumf += q8.d[b0] * (d_arr[b0] * iprod0 as f32 + m_arr[b0] * q8.bsum[b0] as f32);
+            sumf += q8.d[b1] * (d_arr[b1] * iprod1 as f32 + m_arr[b1] * q8.bsum[b1] as f32);
+        }
+        if nb % 2 == 1 {
+            let b = nb - 1;
+            let code = _mm256_loadu_si256(flat[b * 32..].as_ptr() as *const __m256i);
+            let q8v = _mm256_loadu_si256(q8.qs[b * 32..].as_ptr() as *const __m256i);
+            let sum32 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), code, q8v);
+            let iprod = hadd_i32_ymm(sum32);
+            sumf += q8.d[b] * (d_arr[b] * iprod as f32 + m_arr[b] * q8.bsum[b] as f32);
+        }
+        out[r] = sumf;
+    }
+}
+
+/// Scalar oracle for `vec_dot_q4_1_32_batch` (also the non-x86 path). Affine: `as·(d·iprod + m·bsum)`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+fn vec_dot_q4_1_32_batch_scalar(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+    let nb = in_f / 32;
+    let bpr = 20usize; // f16 d (2B) + f16 m (2B) + 16 × packed-nibble qs
+    let mut d_arr = vec![0f32; nb];
+    let mut m_arr = vec![0f32; nb];
+    for b in 0..nb {
+        d_arr[b] = rdf16(&row[b * bpr..b * bpr + 2]);
+        m_arr[b] = rdf16(&row[b * bpr + 2..b * bpr + 4]);
+    }
+    for (r, q8) in q8s.iter().enumerate() {
+        let mut sumf = 0f32;
+        for b in 0..nb {
+            let blk = &row[b * bpr..b * bpr + bpr];
+            let qs = &blk[4..20];
+            let q8b = &q8.qs[b * 32..b * 32 + 32];
+            let mut iprod = 0i32;
+            for j in 0..16 {
+                let code0 = (qs[j] & 0x0F) as i32;
+                let code1 = (qs[j] >> 4) as i32;
+                iprod += code0 * q8b[j] as i32 + code1 * q8b[j + 16] as i32;
+            }
+            sumf += q8.d[b] * (d_arr[b] * iprod as f32 + m_arr[b] * q8.bsum[b] as f32);
+        }
+        out[r] = sumf;
+    }
+}
+
 /// `Σ f16_weight·x` (weight is 2 bytes/elem). `target-cpu=native` lowers the f16→f32 to F16C.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn dot_f16(w: &[u8], x: &[f32]) -> f32 {
@@ -4813,6 +4958,106 @@ mod kernel_tests {
                 assert!(
                     rel_err(one[0], want) < 2e-2,
                     "q4_0_32 single in_f={in_f} row={r}: got {}, want {want}",
+                    one[0]
+                );
+            }
+        }
+    }
+
+    /// Build `nb` real 20-byte Q4_1 blocks: fixed per-block `d`/`m`, random nibbles (both halves
+    /// exercised). `d`/`m` land weights at Q4_0 scale so the int8-activation dot tracks the
+    /// full-precision reference within a tight tolerance.
+    fn build_q4_1(nb: usize, d: f32, m: f32, seed: u64) -> Vec<u8> {
+        let mut w = det_bytes(nb * 20, seed);
+        for k in 0..nb {
+            put_f16(&mut w[k * 20..k * 20 + 2], d);
+            put_f16(&mut w[k * 20 + 2..k * 20 + 4], m);
+        }
+        w
+    }
+
+    /// SIMD (VNNI/AVX2, whichever this host has) must match the Q4_1 scalar oracle bit-for-bit: the
+    /// integer dot is exact and the affine per-block f32 accumulation order is identical. 96
+    /// blocks-odd exercises the VNNI pair-plus-tail path.
+    #[test]
+    fn q4_1_32_batch_simd_bit_identical_to_scalar() {
+        for in_f in [96usize, 256, 704] {
+            let nb = in_f / 32;
+            let m = 5usize;
+            let w = build_q4_1(nb, 0.02, -0.01, 82);
+            let q8s: Vec<Q8x32> = (0..m)
+                .map(|r| quantize_q8_32(&det_x(in_f, 83 + r as u64)))
+                .collect();
+            let mut simd_out = vec![0f32; m];
+            vec_dot_q4_1_32_batch(&w, &q8s, in_f, &mut simd_out);
+            let mut scalar_out = vec![0f32; m];
+            vec_dot_q4_1_32_batch_scalar(&w, &q8s, in_f, &mut scalar_out);
+            for r in 0..m {
+                assert_eq!(
+                    simd_out[r].to_bits(),
+                    scalar_out[r].to_bits(),
+                    "q4_1_32 in_f={in_f} row={r}: simd {}, scalar {}",
+                    simd_out[r],
+                    scalar_out[r]
+                );
+            }
+            // Single-row (m=1) dispatch must agree too.
+            for r in 0..m {
+                let mut one = [0f32; 1];
+                vec_dot_q4_1_32_batch(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
+                assert_eq!(
+                    one[0].to_bits(),
+                    scalar_out[r].to_bits(),
+                    "q4_1_32 single in_f={in_f} row={r}"
+                );
+            }
+        }
+    }
+
+    /// End-to-end tolerance-parity for the Q4_1 native-block int8 kernel: the int8-quantized-
+    /// activation dot must track the FULL-PRECISION `d*q4 + m`-dequant · f32-activation reference.
+    /// int8 activation quant is lossy, so this is a tolerance (not bit-identity). Covers the batch
+    /// (m>1) and single-row (m=1) entries, several in_f, both nibble halves nonzero.
+    #[test]
+    fn q4_1_32_batch_matches_dequant_reference() {
+        for in_f in [32usize, 256, 512] {
+            let nb = in_f / 32;
+            let w = build_q4_1(nb, 0.03, -0.02, 90);
+            let wref = dequant_block(DType::Q4_1, &w).unwrap();
+            // Assert both nibble halves decode to varying values (decode exercises lo AND hi).
+            assert!(wref[..16].iter().any(|&v| v != wref[0]));
+            assert!(wref[16..32].iter().any(|&v| v != wref[16]));
+            // Full-precision activations (NOT the quantized ones) → proves end-to-end accuracy.
+            let xs: Vec<Vec<f32>> = (0..4).map(|i| det_x(in_f, 91 + i)).collect();
+            let q8s: Vec<Q8x32> = xs.iter().map(|x| quantize_q8_32(x)).collect();
+
+            // Batch entry (m>1). Tight 1e-3 vs the QUANTIZED activation the kernel actually sees
+            // (isolates integer-dot correctness), plus a looser 2e-2 vs the full-precision
+            // activation (absorbs the lossy int8 activation quant).
+            let mut got = vec![0f32; xs.len()];
+            vec_dot_q4_1_32_batch(&w, &q8s, in_f, &mut got);
+            for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
+                let want_q = dot(&wref, &dequant_q8_32(q8));
+                assert!(
+                    rel_err(got[r], want_q) < 1e-3,
+                    "q4_1_32 batch(quant-ref) in_f={in_f} row={r}: got {}, want {want_q}",
+                    got[r]
+                );
+                let want_f = dot(&wref, x);
+                assert!(
+                    rel_err(got[r], want_f) < 2e-2,
+                    "q4_1_32 batch(full-ref) in_f={in_f} row={r}: got {}, want {want_f}",
+                    got[r]
+                );
+            }
+            // Single-row entry (m=1): one activation block-set, one-element out.
+            for (r, x) in xs.iter().enumerate() {
+                let mut one = [0f32; 1];
+                vec_dot_q4_1_32_batch(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
+                let want = dot(&wref, x);
+                assert!(
+                    rel_err(one[0], want) < 2e-2,
+                    "q4_1_32 single in_f={in_f} row={r}: got {}, want {want}",
                     one[0]
                 );
             }
