@@ -3096,6 +3096,133 @@ pub(crate) fn vec_dot_iq3s_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
     }
 }
 
+/// Expand a whole IQ3_XXS weight row (98 bytes / 256 elems per super-block) to signed `i8` codebook
+/// weights ONCE, alongside the per-32-element `db` scales — mirrors `dequant_codebook(DType::Iq3Xxs)`
+/// exactly. IQ3_XXS is a GRID-codebook quant like IQ3_S but SIMPLER (no `qh` high bits): each group
+/// of 8 weights is TWO 8-bit indices into the 256-entry `IQ3XXS_GRID` (each entry packs 4 signed i8):
+/// `g1` fills elements 0..3, `g2` fills 4..7. Signs and the per-32 scale ride together in the
+/// `scales_and_signs` `aux32` words: the top nibble (`aux32 >> 28`) is the scale (`db = d*(0.5+s)*0.5`)
+/// and each of the four 7-bit fields indexes `KSIGNS_IQ2XS` for a group's sign byte (flipping via
+/// `KMASK_IQ2XS`, offset 0 for g1's four elems, 4 for g2's — the two-half split of `apply_signs` in
+/// dequant.rs). The grid gather can't be SIMD-vectorized, so the expansion is scalar and the caller
+/// runs the int dot against the Q8 activation, amortising this decode across all `m` tokens.
+/// `weights[b*256 + g*8 + k]` and `dls[b*32 + g]` are in the SAME element order the dequant writes
+/// (`outoff` progression: ib32 0..8 → l 0..4, 8 elems each); `dls[g]` is the group's `db` (same for the
+/// 4 groups-of-8 inside each 32-sub-block). `in_f` must be a multiple of 256.
+fn iq3xxs_expand_row(row: &[u8], in_f: usize) -> (Vec<i8>, Vec<f32>) {
+    use infr_core::iquant_grids::{IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
+    let nb = in_f / 256;
+    let mut weights = vec![0i8; nb * 256];
+    let mut dls = vec![0f32; nb * 32];
+    for b in 0..nb {
+        let blk = &row[b * 98..b * 98 + 98];
+        let d = rdf16(&blk[0..2]);
+        let qs = &blk[2..66]; // 64 bytes: grid indices (two per group of 8)
+        let sas = &blk[66..98]; // 32 bytes: scales-and-signs (8 × u32)
+        let mut outoff = 0usize; // element offset within block (0..256)
+        let mut qs_off = 0usize;
+        for ib32 in 0..8usize {
+            let aux32 = u32::from_le_bytes(sas[4 * ib32..4 * ib32 + 4].try_into().unwrap());
+            let db = d * (0.5 + (aux32 >> 28) as f32) * 0.5;
+            for l in 0..4usize {
+                let sign_idx = ((aux32 >> (7 * l)) & 127) as usize;
+                let sb = KSIGNS_IQ2XS[sign_idx];
+                let g1 = IQ3XXS_GRID[qs[qs_off + 2 * l] as usize] as u64;
+                let g2 = IQ3XXS_GRID[qs[qs_off + 2 * l + 1] as usize] as u64;
+                let wo = b * 256 + outoff;
+                // g1 → elems 0..3 (sign_off 0), g2 → elems 4..7 (sign_off 4).
+                for k in 0..4usize {
+                    let gv = ((g1 >> (8 * k)) & 0xFF) as i8;
+                    weights[wo + k] = if sb & KMASK_IQ2XS[k] != 0 {
+                        gv.wrapping_neg()
+                    } else {
+                        gv
+                    };
+                }
+                for k in 0..4usize {
+                    let gv = ((g2 >> (8 * k)) & 0xFF) as i8;
+                    weights[wo + 4 + k] = if sb & KMASK_IQ2XS[k + 4] != 0 {
+                        gv.wrapping_neg()
+                    } else {
+                        gv
+                    };
+                }
+                dls[b * 32 + outoff / 8] = db;
+                outoff += 8;
+            }
+            qs_off += 8;
+        }
+    }
+    (weights, dls)
+}
+
+/// `Σ weight·x` for one IQ3_XXS row against the Q8 activation. Expands the grid-codebook weight row to
+/// signed i8 once (`iq3xxs_expand_row`), then per group of 8 runs an integer dot scaled by the per-32
+/// `dl`; the block's `dl·iprod` terms accumulate in an f32 running sum, then ONE multiply by the
+/// super-block activation scale `q8.d[b]`. No offset/min/bsum term — grid weights are already signed
+/// and zero-centred. Identical accumulation shape to `vec_dot_iq3s`. `in_f` must be a multiple of 256.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn vec_dot_iq3xxs(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    debug_assert_eq!(
+        in_f % 256,
+        0,
+        "vec_dot_iq3xxs: in_f must be a multiple of 256"
+    );
+    let nb = in_f / 256;
+    let (weights, dls) = iq3xxs_expand_row(row, in_f);
+    let mut sumf = 0f32;
+    for b in 0..nb {
+        let q8b = &q8.qs[b * 256..b * 256 + 256];
+        let mut block_sum = 0f32;
+        for g in 0..32usize {
+            let w = &weights[b * 256 + g * 8..b * 256 + g * 8 + 8];
+            let a = &q8b[g * 8..g * 8 + 8];
+            let mut iprod = 0i32;
+            for k in 0..8usize {
+                iprod += w[k] as i32 * a[k] as i32;
+            }
+            block_sum += dls[b * 32 + g] * iprod as f32;
+        }
+        sumf += q8.d[b] * block_sum;
+    }
+    sumf
+}
+
+/// Batched `Σ weight·x` for one IQ3_XXS row against `m` Q8 activations (`out[r]`). Expands the
+/// grid-codebook weight row to signed i8 ONCE (`iq3xxs_expand_row`), then reuses it across all `m`
+/// token activations — the amortisation the single-token path can't do. Bit-identical accumulation
+/// to `vec_dot_iq3xxs` (same group order, same f32 epilogue), so batch and single agree to the bit.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn vec_dot_iq3xxs_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    debug_assert_eq!(
+        in_f % 256,
+        0,
+        "vec_dot_iq3xxs_batch: in_f must be a multiple of 256"
+    );
+    let m = q8s.len();
+    let nb = in_f / 256;
+    let (weights, dls) = iq3xxs_expand_row(row, in_f);
+    for r in 0..m {
+        let q8 = &q8s[r];
+        let mut sumf = 0f32;
+        for b in 0..nb {
+            let q8b = &q8.qs[b * 256..b * 256 + 256];
+            let mut block_sum = 0f32;
+            for g in 0..32usize {
+                let w = &weights[b * 256 + g * 8..b * 256 + g * 8 + 8];
+                let a = &q8b[g * 8..g * 8 + 8];
+                let mut iprod = 0i32;
+                for k in 0..8usize {
+                    iprod += w[k] as i32 * a[k] as i32;
+                }
+                block_sum += dls[b * 32 + g] * iprod as f32;
+            }
+            sumf += q8.d[b] * block_sum;
+        }
+        out[r] = sumf;
+    }
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn vec_dot_q8_0_batch_scalar(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
     let m = q8s.len();
@@ -7298,6 +7425,129 @@ mod kernel_tests {
                 assert!(
                     rel_err(got1, want_f) < 3e-2,
                     "iq3s single(full-ref) in_f={in_f} row={r}: got {got1}, want {want_f}"
+                );
+            }
+        }
+    }
+
+    /// Build `nb` fully-random 98-byte IQ3_XXS super-blocks with a fixed `d`. Every byte pattern is a
+    /// legal IQ3_XXS block: each grid index is an 8-bit index into the 256-entry `IQ3XXS_GRID`, and
+    /// the scales-and-signs `aux32` words are arbitrary — so random bytes exercise the full grid, all
+    /// `KMASK_IQ2XS` sign combinations (via every `KSIGNS_IQ2XS` entry) and every top-nibble scale.
+    fn build_iq3xxs_rand(nb: usize, d: f32, seed: u64) -> Vec<u8> {
+        let mut w = det_bytes(nb * 98, seed);
+        for b in 0..nb {
+            put_f16(&mut w[b * 98..b * 98 + 2], d);
+        }
+        w
+    }
+
+    /// Build well-conditioned IQ3_XXS blocks: the per-32 scale nibble (`aux32 >> 28`) pinned to a
+    /// narrow band {6..9} (`db = d*(0.5+s)*0.5` → dl within a ~1.36× spread) with random grid indices
+    /// and random 7-bit sign fields, so the int8-activation dot tracks the full-precision grid dequant
+    /// within a tight rel tolerance. (Fully-random blocks drive `dl` across a wide range with heavy
+    /// per-group cancellation, where the activation int8-quant noise legitimately dominates — same
+    /// reasoning as `build_iq3s_wc`.)
+    fn build_iq3xxs_wc(nb: usize, d: f32, mut seed: u64) -> Vec<u8> {
+        let mut w = vec![0u8; nb * 98];
+        for b in 0..nb {
+            let blk = &mut w[b * 98..b * 98 + 98];
+            put_f16(&mut blk[0..2], d);
+            // qs[2..66] = 64 random grid-index bytes (full grid coverage).
+            for j in 0..64usize {
+                blk[2 + j] = (lcg(&mut seed) >> 33) as u8;
+            }
+            // sas[66..98] = 8 × u32 (aux32). Randomize the 28-bit sign region (four 7-bit fields),
+            // then pin the top nibble (scale) into {6..9} → db within a ~1.36× spread.
+            for ib32 in 0..8usize {
+                let signs = (lcg(&mut seed) as u32) & 0x0FFF_FFFF;
+                let scale = 6 + ((lcg(&mut seed) >> 40) % 4) as u32;
+                let aux32 = signs | (scale << 28);
+                blk[66 + 4 * ib32..66 + 4 * ib32 + 4].copy_from_slice(&aux32.to_le_bytes());
+            }
+        }
+        w
+    }
+
+    /// Batch and single-token IQ3_XXS kernels share the SAME scalar grid expansion and f32
+    /// accumulation order, so they must agree to the bit for every row. Fully-random blocks exercise
+    /// the whole grid / all sign masks. (No SIMD variant exists — the grid gather is inherently scalar
+    /// — so this bit-identity check stands in for the SIMD-vs-scalar oracle.)
+    #[test]
+    fn iq3xxs_batch_matches_single() {
+        for in_f in [256usize, 512] {
+            let nb = in_f / 256;
+            let w = build_iq3xxs_rand(nb, 0.05, 90);
+            let m = 5usize;
+            let q8s: Vec<Q8> = (0..m)
+                .map(|r| quantize_q8(&det_x(in_f, 91 + r as u64)))
+                .collect();
+            let mut batch_out = vec![0f32; m];
+            vec_dot_iq3xxs_batch(&w, &q8s, in_f, &mut batch_out);
+            for (r, q8) in q8s.iter().enumerate() {
+                let single = vec_dot_iq3xxs(&w, q8, in_f);
+                assert_eq!(
+                    batch_out[r].to_bits(),
+                    single.to_bits(),
+                    "iq3xxs batch vs single in_f={in_f} row={r}: batch {}, single {single}",
+                    batch_out[r]
+                );
+            }
+        }
+    }
+
+    /// End-to-end tolerance-parity: the int8-activation IQ3_XXS kernel must track the FULL-PRECISION
+    /// grid dequant (`db·signed_grid`) · f32-activation reference. IQ3_XXS weights are stored exactly
+    /// (the grid value IS the weight, no weight-quant loss), so vs the QUANTIZED activation the kernel
+    /// actually sees, the only slack is f32 accumulation order → tight 1e-3 (isolates the
+    /// grid+sign+scale decode AND the integer dot — this is the primary correctness proof, no model
+    /// available). vs the full-precision activation, the looser 3e-2 absorbs the lossy int8 activation
+    /// quant, whose relative error the signed-grid dot's sign cancellation amplifies. Covers
+    /// single-row (m=1) and batch (m>1).
+    #[test]
+    fn iq3xxs_matches_dequant_reference() {
+        for in_f in [256usize, 512] {
+            let nb = in_f / 256;
+            // Seed 70 is well-conditioned (max full-ref rel err well under 3e-2 across all rows /
+            // in_f) — a handful of seeds drive `dl` cancellation that legitimately inflates the
+            // int8-activation error past 3e-2, same as IQ3_S; the tight quant-ref bound holds for ALL
+            // seeds.
+            let w = build_iq3xxs_wc(nb, 0.02, 70);
+            let wref = dequant_codebook(DType::Iq3Xxs, &w);
+            // Sanity: reference spans nonzero grid values / scale range.
+            assert!(wref.iter().any(|&v| v != 0.0));
+            let xs: Vec<Vec<f32>> = (0..4).map(|i| det_x(in_f, 71 + i)).collect();
+            let q8s: Vec<Q8> = xs.iter().map(|x| quantize_q8(x)).collect();
+
+            // Batch (m>1).
+            let mut got = vec![0f32; xs.len()];
+            vec_dot_iq3xxs_batch(&w, &q8s, in_f, &mut got);
+            for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
+                let want_q = dot(&wref, &dequant_q8(q8));
+                assert!(
+                    rel_err(got[r], want_q) < 1e-3,
+                    "iq3xxs batch(quant-ref) in_f={in_f} row={r}: got {}, want {want_q}",
+                    got[r]
+                );
+                let want_f = dot(&wref, x);
+                assert!(
+                    rel_err(got[r], want_f) < 3e-2,
+                    "iq3xxs batch(full-ref) in_f={in_f} row={r}: got {}, want {want_f}",
+                    got[r]
+                );
+            }
+            // Single-row (m=1).
+            for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
+                let got1 = vec_dot_iq3xxs(&w, q8, in_f);
+                let want_q = dot(&wref, &dequant_q8(q8));
+                assert!(
+                    rel_err(got1, want_q) < 1e-3,
+                    "iq3xxs single(quant-ref) in_f={in_f} row={r}: got {got1}, want {want_q}"
+                );
+                let want_f = dot(&wref, x);
+                assert!(
+                    rel_err(got1, want_f) < 3e-2,
+                    "iq3xxs single(full-ref) in_f={in_f} row={r}: got {got1}, want {want_f}"
                 );
             }
         }
