@@ -5,7 +5,7 @@
 use crate::quant::{hadd_i32_xmm, hadd_i32_ymm};
 use crate::quant::{Q8x32, Q8};
 use infr_core::graph::Activation;
-use infr_gguf::dequant::{k4, rdf16};
+use infr_gguf::dequant::{k4, rdf16, KVALUES_IQ4NL};
 
 /// `Σ weight·x` for one Q4_K row (144 bytes / 256 elems) against the Q8 activation. Weight value is
 /// `d·sc_s·q4 − dmin·m_s` over 8 sub-blocks of 32; dispatches to the best SIMD path available at
@@ -456,6 +456,188 @@ unsafe fn vec_dot_q6k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
             s += scales[sub] as i8 as i32 * (simd_sumi[sub] - 32 * simd_bsum[sub]);
         }
         sumf += d * q8.d[b] * s as f32;
+    }
+    sumf
+}
+
+/// `Σ weight·x` for one IQ4_XS row (136 bytes / 256 elems) against the Q8 activation. Weight value
+/// is `d·(ls−32)·KVALUES_IQ4NL[code]` over 8 sub-blocks of 32 (6-bit `ls` scale per sub-block, a
+/// signed 16-entry codebook). Dispatches to the best SIMD path available at runtime
+/// (avx512bw → avx2 → scalar). Same signed-weight × int8-activation regime as Q6_K, but the weight
+/// is a codebook lookup (Q8_0's `abs/sign` maddubs trick) rather than the `q6−32` linear offset, and
+/// the per-sub-block `(ls−32)` scale folds into the SAME i32 integer epilogue Q6_K uses.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn vec_dot_iq4xs(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    debug_assert_eq!(
+        in_f % 256,
+        0,
+        "vec_dot_iq4xs: in_f must be a multiple of 256"
+    );
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512bw") {
+            // SAFETY: avx512bw detected at runtime; pointer bounds checked by slice indexing.
+            return unsafe { vec_dot_iq4xs_avx512bw(row, q8, in_f) };
+        }
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { vec_dot_iq4xs_avx2(row, q8, in_f) };
+        }
+    }
+    vec_dot_iq4xs_scalar(row, q8, in_f)
+}
+
+/// Decode the 6-bit `ls` scale for sub-block `ib` of an IQ4_XS block and return `ls − 32`.
+/// `lo` = low 4 bits from `scales_l[ib/2]`, `hi` = high 2 bits from `scales_h`.
+#[inline]
+fn iq4xs_ls_minus_32(scales_h: u16, scales_l: &[u8], ib: usize) -> i32 {
+    let lo = ((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xF) as i32;
+    let hi = ((scales_h >> (2 * ib)) & 3) as i32;
+    (lo | (hi << 4)) - 32
+}
+
+/// Scalar fallback for `vec_dot_iq4xs`; also used on non-x86 targets. Accumulates a signed integer
+/// dot per 32-element sub-block, weights the dots by the integer `(ls−32)` scale in an i32 epilogue
+/// (order-free, exact — see `vec_dot_q6k_scalar`), then ONE f32 multiply per super-block.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+fn vec_dot_iq4xs_scalar(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    let nb = in_f / 256;
+    let mut sumf = 0f32;
+    for b in 0..nb {
+        let blk = &row[b * 136..b * 136 + 136];
+        let d = rdf16(&blk[0..2]);
+        let scales_h = u16::from_le_bytes([blk[2], blk[3]]);
+        let scales_l = &blk[4..8];
+        let qs = &blk[8..136];
+        let q8b = &q8.qs[b * 256..b * 256 + 256];
+        let mut isum = 0i32;
+        for ib in 0..8usize {
+            let qsb = &qs[ib * 16..ib * 16 + 16];
+            let a = &q8b[ib * 32..ib * 32 + 32];
+            let mut dot = 0i32;
+            for j in 0..16usize {
+                // low nibble → element j (0..15); high nibble → element j+16 (16..31).
+                let w_lo = KVALUES_IQ4NL[(qsb[j] & 0xF) as usize] as i32;
+                let w_hi = KVALUES_IQ4NL[(qsb[j] >> 4) as usize] as i32;
+                dot += w_lo * a[j] as i32;
+                dot += w_hi * a[j + 16] as i32;
+            }
+            isum += iq4xs_ls_minus_32(scales_h, scales_l, ib) * dot;
+        }
+        sumf += d * q8.d[b] * isum as f32;
+    }
+    sumf
+}
+
+/// AVX2 kernel for `vec_dot_iq4xs`: one 32-element sub-block per iteration. The 16 code bytes are
+/// nibble-unpacked into a 32-byte codes ymm (low nibbles → elems 0–15 in the low lane, high nibbles
+/// → elems 16–31 in the high lane); a `pshufb` against the broadcast codebook table yields the 32
+/// signed i8 weights. The signed×int8 dot reuses Q8_0's `abs(w)`/`sign(w)·a` maddubs trick, then the
+/// same i32 `(ls−32)`-weighted epilogue as the scalar path → bit-identical (integer dot, order-free).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+unsafe fn vec_dot_iq4xs_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let nb = in_f / 256;
+    let mut sumf = 0f32;
+    let mask_0f = _mm256_set1_epi8(0x0F_u8 as i8);
+    let ones_i16 = _mm256_set1_epi16(1i16);
+    // Codebook table broadcast into both 128-bit lanes for lane-local pshufb.
+    let table =
+        _mm256_broadcastsi128_si256(_mm_loadu_si128(KVALUES_IQ4NL.as_ptr() as *const __m128i));
+    for b in 0..nb {
+        let blk = &row[b * 136..b * 136 + 136];
+        let d = rdf16(&blk[0..2]);
+        let scales_h = u16::from_le_bytes([blk[2], blk[3]]);
+        let scales_l = &blk[4..8];
+        let qs = &blk[8..136];
+        let q8b = &q8.qs[b * 256..b * 256 + 256];
+        let mut isum = 0i32;
+        for ib in 0..8usize {
+            // 16 code bytes → xmm; nibbles → 32 codes ([lo16 | hi16]).
+            let codes16 = _mm_loadu_si128(qs[ib * 16..].as_ptr() as *const __m128i);
+            let lo =
+                _mm256_castsi128_si256(_mm_and_si128(codes16, _mm256_castsi256_si128(mask_0f)));
+            let hi = _mm256_castsi128_si256(_mm_and_si128(
+                _mm_srli_epi16(codes16, 4),
+                _mm256_castsi256_si128(mask_0f),
+            ));
+            // codes ymm: low lane = lo nibbles (elems 0–15), high lane = hi nibbles (elems 16–31).
+            let codes = _mm256_inserti128_si256::<1>(lo, _mm256_castsi256_si128(hi));
+            let w = _mm256_shuffle_epi8(table, codes); // 32 signed i8 codebook weights
+            let a = _mm256_loadu_si256(q8b[ib * 32..].as_ptr() as *const __m256i);
+            // Q8_0 sign trick: |w| unsigned × sign(w)·a signed → maddubs. Pair sum ≤ 2·127·127 < 2^15.
+            let w_abs = _mm256_abs_epi8(w);
+            let a_signed = _mm256_sign_epi8(a, w);
+            let prod = _mm256_maddubs_epi16(w_abs, a_signed);
+            let sum32 = _mm256_madd_epi16(prod, ones_i16);
+            let dot = hadd_i32_ymm(sum32);
+            isum += iq4xs_ls_minus_32(scales_h, scales_l, ib) * dot;
+        }
+        sumf += d * q8.d[b] * isum as f32;
+    }
+    sumf
+}
+
+/// AVX-512BW kernel for `vec_dot_iq4xs`: TWO sub-blocks (64 elems) per zmm. Both sub-blocks' 16 code
+/// bytes are nibble-unpacked and lane-shuffled into a 64-byte codes zmm laid out
+/// `[lo(ib) | hi(ib) | lo(ib+1) | hi(ib+1)]` to match the contiguous 64-byte activation load; a
+/// single `pshufb512` produces 64 signed weights. The signed×int8 dot uses the Q8_0 abs/sign trick
+/// at ymm granularity (no `_mm512_sign_epi8`), then splits the 16 i32 lanes back into the two
+/// per-sub-block dots for the SAME i32 `(ls−32)` epilogue → bit-identical to scalar.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw,avx512f")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+unsafe fn vec_dot_iq4xs_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let nb = in_f / 256;
+    let mut sumf = 0f32;
+    let mask_0f = _mm256_set1_epi8(0x0F_u8 as i8);
+    let ones_i16_z = _mm512_set1_epi16(1i16);
+    let table_z = _mm512_broadcast_i32x4(_mm_loadu_si128(KVALUES_IQ4NL.as_ptr() as *const __m128i));
+    for b in 0..nb {
+        let blk = &row[b * 136..b * 136 + 136];
+        let d = rdf16(&blk[0..2]);
+        let scales_h = u16::from_le_bytes([blk[2], blk[3]]);
+        let scales_l = &blk[4..8];
+        let qs = &blk[8..136];
+        let q8b = &q8.qs[b * 256..b * 256 + 256];
+        let mut isum = 0i32;
+        for k in 0..4usize {
+            let ib = 2 * k;
+            // 32 code bytes covering sub-blocks ib (low lane) and ib+1 (high lane).
+            let codes32 = _mm256_loadu_si256(qs[ib * 16..].as_ptr() as *const __m256i);
+            let lo = _mm256_and_si256(codes32, mask_0f); // lanes: [lo(ib), lo(ib+1)]
+            let hi = _mm256_and_si256(_mm256_srli_epi16(codes32, 4), mask_0f); // [hi(ib), hi(ib+1)]
+                                                                               // Reorder 128-bit lanes into [lo(ib), hi(ib)] and [lo(ib+1), hi(ib+1)].
+            let low256 = _mm256_permute2x128_si256::<0x20>(lo, hi);
+            let up256 = _mm256_permute2x128_si256::<0x31>(lo, hi);
+            let codes_z = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(low256), up256);
+            let w_z = _mm512_shuffle_epi8(table_z, codes_z); // 64 signed weights
+                                                             // 64 contiguous activation bytes = [a(ib) | a(ib+1)], lanes align with w_z.
+            let a_z = _mm512_loadu_si512(q8b[ib * 32..].as_ptr() as *const __m512i);
+            // Sign trick at ymm level (no _mm512_sign_epi8), then repack into zmm.
+            let w0 = _mm512_castsi512_si256(w_z);
+            let w1 = _mm512_extracti64x4_epi64::<1>(w_z);
+            let a0 = _mm512_castsi512_si256(a_z);
+            let a1 = _mm512_extracti64x4_epi64::<1>(a_z);
+            let wabs_z = _mm512_inserti64x4::<1>(
+                _mm512_castsi256_si512(_mm256_abs_epi8(w0)),
+                _mm256_abs_epi8(w1),
+            );
+            let as_z = _mm512_inserti64x4::<1>(
+                _mm512_castsi256_si512(_mm256_sign_epi8(a0, w0)),
+                _mm256_sign_epi8(a1, w1),
+            );
+            let prod = _mm512_maddubs_epi16(wabs_z, as_z);
+            let sum32 = _mm512_madd_epi16(prod, ones_i16_z);
+            // Lower ymm = sub-block ib's 8 i32; upper ymm = sub-block ib+1's.
+            let dot_ib = hadd_i32_ymm(_mm512_castsi512_si256(sum32));
+            let dot_ib1 = hadd_i32_ymm(_mm512_extracti64x4_epi64::<1>(sum32));
+            isum += iq4xs_ls_minus_32(scales_h, scales_l, ib) * dot_ib;
+            isum += iq4xs_ls_minus_32(scales_h, scales_l, ib + 1) * dot_ib1;
+        }
+        sumf += d * q8.d[b] * isum as f32;
     }
     sumf
 }
@@ -2025,6 +2207,132 @@ pub(crate) fn vec_dot_q6k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [
     vec_dot_q6k_batch_scalar(row, q8s, in_f, out);
 }
 
+/// Batched `Σ weight·x` for one IQ4_XS row against `m` Q8 activations (`out[r]`). Dispatches
+/// avx2 → scalar. Mirrors `vec_dot_q6k_batch`: the weight row's codebook lookup (nibble unpack +
+/// `pshufb`) is done ONCE into a flat signed-i8 buffer, then reused across all `m` token
+/// activations — amortising the decode the single-token path would repeat per token.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn vec_dot_iq4xs_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    debug_assert_eq!(
+        in_f % 256,
+        0,
+        "vec_dot_iq4xs_batch: in_f must be a multiple of 256"
+    );
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { vec_dot_iq4xs_batch_avx2(row, q8s, in_f, out) };
+        }
+    }
+    vec_dot_iq4xs_batch_scalar(row, q8s, in_f, out);
+}
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+fn vec_dot_iq4xs_batch_scalar(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    let m = q8s.len();
+    let nb = in_f / 256;
+    // Pre-expand codebook weights (signed i8), (ls−32) scales, and d ONCE per super-block.
+    let mut d_arr = vec![0f32; nb];
+    let mut ls_arr = vec![0i32; nb * 8];
+    let mut w_flat = vec![0i8; nb * 256];
+    for b in 0..nb {
+        let blk = &row[b * 136..b * 136 + 136];
+        d_arr[b] = rdf16(&blk[0..2]);
+        let scales_h = u16::from_le_bytes([blk[2], blk[3]]);
+        let scales_l = &blk[4..8];
+        let qs = &blk[8..136];
+        for ib in 0..8usize {
+            ls_arr[b * 8 + ib] = iq4xs_ls_minus_32(scales_h, scales_l, ib);
+            let qsb = &qs[ib * 16..ib * 16 + 16];
+            let dst = &mut w_flat[b * 256 + ib * 32..b * 256 + ib * 32 + 32];
+            for j in 0..16usize {
+                dst[j] = KVALUES_IQ4NL[(qsb[j] & 0xF) as usize];
+                dst[j + 16] = KVALUES_IQ4NL[(qsb[j] >> 4) as usize];
+            }
+        }
+    }
+    for r in 0..m {
+        let q8 = &q8s[r];
+        let mut sumf = 0f32;
+        for b in 0..nb {
+            let q8b = &q8.qs[b * 256..b * 256 + 256];
+            let mut isum = 0i32;
+            for ib in 0..8usize {
+                let w = &w_flat[b * 256 + ib * 32..b * 256 + ib * 32 + 32];
+                let a = &q8b[ib * 32..ib * 32 + 32];
+                let mut dot = 0i32;
+                for i in 0..32usize {
+                    dot += w[i] as i32 * a[i] as i32;
+                }
+                isum += ls_arr[b * 8 + ib] * dot;
+            }
+            sumf += d_arr[b] * q8.d[b] * isum as f32;
+        }
+        out[r] = sumf;
+    }
+}
+
+/// AVX2 batch kernel for IQ4_XS: expand the weight row's codebook values once (same nibble+pshufb
+/// as single-token), store signed i8 to `w_flat`, then per token run the Q8_0 abs/sign maddubs dot.
+/// Integer dot is order-free, and the epilogue formula matches the scalar path → bit-identical.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+unsafe fn vec_dot_iq4xs_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let m = q8s.len();
+    let nb = in_f / 256;
+    let mask_0f = _mm256_set1_epi8(0x0F_u8 as i8);
+    let ones_i16 = _mm256_set1_epi16(1i16);
+    let table =
+        _mm256_broadcastsi128_si256(_mm_loadu_si128(KVALUES_IQ4NL.as_ptr() as *const __m128i));
+
+    let mut d_arr = vec![0f32; nb];
+    let mut ls_arr = vec![0i32; nb * 8];
+    let mut w_flat = vec![0i8; nb * 256];
+    for b in 0..nb {
+        let blk = &row[b * 136..b * 136 + 136];
+        d_arr[b] = rdf16(&blk[0..2]);
+        let scales_h = u16::from_le_bytes([blk[2], blk[3]]);
+        let scales_l = &blk[4..8];
+        let qs = &blk[8..136];
+        for ib in 0..8usize {
+            ls_arr[b * 8 + ib] = iq4xs_ls_minus_32(scales_h, scales_l, ib);
+            let codes16 = _mm_loadu_si128(qs[ib * 16..].as_ptr() as *const __m128i);
+            let lo =
+                _mm256_castsi128_si256(_mm_and_si128(codes16, _mm256_castsi256_si128(mask_0f)));
+            let hi = _mm256_castsi128_si256(_mm_and_si128(
+                _mm_srli_epi16(codes16, 4),
+                _mm256_castsi256_si128(mask_0f),
+            ));
+            let codes = _mm256_inserti128_si256::<1>(lo, _mm256_castsi256_si128(hi));
+            let w = _mm256_shuffle_epi8(table, codes);
+            _mm256_storeu_si256(w_flat[b * 256 + ib * 32..].as_mut_ptr() as *mut __m256i, w);
+        }
+    }
+
+    for r in 0..m {
+        let q8 = &q8s[r];
+        let mut sumf = 0f32;
+        for b in 0..nb {
+            let q8b = &q8.qs[b * 256..b * 256 + 256];
+            let mut isum = 0i32;
+            for ib in 0..8usize {
+                let w = _mm256_loadu_si256(w_flat[b * 256 + ib * 32..].as_ptr() as *const __m256i);
+                let a = _mm256_loadu_si256(q8b[ib * 32..].as_ptr() as *const __m256i);
+                let w_abs = _mm256_abs_epi8(w);
+                let a_signed = _mm256_sign_epi8(a, w);
+                let prod = _mm256_maddubs_epi16(w_abs, a_signed);
+                let sum32 = _mm256_madd_epi16(prod, ones_i16);
+                let dot = hadd_i32_ymm(sum32);
+                isum += ls_arr[b * 8 + ib] * dot;
+            }
+            sumf += d_arr[b] * q8.d[b] * isum as f32;
+        }
+        out[r] = sumf;
+    }
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn vec_dot_q8_0_batch_scalar(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
     let m = q8s.len();
@@ -3165,7 +3473,7 @@ mod kernel_tests {
     #[cfg(target_arch = "x86_64")]
     use crate::repack::{q4k_gemm_group, q4k_pack, q6k_gemm_group, q6k_pack};
     use infr_core::tensor::DType;
-    use infr_gguf::dequant::dequant_block;
+    use infr_gguf::dequant::{dequant_block, dequant_codebook};
 
     fn lcg(seed: &mut u64) -> u64 {
         *seed = seed
@@ -3606,6 +3914,135 @@ mod kernel_tests {
                     rel_err(one[0], want) < 2e-2,
                     "q4_0_32 single in_f={in_f} row={r}: got {}, want {want}",
                     one[0]
+                );
+            }
+        }
+    }
+
+    /// Build `nb` real 136-byte IQ4_XS super-blocks with a fixed `d` and otherwise random (but
+    /// structurally valid) `scales_h`/`scales_l`/`qs` bytes — any byte pattern is a legal IQ4_XS
+    /// block (6-bit `ls` from arbitrary bits, 4-bit codes are nibbles 0–15). The full `ls` range
+    /// (0..63) and every code is exercised — used by the bit-identity oracle test.
+    fn build_iq4xs_rand(nb: usize, d: f32, seed: u64) -> Vec<u8> {
+        let mut w = det_bytes(nb * 136, seed);
+        for b in 0..nb {
+            put_f16(&mut w[b * 136..b * 136 + 2], d);
+        }
+        w
+    }
+
+    /// Build well-conditioned IQ4_XS blocks: a small mixed-sign `ls` band around 32 (uniform weight
+    /// magnitude, no pathological dynamic range → little catastrophic cancellation) plus random
+    /// codes. Weights land at Q4_0 scale, so the int8-activation dot tracks the full-precision
+    /// reference within a tight rel tolerance (the fully-random builder makes weights up to ±120
+    /// with heavy cancellation, where int8 activation-quant noise legitimately dominates).
+    fn build_iq4xs_wc(nb: usize, d: f32, mut seed: u64) -> Vec<u8> {
+        let mut w = vec![0u8; nb * 136];
+        for b in 0..nb {
+            let blk = &mut w[b * 136..b * 136 + 136];
+            put_f16(&mut blk[0..2], d);
+            let mut scales_h = 0u16;
+            for ib in 0..8usize {
+                let ls = 28 + (lcg(&mut seed) >> 40) % 9; // ls ∈ 28..36 → ls−32 ∈ [−4,4]
+                let lo = (ls & 0xF) as u8;
+                let hi = ((ls >> 4) & 3) as u8;
+                blk[4 + ib / 2] |= lo << (4 * (ib % 2));
+                scales_h |= (hi as u16) << (2 * ib);
+            }
+            blk[2..4].copy_from_slice(&scales_h.to_le_bytes());
+            for j in 0..128usize {
+                blk[8 + j] = (lcg(&mut seed) >> 33) as u8;
+            }
+        }
+        w
+    }
+
+    /// The SIMD dispatch (whatever tier this CPU has) must be BIT-IDENTICAL to the scalar oracle for
+    /// both the single-token and batch IQ4_XS kernels: the per-sub-block dot is an integer sum (no
+    /// rounding, order-free) and the `d·d8·isum` epilogue is shared, so every tier collapses to the
+    /// same bits. Falls through to the same scalar fn on non-x86, where the assertion is trivial.
+    #[test]
+    fn iq4xs_simd_bit_identical_to_scalar() {
+        for in_f in [256usize, 512, 768] {
+            let nb = in_f / 256;
+            let w = build_iq4xs_rand(nb, 0.05, 40);
+            let m = 5usize;
+            let q8s: Vec<Q8> = (0..m)
+                .map(|r| quantize_q8(&det_x(in_f, 41 + r as u64)))
+                .collect();
+            // Single-token: SIMD dispatch vs scalar oracle.
+            for (r, q8) in q8s.iter().enumerate() {
+                let simd = vec_dot_iq4xs(&w, q8, in_f);
+                let scalar = vec_dot_iq4xs_scalar(&w, q8, in_f);
+                assert_eq!(
+                    simd.to_bits(),
+                    scalar.to_bits(),
+                    "iq4xs single in_f={in_f} row={r}: simd {simd}, scalar {scalar}"
+                );
+            }
+            // Batch: SIMD dispatch vs scalar oracle.
+            let mut simd_out = vec![0f32; m];
+            vec_dot_iq4xs_batch(&w, &q8s, in_f, &mut simd_out);
+            let mut scalar_out = vec![0f32; m];
+            vec_dot_iq4xs_batch_scalar(&w, &q8s, in_f, &mut scalar_out);
+            for r in 0..m {
+                assert_eq!(
+                    simd_out[r].to_bits(),
+                    scalar_out[r].to_bits(),
+                    "iq4xs batch in_f={in_f} row={r}: simd {}, scalar {}",
+                    simd_out[r],
+                    scalar_out[r]
+                );
+            }
+        }
+    }
+
+    /// End-to-end tolerance-parity: the int8-activation IQ4_XS kernel must track the FULL-PRECISION
+    /// codebook dequant (`d·(ls−32)·kv[code]`) · f32-activation reference. IQ4_XS weights are stored
+    /// exactly (no weight-quant loss), so vs the QUANTIZED activation the kernel sees, the only slack
+    /// is f32 accumulation order → tight 1e-3 (isolates integer-dot correctness, as the Q4_0 sibling
+    /// does). vs the full-precision activation, the looser 2e-2 absorbs the lossy int8 activation
+    /// quant. Covers single-row (m=1) and batch (m>1).
+    #[test]
+    fn iq4xs_matches_dequant_reference() {
+        for in_f in [256usize, 512, 768] {
+            let nb = in_f / 256;
+            let w = build_iq4xs_wc(nb, 0.0006, 50);
+            let wref = dequant_codebook(DType::Iq4Xs, &w);
+            // Sanity: reference actually spans both nibble halves / nonzero scales.
+            assert!(wref.iter().any(|&v| v != 0.0));
+            let xs: Vec<Vec<f32>> = (0..4).map(|i| det_x(in_f, 51 + i)).collect();
+            let q8s: Vec<Q8> = xs.iter().map(|x| quantize_q8(x)).collect();
+
+            // Batch (m>1).
+            let mut got = vec![0f32; xs.len()];
+            vec_dot_iq4xs_batch(&w, &q8s, in_f, &mut got);
+            for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
+                let want_q = dot(&wref, &dequant_q8(q8));
+                assert!(
+                    rel_err(got[r], want_q) < 1e-3,
+                    "iq4xs batch(quant-ref) in_f={in_f} row={r}: got {}, want {want_q}",
+                    got[r]
+                );
+                let want_f = dot(&wref, x);
+                assert!(
+                    rel_err(got[r], want_f) < 2e-2,
+                    "iq4xs batch(full-ref) in_f={in_f} row={r}: got {}, want {want_f}",
+                    got[r]
+                );
+            }
+            // Single-row (m=1).
+            for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
+                let got1 = vec_dot_iq4xs(&w, q8, in_f);
+                let want_q = dot(&wref, &dequant_q8(q8));
+                assert!(
+                    rel_err(got1, want_q) < 1e-3,
+                    "iq4xs single(quant-ref) in_f={in_f} row={r}: got {got1}, want {want_q}"
+                );
+                let want_f = dot(&wref, x);
+                assert!(
+                    rel_err(got1, want_f) < 2e-2,
+                    "iq4xs single(full-ref) in_f={in_f} row={r}: got {got1}, want {want_f}"
                 );
             }
         }
