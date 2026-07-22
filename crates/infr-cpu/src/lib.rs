@@ -2256,68 +2256,26 @@ impl Backend for CpuBackend {
                     let acoef = weight(a_coef);
                     let dtb = weight(dt_bias);
                     let st = &mut vals[state.0 as usize]; // [nv, kd, vd]
-                    let mut out = vec![0f32; rr * nv * vd];
-                    let qscale = 1.0 / (kd as f32).sqrt();
-                    let l2 = |slice: &[f32]| -> f32 {
-                        (slice.iter().map(|x| x * x).sum::<f32>() + eps).sqrt()
-                    };
-                    // Sequential scan over the rows, carrying the per-head state S across tokens.
-                    for t in 0..rr {
-                        let (qb, vb, bb) = (t * nk * kd, t * nv * vd, t * nv);
-                        for h in 0..nv {
-                            // GQA: q/k heads TILED to nv value heads → v-head h uses q/k head h % nk.
-                            let kh_idx = h % nk;
-                            let mut qh = qf[qb + kh_idx * kd..qb + kh_idx * kd + kd].to_vec();
-                            let mut kh = kf[qb + kh_idx * kd..qb + kh_idx * kd + kd].to_vec();
-                            let vh = &vf[vb + h * vd..vb + h * vd + vd];
-                            let qn = l2(&qh);
-                            let kn = l2(&kh);
-                            for x in qh.iter_mut() {
-                                *x = *x / qn * qscale;
-                            }
-                            for x in kh.iter_mut() {
-                                *x /= kn;
-                            }
-                            let beta = 1.0 / (1.0 + (-bf[bb + h]).exp());
-                            // softplus(a + dt_bias), then g = a_coef * softplus (≤ 0); decay = exp(g).
-                            let sp = {
-                                let z = af[bb + h] + dtb[h];
-                                z.max(0.0) + (-z.abs()).exp().ln_1p()
-                            };
-                            let decay = (acoef[h] * sp).exp();
-                            let sh = &mut st[h * kd * vd..(h + 1) * kd * vd]; // [kd, vd]
-                            for x in sh.iter_mut() {
-                                *x *= decay;
-                            }
-                            // kv = kᵀS  [vd]
-                            let mut kv = vec![0f32; vd];
-                            for kk in 0..kd {
-                                let kkv = kh[kk];
-                                let row = &sh[kk * vd..kk * vd + vd];
-                                for d in 0..vd {
-                                    kv[d] += kkv * row[d];
-                                }
-                            }
-                            // delta = (v - kv)*beta ; S += k ⊗ delta
-                            let delta: Vec<f32> = (0..vd).map(|d| (vh[d] - kv[d]) * beta).collect();
-                            for kk in 0..kd {
-                                let kkv = kh[kk];
-                                let row = &mut sh[kk * vd..kk * vd + vd];
-                                for d in 0..vd {
-                                    row[d] += kkv * delta[d];
-                                }
-                            }
-                            // out = qᵀS  [vd]
-                            let oh = &mut out[vb + h * vd..vb + h * vd + vd];
-                            for kk in 0..kd {
-                                let qv = qh[kk];
-                                let row = &sh[kk * vd..kk * vd + vd];
-                                for d in 0..vd {
-                                    oh[d] += qv * row[d];
-                                }
-                            }
-                        }
-                    }
+                                                          // The token scan is inherently sequential (state S carries across tokens), but
+                                                          // value heads are fully independent — parallelize the per-head t-scan (see
+                                                          // `deltanet_scan`). Bit-identical to the old serial nest: same float ops, order.
+                    let out = deltanet_scan(
+                        self.pool(),
+                        &qf,
+                        &kf,
+                        &vf,
+                        &bf,
+                        &af,
+                        &acoef,
+                        &dtb,
+                        st,
+                        rr,
+                        nv,
+                        nk,
+                        kd,
+                        vd,
+                        eps,
+                    );
                     vals[dst.0 as usize] = out;
                 }
             }
@@ -2419,6 +2377,110 @@ fn conv1d_silu(
     out
 }
 
+/// Parallel DeltaNet scan: ONE pool task per value head. The outer token scan is inherently
+/// sequential (state S carries across tokens), but heads are fully independent — head `h` touches
+/// only its own state slice `st[h*kd*vd..]`, writes only its own output columns, and otherwise
+/// READS shared inputs (`kh_idx = h % nk` is a read index) — so the whole per-head t-scan runs as
+/// one task. Returns `out` [rows, nv*vd]; mutates `st` [nv, kd, vd] in place. Bit-identical to the
+/// old serial nest: per head the float ops (l2 norm, normalize, beta, softplus/decay, S*=decay,
+/// kv=kᵀS, delta, S+=k⊗delta, out=qᵀS) run in the SAME order — heads never interacted, so
+/// cross-head order never mattered, and `pool.collect` is order-preserving pure scheduling.
+#[allow(clippy::too_many_arguments)]
+fn deltanet_scan(
+    pool: &pool::SpinPool,
+    qf: &[f32], // [rows, nk*kd]
+    kf: &[f32], // [rows, nk*kd]
+    vf: &[f32], // [rows, nv*vd]
+    bf: &[f32], // [rows, nv]
+    af: &[f32], // [rows, nv]
+    acoef: &[f32],
+    dtb: &[f32],
+    st: &mut [f32], // [nv, kd, vd]
+    rr: usize,
+    nv: usize,
+    nk: usize,
+    kd: usize,
+    vd: usize,
+    eps: f32,
+) -> Vec<f32> {
+    let qscale = 1.0 / (kd as f32).sqrt();
+    let l2 = |slice: &[f32]| -> f32 { (slice.iter().map(|x| x * x).sum::<f32>() + eps).sqrt() };
+    // Read the incoming state immutably inside the closure; `st` is only touched mutably AFTER
+    // `collect` returns (NLL ends this shared borrow there), so two tasks never `&mut` the state.
+    let st_ro: &[f32] = st;
+    // One task per value head: snapshot the head's state, run its full sequential t-scan into a
+    // local output buffer, and return both for the serial gather below.
+    let per_head: Vec<(Vec<f32>, Vec<f32>)> = pool.collect(nv, &|h| {
+        let mut sh = st_ro[h * kd * vd..(h + 1) * kd * vd].to_vec(); // [kd, vd]
+        let mut oh_all = vec![0f32; rr * vd];
+        // GQA: q/k heads TILED to nv value heads → v-head h uses q/k head h % nk.
+        let kh_idx = h % nk;
+        // Sequential scan over the rows, carrying this head's state S across tokens.
+        for t in 0..rr {
+            let (qb, vb, bb) = (t * nk * kd, t * nv * vd, t * nv);
+            let mut qh = qf[qb + kh_idx * kd..qb + kh_idx * kd + kd].to_vec();
+            let mut kh = kf[qb + kh_idx * kd..qb + kh_idx * kd + kd].to_vec();
+            let vh = &vf[vb + h * vd..vb + h * vd + vd];
+            let qn = l2(&qh);
+            let kn = l2(&kh);
+            for x in qh.iter_mut() {
+                *x = *x / qn * qscale;
+            }
+            for x in kh.iter_mut() {
+                *x /= kn;
+            }
+            let beta = 1.0 / (1.0 + (-bf[bb + h]).exp());
+            // softplus(a + dt_bias), then g = a_coef * softplus (≤ 0); decay = exp(g).
+            let sp = {
+                let z = af[bb + h] + dtb[h];
+                z.max(0.0) + (-z.abs()).exp().ln_1p()
+            };
+            let decay = (acoef[h] * sp).exp();
+            for x in sh.iter_mut() {
+                *x *= decay;
+            }
+            // kv = kᵀS  [vd]
+            let mut kv = vec![0f32; vd];
+            for kk in 0..kd {
+                let kkv = kh[kk];
+                let row = &sh[kk * vd..kk * vd + vd];
+                for d in 0..vd {
+                    kv[d] += kkv * row[d];
+                }
+            }
+            // delta = (v - kv)*beta ; S += k ⊗ delta
+            let delta: Vec<f32> = (0..vd).map(|d| (vh[d] - kv[d]) * beta).collect();
+            for kk in 0..kd {
+                let kkv = kh[kk];
+                let row = &mut sh[kk * vd..kk * vd + vd];
+                for d in 0..vd {
+                    row[d] += kkv * delta[d];
+                }
+            }
+            // out = qᵀS  [vd]
+            let oh = &mut oh_all[t * vd..t * vd + vd];
+            for kk in 0..kd {
+                let qv = qh[kk];
+                let row = &sh[kk * vd..kk * vd + vd];
+                for d in 0..vd {
+                    oh[d] += qv * row[d];
+                }
+            }
+        }
+        (oh_all, sh)
+    });
+    // Serial gather: copy each head's final state back, and scatter its per-row output columns.
+    let mut out = vec![0f32; rr * nv * vd];
+    for (h, (oh_all, sh)) in per_head.into_iter().enumerate() {
+        st[h * kd * vd..(h + 1) * kd * vd].copy_from_slice(&sh);
+        for t in 0..rr {
+            let dst = t * nv * vd + h * vd;
+            out[dst..dst + vd].copy_from_slice(&oh_all[t * vd..t * vd + vd]);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2505,6 +2567,167 @@ mod tests {
                     "rebuilt state mismatch at rr={rr} kk={kk} cc={cc}"
                 );
             }
+        }
+    }
+
+    // Naive serial reference: a byte-for-byte copy of the ORIGINAL DeltaNet scan nest (loop order
+    // `for t { for h }`). The parallel `deltanet_scan` (loop order `for h (parallel) { for t }`)
+    // must reproduce both `out` and the mutated state EXACTLY.
+    #[allow(clippy::too_many_arguments)]
+    fn deltanet_scan_ref(
+        qf: &[f32],
+        kf: &[f32],
+        vf: &[f32],
+        bf: &[f32],
+        af: &[f32],
+        acoef: &[f32],
+        dtb: &[f32],
+        st: &mut [f32],
+        rr: usize,
+        nv: usize,
+        nk: usize,
+        kd: usize,
+        vd: usize,
+        eps: f32,
+    ) -> Vec<f32> {
+        let mut out = vec![0f32; rr * nv * vd];
+        let qscale = 1.0 / (kd as f32).sqrt();
+        let l2 = |slice: &[f32]| -> f32 { (slice.iter().map(|x| x * x).sum::<f32>() + eps).sqrt() };
+        for t in 0..rr {
+            let (qb, vb, bb) = (t * nk * kd, t * nv * vd, t * nv);
+            for h in 0..nv {
+                let kh_idx = h % nk;
+                let mut qh = qf[qb + kh_idx * kd..qb + kh_idx * kd + kd].to_vec();
+                let mut kh = kf[qb + kh_idx * kd..qb + kh_idx * kd + kd].to_vec();
+                let vh = &vf[vb + h * vd..vb + h * vd + vd];
+                let qn = l2(&qh);
+                let kn = l2(&kh);
+                for x in qh.iter_mut() {
+                    *x = *x / qn * qscale;
+                }
+                for x in kh.iter_mut() {
+                    *x /= kn;
+                }
+                let beta = 1.0 / (1.0 + (-bf[bb + h]).exp());
+                let sp = {
+                    let z = af[bb + h] + dtb[h];
+                    z.max(0.0) + (-z.abs()).exp().ln_1p()
+                };
+                let decay = (acoef[h] * sp).exp();
+                let sh = &mut st[h * kd * vd..(h + 1) * kd * vd];
+                for x in sh.iter_mut() {
+                    *x *= decay;
+                }
+                let mut kv = vec![0f32; vd];
+                for kk in 0..kd {
+                    let kkv = kh[kk];
+                    let row = &sh[kk * vd..kk * vd + vd];
+                    for d in 0..vd {
+                        kv[d] += kkv * row[d];
+                    }
+                }
+                let delta: Vec<f32> = (0..vd).map(|d| (vh[d] - kv[d]) * beta).collect();
+                for kk in 0..kd {
+                    let kkv = kh[kk];
+                    let row = &mut sh[kk * vd..kk * vd + vd];
+                    for d in 0..vd {
+                        row[d] += kkv * delta[d];
+                    }
+                }
+                let oh = &mut out[vb + h * vd..vb + h * vd + vd];
+                for kk in 0..kd {
+                    let qv = qh[kk];
+                    let row = &sh[kk * vd..kk * vd + vd];
+                    for d in 0..vd {
+                        oh[d] += qv * row[d];
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    // The head-parallel `deltanet_scan` must be BIT-IDENTICAL (exact f32 equality) to the naive
+    // serial reference for BOTH the output and the mutated state, across a matrix of
+    // (rows, n_vhead, n_khead, head_k, head_v) that spans: decode (rr==1) and prefill (rr>1),
+    // GQA (nk < nv) and nk==nv, small dims, and a large multi-head case that forces the pool's
+    // multi-task path (nv=16, kd=vd=128).
+    #[test]
+    fn deltanet_scan_bit_identical_to_serial() {
+        // Deterministic pseudo-random pattern (no RNG): a cheap hashed ramp in [-1, 1).
+        let pat = |seed: usize, i: usize| -> f32 {
+            let h = (i
+                .wrapping_mul(2654435761)
+                .wrapping_add(seed.wrapping_mul(40503)))
+                & 0xffff;
+            (h as f32 / 32768.0) - 1.0
+        };
+        let be = CpuBackend::new();
+        let pool = be.pool();
+        let eps = 1e-6f32;
+        for &(rr, nv, nk, kd, vd) in &[
+            (1usize, 8usize, 2usize, 16usize, 16usize), // decode, GQA
+            (4, 8, 2, 16, 16),                          // prefill, GQA
+            (7, 16, 4, 32, 32),                         // prefill, GQA
+            (3, 4, 4, 16, 16),                          // nk == nv
+            (1, 4, 4, 32, 32),                          // decode, nk == nv
+            (5, 16, 16, 128, 128),                      // large, multi-task, nk == nv
+            (6, 16, 4, 128, 128),                       // large, multi-task, GQA
+        ] {
+            let qf: Vec<f32> = (0..rr * nk * kd).map(|i| pat(1, i)).collect();
+            let kf: Vec<f32> = (0..rr * nk * kd).map(|i| pat(2, i)).collect();
+            let vf: Vec<f32> = (0..rr * nv * vd).map(|i| pat(3, i)).collect();
+            let bf: Vec<f32> = (0..rr * nv).map(|i| pat(4, i)).collect();
+            let af: Vec<f32> = (0..rr * nv).map(|i| pat(5, i)).collect();
+            let acoef: Vec<f32> = (0..nv).map(|i| pat(6, i)).collect();
+            let dtb: Vec<f32> = (0..nv).map(|i| pat(7, i)).collect();
+            let st0: Vec<f32> = (0..nv * kd * vd).map(|i| pat(8, i)).collect();
+
+            let mut st_ref = st0.clone();
+            let out_ref = deltanet_scan_ref(
+                &qf,
+                &kf,
+                &vf,
+                &bf,
+                &af,
+                &acoef,
+                &dtb,
+                &mut st_ref,
+                rr,
+                nv,
+                nk,
+                kd,
+                vd,
+                eps,
+            );
+
+            let mut st_par = st0.clone();
+            let out_par = deltanet_scan(
+                pool,
+                &qf,
+                &kf,
+                &vf,
+                &bf,
+                &af,
+                &acoef,
+                &dtb,
+                &mut st_par,
+                rr,
+                nv,
+                nk,
+                kd,
+                vd,
+                eps,
+            );
+
+            assert_eq!(
+                out_par, out_ref,
+                "output mismatch at rr={rr} nv={nv} nk={nk} kd={kd} vd={vd}"
+            );
+            assert_eq!(
+                st_par, st_ref,
+                "state mismatch at rr={rr} nv={nv} nk={nk} kd={kd} vd={vd}"
+            );
         }
     }
 
