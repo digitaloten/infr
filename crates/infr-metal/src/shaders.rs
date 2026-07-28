@@ -144,7 +144,7 @@ impl Pipelines {
         let lib_wall = t0.elapsed();
 
         let archive = ArchiveCache::open(device, &src, cfg);
-        let prof = cfg.prof.prof;
+        let prof = cfg.prof.stages;
         if prof {
             match archive.as_ref() {
                 Some(a) => eprintln!(

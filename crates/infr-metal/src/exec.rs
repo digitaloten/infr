@@ -1117,10 +1117,20 @@ fn select_attention_flash2_kern(
     c128_pipeline_ok: impl FnOnce() -> bool,
     standard_pipeline: impl FnOnce() -> Option<&'static str>,
 ) -> Option<&'static str> {
-    if f16 && rows == 4 && n_head >= 16 && kv_len >= 64 && head_dim == 128 && c128_pipeline_ok() {
+    let force_c64 = std::env::var_os("INFR_METAL_ATTN_FLASH2_FORCE_C64").is_some();
+    let c128_shape = f16 && rows == 4 && n_head >= 16 && kv_len >= 64 && head_dim == 128;
+    let c128_ok = c128_shape && !force_c64 && c128_pipeline_ok();
+    if c128_ok {
+        if std::env::var_os("INFR_METAL_ATTN_FLASH2_BENCH_LABEL").is_some() {
+            eprintln!("ATTN_FLASH2_M4_KERNEL=attnflash2_c128_f16kv_hd128");
+        }
         Some("attnflash2_c128_f16kv_hd128")
     } else {
-        standard_pipeline()
+        let standard = standard_pipeline();
+        if c128_shape && std::env::var_os("INFR_METAL_ATTN_FLASH2_BENCH_LABEL").is_some() {
+            eprintln!("ATTN_FLASH2_M4_KERNEL={}", standard.unwrap_or("none"));
+        }
+        standard
     }
 }
 

@@ -2866,12 +2866,12 @@ fn attention_flash2_hd128_matches_reference() {
     assert_parity(&g, &bound, dst, rows * nh * hd, 5e-3);
 }
 
-fn attention_flash2_four_row_prefill_match(
+fn attention_flash2_four_row_prefill_case(
     kv_len: usize,
     mask: infr_core::graph::AttnMask,
     pos: usize,
     seed: u64,
-) {
+) -> (Graph, TensorId, Vec<(TensorId, Vec<u8>)>, usize) {
     let (rows, nh, nkv, hd) = (4usize, 16usize, 8usize, 128usize);
     let mut g = Graph::new();
     let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
@@ -2897,7 +2897,69 @@ fn attention_flash2_four_row_prefill_match(
         (kc, f16_bytes(&rand_f32(kv_len * nkv * hd, seed + 1))),
         (vc, f16_bytes(&rand_f32(kv_len * nkv * hd, seed + 2))),
     ];
-    assert_parity(&g, &bound, dst, rows * nh * hd, 5e-3);
+    (g, dst, bound, rows * nh * hd)
+}
+
+fn attention_flash2_four_row_prefill_match(
+    kv_len: usize,
+    mask: infr_core::graph::AttnMask,
+    pos: usize,
+    seed: u64,
+) {
+    let (g, dst, bound, out_n) = attention_flash2_four_row_prefill_case(kv_len, mask, pos, seed);
+    assert_parity(&g, &bound, dst, out_n, 5e-3);
+}
+
+fn run_attention_flash2_four_row_prefill_timing(
+    be: &dyn Backend,
+    g: &Graph,
+    bound: &[(TensorId, Vec<u8>)],
+    out: TensorId,
+    out_n: usize,
+    warmup: usize,
+    iters: usize,
+) {
+    let mut bufs: Vec<(TensorId, Box<dyn Buffer>)> = Vec::new();
+    for (id, bytes) in bound {
+        let b = be
+            .alloc(bytes.len().max(4), BufferUsage::Activations)
+            .unwrap();
+        be.upload(b.as_ref(), bytes).unwrap();
+        bufs.push((*id, b));
+    }
+    let mut binds = Bindings::new();
+    for (id, b) in &bufs {
+        binds.bind(*id, b.as_ref());
+    }
+    let output = be.alloc(out_n * 4, BufferUsage::Activations).unwrap();
+    binds.bind(out, output.as_ref());
+    let plan = be.compile(g).unwrap();
+
+    let warmup_started = std::time::Instant::now();
+    let mut warmed = 0usize;
+    while warmed < warmup || warmup_started.elapsed() < std::time::Duration::from_secs(1) {
+        be.execute(plan.as_ref(), &binds).unwrap();
+        warmed += 1;
+    }
+
+    let calibrate_started = std::time::Instant::now();
+    for _ in 0..iters {
+        be.execute(plan.as_ref(), &binds).unwrap();
+    }
+    let calibrated = calibrate_started.elapsed().as_secs_f64() / iters as f64;
+    let block_iters = ((2.0 / calibrated).ceil() as usize).max(iters);
+    println!("ATTN_FLASH2_M4_WARMUP={warmed} BLOCK_ITERS={block_iters}");
+    for block in 0..10 {
+        let started = std::time::Instant::now();
+        for _ in 0..block_iters {
+            be.execute(plan.as_ref(), &binds).unwrap();
+        }
+        let us = started.elapsed().as_secs_f64() * 1_000_000.0 / block_iters as f64;
+        println!("ATTN_FLASH2_M4_BLOCK={block} US={us:.3}");
+    }
+    let mut bytes = vec![0u8; out_n * 4];
+    be.download(output.as_ref(), &mut bytes).unwrap();
+    std::hint::black_box(bytes);
 }
 
 // Four-row deep prefill reuses each K/V tile across the query rows through cooperative flash.
@@ -2921,6 +2983,15 @@ fn attention_flash2_four_row_prefill_matches_reference() {
         pos,
         602,
     );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_flash2_four_row_prefill_timing() {
+    let (g, dst, bound, out_n) =
+        attention_flash2_four_row_prefill_case(4096, infr_core::graph::AttnMask::Causal, 4092, 603);
+    let be = MetalBackend::new().expect("metal backend");
+    run_attention_flash2_four_row_prefill_timing(&be, &g, &bound, dst, out_n, 50, 200);
 }
 
 // hd=256 (gemma): the cooperative flash instantiation with 8 O fragments per simdgroup.

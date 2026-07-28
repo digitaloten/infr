@@ -190,3 +190,30 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --locked
       - run: cargo test -p infr-metal --locked -- --include-ignored --nocapture
+
+  attention-bench:
+    name: four-row flash attention A/B
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install glslc (shaderc)
+        run: brew install shaderc
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+      - name: C128
+        env:
+          INFR_METAL_ATTN_FLASH2_BENCH_LABEL: "1"
+        run: |
+          cargo test --release -p infr-metal attention_flash2_four_row_prefill_timing --locked -- \
+            --ignored --exact --nocapture --test-threads=1
+      - name: C64
+        env:
+          INFR_METAL_ATTN_FLASH2_BENCH_LABEL: "1"
+          INFR_METAL_ATTN_FLASH2_FORCE_C64: "1"
+        run: |
+          cargo test --release -p infr-metal attention_flash2_four_row_prefill_timing --locked -- \
+            --ignored --exact --nocapture --test-threads=1
