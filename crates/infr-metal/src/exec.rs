@@ -1108,6 +1108,19 @@ fn prefer_attention_flash(
         && (head_dim <= 128 || flash2_ok)
 }
 
+static ATTN_FLASH2_FORCE_C64: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static ATTN_FLASH2_BENCH_LABEL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static ATTN_FLASH2_LABEL_PRINTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn log_attention_flash2_bench_kernel(kern: &str) {
+    let enabled = *ATTN_FLASH2_BENCH_LABEL
+        .get_or_init(|| std::env::var_os("INFR_METAL_ATTN_FLASH2_BENCH_LABEL").is_some());
+    if enabled && !ATTN_FLASH2_LABEL_PRINTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("ATTN_FLASH2_M4_KERNEL={kern}");
+    }
+}
+
 fn select_attention_flash2_kern(
     f16: bool,
     rows: usize,
@@ -1117,18 +1130,17 @@ fn select_attention_flash2_kern(
     c128_pipeline_ok: impl FnOnce() -> bool,
     standard_pipeline: impl FnOnce() -> Option<&'static str>,
 ) -> Option<&'static str> {
-    let force_c64 = std::env::var_os("INFR_METAL_ATTN_FLASH2_FORCE_C64").is_some();
+    let force_c64 = *ATTN_FLASH2_FORCE_C64
+        .get_or_init(|| std::env::var_os("INFR_METAL_ATTN_FLASH2_FORCE_C64").is_some());
     let c128_shape = f16 && rows == 4 && n_head >= 16 && kv_len >= 64 && head_dim == 128;
     let c128_ok = c128_shape && !force_c64 && c128_pipeline_ok();
     if c128_ok {
-        if std::env::var_os("INFR_METAL_ATTN_FLASH2_BENCH_LABEL").is_some() {
-            eprintln!("ATTN_FLASH2_M4_KERNEL=attnflash2_c128_f16kv_hd128");
-        }
+        log_attention_flash2_bench_kernel("attnflash2_c128_f16kv_hd128");
         Some("attnflash2_c128_f16kv_hd128")
     } else {
         let standard = standard_pipeline();
-        if c128_shape && std::env::var_os("INFR_METAL_ATTN_FLASH2_BENCH_LABEL").is_some() {
-            eprintln!("ATTN_FLASH2_M4_KERNEL={}", standard.unwrap_or("none"));
+        if c128_shape {
+            log_attention_flash2_bench_kernel(standard.unwrap_or("none"));
         }
         standard
     }

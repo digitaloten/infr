@@ -1,0 +1,58 @@
+name: Metal attention benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      order:
+        description: Variant order
+        required: true
+        default: AB
+        type: choice
+        options:
+          - AB
+          - BA
+
+jobs:
+  benchmark:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install glslc
+        run: brew install shaderc
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+      - name: Build probe
+        run: cargo test --release -p infr-metal attention_flash2_four_row_prefill_timing --locked --no-run
+      - name: C128 first
+        if: inputs.order == 'AB'
+        env:
+          INFR_METAL_ATTN_FLASH2_BENCH_LABEL: "1"
+        run: |
+          cargo test --release -p infr-metal attention_flash2_four_row_prefill_timing --locked -- \
+            --ignored --exact --nocapture --test-threads=1
+      - name: C64 second
+        if: inputs.order == 'AB'
+        env:
+          INFR_METAL_ATTN_FLASH2_BENCH_LABEL: "1"
+          INFR_METAL_ATTN_FLASH2_FORCE_C64: "1"
+        run: |
+          cargo test --release -p infr-metal attention_flash2_four_row_prefill_timing --locked -- \
+            --ignored --exact --nocapture --test-threads=1
+      - name: C64 first
+        if: inputs.order == 'BA'
+        env:
+          INFR_METAL_ATTN_FLASH2_BENCH_LABEL: "1"
+          INFR_METAL_ATTN_FLASH2_FORCE_C64: "1"
+        run: |
+          cargo test --release -p infr-metal attention_flash2_four_row_prefill_timing --locked -- \
+            --ignored --exact --nocapture --test-threads=1
+      - name: C128 second
+        if: inputs.order == 'BA'
+        env:
+          INFR_METAL_ATTN_FLASH2_BENCH_LABEL: "1"
+        run: |
+          cargo test --release -p infr-metal attention_flash2_four_row_prefill_timing --locked -- \
+            --ignored --exact --nocapture --test-threads=1
