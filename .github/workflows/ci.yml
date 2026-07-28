@@ -175,6 +175,66 @@ jobs:
   # cold-vs-warm pipeline-cache breakdown (MSL front end, which is NOT cached,
   # versus PSO creation, which is), and this log is the ONLY place that
   # measurement exists — no one on this project has a Metal device.
+  attention-bench:
+    name: four-row flash A/B (${{ matrix.pair }})
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pair: 1-AB
+            order: AB
+          - pair: 2-BA
+            order: BA
+          - pair: 3-AB
+            order: AB
+          - pair: 4-BA
+            order: BA
+          - pair: 5-AB
+            order: AB
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install glslc
+        run: brew install shaderc
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+      - name: Build probe
+        run: cargo test --release -p infr-metal attention_flash2_four_row_prefill_timing --locked --no-run
+      - name: C128 first
+        if: matrix.order == 'AB'
+        env:
+          INFR_METAL_ATTN_FLASH2_BENCH_LABEL: "1"
+        run: |
+          cargo test --release -p infr-metal attention_flash2_four_row_prefill_timing --locked -- \
+            --ignored --exact --nocapture --test-threads=1
+      - name: C64 second
+        if: matrix.order == 'AB'
+        env:
+          INFR_METAL_ATTN_FLASH2_BENCH_LABEL: "1"
+          INFR_METAL_ATTN_FLASH2_FORCE_C64: "1"
+        run: |
+          cargo test --release -p infr-metal attention_flash2_four_row_prefill_timing --locked -- \
+            --ignored --exact --nocapture --test-threads=1
+      - name: C64 first
+        if: matrix.order == 'BA'
+        env:
+          INFR_METAL_ATTN_FLASH2_BENCH_LABEL: "1"
+          INFR_METAL_ATTN_FLASH2_FORCE_C64: "1"
+        run: |
+          cargo test --release -p infr-metal attention_flash2_four_row_prefill_timing --locked -- \
+            --ignored --exact --nocapture --test-threads=1
+      - name: C128 second
+        if: matrix.order == 'BA'
+        env:
+          INFR_METAL_ATTN_FLASH2_BENCH_LABEL: "1"
+        run: |
+          cargo test --release -p infr-metal attention_flash2_four_row_prefill_timing --locked -- \
+            --ignored --exact --nocapture --test-threads=1
+
   test-macos:
     name: cargo test (macOS / Metal)
     runs-on: macos-15
