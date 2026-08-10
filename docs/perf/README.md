@@ -26,6 +26,11 @@ headline.
 - **[vulkan-review.md](vulkan-review.md)** — multi-vendor review of the Vulkan
   backend: what is RDNA3-tuned versus genuinely portable, and the per-vendor
   gaps (Intel Arc, NVIDIA) that follow from it.
+- **[nvidia-ada.md](nvidia-ada.md)** — measurements on an NVIDIA RTX 4000 SFF
+  Ada against llama.cpp's Vulkan and CUDA builds, stock infr: prefill 0.34-0.37×,
+  decode 0.79×. Records the mechanisms consistent with that split (prefill
+  running at the 128-row chunk floor, the coopmat2 verdict having been taken on
+  RADV emulation) and the profiling phase that would attribute it.
 
 ## Reading the numbers
 
