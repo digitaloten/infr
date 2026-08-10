@@ -780,7 +780,9 @@ explicitly unverified on Windows, where a non-overlapped handle serializes
 concurrent reads).
 
 > Numbers are a snapshot and move with each perf slice; regenerate on your own
-> hardware with `infr compare --sweep <model...>`. Results on other GPUs
+> hardware with `infr compare --sweep <model...>`. One NVIDIA data point now
+> exists — RTX 4000 SFF Ada, Qwen3.6-27B Q4_K_M, in
+> [nvidia-ada.md](nvidia-ada.md). Results on other GPUs
 > (NVIDIA, Intel Arc) and Apple Metal are wanted — please open an issue with
 > your `infr bench` / `infr compare` output. Intel Arc testers: include one run
 > with `INFR_DEBUG_COOPMAT=1` (the enumerated/chosen coopmat shapes), then A/B
