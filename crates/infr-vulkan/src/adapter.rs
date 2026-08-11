@@ -212,10 +212,17 @@ fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
                 k_cache,
                 v_cache,
                 kv_len,
+                sinks,
                 ..
             } => {
                 has_attn = true;
                 if *rows != 1 || *head_dim % 4 != 0 || *head_dim > 512 {
+                    return false;
+                }
+                // Attention sinks have ONE kernel (`attention_kv.comp`'s -DSINKS static build) and
+                // no params-driven `_dyn` twin, so a replayed tape would run the sink-free split-K
+                // family instead. Force static.
+                if sinks.is_some() {
                     return false;
                 }
                 // Multi-position graph (see the comment above `attn_kv_len`): different kv_len across
@@ -1172,10 +1179,28 @@ fn lower_op(
                 }
                 return Ok(());
             }
-            // `w_off` (fused-QKV slices) only rides the offset-capable native paths — the runner
-            // gates fusion on `native_dense_supported`, so the f16/f32 fallbacks never see it.
-            if w_off != 0 && !native_dense_supported(dt) {
-                return Err(be("vulkan adapter: Linear w_off on a non-native weight"));
+            // `w_off` on a NON-native (float) weight. The native quant/bf16 kernels take the offset
+            // as a push field; the float fallbacks have no such field and index the weight from
+            // element 0 — so an unhandled `w_off` there reads rows 0..out_f and is silently wrong.
+            //
+            // F32 is handled: every float GEMV in this backend already addresses its weight by a
+            // 64-bit `bufferDeviceAddress` (`Recorder::linear_f32` is `linear_f32_at` at
+            // `w.device_addr()`), so a ROW-ALIGNED slice is just a shifted base pointer, which is
+            // what the `w_off != 0` arm at the F32 dispatch below passes. DeepSeek V4's grouped
+            // output projection is the caller (`w_off = g * o_lora_rank * in_f`); an f32 `wo_a` is
+            // what the synthetic V4 fixture writes, and what the CPU-vs-Vulkan parity test runs.
+            //
+            // F16 is NOT, and is refused rather than approximated: its m>1 path is the coopmat
+            // `matmul_proj` and its m=1 path is `linear`/`linear_f16_noext`, three more shifted-
+            // address call sites plus a 4-byte alignment obligation on the two that read the
+            // weight as packed u32 words — and nothing in the tree produces an f16 `w_off` today,
+            // so every line of it would be untested. A real (quantized) V4 GGUF takes the native
+            // path above and never reaches here.
+            if w_off != 0 && !native_dense_supported(dt) && dt != infr_core::DType::F32 {
+                return Err(be(format!(
+                    "vulkan adapter: Linear w_off on a {dt:?} weight — only the native (quant / \
+                     bf16) kernels and the f32 GEMV take a weight offset"
+                )));
             }
             // Fused Linear+Add (decode residual): one GEMV with the residual added in-kernel —
             // see linear_add_peephole. `y` (the Linear's scratch dst) is never written.
@@ -1507,9 +1532,12 @@ fn lower_op(
                         && be_.caps().f8_coopmat()
                         && (f8_wide || f8_narrow)
                         && be_.cfg().kernels.vulkan.f8_coopmat;
-                    let i8cm_ok = matches!(dt, infr_core::DType::Q8_0)
-                        && be_.caps().i8_coopmat()
-                        && be_.cfg().kernels.vulkan.i8_coopmat;
+                    // `i8_coopmat_ready` is `caps.i8_coopmat()` AND the `INFR_I8_COOPMAT=1` opt-in
+                    // AND this driver having PASSED the accumulator-layout known-answer probe at
+                    // init (see `VulkanBackend::verify_i8_coopmat_layout`): the kernel's
+                    // in-fragment descale reads accumulator elements at a mapping that is fixed per
+                    // implementation, so enumeration alone does not make it safe to dispatch.
+                    let i8cm_ok = matches!(dt, infr_core::DType::Q8_0) && be_.i8_coopmat_ready();
                     // NATIVE bf16 cooperative-matrix (WMMA) prefill GEMM — the `-DBF16CM` build of the
                     // SAME production kernel (crates/infr-vulkan/shaders/native_gemm_warp.comp) that
                     // `native_gemm_warp_bf16` (the f16-clamped path below) already uses; only the
@@ -1870,9 +1898,31 @@ fn lower_op(
                     rec.linear_native(dt, w, w_off, xb, y, m, in_f, out_f);
                 }
             } else if matches!(dt, infr_core::DType::F32) {
-                // Full-precision projection weight (gemma4 E2B per-layer inp_gate/proj): the seam
-                // uploads native dtype, and the f16 GEMV would read the f32 bytes as f16 garbage.
-                rec.linear_f32(w, xb, y, m, in_f, out_f);
+                // Full-precision projection weight (gemma4 E2B per-layer inp_gate/proj, DeepSeek
+                // V4's grouped output projection): the seam uploads native dtype, and the f16 GEMV
+                // would read the f32 bytes as f16 garbage.
+                if w_off == 0 {
+                    rec.linear_f32(w, xb, y, m, in_f, out_f);
+                } else {
+                    // Row-aligned slice of the weight (`w_off % in_f == 0`, `Op::Linear::w_off`'s
+                    // contract) expressed as a shifted base ADDRESS, because `linear_f32r.comp` has
+                    // no offset field. Alignment: the vec4 variant declares a 16-byte-aligned
+                    // buffer_reference and is only chosen when `in_f % 4 == 0`, and `w_off` is a
+                    // whole multiple of `in_f`, so `w_off * 4` bytes is a multiple of 16 exactly
+                    // when that variant can run. The scalar variants need 4, which any f32 element
+                    // offset satisfies. Asserted rather than assumed — a violation would read
+                    // misaligned and is not otherwise detectable.
+                    if w_off % in_f != 0 {
+                        return Err(be(format!(
+                            "vulkan adapter: Linear w_off {w_off} is not a whole multiple of \
+                             in_f {in_f} — the f32 GEMV addresses a row-aligned weight slice"
+                        )));
+                    }
+                    let base = w.device_addr().ok_or_else(|| {
+                        be("vulkan adapter: f32 Linear with w_off needs a BDA weight address")
+                    })?;
+                    rec.linear_f32_at(base + (w_off * 4) as u64, xb, y, m, in_f, out_f);
+                }
             } else if be_.caps().f16 {
                 rec.linear(w, xb, y, m, in_f, out_f);
             } else {
@@ -2020,6 +2070,7 @@ fn lower_op(
             up_stride,
             gate_stride,
             gate_block_width,
+            swiglu_clamp,
             ..
         } => {
             let n = *rows as usize * *nff as usize;
@@ -2040,12 +2091,17 @@ fn lower_op(
                             "vulkan adapter: GatedAct Silu gate_stride/gate_block_width!=0 unsupported",
                         ));
                     }
-                    rec.silu_mul(g_, u_, y, n);
+                    rec.silu_mul(g_, u_, y, n, *swiglu_clamp);
                 }
                 Activation::Sigmoid => {
                     if *up_off != 0 || *up_stride != 0 {
                         return Err(be(
                             "vulkan adapter: GatedAct Sigmoid up_off/stride!=0 unsupported",
+                        ));
+                    }
+                    if swiglu_clamp.is_some() {
+                        return Err(be(
+                            "vulkan adapter: GatedAct Sigmoid swiglu_clamp unsupported",
                         ));
                     }
                     rec.mul_sigmoid(
@@ -2059,6 +2115,12 @@ fn lower_op(
                     );
                 }
                 Activation::Gelu => {
+                    // `gelu_mul_off` is the strided form, which pushes the clamp words as zero —
+                    // no GELU caller clamps (V4 is SiLU), so this stays a refusal rather than a
+                    // second clamped kernel variant nothing exercises.
+                    if swiglu_clamp.is_some() {
+                        return Err(be("vulkan adapter: GatedAct Gelu swiglu_clamp unsupported"));
+                    }
                     rec.gelu_mul_off(
                         g_,
                         u_,
@@ -2082,12 +2144,13 @@ fn lower_op(
             rows,
             nff,
             act,
+            swiglu_clamp,
         } => {
             let (rows, nff) = (*rows as usize, *nff as usize);
             let (gu_, y) = (r(*gu)?, r(*dst)?);
             match act {
-                Activation::Silu => rec.silu_mul_fused(gu_, y, rows, nff),
-                Activation::Gelu => rec.gelu_mul_fused(gu_, y, rows, nff),
+                Activation::Silu => rec.silu_mul_fused(gu_, y, rows, nff, *swiglu_clamp),
+                Activation::Gelu => rec.gelu_mul_fused(gu_, y, rows, nff, *swiglu_clamp),
                 Activation::Sigmoid => {
                     return Err(be("vulkan adapter: GatedActFused Sigmoid unsupported"))
                 }
@@ -2388,6 +2451,7 @@ fn lower_op(
             theta,
             freq_factors,
             neox,
+            backward,
             ..
         } => {
             let f16_out = matches!(graph.desc(*dst).dtype, infr_core::DType::F16);
@@ -2407,6 +2471,15 @@ fn lower_op(
                 return Err(be(
                     "vulkan adapter: standalone NEOX Rope unsupported on this path (f16-out / \
                      record-once decode have no -DNEOX kernel build)",
+                ));
+            }
+            // Same again for BACKWARD (deepseek4's attention-output de-rope, `Op::Rope::backward`):
+            // only the static f32 NORM builds carry `-DBACKWARD`. A dropped sign is the same class
+            // of silent-wrong-numbers as a dropped pairing, so refuse.
+            if *backward && (f16_out || *neox || !matches!(mode, RopeMode::Static(_))) {
+                return Err(be(
+                    "vulkan adapter: backward (de-)Rope unsupported on this path (f16-out / NEOX / \
+                     record-once decode have no -DBACKWARD kernel build)",
                 ));
             }
             let ff = freq_factors.map(&r).transpose()?;
@@ -2459,6 +2532,7 @@ fn lower_op(
                             rope_pos[&positions.0],
                             ff,
                             *neox,
+                            *backward,
                         );
                     }
                 }
@@ -2512,6 +2586,7 @@ fn lower_op(
             scale,
             mask,
             pos,
+            sinks,
         } => {
             let (rows, kv_len, nh, nkv, hd, pos) = (
                 *rows as usize,
@@ -2539,6 +2614,55 @@ fn lower_op(
             // kv_len (padded, for nonfa's 256-row tiles) outruns the rows actually present. On a
             // full-context cache kv_len <= att_cap_rows always, so none of these gates move.
             let att_cap_rows = cap / (nkv * hd).max(1);
+            // Per-head attention sinks (deepseek4, `Op::Attention::sinks`) live in exactly ONE
+            // kernel — `attention_kv.comp`'s -DSINKS build. Nothing else in the tier ladder below
+            // (flash, non-FA coopmat, split-K, the Q8/BDA/params twins) knows about them, and a
+            // tier that quietly ignored the sink would produce a correct-looking softmax over the
+            // wrong denominator. So a sinks op takes the scalar path unconditionally, and the
+            // shapes that path cannot serve are refused here rather than silently mis-served.
+            // `decode_eligible` already forces sinks graphs off the record-once replay tape.
+            if let Some(sk) = sinks {
+                // The scalar sinks build reads `q` and both caches as f16 (the seam's own
+                // producer→consumer dtype flow). Every other KV dtype reaches the tier ladder
+                // through the dequant→f16 prepass below, which this early return skips — so
+                // require f16 outright rather than hand the kernel bytes it will misread.
+                let f16 = |t: infr_core::tensor::TensorId| {
+                    matches!(graph.desc(t).dtype, infr_core::DType::F16)
+                };
+                if !f16(*k_cache) || !f16(*v_cache) {
+                    return Err(be(
+                        "vulkan adapter: Op::Attention with sinks needs an f16 K/V cache — the \
+                         sinks build (attention_kv_sinks) has no quant read and no dequant prepass",
+                    ));
+                }
+                let window = match mask {
+                    AttnMask::Causal => 0,
+                    AttnMask::SlidingWindow(w) => *w,
+                    AttnMask::Canvas { .. } => {
+                        return Err(be(
+                            "vulkan adapter: Op::Attention with sinks under AttnMask::Canvas has \
+                             no kernel — the scalar sinks path carries no bidirectional `lo`",
+                        ));
+                    }
+                };
+                rec.attention_kv_sinks(
+                    r(*q)?,
+                    r(*k_cache)?,
+                    r(*v_cache)?,
+                    r(*sk)?,
+                    r(*dst)?,
+                    rows,
+                    kv_len,
+                    nh,
+                    nkv,
+                    hd,
+                    pos,
+                    window,
+                    *scale,
+                    cap,
+                );
+                return Ok(());
+            }
             if let RopeMode::Dynamic(params) = mode {
                 // Eligibility guarantees rows==1. Scale rides a push constant (gemma4 uses 1.0;
                 // 0.0 → kernel default 1/√hd) and SWA windows ride the window-aware prologue +
@@ -3313,7 +3437,8 @@ fn lower_op(
         // Per-head RMSNorm == rmsnorm over rows*n_head rows of head_dim (gemma4's weightless
         // V-norm passes a ones weight → out = x/rms; llama4's post-rope weightless Q/K L2-norm
         // runs in-place on the f16 rope scratch — `x`'s dtype picks the f16 or f32 kernel, `w`
-        // (the ones-vector weight) stays f32 either way).
+        // (the ones-vector weight) stays f32 either way). `weight: None` (deepseek4's Q norm) is
+        // the genuinely weightless build with no `w` binding at all.
         Op::QkNorm {
             x,
             weight,
@@ -3325,10 +3450,19 @@ fn lower_op(
             ..
         } => {
             let (rows_n, dim) = ((*rows * *n_head) as usize, *head_dim as usize);
-            if matches!(graph.desc(*x).dtype, infr_core::DType::F16) {
-                rec.rmsnorm_f16(r(*x)?, r(*weight)?, r(*dst)?, rows_n, dim, *eps);
-            } else {
-                rec.rmsnorm(r(*x)?, r(*weight)?, r(*dst)?, rows_n, dim, *eps);
+            let f16 = matches!(graph.desc(*x).dtype, infr_core::DType::F16);
+            match (weight, f16) {
+                (Some(w), true) => rec.rmsnorm_f16(r(*x)?, r(*w)?, r(*dst)?, rows_n, dim, *eps),
+                (Some(w), false) => rec.rmsnorm(r(*x)?, r(*w)?, r(*dst)?, rows_n, dim, *eps),
+                (None, false) => rec.rmsnorm_nw(r(*x)?, r(*dst)?, rows_n, dim, *eps),
+                // No -DNO_WEIGHT -DF16IO build: deepseek4's weightless Q norm runs on the f32
+                // wq_b output, and a variant nothing dispatches is a variant nothing tests.
+                (None, true) => {
+                    return Err(be(
+                        "vulkan adapter: Op::QkNorm { weight: None } over an f16 x has no kernel \
+                         — the weightless per-head RMSNorm is built f32-only (rmsnorm_nw)",
+                    ));
+                }
             }
         }
         // Fused per-head RMSNorm + SiLU gate multiply (qwen35 DeltaNet z-gate) — one dispatch
@@ -3699,6 +3833,8 @@ fn lower_op(
             exp_probs_b,
             n_expert_groups,
             n_expert_groups_used,
+            swiglu_clamp,
+            expert_ids,
         } => {
             // Router gating (softmax vs sigmoid) and renormalization are `moe_topk` push-constant
             // flags — see its shader doc. `weight_before` (llama4: the routing weight scales the
@@ -3720,6 +3856,28 @@ fn lower_op(
                 &*be_.alloc_uninit(4, BufferUsage::Weights)?
             };
             let has_bias = exp_probs_b.is_some();
+            // DeepSeek V4 hash routing: the selection arrives pre-gathered, so `moe_topk` copies
+            // it in and skips its whole selection phase (see `moe_topk.comp`). Same dummy-bind
+            // shape as `bias_buf` when absent. The two SELECTION-only inputs have nothing left to
+            // select on a hash layer, so refuse rather than ignore them.
+            let hash_buf: &dyn Buffer = if let Some(hid) = expert_ids {
+                r(*hid)?
+            } else {
+                &*be_.alloc_uninit(4, BufferUsage::Activations)?
+            };
+            let hash = expert_ids.is_some();
+            if hash && (has_bias || *n_expert_groups > 1) {
+                return Err(be(
+                    "vulkan adapter: MoeFfn expert_ids (hash routing) supplies the selection — \
+                     exp_probs_b and group routing have nothing to select",
+                ));
+            }
+            if swiglu_clamp.is_some() && (matches!(act, Activation::Sigmoid) || *weight_before) {
+                return Err(be(
+                    "vulkan adapter: MoeFfn swiglu_clamp needs a gated SiLU/GELU with \
+                     output-side weighting",
+                ));
+            }
             let (ne, n_expert, n_used, nff) = (
                 *ne as usize,
                 *n_expert as usize,
@@ -3907,6 +4065,8 @@ fn lower_op(
                     has_bias,
                     *n_expert_groups,
                     *n_expert_groups_used,
+                    hash_buf,
+                    hash,
                 );
                 // EP: rewrite the global top-k ids into this rank's local shard indices before the
                 // bucket sort (out-of-band → id 0, weight 0 — those assignments bucket harmlessly
@@ -4024,6 +4184,7 @@ fn lower_op(
                         pool[&ue].as_ref(),
                         pool[&ae].as_ref(),
                         n_pairs * nff,
+                        *swiglu_clamp,
                     );
                 } else {
                     // Fused: `ge` already holds [n_pairs, 2*nff] (gate half first, up half second
@@ -4037,12 +4198,20 @@ fn lower_op(
                         );
                     }
                     match act {
-                        Activation::Silu => {
-                            rec.silu_mul_fused(pool[&ge].as_ref(), pool[&ae].as_ref(), n_pairs, nff)
-                        }
-                        Activation::Gelu => {
-                            rec.gelu_mul_fused(pool[&ge].as_ref(), pool[&ae].as_ref(), n_pairs, nff)
-                        }
+                        Activation::Silu => rec.silu_mul_fused(
+                            pool[&ge].as_ref(),
+                            pool[&ae].as_ref(),
+                            n_pairs,
+                            nff,
+                            *swiglu_clamp,
+                        ),
+                        Activation::Gelu => rec.gelu_mul_fused(
+                            pool[&ge].as_ref(),
+                            pool[&ae].as_ref(),
+                            n_pairs,
+                            nff,
+                            *swiglu_clamp,
+                        ),
                         Activation::Sigmoid => {
                             return Err(be(
                                 "vulkan adapter: fused_gate_up batched MoeFfn Sigmoid unsupported",
@@ -4194,6 +4363,8 @@ fn lower_op(
                 has_bias,
                 *n_expert_groups,
                 *n_expert_groups_used,
+                hash_buf,
+                hash,
             );
             // EP: rewrite the global top-k ids into this rank's local shard indices (out-of-band →
             // id 0, weight 0). The id-indexed GEMVs below then read the local bank; the weighted
@@ -4231,12 +4402,20 @@ fn lower_op(
                     rec.moe_weight_scale(gubuf.get(pool), wts.get(pool), n_slots, 2 * nff);
                 }
                 match act {
-                    Activation::Silu => {
-                        rec.silu_mul_fused(gubuf.get(pool), abuf.get(pool), n_slots, nff)
-                    }
-                    Activation::Gelu => {
-                        rec.gelu_mul_fused(gubuf.get(pool), abuf.get(pool), n_slots, nff)
-                    }
+                    Activation::Silu => rec.silu_mul_fused(
+                        gubuf.get(pool),
+                        abuf.get(pool),
+                        n_slots,
+                        nff,
+                        *swiglu_clamp,
+                    ),
+                    Activation::Gelu => rec.gelu_mul_fused(
+                        gubuf.get(pool),
+                        abuf.get(pool),
+                        n_slots,
+                        nff,
+                        *swiglu_clamp,
+                    ),
                     Activation::Sigmoid => {
                         return Err(be(
                             "vulkan adapter: fused_gate_up MoeFfn Sigmoid unsupported",
@@ -4277,9 +4456,13 @@ fn lower_op(
                     rec.moe_weight_scale(ubuf.get(pool), wts.get(pool), n_slots, nff);
                 }
                 match act {
-                    Activation::Silu => {
-                        rec.silu_mul(gbuf.get(pool), ubuf.get(pool), abuf.get(pool), n_act)
-                    }
+                    Activation::Silu => rec.silu_mul(
+                        gbuf.get(pool),
+                        ubuf.get(pool),
+                        abuf.get(pool),
+                        n_act,
+                        *swiglu_clamp,
+                    ),
                     Activation::Sigmoid => rec.mul_sigmoid(
                         gbuf.get(pool),
                         ubuf.get(pool),
@@ -4508,6 +4691,88 @@ fn lower_op(
             }
             rec.topk_mask(r(*idx)?, r(*dst)?, *rows, *kv_len, *top_k);
         }
+        Op::HyperConnectMix {
+            mixes,
+            scale,
+            base,
+            pre,
+            gates,
+            rows,
+            hc,
+            eps,
+            n_iter,
+        } => {
+            hyper_check_hc(*hc, "vulkan Op::HyperConnectMix")?;
+            if *n_iter < 1 {
+                return Err(be(format!(
+                    "vulkan Op::HyperConnectMix: n_iter {n_iter} — Sinkhorn runs at least one \
+                     normalisation over src"
+                )));
+            }
+            let g = match gates {
+                Some(infr_core::graph::HyperGates { post, comb }) => Some((r(*post)?, r(*comb)?)),
+                None => None,
+            };
+            rec.hyper_mix(
+                r(*mixes)?,
+                r(*scale)?,
+                r(*base)?,
+                r(*pre)?,
+                g,
+                *rows,
+                *hc,
+                *eps,
+                *n_iter,
+            );
+        }
+        Op::HyperConnectPre {
+            x,
+            weights,
+            dst,
+            rows,
+            hc,
+            n_embd,
+        } => {
+            hyper_check_hc(*hc, "vulkan Op::HyperConnectPre")?;
+            rec.hyper_pre(r(*x)?, r(*weights)?, r(*dst)?, *rows, *hc, *n_embd);
+        }
+        Op::HyperConnectPost {
+            x,
+            residual,
+            post,
+            comb,
+            dst,
+            rows,
+            hc,
+            n_embd,
+        } => {
+            hyper_check_hc(*hc, "vulkan Op::HyperConnectPost")?;
+            rec.hyper_post(
+                r(*x)?,
+                r(*residual)?,
+                r(*post)?,
+                r(*comb)?,
+                r(*dst)?,
+                *rows,
+                *hc,
+                *n_embd,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a stream count wider than the fixed-size private array `hyper_mix.comp` holds a token's
+/// mixing matrix in. The kernel cannot bounds-check itself — an out-of-range private-array write
+/// is undefined — so the refusal has to happen here, before the dispatch.
+fn hyper_check_hc(hc: u32, what: &str) -> Result<()> {
+    let max = infr_core::graph::HYPER_CONNECT_MAX_MULT;
+    if hc < 1 || hc > max {
+        return Err(be(format!(
+            "{what}: hc_mult {hc} outside the supported 1..={max} (every shipped DeepSeek V4 \
+             config uses 4; hyper_mix.comp holds a token's whole hc*hc matrix in a private array \
+             of HC_MAX*HC_MAX floats)"
+        )));
     }
     Ok(())
 }
@@ -5410,6 +5675,8 @@ fn execute_paged_moe<'a>(
         exp_probs_b,
         n_expert_groups,
         n_expert_groups_used,
+        swiglu_clamp,
+        expert_ids,
         ..
     } = op
     else {
@@ -5446,6 +5713,22 @@ fn execute_paged_moe<'a>(
         &*be_.alloc_uninit(4, BufferUsage::Weights)?
     };
     let has_bias = exp_probs_b.is_some();
+    // Hash routing through the PAGER is unreached: the pager serves an expert bank too big for
+    // VRAM (Llama-4-Scout), and DeepSeek V4's hash layers are not that model. Rather than carry a
+    // second untested hash path here, bind the dummy and refuse — the resident arms above are
+    // where hash routing is implemented and tested.
+    let hash_buf: &dyn Buffer = &*be_.alloc_uninit(4, BufferUsage::Activations)?;
+    if expert_ids.is_some() {
+        return Err(be(
+            "vulkan adapter: paged MoeFfn does not implement hash routing (expert_ids)",
+        ));
+    }
+    if swiglu_clamp.is_some() && (matches!(act, Activation::Sigmoid) || *weight_before) {
+        return Err(be(
+            "vulkan adapter: paged MoeFfn swiglu_clamp needs a gated SiLU/GELU with \
+             output-side weighting",
+        ));
+    }
 
     // ── Router GEMV + top-k, recorded into the AMBIENT segment (no dedicated submit). `ids` is
     // `Staging` (ReBAR device-local host-visible): the ONE remaining readback — the small-m
@@ -5486,6 +5769,8 @@ fn execute_paged_moe<'a>(
             has_bias,
             *n_expert_groups,
             *n_expert_groups_used,
+            hash_buf,
+            false,
         );
     }
 
@@ -5723,16 +6008,25 @@ fn execute_paged_moe<'a>(
                     pool[ue].as_ref(),
                     pool[&ae].as_ref(),
                     n_pairs * nff,
+                    *swiglu_clamp,
                 ),
                 // Fused: `ge` already holds [n_pairs, 2*nff] (gate half first, up half second per
                 // row) from the single wide GEMM above — the resident batched fused arm's shape.
                 None => match act {
-                    Activation::Silu => {
-                        rec2.silu_mul_fused(pool[&ge].as_ref(), pool[&ae].as_ref(), n_pairs, nff)
-                    }
-                    Activation::Gelu => {
-                        rec2.gelu_mul_fused(pool[&ge].as_ref(), pool[&ae].as_ref(), n_pairs, nff)
-                    }
+                    Activation::Silu => rec2.silu_mul_fused(
+                        pool[&ge].as_ref(),
+                        pool[&ae].as_ref(),
+                        n_pairs,
+                        nff,
+                        *swiglu_clamp,
+                    ),
+                    Activation::Gelu => rec2.gelu_mul_fused(
+                        pool[&ge].as_ref(),
+                        pool[&ae].as_ref(),
+                        n_pairs,
+                        nff,
+                        *swiglu_clamp,
+                    ),
                     Activation::Sigmoid => unreachable!("act_ok gate above excludes Sigmoid"),
                 },
             }
@@ -5847,6 +6141,7 @@ fn execute_paged_moe<'a>(
                 pool[ubuf].as_ref(),
                 pool[&abuf].as_ref(),
                 n_act,
+                *swiglu_clamp,
             ),
             Activation::Sigmoid => rec2.mul_sigmoid(
                 pool[&gbuf].as_ref(),
@@ -5874,12 +6169,20 @@ fn execute_paged_moe<'a>(
         // (gate half first, up half second per row — `Op::GatedActFused`'s convention), exactly
         // like the resident small-m fused arm.
         None => match act {
-            Activation::Silu => {
-                rec2.silu_mul_fused(pool[&gbuf].as_ref(), pool[&abuf].as_ref(), n_slots, nff)
-            }
-            Activation::Gelu => {
-                rec2.gelu_mul_fused(pool[&gbuf].as_ref(), pool[&abuf].as_ref(), n_slots, nff)
-            }
+            Activation::Silu => rec2.silu_mul_fused(
+                pool[&gbuf].as_ref(),
+                pool[&abuf].as_ref(),
+                n_slots,
+                nff,
+                *swiglu_clamp,
+            ),
+            Activation::Gelu => rec2.gelu_mul_fused(
+                pool[&gbuf].as_ref(),
+                pool[&abuf].as_ref(),
+                n_slots,
+                nff,
+                *swiglu_clamp,
+            ),
             Activation::Sigmoid => {
                 return Err(be(
                     "vulkan adapter: fused_gate_up paged MoeFfn Sigmoid unsupported",
@@ -6253,6 +6556,7 @@ mod tests {
             up_stride: 0,
             gate_stride: (2 * nff) as u32, // strided gate — unsupported by silu_mul
             gate_block_width: 0,
+            swiglu_clamp: None,
         });
         let gb = be_.alloc(rows * nff * 4, BufferUsage::Activations).unwrap();
         let ub = be_.alloc(rows * nff * 4, BufferUsage::Activations).unwrap();
@@ -6700,6 +7004,7 @@ mod tests {
             gate_stride: 0,
             up_stride: 0,
             gate_block_width: 0,
+            swiglu_clamp: None,
         });
         let got = infr_testkit::run_graph(
             &be_,
@@ -6840,7 +7145,7 @@ mod tests {
         let wi = g.weight(TensorDesc::new(vec![hd], DType::F32));
         g.push(Op::QkNorm {
             x: xi,
-            weight: wi,
+            weight: Some(wi),
             dst: xi, // in-place — matches the runner's q16/k16 usage exactly
             rows: 1,
             n_head: nh as u32,
@@ -6986,6 +7291,7 @@ mod tests {
             scale,
             mask: AttnMask::Causal,
             pos: pos as u32,
+            sinks: None,
         });
         let qb = be_.alloc(qf.len(), BufferUsage::Activations).unwrap();
         let kb = be_.alloc(kf.len(), BufferUsage::Activations).unwrap();
@@ -7323,6 +7629,7 @@ mod tests {
             gate_stride: 0,
             up_stride: 0,
             gate_block_width: 0,
+            swiglu_clamp: None,
         });
         g.push(Op::Linear {
             x: act_i,
@@ -7482,6 +7789,7 @@ mod tests {
                     AttnMask::Causal
                 },
                 pos: pos as u32,
+                sinks: None,
             });
             let qb = be_.alloc(qf.len(), BufferUsage::Activations).unwrap();
             let kb = be_.alloc(kf.len(), BufferUsage::Activations).unwrap();
@@ -7740,6 +8048,8 @@ mod tests {
                 exp_probs_b: None,
                 n_expert_groups: 0,
                 n_expert_groups_used: 0,
+                swiglu_clamp: None,
+                expert_ids: None,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -7883,6 +8193,8 @@ mod tests {
                 exp_probs_b: None,
                 n_expert_groups: 0,
                 n_expert_groups_used: 0,
+                swiglu_clamp: None,
+                expert_ids: None,
             });
             g.push(Op::Copy {
                 src: sub,
@@ -8082,6 +8394,8 @@ mod tests {
             exp_probs_b: None,
             n_expert_groups: 0,
             n_expert_groups_used: 0,
+            swiglu_clamp: None,
+            expert_ids: None,
         });
         let mk = |bytes: &[u8], usage| {
             let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -8205,6 +8519,8 @@ mod tests {
                 exp_probs_b: None,
                 n_expert_groups: 0,
                 n_expert_groups_used: 0,
+                swiglu_clamp: None,
+                expert_ids: None,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -8337,6 +8653,8 @@ mod tests {
                 exp_probs_b: None,
                 n_expert_groups: 0,
                 n_expert_groups_used: 0,
+                swiglu_clamp: None,
+                expert_ids: None,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -9055,6 +9373,8 @@ mod tests {
                 exp_probs_b: None,
                 n_expert_groups: 0,
                 n_expert_groups_used: 0,
+                swiglu_clamp: None,
+                expert_ids: None,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -9207,6 +9527,8 @@ mod tests {
                 exp_probs_b: None,
                 n_expert_groups: 0,
                 n_expert_groups_used: 0,
+                swiglu_clamp: None,
+                expert_ids: None,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -9346,6 +9668,8 @@ mod tests {
                 exp_probs_b: None,
                 n_expert_groups: 0,
                 n_expert_groups_used: 0,
+                swiglu_clamp: None,
+                expert_ids: None,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -9479,6 +9803,8 @@ mod tests {
                 exp_probs_b: None,
                 n_expert_groups: 0,
                 n_expert_groups_used: 0,
+                swiglu_clamp: None,
+                expert_ids: None,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -9616,6 +9942,8 @@ mod tests {
                 exp_probs_b: None,
                 n_expert_groups: 0,
                 n_expert_groups_used: 0,
+                swiglu_clamp: None,
+                expert_ids: None,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -9792,6 +10120,8 @@ mod tests {
                 exp_probs_b: None,
                 n_expert_groups: 0,
                 n_expert_groups_used: 0,
+                swiglu_clamp: None,
+                expert_ids: None,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();

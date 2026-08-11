@@ -8,6 +8,115 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`infr pull` splits ONE file across connections too.** Shard-level
+  concurrency did nothing for a model that ships as a single file, which most
+  do: `unsloth/DeepSeek-V3.2-GGUF`'s `UD-TQ1_0` is one 161 GB GGUF and still
+  went over one connection. It is now fetched as a grid of 64 MiB byte ranges,
+  several at a time, and reassembled — measured on that object, in the same
+  60-second window: 11.4 MB/s before, 80.5 MB/s after, and the whole 161 GB pull
+  ran at 80.0 MB/s end to end (33.6 minutes against a projected 3.9 hours).
+  `hub.pull_jobs` (default `8`) is now the TOTAL connection bound rather than a
+  file count, so shards and ranges share one allowance and a 236-shard repo
+  cannot turn into 64 sockets; `0` and `1` still mean strictly one connection,
+  never split. An interrupted ranged download resumes from a per-range sidecar
+  next to the partial, and a partial whose object was re-published upstream is
+  discarded rather than continued — a resumed splice of two uploads is a
+  plausible-sized corrupt file, and it is bound to HF's LFS sha256 rather than
+  to an `ETag` so a different CDN edge cannot look like a different file.
+  Servers that do not serve ranges (no `Accept-Ranges`, or a `200` where a `206`
+  was asked for) fall back to the single stream, files of 64 MiB or less are
+  never split, and the end-of-download sha256 gate is unchanged: one bar per
+  file, one digest, one decision.
+
+- **`infr pull` fetches a split model's shards concurrently.** A single
+  connection to the HF CDN is what caps a download, not the link — measured
+  against the same objects, one connection sustained 8.8 MB/s and five sustained
+  78.7 MB/s — so the shards of a `-NNNNN-of-MMMMM` set are now fetched several
+  at a time. A 245 GB five-shard `unsloth/DeepSeek-V3.2-GGUF:Q2_K` pull ran at
+  80 MB/s end to end. Bounded by the new `hub.pull_jobs` (`INFR_PULL_JOBS`,
+  `--set hub.pull_jobs=N`, default `8`), because shard counts come from the repo
+  rather than from the user (`DeepSeek-V3.2-REAP` ships 236); `0` and `1` both
+  keep the old strictly sequential behaviour. Resume, the LFS-sha256 gate and
+  the refusal to link a mismatched blob are unchanged and per-file. Concurrent
+  downloads each get their own progress line (`infr_core::progress::group`)
+  instead of overwriting one another, and a failed file stops the others from
+  claiming more work instead of pulling the rest of a model that cannot load.
+
+- **Multi-shard (`gguf-split`) models load.** `Gguf::open` on any member of a
+  `-NNNNN-of-MMMMM.gguf` set follows `split.count` to the whole set, maps every
+  shard separately (each keeping the shared file mapping that makes a
+  larger-than-RAM model runnable), takes the metadata from shard 1 and unions
+  the tensor index across all of them — so a tensor resolves against the file
+  that actually holds it instead of failing with `tensor not found`. Opening a
+  LATER shard works too: it carries no model metadata, so the set is re-rooted
+  at shard 1. The set is validated rather than trusted — the filename's
+  `-of-MMMMM` must equal `split.count`, every shard's `split.no` must match the
+  position its filename claims, all shards must agree on `split.count`, the
+  assembled index must be exactly `split.tensors.count` entries with no repeated
+  name, and a missing shard fails naming the file. Tested against a 5-shard 229
+  GB DeepSeek-V3.2-Q2_K.
+- `infr_core::gguf_split` — the `-NNNNN-of-MMMMM.gguf` naming convention, parsed
+  in one place instead of two. `infr-hub` (is the cached set complete?) and
+  `infr-gguf` (which files is this model?) now share it.
+- `infr_core::blockio::FileBlockIo::open_shards` — the weight pager's disk tier
+  reads a shard set as one address space, refusing at open any shard whose
+  length is no longer the one the weights were loaded against (which would shift
+  every offset in every later shard).
+
+- **A DeepSeek V4 model whose `compress_ratios` are all zero now GENERATES**
+  (stage 4, slice A). The `ratio == 0` tier — hyper-connections wrapping both
+  sublayers, single-head MQA attention with a weightless per-head Q norm, a
+  `[nope | rope]` tail rope, attention sinks, a de-roped grouped low-rank output
+  projection, and bias-routed sqrt-softplus MoE with the per-layer SwiGLU clamps
+  — is emitted end to end and runs on CPU and Vulkan. Compressed layers (ratio 4
+  or 128) and hash-routed layers are refused by name, each message saying which
+  layer and what is missing, rather than approximated by the ratio-0 graph. Two
+  supporting changes ship with it: Vulkan's `Op::Linear` now accepts `w_off` on
+  an **F32** weight (by shifting the weight's `bufferDeviceAddress` base — the
+  float GEMVs already address their weight by pointer, and `w_off` is
+  row-aligned), which is what lets the grouped output projection run there at
+  all; and V4 is excluded from the record-once decode replay tape, like
+  `deepseek2`, because its ops have no dynamic twins. See `docs/deepseek.md` §
+  Stage 4.
+- **DeepSeek V4 hash-routed MoE and per-layer SwiGLU clamping** (stage 4, op
+  level). `Op::MoeFfn` gains `expert_ids`: an optional pre-gathered
+  `[rows, n_expert_used]` I32 handle (llama.cpp's `selected_experts_in`,
+  gathered from `ffn_gate_tid2eid` by token id) that replaces the top-k
+  selection on V4's first `hash_layer_count` layers. The router matmul and
+  gating still run — the routing WEIGHTS remain the router's own probabilities
+  at the hash-chosen experts, renormalised and scaled — while `argsort_top_k`,
+  `exp_probs_b` and group-limited routing are skipped; the last two are refused
+  alongside `expert_ids` rather than silently ignored. `Op::GatedAct`,
+  `Op::GatedActFused` and `Op::MoeFfn` also gain `swiglu_clamp: Option<f32>`,
+  built through the new `infr_core::graph::swiglu_clamp(limit)` which carries
+  llama.cpp's `limit > 1e-6` disabled gate so no caller can pass a layer's `0.0`
+  through as a real clamp. V4 clamps `up` symmetrically and the gate one-sided
+  and **pre**-activation, where every other arch clamps post-SiLU. All of it
+  runs on CPU, Vulkan and Metal; `None` leaves every existing model's numerics
+  bit-identical. See `docs/deepseek.md` § Stage 4.
+- **DeepSeek V4 Sinkhorn hyper-connections** (stage 4, op level): three new ops
+  that replace `x = x + f(x)` with `hc_mult` parallel residual streams.
+  `Op::HyperConnectMix` turns the mixing matmul's output into the `pre` collapse
+  weights, the `post` output gates and the `comb` mixing matrix
+  (Sinkhorn-normalised to approximately doubly stochastic);
+  `Op::HyperConnectPre` collapses the streams to one vector for a sublayer; and
+  `Op::HyperConnectPost` re-expands that sublayer's output back across the
+  streams. `Op::HyperConnectMix`'s `gates` is `None` for the model head
+  (llama.cpp's `build_hc_head`), which is the same arithmetic over a narrower
+  `mixes`. All three run on CPU, Vulkan and Metal; `hc_mult` is accepted in
+  `1..=infr_core::graph::HYPER_CONNECT_MAX_MULT` (8) and refused loudly on the
+  host beyond that. See `docs/deepseek.md` § "Sinkhorn hyper-connections".
+- **DeepSeek V4 attention primitives** (stage 4, op level): `Op::QkNorm`'s
+  `weight` became optional, so a weightless per-head RMSNorm is expressible
+  without a fake ones-vector operand; `Op::Attention` gained an optional
+  per-head `sinks` input (one extra logit per head joining the softmax max and
+  denominator, contributing no value); and `Op::Rope` gained a `backward` flag
+  for de-roping (llama.cpp's `ggml_rope_ext_back` — the forward rotation with
+  `sin` negated). All three run on CPU, Vulkan and Metal; `sinks: None` /
+  `backward: false` / `weight: Some(..)` reproduce the previous code path
+  exactly, so no existing model's numerics move. V4's grouped low-rank output
+  projection needs no new op — it composes from `Op::CopyStrided` and
+  `Op::Linear`'s existing `w_off`.
 - **DeepSeek V2 architecture support** (stage 2): registered `deepseek2` arch
   string, parsed MLA hyperparameters (`q_lora_rank`, `kv_lora_rank`,
   `qk_rope_dim`, `head_k_mla`, `v_head_dim`, lite detection via tensor
@@ -125,6 +234,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `Gguf::path()` → `Gguf::shards()`, which returns `(path, length)` per shard in
+  order. `TensorBytes::file_range` / `Gguf::tensor_file_range` now report
+  offsets in the model's concatenated file address space; for a single-file
+  model that is the file offset it always was.
+
 - **A streamed model now prefills LAYER-MAJOR: the prompt sweeps the weight set
   once instead of once per prefill chunk.** Prefill runs in `device.ubatch`
   chunks and every chunk used to run the whole model, so a P-token prompt paid
@@ -174,6 +288,50 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Every DeepSeek model prefilled one token per submit.** The batched-prefill
+  eligibility scan (`moe_batched_ok` in `seam/runner.rs`) demanded a dp4a-mmq
+  expert bank on EVERY layer, but DeepSeek's leading dense blocks ship a plain
+  `ffn_gate/up/down` and no `ffn_*_exps` tensor at all — the missing lookup read
+  as "unsupported dtype" and disqualified the whole model, so the entire prompt
+  went through the per-token decode path. The scan now covers the layers that
+  actually hold expert banks (`Config::is_moe_layer`), which also picks up
+  llama4 checkpoints with a non-`1` `interleave_moe_layer_step`. Measured on an
+  RX 7900 XTX: DeepSeek-V2-Lite-Chat Q4_K_M pp512 39.1 → 975.5 t/s and pp2048
+  12.3 → 673.4 t/s; DeepSeek-MoE-16B-Chat Q4_K_M pp512 229.0 → 4185.0 t/s, level
+  with llama.cpp's Vulkan backend on the same file. Decode is unchanged.
+- **The int8 cooperative-matrix prefill GEMM assumed a fragment layout no device
+  was ever asked about.** `native_gemm_i8cm_q8_0.comp` reads its accumulator
+  elements at `(row, col) = (2*i + (lane>>4), lane&15)`, a mapping
+  `KHR_cooperative_matrix` fixes per IMPLEMENTATION and which was derived
+  empirically on RADV/RDNA3 — on a driver that lays the fragment out differently
+  the kernel would have returned plausible wrong numbers with no error. The
+  Vulkan backend now multiplies two known matrices on the device and reads the
+  product back through that same mapping before arming the tier
+  (`INFR_I8_COOPMAT=1` runs the check at init; a mismatch logs the offending
+  element and leaves the tier off). Verified passing on an RX 7900 XTX, and
+  verified to REFUSE when the mapping is perturbed.
+- **Two drivers that misreport cooperative-matrix support are no longer
+  believed.** AMD's proprietary and AMDVLK drivers advertise the unit on all
+  GPUs, and Intel pre-Xe2 regresses on it (both documented upstream in
+  llama.cpp). Cooperative matrix is now refused on `AMD_PROPRIETARY` /
+  `AMD_OPEN_SOURCE` below RDNA3, and Intel pre-Xe2 keeps only the 8x8x16 tile
+  that already required `INFR_CM_8X8=1`. The device is bucketed by probes (wave
+  mode, wavefronts/SIMD, packed-dot bits, subgroup width, warps/SM), never by
+  PCI device id, and the bucket plus driver id are printed in the GPU banner.
+  Mesa RADV and NVIDIA are unaffected.
+- **bf16 and fp8 were gated on an extension STRING with no feature bit, and the
+  features were never enabled on the device.** `VK_KHR_shader_bfloat16` /
+  `VK_EXT_shader_float8` now go through their feature structs like every other
+  capability: `Capabilities::bf16` / `f8` mean the device will run it, the bf16
+  and fp8 coopmat tiers additionally require `shaderBFloat16CooperativeMatrix` /
+  `shaderFloat8CooperativeMatrix`, and both extension and feature are enabled on
+  the logical device when a tier is live — without which those kernels' SPIR-V
+  violated its VUID.
+- **`maxPushConstantsSize` and `maxStorageBufferRange` are queried instead of
+  assumed.** A kernel whose push block exceeds the device limit is refused by
+  name at build time rather than failing a driver-side VUID, and the
+  descriptor-range bind check now runs in RELEASE builds against the limit the
+  device reported (it was a `debug_assert!` against an assumed 4 GiB).
 - **DeepSeek `deepseek-llm` pre-tokenizer split on the wrong character
   classes**: `DEEPSEEK_LLM_PRE_RES[2]` opened its quote range with `'` (U+0027)
   instead of `‘` (U+2018), so the class covered U+0027–U+201F — most of the BMP,

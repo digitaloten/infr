@@ -2213,7 +2213,7 @@ fn qknorm_parity() {
     let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
     g.push(Op::QkNorm {
         x,
-        weight: w,
+        weight: Some(w),
         dst,
         rows: rows as u32,
         n_head: nh as u32,
@@ -2279,6 +2279,7 @@ fn rope_parity() {
         freq_factors: None,
         x_stride: 0,
         neox: false,
+        backward: false,
     });
     let positions: Vec<i32> = (0..rows as i32).map(|i| i + 3).collect();
     let bound = vec![
@@ -2310,6 +2311,7 @@ fn rope_partial_with_freq_factors_parity() {
         freq_factors: Some(ff),
         x_stride: 0,
         neox: false,
+        backward: false,
     });
     let positions: Vec<i32> = (0..rows as i32).map(|i| i * 2 + 1).collect();
     let ffv: Vec<f32> = (0..rd / 2).map(|i| 1.0 + i as f32 * 0.1).collect();
@@ -2494,6 +2496,7 @@ fn q8_attention_test(rows: usize, kv_len: usize, hd: usize, pos: usize, tol: f32
         scale: 1.0 / (hd as f32).sqrt(),
         mask: infr_core::graph::AttnMask::Causal,
         pos: pos as u32,
+        sinks: None,
     });
     let nkv_elems = kv_len * nkv * hd;
     let bound = vec![
@@ -2595,6 +2598,7 @@ fn kvquant_attention_test(
         scale: 1.0 / (hd as f32).sqrt(),
         mask: infr_core::graph::AttnMask::Causal,
         pos: pos as u32,
+        sinks: None,
     });
     let nkv_elems = kv_len * nkv * hd;
     let bound = vec![
@@ -2728,6 +2732,7 @@ fn attention_gqa_causal_parity() {
         scale: 1.0 / (hd as f32).sqrt(),
         mask: infr_core::graph::AttnMask::Causal,
         pos: pos as u32,
+        sinks: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 41))),
@@ -2767,6 +2772,7 @@ fn attention_decode_hd256_short_kv_parity() {
             scale: 1.0 / (hd as f32).sqrt(),
             mask: infr_core::graph::AttnMask::Causal,
             pos: pos as u32,
+            sinks: None,
         });
         let bound = vec![
             (q, f32_bytes(&rand_f32(rows * nh * hd, 71 + kv_len as u64))),
@@ -2807,6 +2813,7 @@ fn attention_prefill_wide_parity() {
         scale: 1.0 / (hd as f32).sqrt(),
         mask: infr_core::graph::AttnMask::Causal,
         pos: pos as u32,
+        sinks: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 61))),
@@ -2842,6 +2849,7 @@ fn attention_flash_matches_reference() {
         scale: 1.0 / (hd as f32).sqrt(),
         mask: infr_core::graph::AttnMask::Causal,
         pos: pos as u32,
+        sinks: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 71))),
@@ -2876,6 +2884,7 @@ fn attention_flash_hd72_matches_reference() {
         scale: 1.0 / (hd as f32).sqrt(),
         mask: infr_core::graph::AttnMask::Causal,
         pos: pos as u32,
+        sinks: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 171))),
@@ -2910,6 +2919,7 @@ fn attention_flash2_hd128_matches_reference() {
         scale: 1.0 / (hd as f32).sqrt(),
         mask: infr_core::graph::AttnMask::Causal,
         pos: pos as u32,
+        sinks: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 181))),
@@ -2944,6 +2954,7 @@ fn attention_flash2_four_row_prefill_match(
         scale: 1.0 / (hd as f32).sqrt(),
         mask,
         pos: pos as u32,
+        sinks: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, seed))),
@@ -2999,6 +3010,7 @@ fn attention_flash2_hd256_matches_reference() {
         scale: 1.0 / (hd as f32).sqrt(),
         mask: infr_core::graph::AttnMask::SlidingWindow(64),
         pos: pos as u32,
+        sinks: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 401))),
@@ -3032,6 +3044,7 @@ fn attention_vec_hd256_sliding_window_parity() {
         scale: 1.0 / (hd as f32).sqrt(),
         mask: infr_core::graph::AttnMask::SlidingWindow(96),
         pos: pos as u32,
+        sinks: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 404))),
@@ -3066,6 +3079,7 @@ fn attention_flash2_sliding_window_parity() {
         scale: 1.0 / (hd as f32).sqrt(),
         mask: infr_core::graph::AttnMask::SlidingWindow(64),
         pos: pos as u32,
+        sinks: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 191))),
@@ -3100,6 +3114,7 @@ fn attention_long_context_split32_parity() {
         scale: 1.0 / (hd as f32).sqrt(),
         mask: infr_core::graph::AttnMask::Causal,
         pos: pos as u32,
+        sinks: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 51))),
@@ -3133,6 +3148,7 @@ fn attention_long_context_split32_hd96_parity() {
         scale: 1.0 / (hd as f32).sqrt(),
         mask: infr_core::graph::AttnMask::Causal,
         pos: pos as u32,
+        sinks: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 201))),
@@ -3168,6 +3184,7 @@ fn attention_vec_sliding_window_parity() {
         scale: 1.0 / (hd as f32).sqrt(),
         mask: infr_core::graph::AttnMask::SlidingWindow(win),
         pos: pos as u32,
+        sinks: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 211))),
@@ -3200,6 +3217,7 @@ fn attention_sliding_window_parity() {
         scale: 1.0 / (hd as f32).sqrt(),
         mask: infr_core::graph::AttnMask::SlidingWindow(win),
         pos: pos as u32,
+        sinks: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 44))),
@@ -3227,6 +3245,7 @@ fn gated_test(act: infr_core::graph::Activation, up_off: usize, seed: u64) {
         up_stride: 0,
         gate_stride: 0,
         gate_block_width: 0,
+        swiglu_clamp: None,
     });
     let bound = vec![
         (gate, f32_bytes(&rand_f32(rows * nff, seed))),
@@ -3266,6 +3285,7 @@ fn gatedactfused_parity() {
         rows: rows as u32,
         nff: nff as u32,
         act: infr_core::graph::Activation::Silu,
+        swiglu_clamp: None,
     });
     let bound = vec![(gu, f32_bytes(&rand_f32(rows * 2 * nff, 270)))];
     assert_parity(&g, &bound, dst, rows * nff, 1e-5);
@@ -3305,6 +3325,8 @@ fn moe_ffn_parity() {
         exp_probs_b: None,
         n_expert_groups: 0,
         n_expert_groups_used: 0,
+        swiglu_clamp: None,
+        expert_ids: None,
     });
     let bound = vec![
         (x, f32_bytes(&rand_f32(ne, 60))),
@@ -3351,6 +3373,8 @@ fn moe_quant_test(dtype: DType, synth: fn(usize, u32) -> Vec<u8>, seed: u32) {
         exp_probs_b: None,
         n_expert_groups: 0,
         n_expert_groups_used: 0,
+        swiglu_clamp: None,
+        expert_ids: None,
     });
     let bound = vec![
         (x, f32_bytes(&rand_f32(ne, seed as u64))),
@@ -3410,6 +3434,8 @@ fn moe_ffn_batched_rows_parity() {
         exp_probs_b: None,
         n_expert_groups: 0,
         n_expert_groups_used: 0,
+        swiglu_clamp: None,
+        expert_ids: None,
     });
     // x scaled down: the ~50x-real synthetic weights would push gate/up activations past f16
     // range (the kernels' operand precision) with unit-scale inputs — real hidden states don't.
@@ -3727,6 +3753,7 @@ fn attention_canvas_split32_matches_reference() {
         // `pos` is unused by Canvas (every row's bound is `[lo, kv_len)` regardless of position)
         // — 0 here matches how the denoise call site sizes it (see `Op::Attention`'s doc).
         pos: 0,
+        sinks: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 501))),
@@ -3760,6 +3787,7 @@ fn attention_canvas_split8_hd256_matches_reference() {
         scale: 1.0 / (hd as f32).sqrt(),
         mask: infr_core::graph::AttnMask::Canvas { lo },
         pos: 0,
+        sinks: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 511))),
@@ -4573,4 +4601,568 @@ fn lightning_indexer_parity() {
         println!("LightningIndexer metal {}: cpu={cpu:?}", c.name);
         assert_eq!(mtl, cpu, "LightningIndexer metal {}: diverges", c.name);
     }
+}
+
+// ── DeepSeek V4 attention primitives (docs/deepseek.md § Stage 4) ─────────────────────────────
+//
+// Metal-vs-CPU for the three ops slice 2 of stage 4 extended. The op-level references live with
+// the Vulkan probes (`infr-llama/tests/seam_op_parity.rs`); here the CPU interpreter — which those
+// references already validated — is the oracle, exactly as every other test in this file.
+// NOTE: this file has never run on Apple hardware in this session (no Apple hardware available);
+// the macOS CI job is the first real execution of these three.
+
+/// `Op::QkNorm { weight: None }` — deepseek4's weightless per-head Q norm. Heads with wildly
+/// different magnitudes, so a whole-row reduction (the mistake) cannot pass.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn qknorm_weightless_parity() {
+    let (rows, nh, hd) = (5usize, 8usize, 128usize);
+    let n = rows * nh * hd;
+    let mut g = Graph::new();
+    let x = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    g.push(Op::QkNorm {
+        x,
+        weight: None,
+        dst,
+        rows: rows as u32,
+        n_head: nh as u32,
+        head_dim: hd as u32,
+        eps: 1e-6,
+        x_stride: 0,
+    });
+    // Per-head magnitudes spanning 1e-2 .. 1e2: a row-wide norm would crush all but the largest.
+    let base = rand_f32(n, 4242);
+    let xi: Vec<f32> = base
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| v * [100.0f32, 0.01, 1.0, 30.0][((i / hd) % nh) % 4])
+        .collect();
+    let bound = vec![(x, f32_bytes(&xi))];
+    assert_parity(&g, &bound, dst, n, 1e-5);
+}
+
+/// `Op::Rope { backward: true }` — deepseek4's attention-output de-rope. Both legs are asserted:
+/// the backward rope against the CPU interpreter, and forward∘backward against the input (the
+/// property `Op::Rope::backward` claims). `rope_dim < head_dim` and non-trivial positions.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn rope_backward_parity() {
+    let (rows, nh, hd, rd) = (3usize, 4usize, 128usize, 64usize);
+    let n = rows * nh * hd;
+    let positions: Vec<i32> = vec![37, 38, 39];
+    let xi = rand_f32(n, 4243);
+    let ffv: Vec<f32> = (0..rd / 2).map(|i| 1.0 + i as f32 * 0.1).collect();
+
+    // Leg 1: a standalone backward rope, Metal vs CPU.
+    let mut g = Graph::new();
+    let x = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let pos = g.input(TensorDesc::new(vec![rows], DType::I32));
+    let ff = g.input(TensorDesc::new(vec![rd / 2], DType::F32));
+    let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    g.push(Op::Rope {
+        x,
+        positions: pos,
+        dst,
+        rows: rows as u32,
+        n_head: nh as u32,
+        head_dim: hd as u32,
+        rope_dim: rd as u32,
+        theta: 10000.0,
+        freq_factors: Some(ff),
+        x_stride: 0,
+        neox: false,
+        backward: true,
+    });
+    let bound = vec![
+        (x, f32_bytes(&xi)),
+        (pos, i32_bytes(&positions)),
+        (ff, f32_bytes(&ffv)),
+    ];
+    assert_parity(&g, &bound, dst, n, 1e-4);
+
+    // Leg 2: forward then backward must return the input, on the device.
+    let mut g2 = Graph::new();
+    let x2 = g2.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let pos2 = g2.input(TensorDesc::new(vec![rows], DType::I32));
+    let ff2 = g2.input(TensorDesc::new(vec![rd / 2], DType::F32));
+    let mid = g2.internal(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let dst2 = g2.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    for (src, out, backward) in [(x2, mid, false), (mid, dst2, true)] {
+        g2.push(Op::Rope {
+            x: src,
+            positions: pos2,
+            dst: out,
+            rows: rows as u32,
+            n_head: nh as u32,
+            head_dim: hd as u32,
+            rope_dim: rd as u32,
+            theta: 10000.0,
+            freq_factors: Some(ff2),
+            x_stride: 0,
+            neox: false,
+            backward,
+        });
+    }
+    let bound2 = vec![
+        (x2, f32_bytes(&xi)),
+        (pos2, i32_bytes(&positions)),
+        (ff2, f32_bytes(&ffv)),
+    ];
+    let mtl = run(
+        &MetalBackend::new().expect("metal backend"),
+        &g2,
+        &bound2,
+        dst2,
+        n,
+    );
+    assert_close(
+        &xi,
+        &mtl,
+        1e-4,
+        "metal rope forward∘backward is not the identity",
+    );
+}
+
+/// `Op::Attention { sinks }` — deepseek4's `attn_sinks`. Two regimes: a DOMINANT sink (which
+/// suppresses every real key, so an implementation that left the sink out of the denominator would
+/// return the sink-free output) and a NEGLIGIBLE one (which must leave the output alone). The
+/// sink-free run is taken on the same graph shape so the comparison isolates the sink.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_sinks_parity() {
+    let (rows, nh, nkv, hd) = (4usize, 4usize, 2usize, 64usize);
+    let kv_len = rows;
+    let n_out = rows * nh * hd;
+    let scale = 1.0 / (hd as f32).sqrt();
+    let qi = rand_f32(n_out, 4244);
+    let ki = rand_f32(kv_len * nkv * hd, 4245);
+    let vi = rand_f32(kv_len * nkv * hd, 4246);
+
+    let build = |with_sinks: bool| {
+        let mut g = Graph::new();
+        let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+        let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F32));
+        let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F32));
+        let sk = g.weight(TensorDesc::new(vec![nh], DType::F32));
+        let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+        g.push(Op::Attention {
+            q,
+            k_cache: kc,
+            v_cache: vc,
+            dst,
+            rows: rows as u32,
+            kv_len: kv_len as u32,
+            n_head: nh as u32,
+            n_kv: nkv as u32,
+            head_dim: hd as u32,
+            scale,
+            mask: infr_core::graph::AttnMask::Causal,
+            pos: 0,
+            sinks: with_sinks.then_some(sk),
+        });
+        (g, q, kc, vc, sk, dst)
+    };
+    let bind = |q, kc, vc, sk, sinks: Option<&[f32]>| {
+        let mut b = vec![
+            (q, f32_bytes(&qi)),
+            (kc, f32_bytes(&ki)),
+            (vc, f32_bytes(&vi)),
+        ];
+        if let Some(s) = sinks {
+            b.push((sk, f32_bytes(s)));
+        }
+        b
+    };
+
+    let dominant = vec![18.0f32; nh];
+    let negligible = vec![-18.0f32; nh];
+    for sinks in [&dominant, &negligible] {
+        let (g, q, kc, vc, sk, dst) = build(true);
+        assert_parity(&g, &bind(q, kc, vc, sk, Some(sinks)), dst, n_out, 1e-4);
+    }
+
+    // The dominant sink must actually change the answer, or the test above compares two runs that
+    // both ignored it.
+    let mtl_be = MetalBackend::new().expect("metal backend");
+    let (gs, q, kc, vc, sk, dst) = build(true);
+    let with = run(
+        &mtl_be,
+        &gs,
+        &bind(q, kc, vc, sk, Some(&dominant)),
+        dst,
+        n_out,
+    );
+    let (gn, q, kc, vc, sk, dst) = build(false);
+    let without = run(&mtl_be, &gn, &bind(q, kc, vc, sk, None), dst, n_out);
+    let gap = with
+        .iter()
+        .zip(&without)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        gap > 0.05,
+        "metal: a sink 18 above every score changed nothing (gap={gap:e}) — it never reached the \
+         denominator"
+    );
+}
+
+// ---- DeepSeek V4 Sinkhorn hyper-connections: `Op::HyperConnectMix` / `Pre` / `Post`
+// (`hyper_mix_f32`, `hyper_mix_gates_f32`, `hyper_pre_f32`, `hyper_post_f32`).
+//
+// The cases mirror `infr-llama`'s `hyper_connect_*` table case for case — same generators, same
+// axes (production `hc = 4`; `hc = 3`, not a power of two; `hc = 1`, a degenerate 1x1 Sinkhorn;
+// `hc = 8`, `HYPER_CONNECT_MAX_MULT`; `n_iter = 1`, where the asymmetric loop body never runs; the
+// `build_hc_head` form with no `post`/`comb`) — so a Metal-only divergence is identifiable by
+// case. That test is where the semantics are pinned against a from-definition f64 reference; this
+// one only asks whether the Metal kernels reproduce the CPU oracle.
+
+/// One hyper-connection case: `(name, rows, hc, n_embd, eps, n_iter, head)`.
+type HcCase = (&'static str, usize, usize, usize, f32, u32, bool);
+
+const HC_CASES: [HcCase; 7] = [
+    (
+        "production hc=4 n_iter=3, 7 tokens",
+        7,
+        4,
+        5,
+        1e-6,
+        3,
+        false,
+    ),
+    ("hc=4 n_iter=1 (lone norm_src)", 5, 4, 6, 1e-6, 1, false),
+    (
+        "hc=3 (not a power of two) n_iter=2",
+        6,
+        3,
+        7,
+        1e-6,
+        2,
+        false,
+    ),
+    ("hc=1 (degenerate 1x1) n_iter=4", 3, 1, 9, 1e-6, 4, false),
+    (
+        "hc=8 (HYPER_CONNECT_MAX_MULT) n_iter=5",
+        4,
+        8,
+        3,
+        1e-6,
+        5,
+        false,
+    ),
+    ("model head form (pre only), hc=4", 7, 4, 5, 1e-6, 3, true),
+    ("large eps 1e-2, hc=4 n_iter=3", 5, 4, 4, 1e-2, 3, false),
+];
+
+fn hc_mix_dim(hc: usize, head: bool) -> usize {
+    if head {
+        hc
+    } else {
+        (2 + hc) * hc
+    }
+}
+
+/// Same generators as `infr-llama`'s `hc_mixes` / `hc_scale_base`.
+fn hc_inputs(rows: usize, hc: usize, head: bool) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let md = hc_mix_dim(hc, head);
+    let mixes = (0..rows * md)
+        .map(|i| (((i * 37 + 11) % 23) as f32 - 11.0) * 0.31)
+        .collect();
+    let scale = vec![0.7f32, -1.3, 1.9][..if head { 1 } else { 3 }].to_vec();
+    let base = (0..md)
+        .map(|i| (((i * 13 + 5) % 17) as f32 - 8.0) * 0.17)
+        .collect();
+    (mixes, scale, base)
+}
+
+/// Build one `Op::HyperConnectMix` graph plus its bound inputs and the (id, len) reads.
+#[allow(clippy::type_complexity)]
+fn hc_mix_graph(
+    rows: usize,
+    hc: usize,
+    eps: f32,
+    n_iter: u32,
+    head: bool,
+) -> (Graph, Vec<(TensorId, Vec<u8>)>, Vec<(TensorId, usize)>) {
+    let md = hc_mix_dim(hc, head);
+    let (mixes, scale, base) = hc_inputs(rows, hc, head);
+    let mut g = Graph::new();
+    let mx = g.input(TensorDesc::new(vec![rows * md], DType::F32));
+    let sc = g.weight(TensorDesc::new(vec![scale.len()], DType::F32));
+    let bs = g.weight(TensorDesc::new(vec![md], DType::F32));
+    let pre = g.output(TensorDesc::new(vec![rows * hc], DType::F32));
+    let gates = (!head).then(|| infr_core::graph::HyperGates {
+        post: g.output(TensorDesc::new(vec![rows * hc], DType::F32)),
+        comb: g.output(TensorDesc::new(vec![rows * hc * hc], DType::F32)),
+    });
+    g.push(Op::HyperConnectMix {
+        mixes: mx,
+        scale: sc,
+        base: bs,
+        pre,
+        gates,
+        rows: rows as u32,
+        hc: hc as u32,
+        eps,
+        n_iter,
+    });
+    let bound = vec![
+        (mx, f32_bytes(&mixes)),
+        (sc, f32_bytes(&scale)),
+        (bs, f32_bytes(&base)),
+    ];
+    let mut reads = vec![(pre, rows * hc)];
+    if let Some(gt) = gates {
+        reads.push((gt.post, rows * hc));
+        reads.push((gt.comb, rows * hc * hc));
+    }
+    (g, bound, reads)
+}
+
+/// `Op::HyperConnectMix` — Metal vs the CPU oracle, all three outputs.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn hyper_connect_mix_parity() {
+    for (name, rows, hc, _ne, eps, n_iter, head) in HC_CASES {
+        let (g, bound, reads) = hc_mix_graph(rows, hc, eps, n_iter, head);
+        let cpu = run_multi(&CpuBackend::new(), &g, &bound, &reads);
+        let mtl = run_multi(
+            &MetalBackend::new().expect("metal backend"),
+            &g,
+            &bound,
+            &reads,
+        );
+        for (i, label) in ["pre", "post", "comb"].iter().enumerate().take(reads.len()) {
+            // Same bound as `infr-llama`'s HC_TOL: these outputs are O(1), and a GPU `exp` is only
+            // required to be within a few ULP of the host's.
+            assert_close(
+                &cpu[i],
+                &mtl[i],
+                1e-5,
+                &format!("HyperConnectMix {name} {label}"),
+            );
+        }
+    }
+}
+
+/// `Op::HyperConnectPre` — Metal vs CPU. The `hc` streams differ in magnitude by `100^h`, so a
+/// collapse that dropped `weights` or picked the wrong stream is off by orders of magnitude.
+/// `weights` is a real `Op::HyperConnectMix` output, so the pair is exercised as it will be wired.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn hyper_connect_pre_parity() {
+    for (name, rows, hc, ne, eps, n_iter, head) in HC_CASES {
+        let (mg, mbound, mreads) = hc_mix_graph(rows, hc, eps, n_iter, head);
+        let w = run_multi(&CpuBackend::new(), &mg, &mbound, &mreads).swap_remove(0);
+        let x: Vec<f32> = (0..rows * hc * ne)
+            .map(|i| {
+                let h = (i / ne) % hc;
+                (((i * 7 + 3) % 11) as f32 - 5.0) * 0.25 * 100f32.powi(h as i32)
+            })
+            .collect();
+        let mut g = Graph::new();
+        let xi = g.input(TensorDesc::new(vec![rows * hc * ne], DType::F32));
+        let wi = g.input(TensorDesc::new(vec![rows * hc], DType::F32));
+        let dst = g.output(TensorDesc::new(vec![rows * ne], DType::F32));
+        g.push(Op::HyperConnectPre {
+            x: xi,
+            weights: wi,
+            dst,
+            rows: rows as u32,
+            hc: hc as u32,
+            n_embd: ne as u32,
+        });
+        println!("HyperConnectPre metal case: {name}");
+        // `assert_parity`'s error is relative to `max(|cpu|, 1)`, which is what makes the 1e6-scale
+        // streams comparable at all.
+        assert_parity(
+            &g,
+            &[(xi, f32_bytes(&x)), (wi, f32_bytes(&w))],
+            dst,
+            rows * ne,
+            1e-5,
+        );
+    }
+}
+
+/// `Op::HyperConnectPost` — Metal vs CPU, with `post`/`comb` taken from a real
+/// `Op::HyperConnectMix` run and residual streams again spread over `100^h`.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn hyper_connect_post_parity() {
+    for (name, rows, hc, ne, eps, n_iter, head) in HC_CASES {
+        if head {
+            continue; // the head form has no post/comb, and no sublayer to wrap
+        }
+        let (mg, mbound, mreads) = hc_mix_graph(rows, hc, eps, n_iter, head);
+        let mixed = run_multi(&CpuBackend::new(), &mg, &mbound, &mreads);
+        let (post, comb) = (&mixed[1], &mixed[2]);
+        let residual: Vec<f32> = (0..rows * hc * ne)
+            .map(|i| {
+                let h = (i / ne) % hc;
+                (((i * 5 + 2) % 13) as f32 - 6.0) * 0.25 * 100f32.powi(h as i32)
+            })
+            .collect();
+        let x: Vec<f32> = (0..rows * ne)
+            .map(|i| (((i * 11 + 4) % 9) as f32 - 4.0) * 0.5)
+            .collect();
+        let mut g = Graph::new();
+        let xi = g.input(TensorDesc::new(vec![rows * ne], DType::F32));
+        let ri = g.input(TensorDesc::new(vec![rows * hc * ne], DType::F32));
+        let pi = g.input(TensorDesc::new(vec![rows * hc], DType::F32));
+        let ci = g.input(TensorDesc::new(vec![rows * hc * hc], DType::F32));
+        let dst = g.output(TensorDesc::new(vec![rows * hc * ne], DType::F32));
+        g.push(Op::HyperConnectPost {
+            x: xi,
+            residual: ri,
+            post: pi,
+            comb: ci,
+            dst,
+            rows: rows as u32,
+            hc: hc as u32,
+            n_embd: ne as u32,
+        });
+        println!("HyperConnectPost metal case: {name}");
+        assert_parity(
+            &g,
+            &[
+                (xi, f32_bytes(&x)),
+                (ri, f32_bytes(&residual)),
+                (pi, f32_bytes(post)),
+                (ci, f32_bytes(comb)),
+            ],
+            dst,
+            rows * hc * ne,
+            1e-5,
+        );
+    }
+}
+
+// ── DeepSeek V4: per-layer SwiGLU clamping + hash-routed MoE (docs/deepseek.md § Stage 4). ──
+// CPU is the oracle, as everywhere in this file; the arithmetic itself is pinned against a
+// from-definition reference in infr-llama's `seam_op_parity.rs` (`swiglu_clamp_*`, `moe_hash_*`).
+
+/// `Op::GatedAct` / `Op::GatedActFused` with V4's clamp: `act(min(gate, limit)) * clamp(up, ±limit)`.
+/// Inputs are scaled past the limit on BOTH sides so the one-sided gate bound and the symmetric
+/// `up` bound both bite (an unclamped range would make this a no-op test).
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn gatedact_swiglu_clamp_parity() {
+    let (rows, nff) = (3usize, 512usize);
+    let limit = 0.5f32;
+    let clamp = infr_core::graph::swiglu_clamp(limit);
+    let wide =
+        |n: usize, seed: u64| -> Vec<f32> { rand_f32(n, seed).iter().map(|v| v * 6.0).collect() };
+    let gi = wide(rows * nff, 910);
+    let ui = wide(rows * nff, 911);
+
+    let mut g = Graph::new();
+    let gate = g.input(TensorDesc::new(vec![rows, nff], DType::F32));
+    let up = g.input(TensorDesc::new(vec![rows, nff], DType::F32));
+    let dst = g.output(TensorDesc::new(vec![rows, nff], DType::F32));
+    g.push(Op::GatedAct {
+        gate,
+        up,
+        dst,
+        rows: rows as u32,
+        nff: nff as u32,
+        act: infr_core::graph::Activation::Silu,
+        up_off: 0,
+        up_stride: 0,
+        gate_stride: 0,
+        gate_block_width: 0,
+        swiglu_clamp: clamp,
+    });
+    assert_parity(
+        &g,
+        &[(gate, f32_bytes(&gi)), (up, f32_bytes(&ui))],
+        dst,
+        rows * nff,
+        1e-5,
+    );
+
+    let gu: Vec<f32> = (0..rows)
+        .flat_map(|r| {
+            gi[r * nff..(r + 1) * nff]
+                .iter()
+                .chain(&ui[r * nff..(r + 1) * nff])
+                .copied()
+                .collect::<Vec<f32>>()
+        })
+        .collect();
+    let mut g2 = Graph::new();
+    let gub = g2.input(TensorDesc::new(vec![rows, 2 * nff], DType::F32));
+    let dst2 = g2.output(TensorDesc::new(vec![rows, nff], DType::F32));
+    g2.push(Op::GatedActFused {
+        gu: gub,
+        dst: dst2,
+        rows: rows as u32,
+        nff: nff as u32,
+        act: infr_core::graph::Activation::Silu,
+        swiglu_clamp: clamp,
+    });
+    assert_parity(&g2, &[(gub, f32_bytes(&gu))], dst2, rows * nff, 1e-5);
+}
+
+/// `Op::MoeFfn` with V4's hash routing (pre-gathered `[rows, n_used]` expert ids) and the routed-
+/// expert SwiGLU clamp. f32 expert banks, so this exercises Metal's HOST MoE fallback; the device
+/// path's own `moe_topk` hash branch and clamped `gatedact_f32` push are covered by the quantized
+/// tests' shapes only once a quantized V4 bank exists — see docs/backlog.md.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn moe_ffn_hash_routing_parity() {
+    let (ne, n_expert, n_used, nff) = (64usize, 8usize, 2usize, 128usize);
+    let rows = 2usize;
+    // Row 0 → {5, 2}; row 1 → {7, 0}. Disjoint, so a fallback to top-k moves the output.
+    let ids: [u32; 4] = [5, 2, 7, 0];
+    let mut g = Graph::new();
+    let x = g.input(TensorDesc::new(vec![rows, ne], DType::F32));
+    let eids = g.input(TensorDesc::new(vec![rows, n_used], DType::I32));
+    let router = g.weight(TensorDesc::new(vec![n_expert, ne], DType::F32));
+    let gate = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::F32));
+    let up = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::F32));
+    let down = g.weight(TensorDesc::new(vec![n_expert, ne, nff], DType::F32));
+    let dst = g.output(TensorDesc::new(vec![rows, ne], DType::F32));
+    g.push(Op::MoeFfn {
+        x,
+        router_x: x,
+        router,
+        gate_exps: gate,
+        up_exps: up,
+        down_exps: down,
+        down_scale: None,
+        fused_gate_up: false,
+        dst,
+        ne: ne as u32,
+        n_expert: n_expert as u32,
+        n_used: n_used as u32,
+        n_ff_exp: nff as u32,
+        scale: 1.0,
+        act: infr_core::graph::Activation::Silu,
+        // Metal's MoE arm implements softmax gating only (V4's sqrt-softplus is refused there),
+        // so this covers the ROUTING and CLAMP changes on the gating Metal does support.
+        gating: infr_core::graph::MoeGating::Softmax,
+        norm_w: true,
+        weight_before: false,
+        ep_band: None,
+        exp_probs_b: None,
+        n_expert_groups: 0,
+        n_expert_groups_used: 0,
+        swiglu_clamp: infr_core::graph::swiglu_clamp(0.5),
+        expert_ids: Some(eids),
+    });
+    let bound = vec![
+        (x, f32_bytes(&rand_f32(rows * ne, 920))),
+        (
+            eids,
+            ids.iter()
+                .flat_map(|e| e.to_ne_bytes())
+                .collect::<Vec<u8>>(),
+        ),
+        (router, f32_bytes(&rand_f32(n_expert * ne, 921))),
+        (gate, f32_bytes(&rand_f32(n_expert * nff * ne, 922))),
+        (up, f32_bytes(&rand_f32(n_expert * nff * ne, 923))),
+        (down, f32_bytes(&rand_f32(n_expert * ne * nff, 924))),
+    ];
+    assert_parity(&g, &bound, dst, rows * ne, 1e-3);
 }

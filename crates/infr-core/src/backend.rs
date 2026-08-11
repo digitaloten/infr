@@ -91,7 +91,11 @@ pub struct Capabilities {
     /// HUNG the GPU on an older Mesa (commit ad82a77; the standalone `coopmat_int8_test` harness
     /// confirmed the fix). The kernel is therefore an ADDITIONAL opt-in gate on top of this:
     /// the adapter only dispatches it when `INFR_I8_COOPMAT=1` is also set (default off) — see
-    /// adapter.rs's `Op::Linear` GEMM branch.
+    /// adapter.rs's `Op::Linear` GEMM branch. The Vulkan backend adds a third gate the other
+    /// tiers have no equivalent of: the kernel reads its accumulator elements at a (row,col)
+    /// mapping the cooperative-matrix spec fixes per IMPLEMENTATION, so that mapping is checked
+    /// against a known-answer product on the actual device before the tier is armed
+    /// (`VulkanBackend::verify_i8_coopmat_layout`).
     pub coopmat_i8: Option<(u32, u32, u32)>,
     /// bf16 (bfloat16) scalar storage/convert support (`VK_KHR_shader_bfloat16`-class). Distinct
     /// from `f16` (IEEE half): same 16 bits but 8 exponent / 7 mantissa. False on RDNA3.
@@ -679,8 +683,9 @@ mod tests {
     /// knob — and it must never return 0 (a zero-row prefill chunk would not terminate).
     #[test]
     fn integrated_ubatch_rows_is_a_bounded_shrink() {
-        // Unknown CU count (the common case: only AMD reports one) takes the conservative floor —
-        // the ~2-CU RDNA2 iGPU the 128-row figure is calibrated on.
+        // Unknown CU count takes the conservative floor — the ~2-CU RDNA2 iGPU the 128-row figure
+        // is calibrated on. Still reachable: `caps::shader_core_count` covers AMD, NVIDIA and the
+        // Intel parts in its table, but a device outside all three sources reports nothing.
         assert_eq!(integrated_ubatch_rows(0), 128);
         assert_eq!(integrated_ubatch_rows(2), 128); // the calibrated part
         assert_eq!(integrated_ubatch_rows(1), 128); // never below the floor

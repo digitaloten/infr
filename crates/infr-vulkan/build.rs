@@ -520,6 +520,10 @@ fn main() {
         // f16-in/f16-out RMSNorm (llama4's post-rope weightless Q/K L2-norm, `Op::QkNorm` on the
         // f16 rope scratch — `w` stays f32).
         ("rmsnorm", "rmsnorm_f16", &["-DF16IO"]),
+        // Weightless RMSNorm — no `w` binding, no multiply (`Op::QkNorm { weight: None }`,
+        // deepseek4's bare per-head `ggml_rms_norm` on Q). f32 only; the adapter refuses a
+        // weightless f16 QkNorm rather than carry a build nothing dispatches.
+        ("rmsnorm", "rmsnorm_nw", &["-DNO_WEIGHT"]),
         // Mean-centred LayerNorm (deepseek32's `indexer_k_norm`, Op::LayerNorm) — a separate
         // shader, not an rmsnorm build: it needs two cooperative reductions and a bias binding.
         ("layernorm", "layernorm", &[]),
@@ -527,6 +531,13 @@ fn main() {
         // expansion of its indices into the additive score mask `Op::Mla` adds (Op::TopkMask).
         ("lightning_indexer", "lightning_indexer", &[]),
         ("topk_mask", "topk_mask", &[]),
+        // DeepSeek V4 Sinkhorn hyper-connections (Op::HyperConnectMix / Pre / Post). `-DGATES`
+        // adds the `post` + `comb` outputs; without it the mix kernel is `build_hc_head`'s
+        // pre-only form, whose `mixes` is the pre chunk alone.
+        ("hyper_mix", "hyper_mix", &[]),
+        ("hyper_mix", "hyper_mix_gates", &["-DGATES"]),
+        ("hyper_pre", "hyper_pre", &[]),
+        ("hyper_post", "hyper_post", &[]),
         ("softmax", "softmax", &[]),
         // DiffusionGemma denoise self-conditioning perf: scale read from a device buffer instead
         // of a push constant (see `Op::Softmax::scale_buf`'s doc + `Recorder::softmax_dyn`).
@@ -657,6 +668,13 @@ fn main() {
         // shape that caller has; the adapter refuses neox on the f16/dyn paths.
         ("rope", "rope_neox", &["-DNEOX"]),
         ("rope", "rope_ff_neox", &["-DFREQ_FACTORS", "-DNEOX"]),
+        // De-roping (`Op::Rope::backward`, llama.cpp's `ggml_rope_ext_back`): `sin` negated, `cos`
+        // untouched. deepseek4 de-ropes its attention OUTPUT, an f32 scratch, and its rope is NORM
+        // — so the same static-f32 rule as NEOX above, with and without YaRN freq_factors (V4's
+        // ratio-0 layers rope plain, its compressed layers rope YaRN). The adapter refuses
+        // backward on the f16/dyn/neox paths.
+        ("rope", "rope_back", &["-DBACKWARD"]),
+        ("rope", "rope_ff_back", &["-DFREQ_FACTORS", "-DBACKWARD"]),
         ("rope", "rope_f16", &["-DOUT_F16"]),
         ("rope", "rope_f16_dyn", &["-DOUT_F16", "-DUSE_PARAMS"]),
         ("linear_f16", "linear_f16", &[]),
@@ -697,6 +715,11 @@ fn main() {
         ("attn_live", "attn_live", &[]),
         ("attention_kv", "attention_kv", &[]),
         ("attention_kv", "attention_kv_dyn", &["-DUSE_PARAMS"]),
+        // Per-head attention sinks (`Op::Attention::sinks`, deepseek4's `attn_sinks`): one extra
+        // logit per head in the softmax max + denominator, no value contribution. ONE build — plain
+        // f16 KV, static, bound (no Q8 / BDA / params twins): the adapter forces a sinks op onto
+        // this scalar path and errors on the shapes it can't serve.
+        ("attention_kv", "attention_kv_sinks", &["-DSINKS"]),
         // Planar Q8_0 KV cache: scalar dequant-on-read variants. K/V decouple (-DKQ8 / -DVQ8) → 3
         // quant combos for the STATIC scalar path; coupled-only for the record-once (dead for Q8).
         ("attention_kv", "attention_kv_q8", &["-DKQ8", "-DVQ8"]),
@@ -3186,6 +3209,10 @@ fn main() {
             ],
         ),
         ("splitk_reduce", "splitk_reduce", &[]),
+        // Known-answer probe for the int8 coopmat accumulator fragment layout the i8cm GEMM reads
+        // its `csub[i]` elements with — dispatched at init when that tier is opted into, and the
+        // tier is REFUSED when the readback disagrees (see caps.rs `check_i8_coopmat_layout`).
+        ("coopmat_i8_layout", "coopmat_i8_layout", &[]),
         ("native_gemm", "native_gemm_q8_0", &["-DFMT_Q8_0"]),
         ("native_gemm", "native_gemm_bf16", &["-DFMT_BF16"]),
         ("native_gemm", "native_gemm_q4_0", &["-DFMT_Q4_0"]),

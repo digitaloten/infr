@@ -1477,11 +1477,17 @@ impl<'a> Recorder<'a> {
         let range = (vb.size as u64)
             .next_multiple_of(256)
             .min(block_len - vb.sub_offset as u64);
-        debug_assert!(
-            range <= u32::MAX as u64,
-            "resident-BDA sub-tensor range ({range} bytes) exceeds 4 GiB — this tensor must be \
-             read through its 64-bit device_addr() via a -DSTREAMED twin, never bound as a \
-             descriptor"
+        // Checked in RELEASE too, and against the limit this DEVICE reported rather than the 4 GiB
+        // a `u32` range field could hold (see `crate::max_storage_buffer_range`): a bind past
+        // `maxStorageBufferRange` is a VUID violation whose consequence is whatever the driver
+        // does with an out-of-range descriptor, and the old debug-only assert never ran in the
+        // builds that ship. One compare on a path that already does two.
+        let range_cap = crate::max_storage_buffer_range() as u64;
+        assert!(
+            range <= range_cap,
+            "resident-BDA sub-tensor range ({range} bytes) exceeds this device's \
+             maxStorageBufferRange ({range_cap}) — this tensor must be read through its 64-bit \
+             device_addr() via a -DSTREAMED twin, never bound as a descriptor"
         );
         vk::DescriptorBufferInfo {
             buffer: vb.buffer,
@@ -2445,9 +2451,13 @@ impl<'a> Recorder<'a> {
     }
 
     /// int8 cooperative-matrix (WMMA) prefill GEMM for Q8_0 weights — MEASUREMENT kernel, gated by
-    /// the adapter behind `INFR_I8_COOPMAT=1` + `caps.i8_coopmat` (see
+    /// the adapter behind [`VulkanBackend::i8_coopmat_ready`] (`INFR_I8_COOPMAT=1` +
+    /// `caps.i8_coopmat` + this driver having PASSED the accumulator-layout probe; see
     /// `native_gemm_i8cm_q8_0.comp` for the design doc: 16x16 tile per workgroup, per-Q8_0-block
-    /// int32 WMMA dot + shared-mem store/scale epilogue). `qa`/`dact` from `quant_q8`. `c` is
+    /// int32 WMMA dot + in-fragment scale epilogue). The layout gate is the ADAPTER's, not this
+    /// method's — a direct caller (the `parity`-feature resident-vs-streamed test) dispatches the
+    /// kernel deliberately and compares two spellings of it against each other, which stays
+    /// meaningful whatever the fragment layout is. `qa`/`dact` from `quant_q8`. `c` is
     /// `ceil(m/64)*64` rows (same padding convention as `matmul_native_off`). Requires `n%16==0`,
     /// `k%32==0`.
     #[allow(clippy::too_many_arguments)]
@@ -4111,6 +4121,119 @@ impl<'a> Recorder<'a> {
         self.dispatch_wide(k, &[Self::vkb(idx), Self::vkb(dst)], 1, &push, rows);
     }
 
+    /// DeepSeek V4 hyper-connection coefficients (`hyper_mix.comp`, `Op::HyperConnectMix`): one
+    /// thread per token computes `pre`, and — when `gates` is `Some((post, comb))` — `post` plus
+    /// the Sinkhorn-normalised `hc x hc` mixing matrix. `mix_dim` is `(2 + hc)*hc` with gates and
+    /// `hc` without (`build_hc_head`'s narrower `mixes`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn hyper_mix(
+        &self,
+        mixes: &dyn Buffer,
+        scale: &dyn Buffer,
+        base: &dyn Buffer,
+        pre: &dyn Buffer,
+        gates: Option<(&dyn Buffer, &dyn Buffer)>,
+        rows: u32,
+        hc: u32,
+        eps: f32,
+        n_iter: u32,
+    ) {
+        let mut bufs = vec![
+            Self::vkb(mixes),
+            Self::vkb(scale),
+            Self::vkb(base),
+            Self::vkb(pre),
+        ];
+        let mix_dim = match gates {
+            Some((post, comb)) => {
+                bufs.push(Self::vkb(post));
+                bufs.push(Self::vkb(comb));
+                (2 + hc) * hc
+            }
+            None => hc,
+        };
+        let (name, spv) = match gates {
+            Some(_) => ("hyper_mix_gates", crate::gemm::hyper_mix_gates_spv()),
+            None => ("hyper_mix", crate::gemm::hyper_mix_spv()),
+        };
+        let k = self.be.kernel(name, spv, bufs.len(), 20);
+        let mut push = [0u8; 20];
+        push[0..4].copy_from_slice(&rows.to_ne_bytes());
+        push[4..8].copy_from_slice(&hc.to_ne_bytes());
+        push[8..12].copy_from_slice(&mix_dim.to_ne_bytes());
+        push[12..16].copy_from_slice(&eps.to_ne_bytes());
+        push[16..20].copy_from_slice(&n_iter.to_ne_bytes());
+        // `pre` and (with gates) `post` + `comb` are the writes — the trailing bindings.
+        let n_out = if gates.is_some() { 3 } else { 1 };
+        self.dispatch(k, &bufs, n_out, &push, rows.div_ceil(64));
+    }
+
+    /// DeepSeek V4 hyper-connection stream collapse (`hyper_pre.comp`, `Op::HyperConnectPre`):
+    /// `dst[t, i] = Σ_h x[t, h, i] * w[t, h]`, one thread per output element.
+    pub fn hyper_pre(
+        &self,
+        x: &dyn Buffer,
+        w: &dyn Buffer,
+        dst: &dyn Buffer,
+        rows: u32,
+        hc: u32,
+        n_embd: u32,
+    ) {
+        let total = rows * n_embd;
+        let k = self
+            .be
+            .kernel("hyper_pre", crate::gemm::hyper_pre_spv(), 3, 12);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&hc.to_ne_bytes());
+        push[4..8].copy_from_slice(&n_embd.to_ne_bytes());
+        push[8..12].copy_from_slice(&total.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(w), Self::vkb(dst)],
+            1,
+            &push,
+            total.div_ceil(64),
+        );
+    }
+
+    /// DeepSeek V4 hyper-connection stream re-expansion (`hyper_post.comp`,
+    /// `Op::HyperConnectPost`): `dst[t, d, i] = x[t,i]*post[t,d] + Σ_src res[t,src,i]*comb[t,
+    /// d + hc*src]`, one thread per output element.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hyper_post(
+        &self,
+        x: &dyn Buffer,
+        residual: &dyn Buffer,
+        post: &dyn Buffer,
+        comb: &dyn Buffer,
+        dst: &dyn Buffer,
+        rows: u32,
+        hc: u32,
+        n_embd: u32,
+    ) {
+        let total = rows * hc * n_embd;
+        let k = self
+            .be
+            .kernel("hyper_post", crate::gemm::hyper_post_spv(), 5, 12);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&hc.to_ne_bytes());
+        push[4..8].copy_from_slice(&n_embd.to_ne_bytes());
+        push[8..12].copy_from_slice(&total.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[
+                Self::vkb(x),
+                Self::vkb(residual),
+                Self::vkb(post),
+                Self::vkb(comb),
+                Self::vkb(dst),
+            ],
+            1,
+            &push,
+            total.div_ceil(64),
+        );
+    }
+
     /// DeepSeek V3.2 lightning indexer (`lightning_indexer.comp`, `Op::LightningIndexer`): scores
     /// every cached key against the row's indexer heads and writes the top-`top_k` key indices.
     /// One workgroup per query row — the dispatch below is `rows` groups, and each group's 256
@@ -4201,6 +4324,26 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             k,
             &[Self::vkb(x), Self::vkb(w), Self::vkb(y)],
+            1,
+            &push,
+            rows as u32, // one workgroup per row (cooperative reduction)
+        );
+    }
+
+    /// WEIGHTLESS RMSNorm: `y[i] = x[i] * inversesqrt(mean(x²) + eps)`, one workgroup per row
+    /// (`rmsnorm.comp`'s -DNO_WEIGHT build) — `Op::QkNorm { weight: None }`, deepseek4's bare
+    /// per-head `ggml_rms_norm` on Q. Same reduction as [`Self::rmsnorm`], one binding fewer.
+    pub fn rmsnorm_nw(&self, x: &dyn Buffer, y: &dyn Buffer, rows: usize, dim: usize, eps: f32) {
+        let k = self
+            .be
+            .kernel_sg("rmsnorm_nw", crate::gemm::rmsnorm_nw_spv(), 2, 12, 32);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(dim as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&eps.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(y)],
             1,
             &push,
             rows as u32, // one workgroup per row (cooperative reduction)
@@ -4363,6 +4506,10 @@ impl<'a> Recorder<'a> {
         // second compile-time build rather than a push-constant branch, so the existing NORM
         // pipelines and their push layout are untouched.
         neox: bool,
+        // De-rope: negate `sin`, leave `cos` (`Op::Rope::backward` / `ggml_rope_ext_back`). Same
+        // compile-time-build treatment as `neox`. NORM only — deepseek4's de-rope is NORM, and a
+        // build nothing dispatches is a build nothing tests, so the adapter refuses neox+backward.
+        backward: bool,
     ) {
         let mut push = [0u8; 28];
         push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
@@ -4377,6 +4524,9 @@ impl<'a> Recorder<'a> {
                 let k = if neox {
                     self.be
                         .kernel("rope_ff_neox", crate::gemm::rope_ff_neox_spv(), 3, 28)
+                } else if backward {
+                    self.be
+                        .kernel("rope_ff_back", crate::gemm::rope_ff_back_spv(), 3, 28)
                 } else {
                     self.be.kernel("rope_ff", crate::gemm::rope_ff_spv(), 3, 28)
                 };
@@ -4395,6 +4545,9 @@ impl<'a> Recorder<'a> {
                 let k = if neox {
                     self.be
                         .kernel("rope_neox", crate::gemm::rope_neox_spv(), 2, 28)
+                } else if backward {
+                    self.be
+                        .kernel("rope_back", crate::gemm::rope_back_spv(), 2, 28)
                 } else {
                     self.be.kernel("rope", crate::gemm::rope_spv(), 2, 28)
                 };
@@ -4527,6 +4680,64 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             kern,
             &[Self::vkb(q), Self::vkb(kc), Self::vkb(vc), Self::vkb(o)],
+            1,
+            &push,
+            (q_len * nh) as u32,
+        );
+    }
+
+    /// [`Self::attention_kv`] plus per-head ATTENTION SINKS (`attention_kv.comp`'s -DSINKS build,
+    /// `Op::Attention::sinks`): `sinks[nh]` f32 binds at slot 3 (output last at 4), and each head's
+    /// sink logit joins the softmax max and denominator without contributing a value row.
+    ///
+    /// f16 KV, bound, static — no Q8/BDA/params twins, so the adapter must have already refused
+    /// those shapes. Doing it that way (rather than adding SINKS to every tier) keeps the sinks
+    /// arithmetic in ONE kernel; deepseek4's wiring slice can widen it if the perf demands.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_kv_sinks(
+        &self,
+        q: &dyn Buffer,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        sinks: &dyn Buffer,
+        o: &dyn Buffer,
+        q_len: usize,
+        kv_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        pos_offset: usize,
+        window: usize,
+        scale: f32,
+        cap: usize,
+    ) {
+        let kern = self.be.kernel(
+            "attention_kv_sinks",
+            crate::gemm::attention_kv_sinks_spv(),
+            5,
+            36,
+        );
+        let mut push = [0u8; 36];
+        push[0..4].copy_from_slice(&(q_len as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(nh as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(nkv as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(hd as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&(pos_offset as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&scale.to_ne_bytes());
+        push[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
+        self.dispatch(
+            kern,
+            // `o` LAST: the trailing `n_out` bindings are the hazard-tracked writes, so the sinks
+            // weight must bind before it (same rule as `rope_ff`'s divisors and `mla_bias`).
+            &[
+                Self::vkb(q),
+                Self::vkb(kc),
+                Self::vkb(vc),
+                Self::vkb(sinks),
+                Self::vkb(o),
+            ],
             1,
             &push,
             (q_len * nh) as u32,
@@ -7245,14 +7456,24 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// Fused SwiGLU over a combined `gu` `[rows, 2*nff]` → `y` `[rows, nff]`.
-    pub fn silu_mul_fused(&self, gu: &dyn Buffer, y: &dyn Buffer, rows: usize, nff: usize) {
+    /// Fused SwiGLU over a combined `gu` `[rows, 2*nff]` → `y` `[rows, nff]`. `clamp` is DeepSeek
+    /// V4's per-layer SwiGLU limit (`Op::GatedActFused::swiglu_clamp`); `None` for every other arch.
+    pub fn silu_mul_fused(
+        &self,
+        gu: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        nff: usize,
+        clamp: Option<f32>,
+    ) {
         let k = self
             .be
-            .kernel("silu_mul_fused", crate::gemm::silu_mul_fused_spv(), 2, 8);
-        let mut push = [0u8; 8];
+            .kernel("silu_mul_fused", crate::gemm::silu_mul_fused_spv(), 2, 16);
+        let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(nff as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(u32::from(clamp.is_some())).to_ne_bytes());
+        push[12..16].copy_from_slice(&clamp.unwrap_or(0.0).to_ne_bytes());
         // Thread-per-element kernel (local_size 64) — dispatch element-count/64 workgroups.
         self.dispatch(
             k,
@@ -7265,13 +7486,22 @@ impl<'a> Recorder<'a> {
 
     /// Fused GeGLU (GELU tanh-approx gate) over a combined `gu` `[rows, 2*nff]` → `y` `[rows, nff]`.
     /// Same layout/dispatch as [`silu_mul_fused`]; gemma uses GELU instead of SiLU.
-    pub fn gelu_mul_fused(&self, gu: &dyn Buffer, y: &dyn Buffer, rows: usize, nff: usize) {
+    pub fn gelu_mul_fused(
+        &self,
+        gu: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        nff: usize,
+        clamp: Option<f32>,
+    ) {
         let k = self
             .be
-            .kernel("gelu_mul_fused", crate::gemm::gelu_mul_fused_spv(), 2, 8);
-        let mut push = [0u8; 8];
+            .kernel("gelu_mul_fused", crate::gemm::gelu_mul_fused_spv(), 2, 16);
+        let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(nff as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(u32::from(clamp.is_some())).to_ne_bytes());
+        push[12..16].copy_from_slice(&clamp.unwrap_or(0.0).to_ne_bytes());
         // Thread-per-element kernel (local_size 64) — dispatch element-count/64 workgroups.
         self.dispatch(
             k,
@@ -7282,12 +7512,23 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    pub fn silu_mul(&self, gate: &dyn Buffer, up: &dyn Buffer, y: &dyn Buffer, n: usize) {
+    /// SwiGLU over separate contiguous `gate`/`up` buffers. `clamp` is DeepSeek V4's per-layer
+    /// SwiGLU limit (`Op::GatedAct::swiglu_clamp`); `None` for every other arch.
+    pub fn silu_mul(
+        &self,
+        gate: &dyn Buffer,
+        up: &dyn Buffer,
+        y: &dyn Buffer,
+        n: usize,
+        clamp: Option<f32>,
+    ) {
         let k = self
             .be
-            .kernel("silu_mul", crate::gemm::silu_mul_spv(), 3, 28);
-        let mut push = [0u8; 28];
+            .kernel("silu_mul", crate::gemm::silu_mul_spv(), 3, 36);
+        let mut push = [0u8; 36];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&(u32::from(clamp.is_some())).to_ne_bytes());
+        push[32..36].copy_from_slice(&clamp.unwrap_or(0.0).to_ne_bytes());
         self.dispatch(
             k,
             &[Self::vkb(gate), Self::vkb(up), Self::vkb(y)],
@@ -7940,8 +8181,12 @@ impl<'a> Recorder<'a> {
     ) {
         let k = self
             .be
-            .kernel("gelu_mul", crate::gemm::gelu_mul_spv(), 3, 28);
-        let mut push = [0u8; 28];
+            .kernel("gelu_mul", crate::gemm::gelu_mul_spv(), 3, 36);
+        // The strided GeGLU shares silu_mul.comp (`-DGELU`), so it pushes that kernel's FULL
+        // params — the trailing `do_clamp`/`limit` pair included, left zero here: no caller clamps
+        // through this form (gemma4's per-layer-embd gate), and a short push would leave the
+        // shader reading whatever the last dispatch left in those two words.
+        let mut push = [0u8; 36];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&((up_off_bytes / 4) as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&((up_stride_bytes / 4) as u32).to_ne_bytes());
@@ -7987,11 +8232,13 @@ impl<'a> Recorder<'a> {
         has_bias: bool,
         n_expert_groups: u32,
         n_expert_groups_used: u32,
+        hash_ids: &dyn Buffer,
+        hash: bool,
     ) {
         let k = self
             .be
-            .kernel("moe_topk", crate::gemm::moe_topk_spv(), 4, 32);
-        let mut push = [0u8; 32];
+            .kernel("moe_topk", crate::gemm::moe_topk_spv(), 5, 36);
+        let mut push = [0u8; 36];
         push[0..4].copy_from_slice(&(n_expert as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n_used as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&scale.to_ne_bytes());
@@ -8000,11 +8247,13 @@ impl<'a> Recorder<'a> {
         push[20..24].copy_from_slice(&(has_bias as u32).to_ne_bytes());
         push[24..28].copy_from_slice(&n_expert_groups.to_ne_bytes());
         push[28..32].copy_from_slice(&n_expert_groups_used.to_ne_bytes());
+        push[32..36].copy_from_slice(&(hash as u32).to_ne_bytes());
         self.dispatch(
             k,
             &[
                 Self::vkb(logits),
                 Self::vkb(bias),
+                Self::vkb(hash_ids),
                 Self::vkb(ids),
                 Self::vkb(wts),
             ],
@@ -12246,12 +12495,14 @@ mod tests {
             n_tokens,
             n_expert,
             n_used,
-            1.0,  // scale
-            0,    // gating: softmax
-            true, // norm_w — the branch that used to read the first-pick max
-            true, // has_bias
-            0,    // n_expert_groups
-            0,    // n_expert_groups_used
+            1.0,            // scale
+            0,              // gating: softmax
+            true,           // norm_w — the branch that used to read the first-pick max
+            true,           // has_bias
+            0,              // n_expert_groups
+            0,              // n_expert_groups_used
+            bbias.as_ref(), // hash_ids: unused dummy (hash == false)
+            false,          // hash
         );
         rec.finish().unwrap();
         let mut idb = vec![0u8; n_tokens * n_used * 4];

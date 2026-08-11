@@ -53,6 +53,23 @@ pub enum Activation {
     Sigmoid,
 }
 
+/// Largest per-layer SwiGLU clamp limit that still means "this layer does NOT clamp". llama.cpp
+/// gates both of its clamp sites on `limit > 1e-6` (`llm_graph_context::build_ffn` and
+/// `build_moe_ffn`, `LLM_FFN_SILU` arms), so a per-layer entry at or below this is the DISABLED
+/// state — not a request to squash the whole FFN into `[-limit, +limit]`, which is what a literal
+/// `clamp(x, -0.0, 0.0)` on a layer whose configured limit is `0.0` would do.
+pub const SWIGLU_CLAMP_MIN: f32 = 1e-6;
+
+/// Resolve a per-layer clamp limit (DeepSeek V4's `swiglu_clamp_exp[il]` / `swiglu_clamp_shexp[il]`)
+/// into the `swiglu_clamp` field [`Op::GatedAct`], [`Op::GatedActFused`] and [`Op::MoeFfn`] carry.
+///
+/// This is the ONE place llama.cpp's `limit > 1e-6` gate lives: a caller hands over the raw
+/// per-layer array entry and gets `None` for the layers that do not clamp, so no backend has to
+/// re-derive the threshold and no caller can pass `Some(0.0)` by reading the array directly.
+pub fn swiglu_clamp(limit: f32) -> Option<f32> {
+    (limit > SWIGLU_CLAMP_MIN).then_some(limit)
+}
+
 /// Router gating function for a routed-expert FFN ([`Op::MoeFfn`]) — how the per-expert logits
 /// (`router · x`) become the selection scores + per-expert weights.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,6 +82,28 @@ pub enum MoeGating {
     /// `probs = sqrt(softplus(logits))` per expert (deepseek2/3/4 with `expert_gating_func=4`).
     /// Monotone in the logit like sigmoid; top-k picks the same experts as by raw logits.
     SqrtSoftplus,
+}
+
+/// Largest `hc_mult` (parallel residual-stream count) any backend accepts for DeepSeek V4's
+/// hyper-connection ops. Every shipped V4 config uses 4 and llama.cpp `GGML_ASSERT`s exactly that;
+/// this is the next power of two above it, chosen so a token's whole `hc × hc` mixing matrix
+/// (`HYPER_CONNECT_MAX_MULT²` = 64 f32) fits in a fixed-size per-thread scratch array on every
+/// backend — Sinkhorn iterates over the whole matrix, so it has to be materialised somewhere.
+/// [`Op::HyperConnectMix`], [`Op::HyperConnectPre`] and [`Op::HyperConnectPost`] refuse anything
+/// wider on the HOST, before a kernel that would read past that array is ever dispatched.
+pub const HYPER_CONNECT_MAX_MULT: u32 = 8;
+
+/// The two extra outputs [`Op::HyperConnectMix`] produces when it wraps a SUBLAYER, absent in the
+/// model-head form. One struct rather than two `Option` fields because llama.cpp's `build_hc_pre`
+/// writes both or neither: separate `Option`s would let a caller ask for a `comb` with no `post`,
+/// a state no backend could act on and every one would have to reject at run time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HyperGates {
+    /// Per-stream output gates `[rows, hc]` f32 — [`Op::HyperConnectPost`]'s `post`.
+    pub post: TensorId,
+    /// Sinkhorn-normalised mixing matrix `[rows, hc, hc]` f32, flat `dst + hc*src` within a token
+    /// — [`Op::HyperConnectPost`]'s `comb`.
+    pub comb: TensorId,
 }
 
 /// How a tensor handle is provisioned.
@@ -177,7 +216,18 @@ pub enum Op {
     /// (Qwen3 / Gemma Q-norm and K-norm). In place when `dst == x`.
     QkNorm {
         x: TensorId,
-        weight: TensorId,
+        /// Per-`head_dim` scale, or `None` for a genuinely WEIGHTLESS per-head RMSNorm —
+        /// `dst = x / sqrt(mean_head(x²) + eps)` with no multiply at all.
+        ///
+        /// `None` is DeepSeek V4's Q norm: after `wq_b` it reshapes to `[head_dim, n_head,
+        /// n_tokens]` and calls bare `ggml_rms_norm` (`deepseek4.cpp`'s `build_attention`, the
+        /// `q_norm` callback) — there is no `attn_q_norm` tensor in the file to bind.
+        ///
+        /// A ones-vector weight would compute the same numbers ([`Op::RmsNorm`]'s doc records that
+        /// convention, and gemma4's V-norm/llama4's L2-norm use it), but it is a fake operand: it
+        /// costs a real `head_dim`-float allocation and upload per graph, and it makes a reader
+        /// look for the weight in the GGUF. `Option` says what the reference says.
+        weight: Option<TensorId>,
         dst: TensorId,
         rows: u32,
         n_head: u32,
@@ -244,6 +294,29 @@ pub enum Op {
         /// GGUF that stayed in HF rotate-half order. It is model-wide and keyed on tensor names, so
         /// it cannot express "this one projection ropes NEOX while the model's main rope is NORM".
         neox: bool,
+        /// Rotate BACKWARDS by the position — llama.cpp's `ggml_rope_ext_back`
+        /// (`GGML_OP_ROPE_BACK`), which DeepSeek V4 applies to the rope slice of the ATTENTION
+        /// OUTPUT before the grouped output projection (`deepseek4.cpp`'s `attn_derope`). Nothing
+        /// else in the family de-ropes.
+        ///
+        /// It is the SAME kernel with one sign flipped. `ggml_compute_forward_rope_back` calls
+        /// `ggml_compute_forward_rope_flt(..., forward = false)`, whose only use of that flag is
+        /// `sin_sign = forward ? 1 : -1`, applied as `cache[i0 + 1] *= sin_sign` in
+        /// `ggml_rope_cache_init` — `cos` untouched, `sin` negated, i.e. the TRANSPOSE of the 2×2
+        /// rotation. Same angles, same `freq_factors` division, same pairing, same pass-through
+        /// tail: `dst[i0] = a·cos + b·sin`, `dst[i1] = −a·sin + b·cos`.
+        ///
+        /// The transpose is the INVERSE only when the rotation is orthonormal, and ggml's is not in
+        /// general: `rope_yarn` multiplies BOTH `cos` and `sin` by `mscale` (the `attn_factor`, with
+        /// YaRN's `1 + 0.1·ln(1/freq_scale)` correction folded in when `ext_factor != 0`), and
+        /// `sin_sign` does not invert that — so ggml's forward-then-back scales by `mscale²`, not 1.
+        /// V4 cancels it exactly: `dsv4_rope_attn_factor` returns `1/(1 + 0.1·ln(1/freq_scale))`
+        /// when `ext_factor != 0` and `1.0` otherwise, making the effective `mscale` 1 at every V4
+        /// rope call site. [`Op::Rope`] carries no magnitude scale at all (YaRN reaches it only as
+        /// `freq_factors`, a per-pair ANGLE divisor), so `backward` here is an exact inverse of the
+        /// forward rope with the same fields — the property `rope_back_inverts_rope_forward`
+        /// asserts.
+        backward: bool,
     },
     /// Fused per-head RMSNorm + NEOX RoPE — `QkNorm` immediately followed by `Rope` on the same
     /// tensor (the common qwen3/gemma q/k case). One pass: each head is rmsnormed (`× weight`) then
@@ -290,6 +363,38 @@ pub enum Op {
         scale: f32,
         mask: AttnMask,
         pos: u32,
+        /// Optional per-head ATTENTION SINK logits `[n_head]`, f32 — one extra logit per head that
+        /// joins the softmax denominator and contributes NO value. DeepSeek V4's `attn_sinks`
+        /// (`deepseek4.cpp` passes `layer.attn_sinks` into `build_attn` at all three of its
+        /// attention call sites); nothing else in this codebase has sinks.
+        ///
+        /// The arithmetic is `ggml_compute_forward_soft_max_f32`'s `src2` handling, verbatim — it is
+        /// two lines, and both matter:
+        ///
+        /// ```text
+        /// m = max_j(score[j])                 // score = q·K[j]*scale (+ mask), masked keys only
+        /// m = max(m, sink[h])                 // the sink JOINS THE MAX
+        /// l = Σ_j exp(score[j] - m)
+        /// l = l + exp(sink[h] - m)            // and the DENOMINATOR
+        /// dst = Σ_j (exp(score[j] - m) / l) * V[j]
+        /// ```
+        ///
+        /// Two ways to get it wrong that still produce plausible numbers. Leaving the sink out of the
+        /// MAX is a pure precision bug — it is algebraically identical while `sink[h] <= max_j
+        /// score[j]`, and only overflows `exp` once a sink dominates, which is exactly the regime a
+        /// sink is FOR. Including the sink in the NUMERATOR (giving it a value row) still yields a
+        /// row summing to 1 and reads like a softmax; it is a different function, and it is what
+        /// `attention_sinks_are_denominator_only` is written to catch.
+        ///
+        /// `sink[h]` is the RAW weight value: not multiplied by `scale` (which has already been
+        /// applied to the scores), not touched by the ALiBi slope, not masked. A head whose sink is
+        /// far below its running max costs essentially nothing (`exp(sink - m) → 0`); a head whose
+        /// sink dominates suppresses every real key's weight toward 0, which is the "attend to
+        /// nothing" escape valve.
+        ///
+        /// `None` for every arch in this codebase today, and on that path each backend runs the code
+        /// it ran before this field existed — no current model's numerics can move.
+        sinks: Option<TensorId>,
     },
     /// Multi-head Latent Attention (DeepSeek V2/V3). Absorbed form: one compressed K row per token
     /// (V is an aliased prefix view), `wk_b` absorbs Q nope into the latent space before the dot
@@ -367,6 +472,135 @@ pub enum Op {
         rows: u32,
         kv_len: u32,
         top_k: u32,
+    },
+    /// DeepSeek V4's **hyper-connection mixing coefficients** — the whole of `deepseek4.cpp`'s
+    /// `build_hc_pre` except its final collapse, i.e. llama.cpp's `ggml_dsv4_hc_comb` plus the
+    /// `pre`/`post` gate arithmetic that reference leaves as elementwise views.
+    ///
+    /// V4 widens the residual stream to `hc` parallel copies and wraps every sublayer
+    /// `pre → sublayer → post` (`docs/deepseek.md` § "Sinkhorn hyper-connections"). ONE matmul over
+    /// the RMS-normed flattened streams produces `mixes` `[rows, (2 + hc)*hc]`; this op turns that
+    /// into the three coefficient sets the wrap needs. Per token `t`:
+    ///
+    /// ```text
+    /// pre[t, h]           = sigmoid(mixes[t, h]                * scale[0] + base[h])              + eps
+    /// post[t, h]          = sigmoid(mixes[t, hc + h]           * scale[1] + base[hc + h])         * 2
+    /// logits[t, dst, src] =         mixes[t, 2hc + dst + hc*src]* scale[2] + base[2hc + dst + hc*src]
+    /// comb[t]             = sinkhorn(logits[t])
+    /// ```
+    ///
+    /// with `sinkhorn` making the `hc × hc` matrix approximately doubly stochastic, so no stream's
+    /// mass blows up or vanishes with depth:
+    ///
+    /// ```text
+    /// m = softmax over dst        (independently for each src column)
+    /// m = m + eps
+    /// norm_src(m)                                     // 1 column normalisation, THEN
+    /// for _ in 1..n_iter { norm_dst(m); norm_src(m) } // n_iter-1 (row, column) rounds
+    ///
+    /// norm_src: for each dst, m[dst, :] /= (Σ_src m[dst, src] + eps)
+    /// norm_dst: for each src, m[:, src] /= (Σ_dst m[dst, src] + eps)
+    /// ```
+    ///
+    /// Five things that still RUN when got wrong, all read off `build_hc_sinkhorn` and
+    /// `ggml_dsv4_hc_comb`'s header comment rather than off prose:
+    ///
+    /// * **The `comb` chunk starts at `2*hc` and its flat index is `dst + hc*src`.** `dst` is the
+    ///   FAST axis. `src + hc*dst` transposes the mixing matrix, and since Sinkhorn's fixed point is
+    ///   near-symmetric the output stays plausible — only a value check catches it.
+    /// * **The iteration is ASYMMETRIC**: `n_iter` normalisations over `src`, `n_iter - 1` over
+    ///   `dst`. The last one is over `src`, which is why `Σ_src` comes out closer to 1 than `Σ_dst`.
+    /// * **`eps` is added in THREE places inside Sinkhorn** — once to every element after the
+    ///   softmax, and once to each of the two sums before they divide — plus a FOURTH on `pre`.
+    ///   None of them is a guard against a zero that cannot happen: the post-softmax `+eps` shifts
+    ///   the fixed point the iteration converges to, so dropping it moves the answer.
+    /// * **`pre` is `sigmoid` then `+ eps`; `post` is `sigmoid` then `× 2`.** Different tails on
+    ///   adjacent, equal-width chunks of the same tensor.
+    /// * **llama.cpp's lambda names are inverted relative to its own `dst`/`src` vocabulary.** Its
+    ///   `norm_cols` sums over `src` (`ggml_sum_rows` of the PERMUTED matrix) and its `norm_rows`
+    ///   sums over `dst` (`ggml_sum_rows` of the matrix as laid out, whose fast axis is `dst`).
+    ///   `norm_src`/`norm_dst` above are named for the axis each one actually reduces.
+    ///
+    /// `gates` is `None` for the **model head** (`build_hc_head`), which collapses the streams one
+    /// last time before `output_norm` and has no sublayer to wrap. That is not a separate op: the
+    /// head's `output_hc_fn` is `{hc_dim, hc}` instead of `{hc_dim, (2+hc)*hc}`, so its `mixes` is
+    /// exactly the `pre` chunk, and its `output_hc_scale` `{1}` / `output_hc_base` `{hc}` are read
+    /// at the SAME indices (`scale[0]`, `base[0..hc]`) the wrapping form reads them at. Same
+    /// arithmetic, narrower inputs — a second op would have been a copy of the `pre` line.
+    ///
+    /// `hc` is 4 in every shipped V4 config (llama.cpp `GGML_ASSERT`s it); every backend here
+    /// accepts `1..=`[`HYPER_CONNECT_MAX_MULT`] and refuses anything wider rather than read past a
+    /// fixed-size per-token scratch array. `n_iter >= 1` is required — `n_iter = 0` would still run
+    /// one `norm_src` in the reference (its loop starts at 1), which is a shape no config asks for
+    /// and not worth reproducing.
+    HyperConnectMix {
+        /// `[rows, (2 + hc)*hc]` f32 — the mixing matmul's output. `[rows, hc]` when `gates` is
+        /// `None` (the head form).
+        mixes: TensorId,
+        /// `[3]` f32 — the per-chunk affine slopes. `[1]` when `gates` is `None`.
+        scale: TensorId,
+        /// `[(2 + hc)*hc]` f32 — the per-element affine offsets, sliced at `0`, `hc` and `2*hc`.
+        /// `[hc]` when `gates` is `None`.
+        base: TensorId,
+        /// Stream-collapse weights `[rows, hc]` f32 — [`Op::HyperConnectPre`]'s `weights`.
+        pre: TensorId,
+        /// The wrapping form's two extra outputs; `None` for the model head (see above).
+        gates: Option<HyperGates>,
+        /// Token count.
+        rows: u32,
+        /// Number of parallel residual streams (`hc_mult`).
+        hc: u32,
+        eps: f32,
+        /// Sinkhorn iteration count. Ignored when `gates` is `None` (nothing to normalise).
+        n_iter: u32,
+    },
+    /// DeepSeek V4 hyper-connection **stream collapse** — llama.cpp's `ggml_dsv4_hc_pre`, the
+    /// three-argument `build_hc_pre` overload. Weighted sum of the `hc` parallel residual streams
+    /// down to the single vector a sublayer (or the model head) consumes:
+    ///
+    /// ```text
+    /// dst[t, i] = Σ_h x[t, h, i] * weights[t, h]
+    /// ```
+    ///
+    /// `weights` is [`Op::HyperConnectMix`]'s `pre` — strictly positive (a sigmoid plus `eps`), so
+    /// this is a convex-ish blend rather than a signed combination, but nothing here depends on
+    /// that.
+    HyperConnectPre {
+        /// The widened residual `[rows, hc, n_embd]` f32.
+        x: TensorId,
+        /// Per-stream collapse weights `[rows, hc]` f32.
+        weights: TensorId,
+        /// `[rows, n_embd]` f32.
+        dst: TensorId,
+        rows: u32,
+        hc: u32,
+        n_embd: u32,
+    },
+    /// DeepSeek V4 hyper-connection **stream re-expansion** — llama.cpp's `ggml_dsv4_hc_post`, the
+    /// non-fused `build_hc_post`. Writes the sublayer's single output back across all `hc` streams
+    /// while mixing the streams among themselves, replacing `x = x + f(x)`:
+    ///
+    /// ```text
+    /// dst[t, dst_h, i] = x[t, i] * post[t, dst_h] + Σ_src residual[t, src, i] * comb[t, dst_h, src]
+    /// ```
+    ///
+    /// `residual` is the widened stream as it entered the wrap (NOT the collapsed vector), and
+    /// `comb`'s per-token flat index is `dst_h + hc*src` — see [`Op::HyperConnectMix`] on why that
+    /// transpose is invisible to anything but a value check.
+    HyperConnectPost {
+        /// The sublayer's output `[rows, n_embd]` f32.
+        x: TensorId,
+        /// The widened residual as it entered the wrap `[rows, hc, n_embd]` f32.
+        residual: TensorId,
+        /// Per-stream output gates `[rows, hc]` f32.
+        post: TensorId,
+        /// Sinkhorn-normalised mixing matrix `[rows, hc, hc]` f32, `dst_h + hc*src` per token.
+        comb: TensorId,
+        /// The new widened residual `[rows, hc, n_embd]` f32.
+        dst: TensorId,
+        rows: u32,
+        hc: u32,
+        n_embd: u32,
     },
     /// DeepSeek V3.2's **lightning indexer** (`deepseek32.cpp`'s `// lightning indexer` block, the
     /// non-fused branch): a cheap per-(query row, key) relevance score whose top-`top_k` keys are
@@ -481,6 +715,25 @@ pub enum Op {
         up_stride: u32,
         gate_stride: u32,
         gate_block_width: u32,
+        /// DeepSeek V4's per-layer SwiGLU clamp — `swiglu_clamp_shexp[il]` on this (dense /
+        /// shared-expert) path, resolved through [`swiglu_clamp`] so `None` is the disabled state.
+        ///
+        /// `Some(limit)` replaces `act(gate) * up` with
+        /// **`act(min(gate, limit)) * clamp(up, -limit, limit)`**: `up` is clamped SYMMETRICALLY,
+        /// the gate ONE-SIDED (upper bound only, `ggml_clamp(gate, -INFINITY, limit)`), and the
+        /// gate clamp happens **BEFORE** the activation. Every other arch llama.cpp clamps
+        /// (gpt-oss) clamps the gate AFTER its SiLU; V4 is the exception, and `deepseek4.cpp` is
+        /// the only reason this field exists, so the post-activation order is not representable
+        /// here — the moment an arch needing it lands, that is when the mode flag earns its place.
+        /// Read off `llm_graph_context::build_ffn`'s `LLM_FFN_SILU` arm
+        /// (`arch == LLM_ARCH_DEEPSEEK4` branch) in llama.cpp's `src/llama-graph.cpp`.
+        ///
+        /// The orders are NOT interchangeable: SiLU is non-monotone below zero and is not the
+        /// identity, so a gate above the limit and a gate below zero both move. Only
+        /// [`Activation::Silu`] and [`Activation::Gelu`] carry it (the two the reference's gated
+        /// arms use); a clamped [`Activation::Sigmoid`] has no caller and every backend refuses it.
+        /// `None` for every existing arch, so no current model's numerics move.
+        swiglu_clamp: Option<f32>,
     },
     /// Gated FFN activation over a COMBINED `gu` buffer `[rows, 2*nff]` (gate half first, up half
     /// second per row): `dst[r,i] = act(gu[r,i]) * gu[r, nff+i]`. Produced when the runner
@@ -492,6 +745,9 @@ pub enum Op {
         rows: u32,
         nff: u32,
         act: Activation,
+        /// Per-layer SwiGLU clamp, same arithmetic and same constraints as
+        /// [`Op::GatedAct::swiglu_clamp`] — see there.
+        swiglu_clamp: Option<f32>,
     },
     /// `dst[i] = a[i] + b[i]` (residual add). In place when `dst == a`.
     Add {
@@ -667,6 +923,13 @@ pub enum Op {
         n_ff_exp: u32,
         scale: f32,
         act: Activation,
+        /// DeepSeek V4's per-layer SwiGLU clamp for the ROUTED experts — `swiglu_clamp_exp[il]`,
+        /// resolved through [`swiglu_clamp`]. Identical arithmetic to
+        /// [`Op::GatedAct::swiglu_clamp`] (see there for the pre-activation / one-sided-gate
+        /// details), applied per selected expert to that expert's own gate/up projections, i.e.
+        /// between the gate/up GEMMs and the down GEMM. llama.cpp reads it from a different
+        /// hparam array than the shared expert's, so the two clamps can differ within a layer.
+        swiglu_clamp: Option<f32>,
         /// Router gating (softmax over experts vs per-expert sigmoid). `Softmax` for
         /// qwen3moe/qwen35moe/diffusion-gemma; `Sigmoid` for llama4.
         gating: MoeGating,
@@ -692,11 +955,36 @@ pub enum Op {
         ep_band: Option<(u32, u32)>,
         /// DeepSeek V2+: per-layer router bias `[n_expert]` added to logits for SELECTION only;
         /// the unbias'd probs are still used for the per-expert routing weights. `None` = no bias.
+        /// Must be `None` when [`Op::MoeFfn::expert_ids`] is set — there is no selection to bias.
         exp_probs_b: Option<TensorId>,
-        /// DeepSeek V3+: group-limited routing — number of expert groups (0 = no grouping).
+        /// DeepSeek V3+: group-limited routing — number of expert groups (0 = no grouping). Must be
+        /// `0`/`1` when [`Op::MoeFfn::expert_ids`] is set (same reason as `exp_probs_b`).
         n_expert_groups: u32,
         /// DeepSeek V3+: number of groups selected per routing decision.
         n_expert_groups_used: u32,
+        /// DeepSeek V4 **hash-routed MoE** (its first `hash_layer_count` layers): the selected
+        /// expert ids `[rows, n_used]`, i32, ALREADY gathered by the caller — llama.cpp's
+        /// `selected_experts = ggml_get_rows(layer.ffn_gate_tid2eid, inp_tokens)`, a
+        /// `{n_expert_used, n_vocab}` lookup table indexed by TOKEN ID (`deepseek4.cpp`'s MoE
+        /// block), handed to `build_moe_ffn` as its `selected_experts_in`. The tensor is an
+        /// [`crate::DType::I32`] handle whose values are read as PLAIN INTEGERS — the convention
+        /// [`Op::EmbedGather`]'s `ids` uses, not [`Op::Argmax`]'s bit-pattern-in-an-f32-slot
+        /// carrier (that one exists for handles a backend declares f32).
+        ///
+        /// What supplying them changes, read off `build_moe_ffn` (`src/llama-graph.cpp`): **only
+        /// the selection**. The router matmul still runs, the [`MoeGating`] function still turns
+        /// its logits into `probs`, and the routing WEIGHTS are still
+        /// `ggml_get_rows(probs, selected_experts)` — i.e. the router's own probability at each
+        /// hash-chosen expert, then `norm_w` and `scale` exactly as on a top-k layer. They are NOT
+        /// uniform. What is bypassed is `ggml_argsort_top_k` and everything feeding only it:
+        /// `exp_probs_b` and the group masking build `selection_probs`, which nothing reads once
+        /// `selected_experts_in` is non-null (llama.cpp passes `exp_probs_b = nullptr` on a hash
+        /// layer for the same reason). Backends must SKIP that work rather than compute and
+        /// overwrite it, and refuse `exp_probs_b`/`n_expert_groups > 1` alongside these ids.
+        ///
+        /// `None` = ordinary top-k routing, the path every other arch and every non-hash V4 layer
+        /// takes, byte-identical to before this field existed.
+        expert_ids: Option<TensorId>,
     },
     /// Depthwise causal 1-D conv over `channels` followed by SiLU (qwen35 gated DeltaNet).
     /// Processes `rows` tokens sequentially, carrying the rolling history in `state` across rows and
@@ -782,6 +1070,9 @@ impl Op {
             Op::Mla { .. } => "Mla",
             Op::LightningIndexer { .. } => "LightningIndexer",
             Op::TopkMask { .. } => "TopkMask",
+            Op::HyperConnectMix { .. } => "HyperConnectMix",
+            Op::HyperConnectPre { .. } => "HyperConnectPre",
+            Op::HyperConnectPost { .. } => "HyperConnectPost",
             Op::GatedAct { .. } => "GatedAct",
             Op::GatedActFused { .. } => "GatedActFused",
             Op::Add { .. } => "Add",
@@ -829,7 +1120,11 @@ impl Op {
                 (r, vec![dst])
             }
             Op::Linear { x, weight, dst, .. } => (vec![x, weight], vec![dst]),
-            Op::QkNorm { x, weight, dst, .. } => (vec![x, weight], vec![dst]),
+            Op::QkNorm { x, weight, dst, .. } => {
+                let mut r = vec![x];
+                r.extend(weight);
+                (r, vec![dst])
+            }
             Op::GatedRmsNorm {
                 x,
                 weight,
@@ -866,8 +1161,13 @@ impl Op {
                 k_cache,
                 v_cache,
                 dst,
+                sinks,
                 ..
-            } => (vec![q, k_cache, v_cache], vec![dst]),
+            } => {
+                let mut r = vec![q, k_cache, v_cache];
+                r.extend(sinks);
+                (r, vec![dst])
+            }
             Op::Mla {
                 q,
                 k_cache,
@@ -889,6 +1189,32 @@ impl Op {
                 ..
             } => (vec![q, k_cache, weights], vec![dst]),
             Op::TopkMask { idx, dst, .. } => (vec![idx], vec![dst]),
+            Op::HyperConnectMix {
+                mixes,
+                scale,
+                base,
+                pre,
+                gates,
+                ..
+            } => {
+                let mut w = vec![pre];
+                if let Some(HyperGates { post, comb }) = gates {
+                    w.push(post);
+                    w.push(comb);
+                }
+                (vec![mixes, scale, base], w)
+            }
+            Op::HyperConnectPre {
+                x, weights, dst, ..
+            } => (vec![x, weights], vec![dst]),
+            Op::HyperConnectPost {
+                x,
+                residual,
+                post,
+                comb,
+                dst,
+                ..
+            } => (vec![x, residual, post, comb], vec![dst]),
             Op::GatedAct { gate, up, dst, .. } => (vec![gate, up], vec![dst]),
             Op::GatedActFused { gu, dst, .. } => (vec![gu], vec![dst]),
             Op::Add { a, b, dst, .. } => (vec![a, b], vec![dst]),
@@ -917,11 +1243,13 @@ impl Op {
                 up_exps,
                 down_exps,
                 down_scale,
+                expert_ids,
                 dst,
                 ..
             } => {
                 let mut r = vec![x, router_x, router, gate_exps, up_exps, down_exps];
                 r.extend(down_scale);
+                r.extend(expert_ids);
                 (r, vec![dst])
             }
             Op::Conv1dSilu {
@@ -1159,6 +1487,7 @@ mod tests {
             scale: 1.0,
             mask: AttnMask::Causal,
             pos: 0,
+            sinks: None,
         };
         assert_eq!(attn.io(), (vec![t(7), t(6), t(8)], vec![t(9)]));
     }
@@ -1179,9 +1508,51 @@ mod tests {
             freq_factors: ff,
             x_stride: 0,
             neox: false,
+            backward: false,
         };
         assert_eq!(rope(None).io(), (vec![t(0), t(1)], vec![t(0)]));
         assert_eq!(rope(Some(t(2))).io(), (vec![t(0), t(1), t(2)], vec![t(0)]));
+        // `Op::QkNorm`'s weight and `Op::Attention`'s sinks are the same shape of optional read.
+        let qkn = |w: Option<TensorId>| Op::QkNorm {
+            x: t(0),
+            weight: w,
+            dst: t(0),
+            rows: 1,
+            n_head: 2,
+            head_dim: 4,
+            eps: 1e-6,
+            x_stride: 0,
+        };
+        assert_eq!(
+            qkn(None).io(),
+            (vec![t(0)], vec![t(0)]),
+            "V4's weightless Q norm reads no weight at all"
+        );
+        assert_eq!(qkn(Some(t(1))).io(), (vec![t(0), t(1)], vec![t(0)]));
+        let attn = |sk: Option<TensorId>| Op::Attention {
+            q: t(0),
+            k_cache: t(1),
+            v_cache: t(2),
+            dst: t(3),
+            rows: 1,
+            kv_len: 1,
+            n_head: 1,
+            n_kv: 1,
+            head_dim: 8,
+            scale: 1.0,
+            mask: AttnMask::Causal,
+            pos: 0,
+            sinks: sk,
+        };
+        assert_eq!(
+            attn(None).io(),
+            (vec![t(0), t(1), t(2)], vec![t(3)]),
+            "every existing arch (sinks None) reads exactly what it always did"
+        );
+        assert_eq!(
+            attn(Some(t(4))).io(),
+            (vec![t(0), t(1), t(2), t(4)], vec![t(3)])
+        );
         // `Op::Mla`'s optional top-k score mask is the same shape of optional read operand.
         let mla = |kb: Option<TensorId>| Op::Mla {
             q: t(0),
@@ -1247,6 +1618,7 @@ mod tests {
             scale: 1.0,
             mask: AttnMask::Causal,
             pos: 0,
+            sinks: None,
         });
         // A non-KV op must NOT contribute any in-place input.
         g.push(Op::Add {

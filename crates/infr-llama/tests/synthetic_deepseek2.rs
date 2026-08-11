@@ -30,6 +30,13 @@
 //! ASSERTS the containment the sharing assumes. A future arch that is not a DeepSeek-MLA variant
 //! should write its own function instead — the harness below [`TempGguf`] is still what it reuses.
 //!
+//! Stage 4 (`deepseek4`/V4) is that arch, and it took the second offer: [`dsv4_model`] is a sibling
+//! of [`mla_model`], not a parameterisation of it. V4 is not MLA — no `kv_lora_rank`, no
+//! `wk_b`/`wv_b` — and its per-layer tensor set is decided by `compress_ratios[il]`, so threading it
+//! through the shared builder would mean a parameter per difference and an `Option` on most of the
+//! shapes. What it DOES reuse is everything above [`mla_model`] plus the damaged-fixture helpers
+//! below it ([`config_err`], [`without_tensor`], [`without_meta`]) and [`PROMPT`].
+//!
 //! The fill is seeded by the tensor NAME, not by its position in the file, which is what makes the
 //! differential tests below valid: adding or removing `exp_probs_b.bias` changes that tensor and
 //! nothing else, so two variants differ only in the thing under test.
@@ -54,6 +61,12 @@ enum Meta {
     Str(String),
     /// An array of STRINGs — the vocab and merge lists.
     StrArr(Vec<String>),
+    /// An array of INT32s. This is what `gguf-py`'s `add_array` writes for a Python `list[int]`
+    /// (`GGUFValueType.get_type` maps every `int` to `INT32`), so it is the on-disk type of
+    /// `deepseek4.attention.compress_ratios`.
+    I32Arr(Vec<i32>),
+    /// An array of FLOAT32s — `deepseek4.swiglu_clamp_exp` / `_shexp` in their per-layer form.
+    F32Arr(Vec<f32>),
 }
 
 fn push_u32(b: &mut Vec<u8>, v: u32) {
@@ -95,6 +108,22 @@ impl Meta {
                 push_u64(b, a.len() as u64);
                 for s in a {
                     push_gguf_str(b, s);
+                }
+            }
+            Meta::I32Arr(a) => {
+                push_u32(b, 9);
+                push_u32(b, 5); // element type: INT32
+                push_u64(b, a.len() as u64);
+                for v in a {
+                    b.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            Meta::F32Arr(a) => {
+                push_u32(b, 9);
+                push_u32(b, 6); // element type: FLOAT32
+                push_u64(b, a.len() as u64);
+                for v in a {
+                    b.extend_from_slice(&v.to_le_bytes());
                 }
             }
         }
@@ -711,10 +740,15 @@ fn load(tmp: &TempGguf) -> infr_llama::SeamModel {
     .expect("synthetic model load")
 }
 
-/// Prefill `PROMPT` on the CPU reference backend and return the last row's logits.
-fn cpu_logits(tag: &str, model: &SyntheticModel) -> Vec<f32> {
+/// Prefill `prompt` on the CPU reference backend and return the last row's logits.
+fn cpu_logits_of(tag: &str, model: &SyntheticModel, prompt: &[u32]) -> Vec<f32> {
     let tmp = TempGguf::write(tag, model);
-    load(&tmp).prefill_logits_cpu(PROMPT).expect("cpu prefill")
+    load(&tmp).prefill_logits_cpu(prompt).expect("cpu prefill")
+}
+
+/// [`cpu_logits_of`] at the shared [`PROMPT`].
+fn cpu_logits(tag: &str, model: &SyntheticModel) -> Vec<f32> {
+    cpu_logits_of(tag, model, PROMPT)
 }
 
 /// [`cpu_logits`]'s Vulkan twin.
@@ -756,17 +790,23 @@ fn cosine(a: &[f32], b: &[f32]) -> f64 {
     dot / (na * nb)
 }
 
-/// Assert the two runs routed differently: a difference that is a real fraction of the signal, not
-/// float noise on an identical computation.
-fn assert_routing_differs(what: &str, a: &[f32], b: &[f32]) {
+/// Assert the two runs produced materially different logits: a difference that is a real fraction
+/// of the signal, not float noise on an identical computation. `mechanism` names what the two runs
+/// were built to separate, so the failure says which code path did not execute.
+fn assert_moves(what: &str, a: &[f32], b: &[f32], mechanism: &str) {
     let d = max_abs_diff(a, b);
     let scale = rms(a).max(rms(b));
     println!("{what}: max|Δ| = {d:e}  (logit rms {scale:e})");
     assert!(
         d > 0.01 * scale,
-        "{what}: the two runs are indistinguishable (max|Δ| = {d:e}, logit rms {scale:e}) — the \
-         routing path under test did not execute"
+        "{what}: the two runs are indistinguishable (max|Δ| = {d:e}, logit rms {scale:e}) — \
+         {mechanism} did not execute"
     );
+}
+
+/// Assert the two runs routed differently.
+fn assert_routing_differs(what: &str, a: &[f32], b: &[f32]) {
+    assert_moves(what, a, b, "the routing path under test");
 }
 
 // ─── tests ───────────────────────────────────────────────────────────────────────
@@ -1657,4 +1697,1252 @@ fn argmax(v: &[f32]) -> usize {
             }
         })
         .0
+}
+
+// ─── deepseek4 (V4) ──────────────────────────────────────────────────────────────
+//
+// Stage 4's LOAD path. V4-Flash's smallest quant is 82.5 GB, so as with V3.2 there is no model file
+// to develop against and this is the only place the arch is exercised at all: `Config::from_gguf`'s
+// `deepseek4` block and `wload`'s `is_dsv4` arm, driven off a real file through the real loader.
+//
+// Every run below ends at `generate_dense_backend`'s refusal rather than in logits — which is what
+// makes the refusal itself testable, and what makes the load path testable THROUGH it: `wload`
+// walks every tensor before the refusal fires, so "the complete fixture reaches the refusal" and
+// "the fixture minus any one tensor does not" together say the loader consumed all of them.
+
+/// The `deepseek4` lightning indexer. V4's differs structurally from V3.2's — no `indexer.attn_k`,
+/// no `indexer.k_norm`, its keys come out of the compressor — but the three metadata keys are
+/// shared, so [`IndexerDims`] describes it too.
+///
+/// `head_size` is deliberately neither `head_dim` nor `rope_dim` and `n_head` is not the model's
+/// `n_head`, so the indexer's four shaped tensors have four shapes no attention dim would fit.
+fn dsv4_indexer() -> IndexerDims {
+    IndexerDims {
+        n_head: 4,
+        head_size: 24,
+        top_k: 5,
+    }
+}
+
+/// Every dimension of the synthetic `deepseek4` model.
+#[derive(Clone, Debug)]
+struct Dsv4Dims {
+    /// One entry per layer; `n_layer` IS `compress_ratios.len()`, because the ratio is what decides
+    /// a layer's tensor set and a fixture with a layer count independent of it could not be
+    /// consistent. See [`dsv4_dims`] for why this particular sequence.
+    compress_ratios: Vec<usize>,
+    /// `hash_layer_count` — layers `< this` carry `ffn_gate_tid2eid` and NO `exp_probs_b`.
+    hash_layer_count: usize,
+    n_embd: usize,
+    n_head: usize,
+    /// `attention.head_count_kv`. V4 is MQA: one KV head serves every query head, which is why
+    /// `attn_kv` is `[n_embd, head_dim]` rather than a per-head bank.
+    n_kv: usize,
+    /// `attention.key_length`. Deliberately NOT `n_embd / n_head`, so a loader that took the
+    /// generic default instead of reading the key would size `attn_q_b`/`attn_kv` wrong.
+    head_dim: usize,
+    rope_dim: usize,
+    /// `attention.sliding_window`. Every V4 layer uses it — `set_swa_pattern(0)`.
+    swa_window: usize,
+    vocab: usize,
+    q_lora_rank: usize,
+    /// `attention.output_group_count` / `attention.output_lora_rank` — the low-rank GROUPED output
+    /// projection that replaces `attn_output`. `n_head * head_dim` must divide by the group count.
+    o_group_count: usize,
+    o_lora_rank: usize,
+    /// `hyper_connection.count` — the number of parallel residual streams.
+    hc_mult: usize,
+    hc_sinkhorn_iters: usize,
+    hc_eps: f32,
+    /// `attention.compress_rope_freq_base` — the rope base the COMPRESSED tiers use. Distinct from
+    /// `rope.freq_base` so the two cannot be confused.
+    compress_rope_theta: f32,
+    n_expert: usize,
+    n_used: usize,
+    n_ff_exp: usize,
+    n_expert_shared: usize,
+    /// `swiglu_clamp_exp`, one entry per layer (the ARRAY form of the key).
+    swiglu_clamp_exp: Vec<f32>,
+    /// `swiglu_clamp_shexp`. `None` omits the key entirely, which is the case the reference falls
+    /// back to `swiglu_clamp_exp` for.
+    swiglu_clamp_shexp: Option<Vec<f32>>,
+    /// `expert_gating_func`. V4 accepts only sqrt-softplus (4); a case below sets it to something
+    /// else to pin the refusal.
+    expert_gating_func: u32,
+}
+
+impl Dsv4Dims {
+    fn n_layer(&self) -> usize {
+        self.compress_ratios.len()
+    }
+
+    /// `hc_dim` — the width of a hyper-connection mixing matmul's input (all `hc_mult` streams
+    /// concatenated).
+    fn hc_dim(&self) -> usize {
+        self.hc_mult * self.n_embd
+    }
+
+    /// `hc_mix_dim` — that matmul's output: the `pre` and `post` chunks (one per stream each) plus
+    /// the `hc × hc` stream-mixing matrix.
+    fn hc_mix_dim(&self) -> usize {
+        (2 + self.hc_mult) * self.hc_mult
+    }
+
+    fn shexp_ff(&self) -> usize {
+        self.n_ff_exp * self.n_expert_shared
+    }
+
+    /// The compressor's channel multiplier for a layer at `ratio`: 2 for the CSA tier, 1 otherwise
+    /// (`deepseek4.cpp`: `const int64_t coff = ratio == 4 ? 2 : 1`).
+    fn coff(ratio: usize) -> usize {
+        if ratio == 4 {
+            2
+        } else {
+            1
+        }
+    }
+}
+
+/// The synthetic V4 model's dimensions.
+///
+/// The ratio sequence is the point of the fixture: **five layers covering every (compress_ratio,
+/// routing) pair the loader branches on.** With `hash_layer_count = 2`:
+///
+/// | layer | ratio | tensors added by the ratio     | routing              |
+/// | ----: | ----: | ------------------------------ | -------------------- |
+/// |     0 |     0 | none                           | hash (`tid2eid`)     |
+/// |     1 |     4 | compressor + indexer + its own | hash (`tid2eid`)     |
+/// |     2 |   128 | compressor only                | bias (`exp_probs_b`) |
+/// |     3 |     4 | compressor + indexer + its own | bias (`exp_probs_b`) |
+/// |     4 |     0 | none                           | bias (`exp_probs_b`) |
+///
+/// A fixture where every layer had the same ratio would load identically whether the switch was
+/// read or hard-coded to that one value; this one cannot.
+fn dsv4_dims() -> Dsv4Dims {
+    Dsv4Dims {
+        compress_ratios: vec![0, 4, 128, 4, 0],
+        hash_layer_count: 2,
+        n_embd: 64,
+        n_head: 2,
+        n_kv: 1,
+        head_dim: 48,
+        rope_dim: 16,
+        swa_window: 64,
+        vocab: 64,
+        q_lora_rank: 32,
+        o_group_count: 2,
+        o_lora_rank: 16,
+        hc_mult: 2,
+        hc_sinkhorn_iters: 2,
+        hc_eps: 1e-6,
+        compress_rope_theta: 40000.0,
+        n_expert: 4,
+        n_used: 2,
+        n_ff_exp: 32,
+        n_expert_shared: 1,
+        // Per-layer, and all different, so a loader that broadcast entry 0 over the array would
+        // land on values no layer but the first actually has.
+        swiglu_clamp_exp: vec![7.0, 7.5, 8.0, 8.5, 9.0],
+        swiglu_clamp_shexp: None,
+        expert_gating_func: SQRT_SOFTPLUS,
+    }
+}
+
+/// `LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS` — the only value `deepseek4.cpp` accepts.
+const SQRT_SOFTPLUS: u32 = 4;
+
+/// Build the whole GGUF description for a `deepseek4` model of `d`. Metadata keys are the ones
+/// `deepseek4.cpp::load_arch_hparams` reads; tensor names and shapes are
+/// `deepseek4.cpp::load_arch_tensors`', via `llama-arch.cpp`'s format strings.
+///
+/// A sibling of [`mla_model`] rather than a parameterisation of it — see the module doc.
+fn dsv4_model(d: &Dsv4Dims) -> SyntheticModel {
+    let arch = infr_llama::arch::DEEPSEEK4;
+    assert!(
+        (d.n_head * d.head_dim).is_multiple_of(d.o_group_count),
+        "attention.output_group_count must divide n_head * key_length"
+    );
+    let u = |k: &str, v: usize| (format!("{arch}.{k}"), Meta::U32(v as u32));
+    let f = |k: &str, v: f32| (format!("{arch}.{k}"), Meta::F32(v));
+    let mut meta = vec![
+        (
+            "general.architecture".to_string(),
+            Meta::Str(arch.to_string()),
+        ),
+        u("block_count", d.n_layer()),
+        u("embedding_length", d.n_embd),
+        u("attention.head_count", d.n_head),
+        u("attention.head_count_kv", d.n_kv),
+        u("attention.key_length", d.head_dim),
+        u("rope.dimension_count", d.rope_dim),
+        f("rope.freq_base", 10000.0),
+        u("context_length", 256),
+        f("attention.layer_norm_rms_epsilon", 1e-5),
+        u("attention.sliding_window", d.swa_window),
+        u("attention.q_lora_rank", d.q_lora_rank),
+        // The grouped low-rank output projection and the compressed tiers' rope.
+        u("attention.output_group_count", d.o_group_count),
+        u("attention.output_lora_rank", d.o_lora_rank),
+        f("attention.compress_rope_freq_base", d.compress_rope_theta),
+        (
+            format!("{arch}.attention.compress_ratios"),
+            Meta::I32Arr(d.compress_ratios.iter().map(|r| *r as i32).collect()),
+        ),
+        // Hyper-connections.
+        u("hyper_connection.count", d.hc_mult),
+        u("hyper_connection.sinkhorn_iterations", d.hc_sinkhorn_iters),
+        f("hyper_connection.epsilon", d.hc_eps),
+        // The lightning indexer (ratio-4 layers only, but the hparams are model-level).
+        u("attention.indexer.head_count", dsv4_indexer().n_head),
+        u("attention.indexer.key_length", dsv4_indexer().head_size),
+        u("attention.indexer.top_k", dsv4_indexer().top_k),
+        // MoE. No `leading_dense_block_count`: V4 has no dense-lead layers at all, and no
+        // `expert_group_count`: it does not use group-limited routing.
+        u("hash_layer_count", d.hash_layer_count),
+        u("expert_count", d.n_expert),
+        u("expert_used_count", d.n_used),
+        u("expert_feed_forward_length", d.n_ff_exp),
+        u("expert_shared_count", d.n_expert_shared),
+        u("expert_gating_func", d.expert_gating_func as usize),
+        (format!("{arch}.expert_weights_norm"), Meta::Bool(true)),
+        f("expert_weights_scale", 2.5),
+        (
+            format!("{arch}.swiglu_clamp_exp"),
+            Meta::F32Arr(d.swiglu_clamp_exp.clone()),
+        ),
+        // The minimum tokenizer `build_tokenizer` accepts — see `mla_model`'s note.
+        (
+            "tokenizer.ggml.model".to_string(),
+            Meta::Str("gpt2".to_string()),
+        ),
+        (
+            "tokenizer.ggml.tokens".to_string(),
+            Meta::StrArr((0..d.vocab).map(|i| format!("t{i}")).collect()),
+        ),
+        (
+            "tokenizer.ggml.merges".to_string(),
+            Meta::StrArr(Vec::new()),
+        ),
+        ("tokenizer.ggml.eos_token_id".to_string(), Meta::U32(2)),
+    ];
+    if let Some(shexp) = &d.swiglu_clamp_shexp {
+        meta.push((
+            format!("{arch}.swiglu_clamp_shexp"),
+            Meta::F32Arr(shexp.clone()),
+        ));
+    }
+    meta.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let w = Fill::Rand(0.25);
+    let ix = dsv4_indexer();
+    let mut tensors = vec![
+        TensorSpec::new("token_embd.weight", vec![d.n_embd, d.vocab], w.clone()),
+        TensorSpec::new("output_norm.weight", vec![d.n_embd], Fill::Gain),
+        TensorSpec::new("output.weight", vec![d.n_embd, d.vocab], w.clone()),
+        // The hyper-connection HEAD: model-level, not per-layer (no `blk.` prefix), collapsing the
+        // `hc_mult` residual streams back to one vector before `output_norm`.
+        TensorSpec::new(
+            "output_hc_fn.weight",
+            vec![d.hc_dim(), d.hc_mult],
+            w.clone(),
+        ),
+        TensorSpec::new("output_hc_base.weight", vec![d.hc_mult], Fill::Rand(0.1)),
+        TensorSpec::new("output_hc_scale.weight", vec![1], Fill::Gain),
+    ];
+    for (l, &ratio) in d.compress_ratios.iter().enumerate() {
+        let p = |s: &str| format!("blk.{l}.{s}");
+        tensors.push(TensorSpec::new(
+            p("attn_norm.weight"),
+            vec![d.n_embd],
+            Fill::Gain,
+        ));
+        // Attention sinks: one learned logit per query head, added to every row's softmax.
+        tensors.push(TensorSpec::new(
+            p("attn_sinks.weight"),
+            vec![d.n_head],
+            Fill::Rand(0.1),
+        ));
+        // The Q-LoRA triple — the one piece of deepseek2's attention V4 keeps.
+        tensors.push(TensorSpec::new(
+            p("attn_q_a.weight"),
+            vec![d.n_embd, d.q_lora_rank],
+            w.clone(),
+        ));
+        tensors.push(TensorSpec::new(
+            p("attn_q_a_norm.weight"),
+            vec![d.q_lora_rank],
+            Fill::Gain,
+        ));
+        tensors.push(TensorSpec::new(
+            p("attn_q_b.weight"),
+            vec![d.q_lora_rank, d.n_head * d.head_dim],
+            w.clone(),
+        ));
+        // Single-head MQA KV: ONE key/value head for every query head.
+        tensors.push(TensorSpec::new(
+            p("attn_kv.weight"),
+            vec![d.n_embd, d.head_dim],
+            w.clone(),
+        ));
+        // `LLM_TENSOR_ATTN_KV_NORM`, which shares `blk.%d.attn_kv_a_norm` with deepseek2's
+        // `LLM_TENSOR_ATTN_KV_A_NORM` — two enum values, one on-disk name.
+        tensors.push(TensorSpec::new(
+            p("attn_kv_a_norm.weight"),
+            vec![d.head_dim],
+            Fill::Gain,
+        ));
+        tensors.push(TensorSpec::new(
+            p("attn_output_a.weight"),
+            vec![
+                d.n_head * d.head_dim / d.o_group_count,
+                d.o_lora_rank * d.o_group_count,
+            ],
+            w.clone(),
+        ));
+        tensors.push(TensorSpec::new(
+            p("attn_output_b.weight"),
+            vec![d.o_group_count * d.o_lora_rank, d.n_embd],
+            w.clone(),
+        ));
+        for kind in ["attn", "ffn"] {
+            tensors.push(TensorSpec::new(
+                p(&format!("hc_{kind}_fn.weight")),
+                vec![d.hc_dim(), d.hc_mix_dim()],
+                w.clone(),
+            ));
+            tensors.push(TensorSpec::new(
+                p(&format!("hc_{kind}_base.weight")),
+                vec![d.hc_mix_dim()],
+                Fill::Rand(0.1),
+            ));
+            tensors.push(TensorSpec::new(
+                p(&format!("hc_{kind}_scale.weight")),
+                vec![3],
+                Fill::Gain,
+            ));
+        }
+        if ratio != 0 {
+            let coff = Dsv4Dims::coff(ratio);
+            tensors.push(TensorSpec::new(
+                p("attn_compressor_kv.weight"),
+                vec![d.n_embd, coff * d.head_dim],
+                w.clone(),
+            ));
+            tensors.push(TensorSpec::new(
+                p("attn_compressor_gate.weight"),
+                vec![d.n_embd, coff * d.head_dim],
+                w.clone(),
+            ));
+            // The absolute position-in-block embedding: one row per position within a block, which
+            // is why `ratio` is a DIMENSION here and not just a switch.
+            tensors.push(TensorSpec::new(
+                p("attn_compressor_ape.weight"),
+                vec![coff * d.head_dim, ratio],
+                w.clone(),
+            ));
+            tensors.push(TensorSpec::new(
+                p("attn_compressor_norm.weight"),
+                vec![d.head_dim],
+                Fill::Gain,
+            ));
+        }
+        if ratio == 4 {
+            tensors.push(TensorSpec::new(
+                p("indexer.proj.weight"),
+                vec![d.n_embd, ix.n_head],
+                w.clone(),
+            ));
+            tensors.push(TensorSpec::new(
+                p("indexer.attn_q_b.weight"),
+                vec![d.q_lora_rank, ix.n_head * ix.head_size],
+                w.clone(),
+            ));
+            tensors.push(TensorSpec::new(
+                p("indexer_compressor_kv.weight"),
+                vec![d.n_embd, 2 * ix.head_size],
+                w.clone(),
+            ));
+            tensors.push(TensorSpec::new(
+                p("indexer_compressor_gate.weight"),
+                vec![d.n_embd, 2 * ix.head_size],
+                w.clone(),
+            ));
+            tensors.push(TensorSpec::new(
+                p("indexer_compressor_ape.weight"),
+                vec![2 * ix.head_size, ratio],
+                w.clone(),
+            ));
+            tensors.push(TensorSpec::new(
+                p("indexer_compressor_norm.weight"),
+                vec![ix.head_size],
+                Fill::Gain,
+            ));
+        }
+        // Every layer has a router; the first `hash_layer_count` replace the router BIAS with a
+        // token-id → expert-id table.
+        tensors.push(TensorSpec::new(
+            p("ffn_gate_inp.weight"),
+            vec![d.n_embd, d.n_expert],
+            w.clone(),
+        ));
+        if l < d.hash_layer_count {
+            tensors.push(TensorSpec::new(
+                p("ffn_gate_tid2eid.weight"),
+                vec![d.n_used, d.vocab],
+                w.clone(),
+            ));
+        } else {
+            tensors.push(TensorSpec::new(
+                p("exp_probs_b.bias"),
+                vec![d.n_expert],
+                Fill::Rand(0.5),
+            ));
+        }
+        tensors.push(TensorSpec::new(
+            p("ffn_norm.weight"),
+            vec![d.n_embd],
+            Fill::Gain,
+        ));
+        tensors.push(TensorSpec::new(
+            p("ffn_gate_exps.weight"),
+            vec![d.n_embd, d.n_ff_exp, d.n_expert],
+            w.clone(),
+        ));
+        tensors.push(TensorSpec::new(
+            p("ffn_up_exps.weight"),
+            vec![d.n_embd, d.n_ff_exp, d.n_expert],
+            w.clone(),
+        ));
+        tensors.push(TensorSpec::new(
+            p("ffn_down_exps.weight"),
+            vec![d.n_ff_exp, d.n_embd, d.n_expert],
+            w.clone(),
+        ));
+        tensors.push(TensorSpec::new(
+            p("ffn_gate_shexp.weight"),
+            vec![d.n_embd, d.shexp_ff()],
+            w.clone(),
+        ));
+        tensors.push(TensorSpec::new(
+            p("ffn_up_shexp.weight"),
+            vec![d.n_embd, d.shexp_ff()],
+            w.clone(),
+        ));
+        tensors.push(TensorSpec::new(
+            p("ffn_down_shexp.weight"),
+            vec![d.shexp_ff(), d.n_embd],
+            w.clone(),
+        ));
+    }
+    SyntheticModel { meta, tensors }
+}
+
+/// The canonical `deepseek4` fixture.
+fn deepseek4_model() -> SyntheticModel {
+    dsv4_model(&dsv4_dims())
+}
+
+/// The refusal `generate_dense_backend` returns for a V4 model with any COMPRESSED (ratio 4 or 128)
+/// layer — the canonical fixture's first blocker. Keyed on the invariant half of the message: which
+/// tier generates. The layer index and the ratio are in the other half, and the tests that care
+/// about them assert those separately.
+const DSV4_REFUSAL: &str = "only the ratio-0 tier (pure sliding window) generates";
+
+/// The error a `deepseek4` fixture fails with, from EITHER the model load or the prefill, as a full
+/// `{:#}` chain. Both are damage sites for this arch — a missing `token_embd` is refused by
+/// `SeamModel::load_with` and a missing `blk.2.attn_kv` by `wload` inside the prefill — and a sweep
+/// over "remove any one tensor" has to catch both without pre-judging which.
+fn dsv4_err(tag: &str, m: &SyntheticModel) -> String {
+    let tmp = TempGguf::write(tag, m);
+    let model = match infr_llama::SeamModel::load_with(
+        tmp.path(),
+        None,
+        std::sync::Arc::new(infr_llama::EngineConfig::default()),
+    ) {
+        Ok(model) => model,
+        Err(e) => return format!("{e:#}"),
+    };
+    match model.prefill_logits_cpu(PROMPT) {
+        Ok(logits) => panic!("this fixture must be refused, but it produced logits: {logits:?}"),
+        Err(e) => format!("{e:#}"),
+    }
+}
+
+/// Every gate boolean and every derived value of a `deepseek4` config — including, first, the three
+/// that must be FALSE. V4 is not MLA, and `Config::deepseek2` is what gates the MLA mixer, the
+/// 576-wide compressed cache row, the f16-only KV rule and group-limited routing; inheriting it
+/// (the way `deepseek32` deliberately does) would point every one of those at a model that has none
+/// of them.
+#[test]
+fn synthetic_deepseek4_config_gates() {
+    let d = dsv4_dims();
+    let ix = dsv4_indexer();
+    let tmp = TempGguf::write("ds4-config", &deepseek4_model());
+    let g = infr_gguf::Gguf::open(tmp.path()).expect("open synthetic GGUF");
+    let cfg = infr_llama::Config::from_gguf(&g).expect("Config::from_gguf");
+
+    assert!(cfg.deepseek4, "deepseek4 gate");
+    assert!(!cfg.deepseek2, "V4 is NOT MLA — deepseek2 must stay false");
+    assert!(!cfg.deepseek32, "deepseek32 must stay false");
+    assert!(!cfg.deepseek, "the V1 gate must stay false");
+    assert!(
+        !cfg.is_lite,
+        "`is_lite` is a deepseek2 tensor-presence test and must not fire here"
+    );
+    // The MLA fields `deepseek2` would have filled in. All zero: V4 has no `kv_lora_rank`, no
+    // `wk_b`/`wv_b`, no MLA head lengths and no YaRN mscale.
+    assert_eq!(
+        (
+            cfg.kv_lora_rank,
+            cfg.key_length,
+            cfg.head_k_mla,
+            cfg.v_head_dim
+        ),
+        (0, 0, 0, 0),
+        "V4 must carry none of deepseek2's MLA geometry"
+    );
+    assert!(!cfg.rope_scaling_yarn);
+    assert_eq!(cfg.rope_yarn_log_mul, 0.0);
+    assert_eq!(cfg.n_expert_groups, 0, "V4 does not group-limit routing");
+    assert_eq!(cfg.n_layer_dense_lead, 0, "V4 has no dense-lead layers");
+    assert_eq!(cfg.n_layer_nextn, 0, "V4 has no NextN blocks");
+    assert_eq!(cfg.norm_eps, 0.0, "that epsilon is deepseek32's LayerNorm");
+    assert!(!cfg.qk_norm && !cfg.qkv_bias && !cfg.permute_qk_neox);
+    assert!(!cfg.sub_norm && !cfg.llama4 && !cfg.qwen35);
+    assert!(!cfg.gemma && !cfg.gemma4);
+    assert!(!cfg.shexp_gated, "DeepSeek's shared expert is summed plain");
+
+    // Geometry read off the file, not defaulted: `head_dim` is 48 where `n_embd / n_head` is 32.
+    assert_eq!(cfg.n_layer, d.n_layer());
+    assert_eq!(cfg.vocab, d.vocab);
+    assert_eq!(cfg.n_embd, d.n_embd);
+    assert_eq!(cfg.n_head, d.n_head);
+    assert_eq!(cfg.n_kv, d.n_kv, "MQA: one KV head");
+    assert_eq!(cfg.head_dim, d.head_dim);
+    assert_ne!(
+        cfg.head_dim,
+        d.n_embd / d.n_head,
+        "the fixture's whole point"
+    );
+    assert_eq!(cfg.rope_dim, d.rope_dim);
+    assert_eq!(cfg.q_lora_rank, d.q_lora_rank);
+
+    // V4's own hyperparameters.
+    assert_eq!(cfg.o_group_count, d.o_group_count);
+    assert_eq!(cfg.o_lora_rank, d.o_lora_rank);
+    assert_eq!(cfg.hc_mult, d.hc_mult);
+    assert_eq!(cfg.hc_sinkhorn_iters, d.hc_sinkhorn_iters);
+    assert_eq!(cfg.hc_eps, d.hc_eps);
+    assert_eq!(cfg.compress_rope_theta, d.compress_rope_theta);
+    assert_ne!(
+        cfg.compress_rope_theta, cfg.rope_theta,
+        "the compressed tiers' rope base is a separate hparam from the plain one"
+    );
+    assert_eq!(cfg.hash_layer_count, d.hash_layer_count);
+    assert_eq!(cfg.compress_ratios, d.compress_ratios);
+    assert_eq!(cfg.indexer_n_head, ix.n_head);
+    assert_eq!(cfg.indexer_head_size, ix.head_size);
+    assert_eq!(cfg.indexer_top_k, ix.top_k);
+
+    // The per-layer switches, through the accessors the loader itself uses.
+    for (l, &ratio) in d.compress_ratios.iter().enumerate() {
+        assert_eq!(cfg.layer_compress_ratio(l), ratio, "layer {l} ratio");
+        assert_eq!(
+            cfg.is_hash_moe_layer(l),
+            l < d.hash_layer_count,
+            "layer {l} routing kind"
+        );
+        assert!(cfg.is_moe_layer(l), "every V4 layer is routed");
+        // `set_swa_pattern(0)`: EVERY layer is sliding-window, which `swa_pattern` cannot express.
+        assert!(cfg.is_swa_layer(l), "layer {l} must be sliding-window");
+    }
+    assert_eq!(cfg.swa_window, d.swa_window);
+    assert_eq!(
+        cfg.swa_pattern, 0,
+        "V4 has no full-attention layers to space"
+    );
+    assert_eq!(
+        cfg.swa_rope_theta, cfg.rope_theta,
+        "V4's sliding-window layers rope at the plain base, not gemma's 10000 fallback"
+    );
+
+    // The SwiGLU clamps: per-layer, and `_shexp` absent from this fixture, so it mirrors `_exp`.
+    assert_eq!(cfg.swiglu_clamp_exp, d.swiglu_clamp_exp);
+    assert_eq!(
+        cfg.swiglu_clamp_shexp, d.swiglu_clamp_exp,
+        "an absent swiglu_clamp_shexp falls back to swiglu_clamp_exp"
+    );
+
+    // MoE.
+    assert_eq!(cfg.shexp_ff, d.shexp_ff());
+    let moe = cfg.moe.expect("deepseek4 is a MoE arch");
+    assert_eq!(moe.gating, infr_core::graph::MoeGating::SqrtSoftplus);
+    assert_eq!(moe.n_expert, d.n_expert);
+    assert_eq!(moe.n_used, d.n_used);
+    assert_eq!(moe.n_ff_exp, d.n_ff_exp);
+    assert!(moe.norm_w, "expert_weights_norm came off the file");
+    assert!(!moe.weight_before);
+    assert_eq!(moe.scale, 2.5);
+}
+
+/// `swiglu_clamp_shexp`, when the file DOES declare it, is read rather than shadowed by `_exp` —
+/// and a scalar is broadcast over the layers (`get_key_or_arr`'s other half).
+#[test]
+fn synthetic_deepseek4_shared_expert_clamp_is_read_when_present() {
+    let d = Dsv4Dims {
+        swiglu_clamp_shexp: Some(vec![1.0, 2.0, 3.0, 4.0, 5.0]),
+        ..dsv4_dims()
+    };
+    let tmp = TempGguf::write("ds4-shexp-clamp", &dsv4_model(&d));
+    let g = infr_gguf::Gguf::open(tmp.path()).expect("open synthetic GGUF");
+    let cfg = infr_llama::Config::from_gguf(&g).expect("Config::from_gguf");
+    assert_eq!(cfg.swiglu_clamp_exp, d.swiglu_clamp_exp);
+    assert_eq!(cfg.swiglu_clamp_shexp, d.swiglu_clamp_shexp.unwrap());
+
+    // The SCALAR form of the same key: `get_key_or_arr` accepts one value and broadcasts it.
+    let mut m = dsv4_model(&dsv4_dims());
+    m.meta
+        .push(("deepseek4.swiglu_clamp_shexp".to_string(), Meta::F32(2.5)));
+    m.meta.sort_by(|a, b| a.0.cmp(&b.0));
+    let tmp = TempGguf::write("ds4-shexp-scalar", &m);
+    let g = infr_gguf::Gguf::open(tmp.path()).expect("open synthetic GGUF");
+    let cfg = infr_llama::Config::from_gguf(&g).expect("Config::from_gguf");
+    assert_eq!(cfg.swiglu_clamp_shexp, vec![2.5; dsv4_dims().n_layer()]);
+}
+
+/// **The weight loader consumes every tensor the file declares.**
+///
+/// Not "every tensor of a list written down twice": the sweep is over the FIXTURE's own tensor
+/// list, so a tensor the builder emits and `wload` never asks for fails here, and so does the
+/// reverse. Because `wload` runs to completion before the graph-build refusal, the complete model's
+/// error IS the refusal — anything else means the load stopped early.
+///
+/// The fixture's five layers cover every (compress_ratio, routing) pair (see [`dsv4_dims`]), so the
+/// per-layer switch is exercised in both directions: a loader that skipped the ratio-4 indexer set
+/// or that asked for `exp_probs_b` on a hash layer fails on those layers' tensors specifically.
+#[test]
+fn synthetic_deepseek4_load_consumes_every_tensor() {
+    let complete = dsv4_err("ds4-complete", &deepseek4_model());
+    println!("deepseek4 complete: {complete}");
+    assert!(
+        complete.contains(DSV4_REFUSAL),
+        "a complete deepseek4 model must load every tensor and then refuse at the graph build, \
+         got: {complete}"
+    );
+
+    let names: Vec<String> = deepseek4_model()
+        .tensors
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+    assert!(
+        names.len() > 100,
+        "fixture got smaller: {} tensors",
+        names.len()
+    );
+    for name in &names {
+        // `output.weight` is the one tensor whose absence is not damage: `wload` falls back to the
+        // (tied) `token_embd.weight` for the LM head, exactly as it does for every tied model. Its
+        // removal must therefore still reach the refusal — asserting that, rather than skipping it,
+        // keeps the sweep exhaustive.
+        let tag = format!("ds4-no-{}", name.replace('.', "-"));
+        let err = dsv4_err(&tag, &without_tensor(deepseek4_model(), name));
+        if name == "output.weight" {
+            assert!(
+                err.contains(DSV4_REFUSAL),
+                "an untied lm_head is optional (tied fallback), got: {err}"
+            );
+            continue;
+        }
+        assert!(
+            err.contains(name.as_str()),
+            "removing {name} must fail the load naming it, got: {err}"
+        );
+        assert!(
+            !err.contains(DSV4_REFUSAL),
+            "removing {name} reached the graph-build refusal — nothing asked for it: {err}"
+        );
+    }
+}
+
+/// The three `compress_ratio` tiers really do change which tensors a layer carries — the direction
+/// the sweep above cannot show, because it only ever removes what the fixture already declared.
+///
+/// Flipping one layer's ratio while leaving its tensors alone makes the file inconsistent in a way
+/// only a loader that READS the ratio can notice, and the tensor it then names says which tier it
+/// switched to.
+#[test]
+fn synthetic_deepseek4_compress_ratio_picks_the_layer_tensor_set() {
+    let base = dsv4_dims();
+    // Each case relabels ONE layer by exactly one tier and names the tensor that tier adds:
+    // 0 → 128 adds the attention compressor (layer 0 carries none), and 128 → 4 adds the indexer
+    // set on top of a compressor layer 2 already has — so each failure names the tier's OWN tensor
+    // rather than one it shares with the tier below.
+    for (l, ratio, want) in [
+        (0usize, 128usize, "blk.0.attn_compressor_kv.weight"),
+        (2, 4, "blk.2.indexer.proj.weight"),
+    ] {
+        let mut ratios = base.compress_ratios.clone();
+        ratios[l] = ratio;
+        // Keep the TENSORS the original ratio gave that layer by building the file from the
+        // unmodified dims and rewriting only the metadata array.
+        let mut m = deepseek4_model();
+        for (k, v) in m.meta.iter_mut() {
+            if k == "deepseek4.attention.compress_ratios" {
+                *v = Meta::I32Arr(ratios.iter().map(|r| *r as i32).collect());
+            }
+        }
+        let err = dsv4_err(&format!("ds4-relabel-{l}-as-{ratio}"), &m);
+        println!("deepseek4 layer {l} relabelled ratio {ratio}: {err}");
+        assert!(
+            err.contains(want),
+            "a layer at ratio {ratio} must demand {want}, got: {err}"
+        );
+    }
+    // And the converse: relabel a ratio-4 layer as 0 and its indexer set is no longer asked for, so
+    // the load runs to the refusal even though those tensors are still sitting in the file unread.
+    let mut ratios = base.compress_ratios.clone();
+    ratios[1] = 0;
+    let mut m = deepseek4_model();
+    for (k, v) in m.meta.iter_mut() {
+        if k == "deepseek4.attention.compress_ratios" {
+            *v = Meta::I32Arr(ratios.iter().map(|r| *r as i32).collect());
+        }
+    }
+    let err = dsv4_err("ds4-ratio4-as-0", &m);
+    println!("deepseek4 layer 1 relabelled ratio 0: {err}");
+    assert!(
+        err.contains(DSV4_REFUSAL),
+        "a ratio-0 layer must not demand any compressor or indexer tensor, got: {err}"
+    );
+}
+
+/// `hash_layer_count` decides `ffn_gate_tid2eid` vs `exp_probs_b`, per layer and exclusively.
+/// Widening it by one makes the loader ask a bias-carrying layer for the table it does not have.
+#[test]
+fn synthetic_deepseek4_hash_layer_count_picks_the_router_table() {
+    let d = Dsv4Dims {
+        hash_layer_count: dsv4_dims().hash_layer_count + 1,
+        ..dsv4_dims()
+    };
+    // Build the file at the ORIGINAL count so layer 2 still carries `exp_probs_b`, then claim the
+    // wider count in metadata.
+    let mut m = deepseek4_model();
+    for (k, v) in m.meta.iter_mut() {
+        if k == "deepseek4.hash_layer_count" {
+            *v = Meta::U32(d.hash_layer_count as u32);
+        }
+    }
+    let err = dsv4_err("ds4-hash-wide", &m);
+    println!("deepseek4 with hash_layer_count widened by one: {err}");
+    assert!(
+        err.contains("blk.2.ffn_gate_tid2eid.weight"),
+        "a hash-routed layer must demand its tid2eid table, got: {err}"
+    );
+
+    // Narrowing it the other way: layer 1 then wants the bias it does not carry.
+    let mut m = deepseek4_model();
+    for (k, v) in m.meta.iter_mut() {
+        if k == "deepseek4.hash_layer_count" {
+            *v = Meta::U32(1);
+        }
+    }
+    let err = dsv4_err("ds4-hash-narrow", &m);
+    println!("deepseek4 with hash_layer_count narrowed by one: {err}");
+    assert!(
+        err.contains("blk.1.exp_probs_b.bias"),
+        "a non-hash layer must demand its router bias, got: {err}"
+    );
+}
+
+/// **Only `{0, 4, 128}` are accepted.** `deepseek4.cpp::load_arch_tensors` throws on anything else,
+/// and it has to: the ratio decides which tensors the layer HAS, so an unknown value is not a
+/// wider variant of a known one to be rounded toward.
+#[test]
+fn synthetic_deepseek4_rejects_an_unknown_compress_ratio() {
+    for bad in [1i32, 8, 64, 127, 129, -4] {
+        let mut m = deepseek4_model();
+        for (k, v) in m.meta.iter_mut() {
+            if k == "deepseek4.attention.compress_ratios" {
+                let mut ratios: Vec<i32> = dsv4_dims()
+                    .compress_ratios
+                    .iter()
+                    .map(|r| *r as i32)
+                    .collect();
+                ratios[2] = bad;
+                *v = Meta::I32Arr(ratios);
+            }
+        }
+        let err = config_err(&format!("ds4-ratio-{bad}"), &m);
+        println!("deepseek4 with compress_ratios[2] = {bad}: {err}");
+        assert!(
+            err.contains("deepseek4.attention.compress_ratios[2]")
+                && err.contains("is not one of 0, 4, 128"),
+            "an unknown compression ratio must be refused naming the layer, got: {err}"
+        );
+    }
+}
+
+/// **`compress_ratios` must cover every layer.** The reference reads the array length first and
+/// throws when it is shorter than `block_count`, because `load_arch_tensors` then indexes `[il]`
+/// for every layer — a short array would leave the tail of the model reading past the end.
+#[test]
+fn synthetic_deepseek4_rejects_a_short_compress_ratios() {
+    let mut m = deepseek4_model();
+    for (k, v) in m.meta.iter_mut() {
+        if k == "deepseek4.attention.compress_ratios" {
+            *v = Meta::I32Arr(vec![0, 4, 128]); // 3 entries for 5 layers
+        }
+    }
+    let err = config_err("ds4-ratios-short", &m);
+    println!("deepseek4 with a short compress_ratios: {err}");
+    assert_eq!(
+        err,
+        "deepseek4.attention.compress_ratios is shorter than block_count: 3 entries for 5 layers"
+    );
+
+    // A LONGER array is fine — the extra entries are simply unused, matching the reference's `<`.
+    let mut m = deepseek4_model();
+    for (k, v) in m.meta.iter_mut() {
+        if k == "deepseek4.attention.compress_ratios" {
+            *v = Meta::I32Arr(vec![0, 4, 128, 4, 0, 128, 0]);
+        }
+    }
+    let tmp = TempGguf::write("ds4-ratios-long", &m);
+    let g = infr_gguf::Gguf::open(tmp.path()).expect("open synthetic GGUF");
+    let cfg = infr_llama::Config::from_gguf(&g).expect("a longer compress_ratios is accepted");
+    assert_eq!(cfg.compress_ratios, dsv4_dims().compress_ratios);
+}
+
+/// **sqrt-softplus gating is mandatory.** Every other `expert_gating_func` names a DIFFERENT
+/// routing function, and defaulting or approximating one would re-route silently — which is why
+/// `deepseek4.cpp` throws rather than falling back.
+#[test]
+fn synthetic_deepseek4_requires_sqrt_softplus_gating() {
+    for gf in [0u32, 1, 2, 3, 5] {
+        let d = Dsv4Dims {
+            expert_gating_func: gf,
+            ..dsv4_dims()
+        };
+        let err = config_err(&format!("ds4-gating-{gf}"), &dsv4_model(&d));
+        println!("deepseek4 with expert_gating_func = {gf}: {err}");
+        assert_eq!(
+            err,
+            format!(
+                "deepseek4 requires sqrt-softplus MoE scoring \
+                 (deepseek4.expert_gating_func=4); got {gf}"
+            )
+        );
+    }
+}
+
+/// The keys `deepseek4.cpp::load_arch_hparams` reads with a plain `get_key`. Every one of them is
+/// either a tensor dimension or a routing input whose absence the shared parses below would paper
+/// over with a default that is wrong in a way nothing downstream can detect — `expert_weights_scale`
+/// defaults to 0, which zeroes every routed expert.
+#[test]
+fn synthetic_deepseek4_mandatory_keys_are_required() {
+    for key in [
+        "attention.layer_norm_rms_epsilon",
+        "attention.q_lora_rank",
+        "attention.sliding_window",
+        "attention.output_group_count",
+        "attention.output_lora_rank",
+        "attention.compress_rope_freq_base",
+        "attention.compress_ratios",
+        "attention.indexer.head_count",
+        "attention.indexer.key_length",
+        "attention.indexer.top_k",
+        "hyper_connection.count",
+        "hyper_connection.sinkhorn_iterations",
+        "hyper_connection.epsilon",
+        "hash_layer_count",
+        "expert_gating_func",
+        "expert_feed_forward_length",
+        "expert_shared_count",
+        "expert_weights_scale",
+        "expert_weights_norm",
+        "swiglu_clamp_exp",
+    ] {
+        let full = format!("deepseek4.{key}");
+        let err = config_err(
+            &format!("ds4-nokey-{}", key.replace('.', "-")),
+            &without_meta(deepseek4_model(), &full),
+        );
+        println!("deepseek4 without {full}: {err}");
+        assert!(
+            err.contains(&full),
+            "a deepseek4 GGUF without {full} must be refused naming it, got: {err}"
+        );
+    }
+}
+
+/// **A COMPRESSED layer is still refused, by name, and the message says which layer and which
+/// tier.** The ratio-0 tier generates (see the `synthetic_deepseek4_ratio0_*` tests below); ratios 4
+/// and 128 need the compressed-KV state machine, which does not exist — and running them through
+/// the ratio-0 graph would silently drop every long-range key, not fail.
+///
+/// The canonical fixture's layer 1 is the first non-zero ratio, so that is the layer named.
+#[test]
+fn synthetic_deepseek4_refuses_a_compressed_layer() {
+    let err = dsv4_err("ds4-refusal", &deepseek4_model());
+    println!("deepseek4 graph build: {err}");
+    assert_eq!(
+        err,
+        "arch=deepseek4 (DeepSeek V4) layer 1 has compress_ratio 4: only the ratio-0 tier (pure \
+         sliding window) generates. A compressed layer needs the CSA compressor over blocks of 4 \
+         tokens, its persistent compressor state, the CSA/HCA block cache and the lightning \
+         indexer with its own compressor + LID cache — none of which is implemented. See \
+         docs/deepseek.md § Stage 4."
+    );
+
+    // The OTHER compressed tier names itself too — a model whose only non-zero ratio is 128 must
+    // not be reported as a CSA layer.
+    let mut d = dsv4_dims();
+    d.compress_ratios = vec![0, 0, 128, 0, 0];
+    d.hash_layer_count = 0;
+    let err = dsv4_err("ds4-refusal-hca", &dsv4_model(&d));
+    println!("deepseek4 hca-only graph build: {err}");
+    assert!(
+        err.contains("layer 2 has compress_ratio 128")
+            && err.contains("HCA compressor over blocks of 128 tokens")
+            && !err.contains("lightning indexer"),
+        "the ratio-128 refusal must name the HCA tier and NOT the indexer (which is ratio 4's), \
+         got: {err}"
+    );
+}
+
+/// **A hash-routed layer is refused too, and separately** — `Op::MoeFfn::expert_ids` is implemented
+/// on every backend, but nothing in this tree can GATHER the ids out of `ffn_gate_tid2eid`. Falling
+/// back to the router's own top-k would pick different experts with no error at all, which is
+/// exactly the silent-wrongness class the refusal exists for. See `docs/backlog.md` § B-DSV4-HASH.
+#[test]
+fn synthetic_deepseek4_refuses_a_hash_routed_layer() {
+    // Ratio 0 everywhere, so the compressed-tier refusal above cannot be what fires.
+    let mut d = dsv4_dims();
+    d.compress_ratios = vec![0; d.n_layer()];
+    let err = dsv4_err("ds4-refusal-hash", &dsv4_model(&d));
+    println!("deepseek4 hash-routed graph build: {err}");
+    assert!(
+        err.contains("layer 0 is hash-routed (hash_layer_count=2)")
+            && err.contains("blk.0.ffn_gate_tid2eid")
+            && err.contains("B-DSV4-HASH"),
+        "a hash-routed layer must be refused naming the table it cannot gather, got: {err}"
+    );
+}
+
+// ─── deepseek4 ratio 0: the tier that GENERATES ──────────────────────────────────
+//
+// `generate_dense_backend` emits `compress_ratio == 0` layers end to end: hyper-connections
+// wrapping both sublayers, MQA attention with a weightless per-head Q norm, a `[nope | rope]` tail
+// rope, attention sinks, a de-roped grouped low-rank output projection, and bias-routed
+// sqrt-softplus MoE with the per-layer SwiGLU clamps. Everything below drives that through the real
+// loader and the real seam, on CPU unconditionally and on Vulkan behind `#[ignore]`.
+
+/// The all-ratio-0 V4 fixture. Everything is [`dsv4_dims`] verbatim except the two things the emit
+/// refuses: every layer's compression ratio is 0, and no layer is hash-routed.
+///
+/// What it deliberately does NOT simplify, because each would leave a path untested:
+/// `o_group_count` stays 2 (a 1 would make the grouped output projection's `w_off` a check that
+/// cannot fail), `hc_mult` stays 2 (a 1 makes almost every Sinkhorn detail inert — see
+/// `docs/backlog.md` § B-DSV4-HC), the per-layer SwiGLU clamps stay all-different, `head_dim`
+/// stays 48 where `n_embd / n_head` is 32, and `rope_dim` (16) stays well below `head_dim` so the
+/// `[nope | rope]` split is a real split.
+fn dsv4_ratio0_dims() -> Dsv4Dims {
+    let base = dsv4_dims();
+    Dsv4Dims {
+        compress_ratios: vec![0; base.n_layer()],
+        hash_layer_count: 0,
+        ..base
+    }
+}
+
+fn dsv4_ratio0_model() -> SyntheticModel {
+    dsv4_model(&dsv4_ratio0_dims())
+}
+
+/// Replace the fill of every tensor whose name ends with `suffix`. Panics when nothing matched: a
+/// perturbation that silently applied to no tensor is a check that cannot fail.
+fn with_fill(mut m: SyntheticModel, suffix: &str, fill: Fill) -> SyntheticModel {
+    let mut n = 0;
+    for t in m.tensors.iter_mut() {
+        if t.name.ends_with(suffix) {
+            t.fill = fill.clone();
+            n += 1;
+        }
+    }
+    assert!(n > 0, "{suffix} matched no tensor — nothing was perturbed");
+    m
+}
+
+/// [`with_fill`]'s metadata twin: overwrite an existing key's value (panics if absent).
+fn with_meta(mut m: SyntheticModel, key: &str, v: Meta) -> SyntheticModel {
+    let mut found = false;
+    for (k, mv) in m.meta.iter_mut() {
+        if k == key {
+            *mv = v.clone();
+            found = true;
+        }
+    }
+    assert!(found, "{key} is not in the model — nothing was overwritten");
+    m
+}
+
+/// **A ratio-0 V4 model generates.** The end-to-end claim: the real loader, the real `wload`/`wpush`
+/// lockstep and the real emit produce finite, non-degenerate logits on the CPU reference backend.
+///
+/// The all-equal check matters as much as the finiteness one: a hyper-connection wrap that zeroed
+/// the residual, or a SwiGLU clamp applied with a `Some(0.0)` limit, both produce a perfectly
+/// finite constant vector.
+#[test]
+fn synthetic_deepseek4_ratio0_prefill_is_finite() {
+    let d = dsv4_ratio0_dims();
+    let logits = cpu_logits("ds4-r0", &dsv4_ratio0_model());
+    assert_eq!(logits.len(), d.vocab, "one logit per vocab entry");
+    assert!(
+        logits.iter().all(|v| v.is_finite()),
+        "non-finite logit in the ratio-0 V4 prefill: {logits:?}"
+    );
+    let lo = logits.iter().copied().fold(f32::INFINITY, f32::min);
+    let hi = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    println!(
+        "deepseek4 ratio-0 logits: min {lo:e} max {hi:e} rms {:e}",
+        rms(&logits)
+    );
+    assert!(
+        hi - lo > 1e-3,
+        "the ratio-0 V4 logits are constant (min {lo:e}, max {hi:e}) — a collapsed residual and a \
+         zero-limit SwiGLU clamp both look exactly like this"
+    );
+}
+
+/// **The cross-stream Sinkhorn mixing is load-bearing.** Two files identical in every tensor except
+/// the `comb` chunk of the per-layer hyper-connection `base` vectors, which is the ONLY part of the
+/// wrap that has anything to mix: with the residual stream collapsed to one, `comb` is a 1x1 matrix
+/// whose Sinkhorn normalisation divides it by itself, so the perturbation would be exactly inert
+/// and the two runs identical.
+///
+/// The baseline is a flat all-zero `base` rather than the fixture's random one, so the two variants
+/// differ in `hc_mult*hc_mult` numbers and in nothing else — including the `pre` and `post` chunks,
+/// which are byte-identical in both.
+///
+/// The `hc_mult = 1` arm is the CONTROL that makes the assertion falsifiable rather than decorative:
+/// the same perturbation, on the same emit, with one residual stream, must be EXACTLY inert. If it
+/// moved anything there, the `hc_mult = 2` arm would be measuring something other than stream
+/// mixing; if the emit collapsed the streams, the `hc_mult = 2` arm would go inert too.
+#[test]
+fn synthetic_deepseek4_stream_mixing_is_load_bearing() {
+    // `comb`'s chunk starts at `2*hc` and its flat index is `dst + hc*src`. At hc=2, bump ONE
+    // off-diagonal entry (dst=1, src=0) — the softmax over `dst` then pushes stream 0's mass onto
+    // stream 1. At hc=1 the chunk is the single entry `2*hc + 0`, and Sinkhorn's normalisation of a
+    // 1x1 matrix divides it by itself, so no value there can reach the output.
+    let pair = |hc_mult: usize| -> (SyntheticModel, SyntheticModel) {
+        let d = Dsv4Dims {
+            hc_mult,
+            ..dsv4_ratio0_dims()
+        };
+        let base_fill = |bump: bool| {
+            let mut v = vec![0.0f32; d.hc_mix_dim()];
+            if bump {
+                v[2 * hc_mult + usize::from(hc_mult > 1)] = 4.0;
+            }
+            Fill::Exact(v)
+        };
+        let variant = |bump: bool| {
+            let m = with_fill(dsv4_model(&d), "hc_attn_base.weight", base_fill(bump));
+            with_fill(m, "hc_ffn_base.weight", base_fill(bump))
+        };
+        (variant(false), variant(true))
+    };
+
+    let (flat, bumped) = pair(dsv4_ratio0_dims().hc_mult);
+    // The premise: the two files differ in the comb chunk and nowhere else.
+    let diffs: Vec<String> = weights_of(&flat)
+        .into_iter()
+        .zip(weights_of(&bumped))
+        .filter(|((_, a), (_, b))| a != b)
+        .map(|((n, _), _)| n)
+        .collect();
+    assert_eq!(
+        diffs.len(),
+        2 * dsv4_ratio0_dims().n_layer(),
+        "only the per-layer hc base vectors may differ, got: {diffs:?}"
+    );
+    let a = cpu_logits("ds4-hc-flat", &flat);
+    let b = cpu_logits("ds4-hc-comb", &bumped);
+    assert_moves(
+        "deepseek4 comb bump",
+        &a,
+        &b,
+        "the cross-stream Sinkhorn mixing (`comb`), which is inert on a single residual stream",
+    );
+
+    // The control: one stream, same perturbation, bit-identical output.
+    let (flat1, bumped1) = pair(1);
+    let a1 = cpu_logits("ds4-hc1-flat", &flat1);
+    let b1 = cpu_logits("ds4-hc1-comb", &bumped1);
+    let d1 = max_abs_diff(&a1, &b1);
+    println!(
+        "deepseek4 comb bump at hc_mult=1: max|Δ| = {d1:e} (logit rms {:e})",
+        rms(&a1)
+    );
+    assert_eq!(
+        d1, 0.0,
+        "at hc_mult=1 the comb chunk has nothing to mix and Sinkhorn normalises it away, so this \
+         perturbation must be EXACTLY inert — a non-zero difference means the hc_mult=2 arm above \
+         is measuring some other sensitivity to the same bytes"
+    );
+    assert!(
+        rms(&a1) > 1e-3,
+        "the hc_mult=1 control produced degenerate logits, so its inertness proves nothing"
+    );
+}
+
+/// **The de-rope is load-bearing, and it is an exact inverse of the forward rope.**
+///
+/// Two halves, because either alone is passable by an implementation that ropes nothing at all:
+///
+/// 1. `rope.freq_base` moves the logits — the forward rope really runs.
+/// 2. At `sliding_window = 1` every query attends ONLY its own position, so `q·k` is a dot of two
+///    vectors rotated by the SAME angle and is position-independent, and the attention output is a
+///    position-independent scalar times the (roped) KV row of that position. The de-rope then
+///    rotates that row back by the query position, cancelling exactly — so on a prompt of a REPEATED
+///    token, where every position's layer input is identical, the last row's logits must not depend
+///    on the prompt LENGTH. Drop the de-rope (or the forward q rope) and each position keeps a
+///    different rotation, and they do.
+///
+/// The tolerance in (2) is not float noise: the cancellation is exact in real arithmetic but the
+/// cache holds the ROPED row in f16, so what comes back is `R(-t)·round_f16(R(t)·kv)` and the
+/// rounding is itself position-dependent. Measured on this fixture: **1.5e-6** with an f32 KV
+/// cache, **1.6e-3** with the default f16 one, and **1.0e0** — the whole signal — with the de-rope
+/// deleted. The threshold sits between the second and the third.
+#[test]
+fn synthetic_deepseek4_derope_inverts_the_query_rope() {
+    // (1) the forward rope is not a no-op.
+    let plain = cpu_logits("ds4-theta-10k", &dsv4_ratio0_model());
+    let retuned = cpu_logits(
+        "ds4-theta-500",
+        &with_meta(
+            dsv4_ratio0_model(),
+            "deepseek4.rope.freq_base",
+            Meta::F32(500.0),
+        ),
+    );
+    assert_moves(
+        "deepseek4 rope theta",
+        &plain,
+        &retuned,
+        "the [nope|rope] tail rope",
+    );
+
+    // (2) window 1 ⇒ rope and de-rope cancel ⇒ a repeated-token prompt is position-independent.
+    let d = Dsv4Dims {
+        swa_window: 1,
+        ..dsv4_ratio0_dims()
+    };
+    let m = dsv4_model(&d);
+    let short = cpu_logits_of("ds4-w1-short", &m, &[7, 7, 7]);
+    let long = cpu_logits_of("ds4-w1-long", &m, &[7, 7, 7, 7, 7, 7, 7, 7, 7]);
+    let dv = max_abs_diff(&short, &long);
+    let scale = rms(&short).max(rms(&long));
+    println!("deepseek4 window-1 position independence: max|Δ| = {dv:e} (logit rms {scale:e})");
+    assert!(
+        dv < 1e-2 * scale,
+        "the last row's logits moved with the prompt LENGTH (max|Δ| = {dv:e}, logit rms {scale:e}) \
+         on a repeated-token prompt at sliding_window=1 — the only position dependence left there \
+         is the attention output's rope slice, so the backward de-rope is missing or is not the \
+         inverse of the forward query rope"
+    );
+    // ...and the run it is being compared against is a real one, not two copies of a degenerate
+    // constant that would satisfy any tolerance.
+    assert!(
+        scale > 1e-3,
+        "window-1 logits are degenerate (rms {scale:e})"
+    );
+}
+
+/// The grouped output projection's `w_off`: **CPU vs Vulkan on the same file.** `o_group_count = 2`
+/// means group 1 reads `wo_a` rows `[o_lora_rank, 2*o_lora_rank)` through `Op::Linear::w_off`, and
+/// the fixture's `wo_a` is f32 — the dtype the Vulkan adapter refused a weight offset on until this
+/// slice taught its f32 GEMV to take the slice as a shifted device address. A Vulkan run that
+/// ignored `w_off` would read group 0's rows twice and land here as a logit mismatch.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_synthetic_deepseek4_ratio0_matches_cpu() {
+    let _lk = gpu_serial_lock();
+    let model = dsv4_ratio0_model();
+    let cpu = cpu_logits("ds4-r0-parity-cpu", &model);
+    let gpu = vulkan_logits("ds4-r0-parity-vk", &model);
+    assert!(
+        gpu.iter().all(|v| v.is_finite()),
+        "non-finite logit in the Vulkan ratio-0 V4 prefill: {gpu:?}"
+    );
+    let cos = cosine(&cpu, &gpu);
+    println!("synthetic deepseek4 ratio-0 cpu-vs-vulkan cosine = {cos}");
+    let (cpu_top, gpu_top) = (argmax(&cpu), argmax(&gpu));
+    println!("cpu argmax = {cpu_top}, vulkan argmax = {gpu_top}");
+    assert_eq!(cpu_top, gpu_top, "CPU and Vulkan disagree on the top token");
+    // Same reasoning as `gpu_synthetic_deepseek2_matches_cpu`: five f32 layers with a pinned
+    // routed set, so the two backends agree far past this. It still fails on any real divergence
+    // — a dropped `w_off`, a missing sink, a de-rope that ran forwards.
+    assert!(
+        cos > 0.9999,
+        "CPU/Vulkan logits diverged on the synthetic ratio-0 deepseek4 model: cosine = {cos}"
+    );
+}
+
+/// The two mechanism tests above, repeated on Vulkan: `hyper_mix.comp`'s Sinkhorn and `rope_back`
+/// are separate implementations of the same rules, so proving them on the CPU proves nothing about
+/// the GPU.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_synthetic_deepseek4_mechanisms_execute() {
+    let _lk = gpu_serial_lock();
+    let d = dsv4_ratio0_dims();
+    let (hc, mix_dim) = (d.hc_mult, d.hc_mix_dim());
+    let base_fill = |bump: bool| {
+        let mut v = vec![0.0f32; mix_dim];
+        if bump {
+            v[2 * hc + 1] = 4.0;
+        }
+        Fill::Exact(v)
+    };
+    let variant = |bump: bool| {
+        let m = with_fill(dsv4_ratio0_model(), "hc_attn_base.weight", base_fill(bump));
+        with_fill(m, "hc_ffn_base.weight", base_fill(bump))
+    };
+    let a = vulkan_logits("vk-ds4-hc-flat", &variant(false));
+    let b = vulkan_logits("vk-ds4-hc-comb", &variant(true));
+    assert_moves(
+        "vulkan deepseek4 comb bump",
+        &a,
+        &b,
+        "the cross-stream Sinkhorn mixing (`comb`), which is inert on a single residual stream",
+    );
+
+    let dw = Dsv4Dims {
+        swa_window: 1,
+        ..dsv4_ratio0_dims()
+    };
+    let m = dsv4_model(&dw);
+    let tmp_s = TempGguf::write("vk-ds4-w1-short", &m);
+    let tmp_l = TempGguf::write("vk-ds4-w1-long", &m);
+    let short = load(&tmp_s)
+        .prefill_logits_vulkan(&[7, 7, 7])
+        .expect("vulkan prefill");
+    let long = load(&tmp_l)
+        .prefill_logits_vulkan(&[7, 7, 7, 7, 7, 7, 7, 7, 7])
+        .expect("vulkan prefill");
+    let dv = max_abs_diff(&short, &long);
+    let scale = rms(&short).max(rms(&long));
+    println!("vulkan deepseek4 window-1 position independence: max|Δ| = {dv:e} (rms {scale:e})");
+    assert!(
+        dv < 1e-2 * scale,
+        "vulkan: the last row's logits moved with the prompt LENGTH (max|Δ| = {dv:e}, rms \
+         {scale:e}) — the backward de-rope is missing or is not the forward rope's inverse"
+    );
+    assert!(
+        scale > 1e-3,
+        "window-1 logits are degenerate (rms {scale:e})"
+    );
 }

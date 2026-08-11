@@ -23,7 +23,7 @@ use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, G
 use infr_core::config::Config;
 use infr_core::error::Result;
 use infr_core::exec::Provision;
-use infr_core::graph::{AttnMask, Graph, MoeGating, Op};
+use infr_core::graph::{Activation, AttnMask, Graph, MoeGating, Op};
 use infr_core::tensor::{DType, TensorId};
 use infr_gguf::dequant::dequant_block;
 use infr_gguf::TensorBytes;
@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use kernels::{
-    act_fn, dot, dot_bf16, dot_f16, vec_dot_iq1m, vec_dot_iq1m_batch, vec_dot_iq1s,
+    dot, dot_bf16, dot_f16, gated_act_fn, vec_dot_iq1m, vec_dot_iq1m_batch, vec_dot_iq1s,
     vec_dot_iq1s_batch, vec_dot_iq2s, vec_dot_iq2s_batch, vec_dot_iq2xs, vec_dot_iq2xs_batch,
     vec_dot_iq2xxs, vec_dot_iq2xxs_batch, vec_dot_iq3s, vec_dot_iq3s_batch, vec_dot_iq3xxs,
     vec_dot_iq3xxs_batch, vec_dot_iq4nl_32_batch, vec_dot_iq4xs, vec_dot_iq4xs_batch,
@@ -523,6 +523,73 @@ pub(crate) fn dequant_prefix_q8_0(bytes: &[u8], need: usize) -> Vec<f32> {
     out
 }
 
+/// Refuse a stream count the fixed-size per-token scratch every backend uses cannot hold. See
+/// `infr_core::graph::HYPER_CONNECT_MAX_MULT`; `what` names the op for the panic message.
+fn hyper_check_hc(hc: usize, what: &str) {
+    let max = infr_core::graph::HYPER_CONNECT_MAX_MULT as usize;
+    assert!(
+        hc >= 1 && hc <= max,
+        "{what}: hc_mult {hc} outside the supported 1..={max} (every shipped DeepSeek V4 config \
+         uses 4; the GPU kernels hold a token's whole hc*hc mixing matrix in a fixed-size array)"
+    );
+}
+
+/// One token's Sinkhorn normalisation for `Op::HyperConnectMix`: in place over the `hc*hc` logit
+/// matrix `m`, laid out `dst + hc*src` so `dst` is the fast axis (ggml's `[dst_hc, src_hc]`).
+///
+/// Transcribed from `deepseek4.cpp`'s `build_hc_sinkhorn`: softmax over `dst`, `+ eps` on every
+/// element, then ONE normalisation over `src` followed by `n_iter - 1` (over-`dst`, over-`src`)
+/// rounds. The asymmetry is the reference's (its loop starts at `i = 1`), and the `+ eps` on each
+/// sum before it divides is the second and third of the three eps sites — see
+/// `Op::HyperConnectMix`'s doc. Both reductions run their axis ASCENDING, `ggml_sum_rows`' order.
+///
+/// Named for the axis each normalisation REDUCES over, which is the opposite of what llama.cpp's
+/// `norm_cols`/`norm_rows` lambdas are called there.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn hyper_sinkhorn(m: &mut [f32], hc: usize, eps: f32, n_iter: u32) {
+    // Softmax over dst — a contiguous run of `hc` per src column — then the post-softmax eps.
+    for src in 0..hc {
+        let col = &mut m[src * hc..][..hc];
+        let mx = col.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0f32;
+        for v in col.iter_mut() {
+            *v = (*v - mx).exp();
+            sum += *v;
+        }
+        for v in col.iter_mut() {
+            *v = *v / sum + eps;
+        }
+    }
+    // Divide each dst row by its sum over src.
+    let norm_src = |m: &mut [f32]| {
+        for dst in 0..hc {
+            let mut s = 0f32;
+            for src in 0..hc {
+                s += m[dst + hc * src];
+            }
+            let d = s + eps;
+            for src in 0..hc {
+                m[dst + hc * src] /= d;
+            }
+        }
+    };
+    // Divide each src column by its sum over dst.
+    let norm_dst = |m: &mut [f32]| {
+        for src in 0..hc {
+            let col = &mut m[src * hc..][..hc];
+            let d = col.iter().sum::<f32>() + eps;
+            for v in col.iter_mut() {
+                *v /= d;
+            }
+        }
+    };
+    norm_src(m);
+    for _ in 1..n_iter {
+        norm_dst(m);
+        norm_src(m);
+    }
+}
+
 /// Device-side stochastic sampling reference (see `Op::Sample`) — IDENTICAL order of operations to
 /// the host `sample_logits` (top-k select desc, softmax(temp), nucleus, CDF walk) with the uniform
 /// draw `uu` factored out. `top_k == 0` is the "disable top-k" sentinel → NO truncation (`k == len`);
@@ -854,7 +921,9 @@ impl Backend for CpuBackend {
                 } => {
                     let (rows, nh, hd) = (rows as usize, n_head as usize, head_dim as usize);
                     let xs = &vals[x.0 as usize];
-                    let ws = weight(w);
+                    // `None` = V4's weightless Q norm (bare `ggml_rms_norm` per head): the scale is
+                    // the only factor. The reduction is identical either way.
+                    let ws = w.map(&weight);
                     let mut out = vec![0f32; rows * nh * hd];
                     for r in 0..rows {
                         for h in 0..nh {
@@ -862,8 +931,17 @@ impl Backend for CpuBackend {
                             let ss: f32 =
                                 (0..hd).map(|i| xs[b + i] * xs[b + i]).sum::<f32>() / hd as f32;
                             let s = 1.0 / (ss + eps).sqrt();
-                            for i in 0..hd {
-                                out[b + i] = xs[b + i] * s * ws[i];
+                            match &ws {
+                                Some(ws) => {
+                                    for i in 0..hd {
+                                        out[b + i] = xs[b + i] * s * ws[i];
+                                    }
+                                }
+                                None => {
+                                    for i in 0..hd {
+                                        out[b + i] = xs[b + i] * s;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1423,6 +1501,7 @@ impl Backend for CpuBackend {
                     theta,
                     freq_factors,
                     neox,
+                    backward,
                     ..
                 } => {
                     let (rows, nh, hd, rd) = (
@@ -1458,7 +1537,12 @@ impl Backend for CpuBackend {
                                 if let Some(ff) = &ff {
                                     ang /= ff[p];
                                 }
-                                let (s, c) = (ang.sin(), ang.cos());
+                                // `ggml_rope_ext_back` is this rotation with `sin` negated and
+                                // `cos` untouched (`sin_sign` in ggml_compute_forward_rope_flt) —
+                                // the transpose, which is the inverse because nothing scales the
+                                // magnitude here. See `Op::Rope::backward`.
+                                let sin_sign = if backward { -1.0 } else { 1.0 };
+                                let (s, c) = (ang.sin() * sin_sign, ang.cos());
                                 let a = xs[b + i0];
                                 let bb = xs[b + i1];
                                 out[b + i0] = a * c - bb * s;
@@ -1670,6 +1754,7 @@ impl Backend for CpuBackend {
                     scale,
                     mask,
                     pos,
+                    sinks,
                 } => {
                     let (rows, kv_len, nh, nkv, hd) = (
                         rows as usize,
@@ -1725,6 +1810,10 @@ impl Backend for CpuBackend {
                     };
                     let ks = deq(&kguard, g.desc(k_cache).dtype);
                     let vs = deq(&vguard, g.desc(v_cache).dtype);
+                    // Per-head attention sinks (V4's `attn_sinks`, `None` everywhere else): one
+                    // extra logit per head in the max AND the denominator, never in the numerator.
+                    // See `Op::Attention::sinks`.
+                    let sk = sinks.map(&weight);
                     let group = nh / nkv;
                     // `Causal`/`SlidingWindow` clip the causal END at `abs+1` (per-row, from
                     // `pos`); `Canvas` (DiffusionGemma denoise — see `AttnMask::Canvas`'s doc)
@@ -1771,9 +1860,19 @@ impl Backend for CpuBackend {
                             *scj = dot(qrow, &ks[kb..kb + hd]) * scale;
                             mx = mx.max(*scj);
                         }
+                        // The sink joins the max first (so a dominating sink can't overflow the
+                        // exps), then the denominator — `ggml_compute_forward_soft_max_f32`'s two
+                        // `if (sk)` lines, in that order.
+                        let sink = sk.as_ref().map(|w| w[h]);
+                        if let Some(sv) = sink {
+                            mx = mx.max(sv);
+                        }
                         let mut l = 0f32;
                         for &s in &sc {
                             l += (s - mx).exp();
+                        }
+                        if let Some(sv) = sink {
+                            l += (sv - mx).exp();
                         }
                         for (jj, &s) in sc.iter().enumerate() {
                             let j = lo + jj;
@@ -1799,8 +1898,14 @@ impl Backend for CpuBackend {
                     up_stride,
                     gate_stride,
                     gate_block_width,
+                    swiglu_clamp,
                     ..
                 } => {
+                    assert!(
+                        swiglu_clamp.is_none() || !matches!(act, Activation::Sigmoid),
+                        "cpu Op::GatedAct: swiglu_clamp is defined for the gated SiLU/GELU forms \
+                         only (llama.cpp clamps in its LLM_FFN_SILU arm); got {act:?}"
+                    );
                     let (rows, nff, up_off, up_stride, gate_stride, gate_block_width) = (
                         rows as usize,
                         nff as usize,
@@ -1832,7 +1937,7 @@ impl Backend for CpuBackend {
                             } else {
                                 gb + i
                             };
-                            orow[i] = act_fn(act, gs[gi]) * us[ub + i];
+                            orow[i] = gated_act_fn(act, swiglu_clamp, gs[gi], us[ub + i]);
                         }
                     });
                     vals[dst.0 as usize] = out;
@@ -1843,7 +1948,13 @@ impl Backend for CpuBackend {
                     rows,
                     nff,
                     act,
+                    swiglu_clamp,
                 } => {
+                    assert!(
+                        swiglu_clamp.is_none() || !matches!(act, Activation::Sigmoid),
+                        "cpu Op::GatedActFused: swiglu_clamp is defined for the gated SiLU/GELU \
+                         forms only (llama.cpp clamps in its LLM_FFN_SILU arm); got {act:?}"
+                    );
                     // Combined [rows, 2*nff] gate|up buffer: gate half first, up half second. Rows
                     // are independent — spin-pool over rows, bit-identical to the serial version.
                     let (rows, nff) = (rows as usize, nff as usize);
@@ -1852,7 +1963,8 @@ impl Backend for CpuBackend {
                     self.pool().for_chunks_mut(&mut out, nff, 1, &|r, orow| {
                         let gb = r * 2 * nff;
                         for i in 0..nff {
-                            orow[i] = act_fn(act, gus[gb + i]) * gus[gb + nff + i];
+                            orow[i] =
+                                gated_act_fn(act, swiglu_clamp, gus[gb + i], gus[gb + nff + i]);
                         }
                     });
                     vals[dst.0 as usize] = out;
@@ -2133,7 +2245,29 @@ impl Backend for CpuBackend {
                     exp_probs_b,
                     n_expert_groups,
                     n_expert_groups_used,
+                    expert_ids,
+                    swiglu_clamp,
                 } => {
+                    // `weight_before` folds the routing weight into gate/up BEFORE the activation,
+                    // so a clamp alongside it would clamp the weighted values — a combination no
+                    // reference defines (llama4 has no clamp, V4 has no weight_before).
+                    assert!(
+                        swiglu_clamp.is_none()
+                            || (!matches!(act, Activation::Sigmoid) && !weight_before),
+                        "cpu Op::MoeFfn: swiglu_clamp is defined for the gated SiLU/GELU forms \
+                         with output-side weighting only (llama.cpp clamps in its LLM_FFN_SILU \
+                         arm); got act={act:?} weight_before={weight_before}"
+                    );
+                    // Hash routing supplies the selection outright, so the two SELECTION-only
+                    // inputs have nothing left to act on — llama.cpp nulls `exp_probs_b` on a hash
+                    // layer for exactly this reason. Refuse rather than ignore them silently.
+                    assert!(
+                        expert_ids.is_none() || (exp_probs_b.is_none() && n_expert_groups <= 1),
+                        "cpu Op::MoeFfn: expert_ids (hash routing) supplies the selection, so \
+                         exp_probs_b (bias: {}) and group routing (groups: {n_expert_groups}) \
+                         have nothing to select — they must be absent",
+                        exp_probs_b.is_some(),
+                    );
                     let (ne, n_expert, n_used, nffx) = (
                         ne as usize,
                         n_expert as usize,
@@ -2223,11 +2357,28 @@ impl Backend for CpuBackend {
                     };
                     struct RouteRow {
                         /// Selected experts, sorted by DESCENDING router prob — the same order the
-                        /// original per-row loop accumulated in.
+                        /// original per-row loop accumulated in. On a HASH-routed layer these are
+                        /// the supplied ids in their table order instead (nothing sorts them).
                         idx: Vec<usize>,
                         /// Final per-expert weight (renormalized top-k prob × `scale`), aligned to `idx`.
                         w: Vec<f32>,
                     }
+                    // DeepSeek V4 hash routing: the selection arrives as an already-gathered
+                    // `[rows, n_used]` I32 tensor, widened to f32 by `bytes_to_f32` like every
+                    // other integer input, so every selection step below is SKIPPED, not computed
+                    // and overwritten. The router GEMM above still ran: llama.cpp's `build_moe_ffn`
+                    // takes the routing WEIGHTS from `ggml_get_rows(probs, selected_experts)` even
+                    // when the ids are supplied, so the probs are still needed.
+                    let hash_ids: Option<Vec<f32>> = expert_ids.map(|id| {
+                        let v = vals[id.0 as usize].clone();
+                        assert!(
+                            v.len() >= rows * n_used,
+                            "cpu Op::MoeFfn: expert_ids holds {} slots but the op routes {rows} \
+                             rows × {n_used} experts",
+                            v.len(),
+                        );
+                        v
+                    });
                     let routes: Vec<RouteRow> = pool.collect(rows, &|r| {
                         let logits = &logits_all[r * n_expert..r * n_expert + n_expert];
                         // Router probabilities: softmax over all experts (qwen3moe/…) or a per-expert
@@ -2263,64 +2414,86 @@ impl Backend for CpuBackend {
                                     .collect()
                             }
                         };
-                        // DeepSeek V2+: router bias for SELECTION only — add to a copy used for
-                        // top-k selection; original probs still used for per-expert weights.
-                        let mut sel_probs: Vec<f32> = if let Some(epb) = exp_probs_b {
-                            let epb_w = weight(epb);
-                            probs
-                                .iter()
-                                .enumerate()
-                                .map(|(e, &p)| p + epb_w[e])
+                        let idx: Vec<usize> = if let Some(hids) = &hash_ids {
+                            // Hash-routed (V4): the token's table row IS the selection. Everything
+                            // the `else` branch computes — the biased copy, the group scores, the
+                            // sort — exists only to RANK experts, so on this path none of it runs
+                            // at all rather than running and being overwritten.
+                            (0..n_used)
+                                .map(|k| {
+                                    let e = hids[r * n_used + k] as usize;
+                                    assert!(
+                                        e < n_expert,
+                                        "cpu Op::MoeFfn: hash-routed expert id {e} at (row {r}, \
+                                         slot {k}) is past n_expert {n_expert} — the ids did not \
+                                         come from a matching ffn_gate_tid2eid table"
+                                    );
+                                    e
+                                })
                                 .collect()
                         } else {
-                            probs.clone()
+                            // DeepSeek V2+: router bias for SELECTION only — add to a copy used for
+                            // top-k selection; original probs still used for per-expert weights.
+                            let mut sel_probs: Vec<f32> = if let Some(epb) = exp_probs_b {
+                                let epb_w = weight(epb);
+                                probs
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(e, &p)| p + epb_w[e])
+                                    .collect()
+                            } else {
+                                probs.clone()
+                            };
+                            // DeepSeek V3+: group-limited routing — per-group top-2, top groups,
+                            // mask the rest to -inf (matching llama.cpp `build_moe_ffn`).
+                            if n_expert_groups > 1 && n_expert_groups_used > 0 {
+                                let n_exp_per_group = n_expert / n_expert_groups as usize;
+                                let ng = n_expert_groups as usize;
+                                let ng_used = n_expert_groups_used as usize;
+                                // Compute per-group score: sum of top-2 within each group.
+                                let mut gscores = vec![f32::NEG_INFINITY; ng];
+                                for g in 0..ng {
+                                    let base = g * n_exp_per_group;
+                                    let mut best = [f32::NEG_INFINITY; 2];
+                                    for &s in &sel_probs[base..base + n_exp_per_group] {
+                                        if s > best[0] {
+                                            best[1] = best[0];
+                                            best[0] = s;
+                                        } else if s > best[1] {
+                                            best[1] = s;
+                                        }
+                                    }
+                                    gscores[g] = best[0] + best[1];
+                                }
+                                // Top ng_used groups by score.
+                                let mut gidx: Vec<usize> = (0..ng).collect();
+                                gidx.sort_by(|&a, &b| gscores[b].partial_cmp(&gscores[a]).unwrap());
+                                gidx.truncate(ng_used);
+                                // Mask non-chosen groups to -inf.
+                                let mut chosen = vec![false; ng];
+                                for &g in &gidx {
+                                    chosen[g] = true;
+                                }
+                                for g in 0..ng {
+                                    if !chosen[g] {
+                                        for s in sel_probs
+                                            [g * n_exp_per_group..(g + 1) * n_exp_per_group]
+                                            .iter_mut()
+                                        {
+                                            *s = f32::NEG_INFINITY;
+                                        }
+                                    }
+                                }
+                            }
+                            let mut idx: Vec<usize> = (0..n_expert).collect();
+                            idx.sort_by(|&a, &b| sel_probs[b].partial_cmp(&sel_probs[a]).unwrap());
+                            idx.truncate(n_used);
+                            idx
                         };
-                        // DeepSeek V3+: group-limited routing — per-group top-2, top groups,
-                        // mask the rest to -inf (matching llama.cpp `build_moe_ffn`).
-                        if n_expert_groups > 1 && n_expert_groups_used > 0 {
-                            let n_exp_per_group = n_expert / n_expert_groups as usize;
-                            let ng = n_expert_groups as usize;
-                            let ng_used = n_expert_groups_used as usize;
-                            // Compute per-group score: sum of top-2 within each group.
-                            let mut gscores = vec![f32::NEG_INFINITY; ng];
-                            for g in 0..ng {
-                                let base = g * n_exp_per_group;
-                                let mut best = [f32::NEG_INFINITY; 2];
-                                for &s in &sel_probs[base..base + n_exp_per_group] {
-                                    if s > best[0] {
-                                        best[1] = best[0];
-                                        best[0] = s;
-                                    } else if s > best[1] {
-                                        best[1] = s;
-                                    }
-                                }
-                                gscores[g] = best[0] + best[1];
-                            }
-                            // Top ng_used groups by score.
-                            let mut gidx: Vec<usize> = (0..ng).collect();
-                            gidx.sort_by(|&a, &b| gscores[b].partial_cmp(&gscores[a]).unwrap());
-                            gidx.truncate(ng_used);
-                            // Mask non-chosen groups to -inf.
-                            let mut chosen = vec![false; ng];
-                            for &g in &gidx {
-                                chosen[g] = true;
-                            }
-                            for g in 0..ng {
-                                if !chosen[g] {
-                                    for s in sel_probs
-                                        [g * n_exp_per_group..(g + 1) * n_exp_per_group]
-                                        .iter_mut()
-                                    {
-                                        *s = f32::NEG_INFINITY;
-                                    }
-                                }
-                            }
-                        }
-                        let mut idx: Vec<usize> = (0..n_expert).collect();
-                        idx.sort_by(|&a, &b| sel_probs[b].partial_cmp(&sel_probs[a]).unwrap());
-                        idx.truncate(n_used);
                         // `norm_w`: renormalize the selected weights to sum to 1 before scaling
                         // (softmax MoE); llama4 uses the raw sigmoid prob × scale (no renorm).
+                        // Hash routing changes nothing here — llama.cpp reads the weights out of
+                        // the same unbiased `probs` at the selected ids on either path.
                         let w: Vec<f32> = if norm_w {
                             let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
                             idx.iter().map(|&e| probs[e] / wsum * scale).collect()
@@ -2626,14 +2799,23 @@ impl Backend for CpuBackend {
                         if fused_gate_up {
                             let gu = &gu_all[gu_off[b]..gu_off[b] + 2 * nffx * count];
                             for (f, v) in row.iter_mut().enumerate() {
-                                *v = act_fn(act, wp * gu[f * count + i])
-                                    * (wp * gu[(nffx + f) * count + i]);
+                                *v = gated_act_fn(
+                                    act,
+                                    swiglu_clamp,
+                                    wp * gu[f * count + i],
+                                    wp * gu[(nffx + f) * count + i],
+                                );
                             }
                         } else {
                             let gt = &gu_all[gu_off[b]..gu_off[b] + nffx * count];
                             let ut = &up_all[gu_off[b]..gu_off[b] + nffx * count];
                             for (f, v) in row.iter_mut().enumerate() {
-                                *v = act_fn(act, wp * gt[f * count + i]) * (wp * ut[f * count + i]);
+                                *v = gated_act_fn(
+                                    act,
+                                    swiglu_clamp,
+                                    wp * gt[f * count + i],
+                                    wp * ut[f * count + i],
+                                );
                             }
                         }
                         row
@@ -3160,6 +3342,145 @@ impl Backend for CpuBackend {
                             row[j] = 0.0;
                         }
                     }
+                    vals[dst.0 as usize] = out;
+                }
+                Op::HyperConnectMix {
+                    mixes,
+                    scale,
+                    base,
+                    pre,
+                    gates,
+                    rows,
+                    hc,
+                    eps,
+                    n_iter,
+                } => {
+                    let (rows, hc) = (rows as usize, hc as usize);
+                    hyper_check_hc(hc, "cpu Op::HyperConnectMix");
+                    assert!(
+                        n_iter >= 1,
+                        "cpu Op::HyperConnectMix: n_iter {n_iter} — Sinkhorn runs at least one \
+                         normalisation over src"
+                    );
+                    let mx = &vals[mixes.0 as usize];
+                    let sc = weight(scale);
+                    let bs = weight(base);
+                    // The head form's `mixes` is the `pre` chunk alone (its `output_hc_fn` is
+                    // `{hc_dim, hc}`) — see `Op::HyperConnectMix`'s doc.
+                    let (mix_dim, n_scale) = if gates.is_some() {
+                        ((2 + hc) * hc, 3)
+                    } else {
+                        (hc, 1)
+                    };
+                    assert!(
+                        mx.len() >= rows * mix_dim && sc.len() >= n_scale && bs.len() >= mix_dim,
+                        "cpu Op::HyperConnectMix: mixes {} / scale {} / base {} too small for rows \
+                         {rows}, hc {hc} (needs {}, {n_scale}, {mix_dim})",
+                        mx.len(),
+                        sc.len(),
+                        bs.len(),
+                        rows * mix_dim,
+                    );
+                    let mut pre_out = vec![0f32; rows * hc];
+                    for (t, p) in pre_out.chunks_exact_mut(hc).enumerate() {
+                        for (h, o) in p.iter_mut().enumerate() {
+                            let z = mx[t * mix_dim + h] * sc[0] + bs[h];
+                            // sigmoid, then + eps — the FOURTH eps site (`ggml_scale_bias(pre,
+                            // 1.0f, eps)`), distinct from the three inside Sinkhorn.
+                            *o = 1.0 / (1.0 + (-z).exp()) + eps;
+                        }
+                    }
+                    // Every output is built before any is stored: `mx`/`sc`/`bs` borrow `vals`.
+                    let gate_out = gates.map(|infr_core::graph::HyperGates { post, comb }| {
+                        let mut post_out = vec![0f32; rows * hc];
+                        for (t, p) in post_out.chunks_exact_mut(hc).enumerate() {
+                            for (h, o) in p.iter_mut().enumerate() {
+                                let z = mx[t * mix_dim + hc + h] * sc[1] + bs[hc + h];
+                                // sigmoid, then × 2 — NOT + eps. Adjacent chunk, different tail.
+                                *o = 2.0 / (1.0 + (-z).exp());
+                            }
+                        }
+                        let mut comb_out = vec![0f32; rows * hc * hc];
+                        // Rows are independent; each is a `hc*hc` Sinkhorn, so the grain is a whole
+                        // token's matrix.
+                        self.pool()
+                            .for_chunks_mut(&mut comb_out, hc * hc, 8, &|t, m| {
+                                // comb's chunk starts at 2*hc and its flat index is `dst + hc*src`
+                                // — the same layout Sinkhorn and `Op::HyperConnectPost` read.
+                                for (i, o) in m.iter_mut().enumerate() {
+                                    *o = mx[t * mix_dim + 2 * hc + i] * sc[2] + bs[2 * hc + i];
+                                }
+                                hyper_sinkhorn(m, hc, eps, n_iter);
+                            });
+                        (post, post_out, comb, comb_out)
+                    });
+                    vals[pre.0 as usize] = pre_out;
+                    if let Some((post, post_out, comb, comb_out)) = gate_out {
+                        vals[post.0 as usize] = post_out;
+                        vals[comb.0 as usize] = comb_out;
+                    }
+                }
+                Op::HyperConnectPre {
+                    x,
+                    weights,
+                    dst,
+                    rows,
+                    hc,
+                    n_embd,
+                } => {
+                    let (rows, hc, ne) = (rows as usize, hc as usize, n_embd as usize);
+                    hyper_check_hc(hc, "cpu Op::HyperConnectPre");
+                    let xs = &vals[x.0 as usize];
+                    let ws = &vals[weights.0 as usize];
+                    let mut out = vec![0f32; rows * ne];
+                    self.pool().for_chunks_mut(&mut out, ne, 1, &|t, o| {
+                        // dst[t, i] = Σ_h x[t, h, i] * w[t, h], h ASCENDING — the accumulation
+                        // order llama.cpp's chain of `ggml_add`s builds up.
+                        for h in 0..hc {
+                            let w = ws[t * hc + h];
+                            let xr = &xs[(t * hc + h) * ne..][..ne];
+                            for (o, &xv) in o.iter_mut().zip(xr) {
+                                *o = xv.mul_add(w, *o);
+                            }
+                        }
+                    });
+                    vals[dst.0 as usize] = out;
+                }
+                Op::HyperConnectPost {
+                    x,
+                    residual,
+                    post,
+                    comb,
+                    dst,
+                    rows,
+                    hc,
+                    n_embd,
+                } => {
+                    let (rows, hc, ne) = (rows as usize, hc as usize, n_embd as usize);
+                    hyper_check_hc(hc, "cpu Op::HyperConnectPost");
+                    let xs = &vals[x.0 as usize];
+                    let rs = &vals[residual.0 as usize];
+                    let ps = &vals[post.0 as usize];
+                    let cs = &vals[comb.0 as usize];
+                    let mut out = vec![0f32; rows * hc * ne];
+                    // One chunk per (token, dst stream).
+                    self.pool().for_chunks_mut(&mut out, ne, 4, &|c, o| {
+                        let (t, d) = (c / hc, c % hc);
+                        let xr = &xs[t * ne..][..ne];
+                        let g = ps[t * hc + d];
+                        for (o, &xv) in o.iter_mut().zip(xr) {
+                            *o = xv * g;
+                        }
+                        for src in 0..hc {
+                            // comb[t, dst, src] at `dst + hc*src` — transposing this is the
+                            // failure `Op::HyperConnectMix`'s doc warns about.
+                            let w = cs[t * hc * hc + d + hc * src];
+                            let rr = &rs[(t * hc + src) * ne..][..ne];
+                            for (o, &rv) in o.iter_mut().zip(rr) {
+                                *o = rv.mul_add(w, *o);
+                            }
+                        }
+                    });
                     vals[dst.0 as usize] = out;
                 }
             }

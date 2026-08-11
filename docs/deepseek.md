@@ -15,11 +15,21 @@ checklist).
 
 Stage 1 (`deepseek`) was skipped — V2-Lite is the development model.
 
-The reference implementation is llama.cpp at `b10218-1-gc629da5`, checked out
-locally at `~/Projects/mxaddict/llama.cpp`. Every claim about DeepSeek's maths
+The reference implementation is llama.cpp, checked out locally at
+`~/Projects/mxaddict/llama.cpp`, now at `b10356-2-g030ebb5`
+(`030ebb558a5820b444a8f836ed5cdd46c9b4bd7a`). Every claim about DeepSeek's maths
 in this document was read out of that tree, and every claim about what `infr`
 already has was read out of this one. Where something was **not** verified it
 says so — those lines are the ones to check first, not to trust.
+
+The document was originally written against `b10218-1-gc629da5`
+(`c629da565c80b0b17fac6262acdca4d772e745d8`). The 2026-08-11 pull advanced the
+checkout by 139 commits and touched all four files this document draws from, so
+each maths claim was re-checked at the new pin: the trunk YaRN pre-scale, the
+lightning indexer, the V4 hyper-connection helpers and `build_moe_ffn`'s router
+bias are all **unchanged**. What did move — a second YaRN copy in the new
+`graph_mtp`, the SwiGLU-clamp arm widening to `LLM_ARCH_DFLASH`, and the V3.2
+layer-count switch — is itemised in `backlog.md` § B-DSHW-PULL.
 
 Re-verified against both trees on 2026-08-05. That pass corrected the stage-1
 rope-type mapping (it prescribed a permute that would have corrupted output),
@@ -483,8 +493,18 @@ Order matters:
     (549). The seam's ff divisors / mscale are context-independent (llama.cpp
     runs the full ramp at every context length), so the short-CPU and long-GPU
     runs exercise the same numbers; both greedy tokens match.
-  - Both cosines sit in the established deepseek2 infr-vs-llama.cpp range
-    (~0.79–0.91; MLA adds f16 cache + norm + rope stages per layer).
+  - **Ignore those two cosine numbers; the greedy tokens are the result.** This
+    entry used to say both sat "in the established deepseek2 infr-vs-llama.cpp
+    range (~0.79–0.91)". That range means nothing. Measured 2026-08-11 by
+    `cpu_prefill_matches_llama_debug_dump`, on the same V2-Lite GGUF and over
+    llama.cpp's own token ids: a **correct** match — both engines picking token
+    8913 (" Paris"), probability cosine 0.9969 — scores a logit cosine of only
+    **0.774**, while two **unrelated** rows of Qwen3-0.6B score **0.851**. A
+    whole-vocab logit cosine is dominated by the per-token bias every row of a
+    model shares, so a correct row can score below an unrelated one and the
+    metric cannot separate them. Score agreement on mutual top-5 containment and
+    a cosine over softmax **probabilities** (0.9969 vs 0.0164 for that unrelated
+    pair). The greedy-token identity above is real evidence and stands.
 - [x] Metal MLA kernel — `mla_f16kv` in `attention.metal` + `exec.rs` dispatch
       (2026-08-06; ported from `mla.comp`, f16 KV cache), plus the YaRN
       `mla_f16kv_ff` twin. Executed for the first time by `mla_parity` /
@@ -688,6 +708,123 @@ row's softmax max is finite and `exp(-inf - max)` is 0 exactly.
 
 ## Stage 4 — `deepseek4` (V4-Flash / V4-Pro)
 
+**Progress: a V4 model whose `compress_ratios` are ALL ZERO generates.** The
+ratio-0 tier is emitted end to end and runs on CPU and Vulkan; ratios 4 and 128,
+and hash-routed layers, are refused by name. See "Slice A — ratio 0" below for
+what that covers and `docs/backlog.md` § B-DSV4-WIRING for what slice B owes.
+
+The 2026-08-10 read slice that preceded it was a read, not a port:
+`llama-kv-cache-dsv4.cpp` had never been read in full, which made this section's
+account of the compressed caches the least trustworthy part of the document. It
+has been, and "The compressed-KV state machine" below is rewritten off it — the
+real inventory, the per-ubatch index plan, four boundary conditions, and two
+corrections to what this document previously claimed about V4's indexer (its
+rope type and its head order were both stated backwards).
+
+### Slice A — ratio 0 end to end (2026-08-10)
+
+`seam::runner`'s `MixerW::Dsv4` arm emits, per layer:
+
+```text
+hc wrap (attn) : rmsnorm(res, ones) -> Linear(hc_attn_fn) -> HyperConnectMix
+                 -> HyperConnectPre -> RmsNorm(attn_norm)
+attention      : wq_a -> q_a_norm -> wq_b -> QkNorm{weight:None}
+                 -> rope the [nope|rope] TAIL -> Copy to f16 q
+                 wkv -> attn_kv_a_norm -> rope the tail -> WriteKv (K and V)
+                 Attention{ n_kv:1, sinks, SlidingWindow(swa) }
+                 -> rope BACKWARD (de-rope) -> per-group Linear(wo_a, w_off)
+                 -> Linear(wo_b)
+hc post (attn) : HyperConnectPost  res[0] -> res[1]
+hc wrap (ffn)  : ... on res[1] -> RmsNorm(ffn_norm)
+ffn            : MoeFfn{ SqrtSoftplus, exp_probs_b, swiglu_clamp_exp[il] }
+                 + shared expert (swiglu_clamp_shexp[il]), summed
+hc post (ffn)  : HyperConnectPost  res[1] -> res[0]
+```
+
+then, once, `HyperConnectMix { gates: None }` + `HyperConnectPre` collapse the
+streams back into `hidden` for `output_norm`. Four resolved design points:
+
+- **The residual PING-PONGS between two `[batch, hc_mult, n_embd]` buffers.**
+  `Op::HyperConnectPost` cannot run in place — every output element reads every
+  `src` stream of `residual`. A layer wraps exactly two sublayers, so the parity
+  returns to buffer 0 at every layer boundary and the pair is a fixed a→b→a.
+- **The widened stream is seeded by REPLICATING the embedding across the
+  `hc_mult` streams.** This is the one piece of the emit that is an assumption
+  rather than a transcription — see the caveat in `docs/backlog.md` § B-DSV4-HC.
+- **The `[nope | rope]` tail is sliced with ONE `Op::CopyStrided` each way**, at
+  `rows = batch * n_head`, `src_stride = head_dim`, `src_off = nope` — the
+  packed result is then a plain `n_head`-head rope row. Three sites: q, kv, and
+  the backward de-rope of the attention output.
+- **`Op::Attention` reads an f16 `q`** (the seam's producer→consumer dtype
+  flow), so the normed+roped f32 query is `Op::Copy`d into `q16` exactly as
+  llama4's NoPE layer casts its unroped one. The rope itself stays on the f32
+  buffer.
+
+Two things outside the emit had to move with it:
+
+- **Vulkan's `Op::Linear` now takes `w_off` on an F32 weight**, by shifting the
+  weight's `bufferDeviceAddress` base rather than adding a push field — every
+  float GEMV here already addresses its weight by pointer, and `w_off` is
+  row-aligned, so the slice IS a shifted pointer. F16 stays refused (four more
+  call sites, an alignment obligation, and no caller). Without this the grouped
+  output projection could not run on Vulkan at all with an f32 `wo_a`.
+- **V4 is excluded from the record-once decode replay tape**, exactly as
+  `deepseek2` already is. Its four new ops have no dyn twins, so the adapter's
+  `decode_eligible` is false and the tape would have been executed STATICALLY
+  with `pos = 0` baked into every `WriteKv` and `Attention` — every token
+  writing its KV to row 0 and attending only itself. Measured before the fix:
+  the CPU-vs-Vulkan cosine fell 1.0 → 0.95 → 0.67 over prompt lengths 1, 2, 3,
+  while a `sliding_window = 1` model (where attending only your own row IS
+  correct) stayed exact and hid it.
+
+What ratio 0 does NOT cover, and is refused rather than approximated: compressed
+layers (ratios 4/128) and hash-routed layers, whose expert ids nothing in the
+tree can gather.
+
+Slice 2 added the op-level pieces V4's attention needs, on CPU, Vulkan and
+Metal, with op-level parity tests in `crates/infr-llama/tests/seam_op_parity.rs`
+and `crates/infr-metal/tests/parity.rs`:
+
+1. **Unweighted per-head RMS norm on Q** — `Op::QkNorm { weight: Option<_> }`.
+   `None` is the bare `ggml_rms_norm` V4 calls after `wq_b`; a ones-vector
+   weight would be a fake operand costing a real allocation.
+2. **Attention sinks** — `Op::Attention { sinks: Option<_> }`, `[n_head]` f32.
+   Read off `ggml_compute_forward_soft_max_f32`'s `src2` handling: the sink
+   joins the softmax MAX **and** the DENOMINATOR, and never the numerator.
+   `None` for every existing arch, so no current model's numerics move.
+3. **Rope BACKWARD** — `Op::Rope { backward: bool }`. `ggml_rope_ext_back` is
+   the same kernel with `sin_sign = -1`: `cos` untouched, `sin` negated, i.e.
+   the TRANSPOSE. That is only the INVERSE when `mscale == 1` — ggml applies
+   `attn_factor` to both `cos` and `sin` and `sin_sign` does not undo it, so a
+   YaRN'd forward-then-back scales by `mscale²`. V4 sidesteps it exactly:
+   `dsv4_rope_attn_factor` returns `1/(1 + 0.1·ln(1/freq_scale))` whenever
+   `ext_factor != 0`, cancelling YaRN's correction to `mscale == 1` at every V4
+   rope call site. `Op::Rope` carries no magnitude scale at all, so `backward`
+   is an exact inverse there.
+4. **The grouped low-rank output projection needs NO new op.** `wo_a`'s batch
+   axis is the OUTERMOST axis of both operands in `ggml_mul_mat`, so group `g`
+   is exactly `Op::Linear` over `wo_a` rows `[g·o_lora_rank, (g+1)·o_lora_rank)`
+   — which `Op::Linear::w_off` already selects — over output columns
+   `[g·o_group_dim, (g+1)·o_group_dim)`, which `Op::CopyStrided` already slices.
+   The Vulkan caveat this listed — `w_off` refused on the f32/f16 fallbacks — is
+   half resolved: F32 now rides a shifted device address (see "Slice A"), F16 is
+   still refused.
+
+The GPU coverage is deliberately narrow, because each new capability lives in
+ONE kernel rather than across the whole tier ladder — see `docs/backlog.md` (§
+B-DSV4) for exactly which shapes are refused and what a perf pass would need.
+
+**The LOAD path is complete.** A `deepseek4` GGUF registers, parses into a
+`Config` — including the per-layer `compress_ratios` array, the per-layer SwiGLU
+clamps and the mandatory sqrt-softplus gating — and loads every tensor, with
+each layer's set chosen by its ratio and its hash/bias routing.
+`Config::deepseek2` is FALSE for V4 (unlike V3.2, which genuinely is V2 plus an
+indexer); every reader of that flag was enumerated and is MLA-specific. A model
+with any non-zero ratio or any hash-routed layer is then refused by name, with
+an `assert!` at the top of the build closure as the backstop — `wpush`'s Dsv4
+arm declares the ratio-0 tensor set only, so a compressed layer reaching the
+builder would bind every later weight one buffer off.
+
 A genuinely different architecture, not an increment. Sharing with stage 2 is
 limited to the MoE block, the FFN, norms, and generic rope/embedding plumbing.
 
@@ -707,12 +844,65 @@ limited to the MoE block, the FFN, norms, and generic rope/embedding plumbing.
 6. **Three-tier per-layer attention** keyed on
    `compress_ratios[il] ∈ {0, 4, 128}`.
 7. **Compressor blocks** that softmax-pool blocks of tokens into single KV rows.
-8. **Hash-routed MoE** on the first `hash_layer_count` layers.
-9. **`sqrt(softplus)` gating**, mandatory.
+8. **Hash-routed MoE** on the first `hash_layer_count` layers. ✓ op level.
+9. **`sqrt(softplus)` gating**, mandatory (`MoeGating::SqrtSoftplus`, already
+   there since stage 2).
 10. **Per-layer SwiGLU clamping**, with V4 clamping the gate **pre-SiLU** where
-    every other arch clamps post-SiLU.
+    every other arch clamps post-SiLU. ✓ op level.
 
 No dense-lead layers, no NextN.
+
+#### ✓ LANDED at the op level (2026-08-10) — items 8 and 10, nothing emits them yet
+
+**Per-layer SwiGLU clamping** is `swiglu_clamp: Option<f32>` on `Op::GatedAct`,
+`Op::GatedActFused` (the dense / shared-expert path, `swiglu_clamp_shexp[il]`)
+and `Op::MoeFfn` (the routed experts, `swiglu_clamp_exp[il]`). One arithmetic,
+read off `llm_graph_context::build_ffn` and `build_moe_ffn`:
+
+```text
+up   = clamp(up, -limit, +limit)      // symmetric
+gate = clamp(gate, -INFINITY, limit)  // ONE-SIDED, upper bound only
+out  = silu(gate) * up                // the gate clamp is BEFORE the activation
+```
+
+- The `limit > 1e-6` disabled gate lives in exactly one place,
+  `infr_core::graph::swiglu_clamp(limit)`, which turns a raw per-layer array
+  entry into the field. Passing a non-clamping layer's `0.0` straight through as
+  `Some(0.0)` would clamp that whole FFN to zero — verified by injection, the
+  output goes to all ±0.
+- **Where the pre/post orders actually differ is narrower than it looks.** For a
+  positive limit the two agree everywhere the gate is negative
+  (`silu(g) < 0 < limit`, so the upper bound never bites either way), and the
+  whole negative lobe is inert. They separate only where `gate > limit`, by
+  `|silu(limit) − limit|` times the clamped `up` — the gap therefore grows with
+  the LIMIT, not with how far the gate reaches below zero. `seam_op_parity.rs`'s
+  `swiglu_clamp_orders_are_distinguishable` asserts both halves of that.
+- Only the gated SiLU/GELU forms carry it (llama.cpp clamps in its
+  `LLM_FFN_SILU` arm); a clamped `Activation::Sigmoid`, and a clamp alongside
+  llama4's `weight_before` (which would clamp the already-weighted values), are
+  refused on every backend rather than silently approximated.
+
+**Hash-routed MoE** is `expert_ids: Option<TensorId>` on `Op::MoeFfn` — the
+`[rows, n_expert_used]` I32 selection already gathered from `ffn_gate_tid2eid`
+by TOKEN ID, i.e. llama.cpp's `selected_experts_in`. What supplying it changes,
+read off `build_moe_ffn`, is **only the selection**:
+
+- The router matmul still runs and the gating function still produces `probs`.
+  The routing WEIGHTS stay `ggml_get_rows(probs, selected_experts)` — the
+  router's own probability at each hash-chosen expert, then `norm_w` and
+  `w_scale` exactly as on a top-k layer. **They are not uniform**; the uniform
+  `1/n_used` reading is asserted to differ and shown to fail.
+- `ggml_argsort_top_k` is skipped, and with it everything that only feeds
+  `selection_probs`: `exp_probs_b` and the group masking. llama.cpp nulls
+  `exp_probs_b` on a hash layer for the same reason, so the two are refused
+  alongside `expert_ids` instead of being computed and discarded. Every backend
+  branches around the selection rather than overwriting it.
+
+**The gather itself still needs work the wiring slice must do.**
+`Op::EmbedGather` cannot serve it: its Vulkan kernel iterates whole 32-element
+sub-blocks (`nsub = ne / 32`), so an `ne = n_expert_used` row (8) writes NOTHING
+and yields a silent zero, and it decodes through `native_decode.glsl`, which has
+no I32 format. See `docs/backlog.md` § B-DSV4-HASH.
 
 ### `compress_ratio` is the master per-layer switch
 
@@ -725,14 +915,22 @@ recall comes exclusively from the compressed caches.
 |     4 | CSA + lightning indexer | raw SWA + CSA(4:1) + LID(4:1) + two compressor states |
 |   128 | HCA                     | raw SWA + HCA(128:1) + compressor state               |
 
+The two ratio-4 compressor states are **overlapping** (`state_size == 2*ratio`,
+so each committed row pools a 2×ratio window); the ratio-128 one is **not**
+(`state_size == ratio`). That asymmetry is in the constructor, not in the graph
+— see "The compressed-KV state machine" below.
+
 Only `{0, 4, 128}` are accepted. Compressed layers use YaRN at
 `compress_rope_theta`; ratio-0 layers use plain unscaled rope. `kq_scale` is
 plain `1/sqrt(n_embd_head)` at all three call sites — none of stage 2's mscale²
 games.
 
-V4's indexer differs from V3.2's in one structural way: **there is no
-`indexer_attn_k` and no `indexer_k_norm`.** The indexer keys come from the
-compressor, so `index_topk` counts _compressed blocks_, not tokens.
+V4's indexer differs from V3.2's in three structural ways. **There is no
+`indexer_attn_k` and no `indexer_k_norm`** — the indexer keys come from the
+compressor, so `index_topk` counts _compressed blocks_, not tokens. And its rope
+is **NORM** with a **`[nope | rope]`** head, both the opposite of V3.2: see "Two
+corrections to what this document said about V4's indexer" below, which reads
+them off the source.
 
 ### Sinkhorn hyper-connections
 
@@ -757,17 +955,202 @@ added in three distinct places; and llama.cpp's own lambda names
 `norm_rows`/`norm_cols` are **inverted** relative to its header's `dst`/`src`
 vocabulary. Trust the index formula and the lambda bodies, not the names.
 
+#### ✓ LANDED at the op level (2026-08-10) — nothing emits them yet
+
+Three ops on CPU + Vulkan + Metal, mirroring llama.cpp's three fused nodes:
+`Op::HyperConnectMix` (`ggml_dsv4_hc_comb` plus the `pre`/`post` gate arithmetic
+the reference leaves as elementwise views), `Op::HyperConnectPre`
+(`ggml_dsv4_hc_pre`) and `Op::HyperConnectPost` (`ggml_dsv4_hc_post`).
+`build_hc_head` is NOT a fourth op: its `output_hc_fn` is `{hc_dim, hc}` so its
+`mixes` is exactly the `pre` chunk, read at the same `scale[0]` / `base[0..hc]`
+indices — it is `Op::HyperConnectMix { gates: None }`. `hc_mult` is accepted in
+`1..=HYPER_CONNECT_MAX_MULT` (8) and refused on the host beyond that, because
+every backend holds a token's whole `hc × hc` matrix in a fixed-size array.
+
+Resolving the warnings above, verified in `seam_op_parity.rs`'s
+`hyper_connect_*` against a from-definition f64 reference (each of the nine
+deviations below was injected into the CPU arm and shown to go red):
+
+- **`norm_cols` reduces over `src`; `norm_rows` reduces over `dst`.**
+  llama.cpp's `norm_cols` permutes so `src` is `ne[0]` before `ggml_sum_rows`;
+  its `norm_rows` sums the matrix as laid out, whose `ne[0]` is `dst`. Both
+  names are the opposite of the axis they touch. The loop therefore ends on an
+  over-`src` normalisation, which is why `Σ_src comb[dst, ·] = 1` comes out
+  exact to eps level while `Σ_dst` is only as converged as the iteration got.
+- **The doubly-stochastic property does NOT catch a transposed `comb` index.**
+  Sinkhorn of a transposed matrix is Sinkhorn of another matrix: it still ends
+  on `norm_src` and its sums are just as well behaved. What the sums DO catch is
+  giving the extra normalisation to `dst` (i.e. trusting the lambda names). The
+  transposed index is caught by value — it moves the output by ~1.
+- **Sinkhorn does not converge on peaked logits.** At `hc = 4, n_iter = 3` with
+  logits spread over ±8, `|Σ_dst − 1| ≈ 0.5`. That is the algorithm (its rate
+  collapses as the matrix approaches a permutation), not a port bug; asserting
+  convergence needs mild logits and tens of iterations.
+- **The asymmetric COUNT is nearly inert, for a reason worth knowing.** The
+  softmax already leaves every `src` column summing to `1 + hc·eps`, so the
+  symmetric variant's extra leading `norm_dst` is a UNIFORM rescale that the
+  following `norm_src` undoes. What survives is second order in eps: ~1e-11 at
+  `eps = 1e-6`, ~9e-5 at `eps = 1e-2`. The count is pinned, but only the
+  large-eps case pins it for an f32 backend.
+- **At `hc = 1` almost every Sinkhorn detail is genuinely inert** (a 1×1 matrix
+  is its own transpose, `norm_src` and `norm_dst` are the same operation, and
+  the iteration's fixed point does not depend on the initial value). It is a
+  kernel SHAPE case, not a semantics one.
+
 ### The compressed-KV state machine
 
-This is the **largest single porting risk in the family**. Seven cache
-structures, three compressor states holding in-flight partial blocks, an
-overlapping 2×ratio pooling window with `-inf` sentinel rows, absolute
-position-in-block embeddings indexed by `pos % ratio`, and per-channel softmax
-pooling. The index planning lives in `llama-kv-cache-dsv4.cpp` (1978 lines),
-which **was not read in full** — the graph code is only meaningful given those
-index plans, and the boundary conditions (partial block at the end of a prefill,
-how visible length interacts with padded `n_kv`) are unspecified in what was
-reviewed.
+This is the **largest single porting risk in the family**, and it is now
+specified rather than guessed: `llama-kv-cache-dsv4.cpp` (1978 lines) has been
+read in full, together with its header, `deepseek4.cpp`'s consumers and
+`llama-graph.cpp`'s input setters. Everything below is read off those files;
+where an earlier revision of this document disagreed, the file won and the
+paragraph was rewritten.
+
+#### The inventory, exactly
+
+Not "seven cache structures" — the constructor
+(`llama-kv-cache-dsv4.cpp:1013-1131`) builds **five caches and three compressor
+states**, and only four of the caches are reachable from a V4 graph:
+
+| structure   | kind                | rows                            | row width             |
+| ----------- | ------------------- | ------------------------------- | --------------------- |
+| `kv_raw`    | ISWA base half      | —                               | never read by V4      |
+| `kv_raw`    | ISWA **SWA** half   | the sliding window              | `n_embd_head_k`       |
+| `kv_csa`    | K-only block cache  | `PAD(ceil(kv_size/4), 256)`     | `n_embd_head_k`       |
+| `kv_hca`    | K-only block cache  | `PAD(ceil(kv_size/128), 256)`   | `n_embd_head_k`       |
+| `kv_lid`    | K-only block cache  | `PAD(ceil(kv_size/4), 256)`     | `indexer_head_size`   |
+| `csa_state` | compressor state ×2 | `state_size = 2*4 = 8`          | `2*n_embd_head_k`     |
+| `hca_state` | compressor state ×2 | `state_size = 128` (**not** 2×) | `n_embd_head_k`       |
+| `lid_state` | compressor state ×2 | `state_size = 2*4 = 8`          | `2*indexer_head_size` |
+
+"×2" is literal: each compressor state is **two** f32 tensors, `kv` and `score`,
+both `[n_embd_state, state_size, n_stream]` and both always f32 regardless of
+`type_k`. The raw base half is allocated for generic ISWA bookkeeping and the
+header says so outright: "DSV4 raw attention only uses the SWA half of
+`kv_raw`."
+
+Two consequences the old prose hid. **`state_size == 2*ratio` is what makes a
+compressor overlapping, and only CSA and LID are** — `hca_state` gets
+`state_size == ratio`, so HCA pools a single non-overlapping block. And **the
+LID plan is not computed at all**: `plans_lid(plans_csa)` (line 1785) copies the
+CSA plan verbatim, because both run at ratio 4 with `overlap = true` and the
+same `state_size`. Only the row widths differ.
+
+#### The per-ubatch plan
+
+`dsv4_build_comp_plan` (lines 418-599) is the whole state machine. Per token, at
+absolute position `pos`:
+
+```text
+state_pos[i]  = pos % ratio                 // APE row id, gathers attn_comp_ape
+n_visible[i]  = (pos + 1) / ratio           // FLOOR — completed blocks only
+plan.n_kv     = GGML_PAD(max_i n_visible[i], 256)
+```
+
+The compressor state is a **ring of `state_size` rows** indexed
+`pos % state_size`, and `state_persist_{src,dst}_idxs` carry one entry per
+distinct ring row the ubatch touches, keeping the highest `pos` when several
+tokens collide (lines 496-505) and sorted by destination (line 576) so the write
+order is deterministic.
+
+A compressed row is committed **only on a block boundary**,
+`(pos + 1) % ratio == 0` (line 507), to cache row `pos / ratio`, with
+`state_write_pos = pos + 1 - ratio` — the block's FIRST position, which is what
+the compressed row then ropes at.
+
+`state_source_idx` (lines 461-476) is the join that makes this work. It
+addresses a graph-local tensor laid out
+`[persistent_state | current_ubatch_scratch | sentinel]`:
+
+- `pos < 0` → `state_rows + n_tokens`, the appended zero/`-inf` sentinel row;
+- `pos` present in this ubatch → `state_rows + i`, the scratch row;
+- otherwise → `stream_off + pos % state_size`, the persistent ring row.
+
+For the overlapping compressors the reads are collected into **two contiguous
+halves** — every block's previous-window indices, then every block's
+current-window indices (lines 565-572) — which is exactly how
+`build_overlap_compressed_kv_from_state` slices them back apart
+(`deepseek4.cpp:463-489`). Getting that concatenation order wrong swaps the two
+halves of every pooling window and still runs.
+
+The pooling itself (`deepseek4.cpp:407-413`, and the same four lines in the HCA
+variant) is **per-channel softmax over the block axis**, not over the feature
+axis: values and scores are both permuted so the block index becomes the fast
+axis, `soft_max` runs, and `sum_rows` collapses it. Then RMS-norm by
+`attn_comp_norm`, rope the `[nope | rope]` tail at `compress_rope_base`, and
+write.
+
+#### The four boundary conditions
+
+Each is a place where a plausible implementation runs and is wrong.
+
+1. **A partial block at the end of a prefill is invisible, and is never
+   committed.** `n_visible` floors, and the commit is gated on
+   `(pos + 1) % ratio == 0`. Tokens in a trailing partial block are recalled
+   through the raw sliding window alone; their compressor-state rows persist and
+   the block completes on a later ubatch. An implementation that ceils
+   `n_visible`, or that flushes the partial block at the end of a prefill,
+   exposes a row built from a half-filled window.
+
+2. **`n_kv == 0` changes the GRAPH, not just the mask.**
+   `dsv4_build_comp_inputs` builds `inp.kq_mask` only `if (plan.n_kv > 0)`
+   (`llama-graph.cpp:839`), and `build_attention` dispatches on that mask being
+   non-null (`deepseek4.cpp:1050-1063`). So a ubatch in which **no** token has
+   completed a block — any prefill shorter than 128 tokens on an HCA layer,
+   shorter than 4 on a CSA layer — runs `build_raw_attention` instead: pure
+   sliding window, no compressed half at all. This is the first thing a short
+   synthetic prefill will hit, and it is a different graph, so it cannot be
+   papered over with masking.
+
+3. **Padded `n_kv` versus per-token visible length.** `plan.n_kv` is padded to
+   256 so the graph shape does not change at every block boundary, and the mask
+   is a plain per-token prefix:
+   `data[i*ne0 + j] = j < n_visible[i] ? 0 : -INFINITY`
+   (`llama-graph.cpp:659-681`). Rows in `[n_visible[i], n_kv)` therefore cover
+   committed-but-not-yet-visible data and never-written zeros alike, and both
+   are masked identically. A token whose `n_visible` is 0 while others in the
+   ubatch are larger gets an **all-`-inf` compressed half** and must survive on
+   the raw half plus the attention sink — which is exactly why the sink joins
+   the softmax max as well as the denominator.
+
+4. **The CSA scratch write.** On a non-boundary CSA step, lines 534-563 push a
+   dummy commit to `cache_off + kv_size - 1` — the cache's LAST row — sourced
+   from one repeated row, purely so a decode step's graph matches a boundary
+   step's. It is garbage, and it is safe only because `n_visible < kv_size`
+   always keeps it masked. **HCA has no such fallback** (the branch is gated
+   `ratio == DSV4_CSA_RATIO`), so an HCA layer's commit op genuinely appears and
+   disappears with the block boundary.
+
+#### Two corrections to what this document said about V4's indexer
+
+Both are contradicted by the source, and both would produce silent wrongness.
+
+- **V4's indexer ropes NORM, not NEOX.** Stage 3 above makes much of V3.2's
+  indexer being NEOX-hardcoded while the main rope is NORM. V4 does **not**
+  inherit that: `build_lid_top_k` ropes `indexer_q_pe` with the graph's
+  `rope_type` (`deepseek4.cpp:555-557`), and `llama_model::rope_type` puts
+  `LLM_ARCH_DEEPSEEK4` in the NORM group (`llama-model.cpp:2530`). Every V4 rope
+  call site — q, kv, both compressors, the indexer — is NORM. The
+  `hparams_lid.rope_type = LLAMA_ROPE_TYPE_NEOX` at
+  `llama-kv-cache-dsv4.cpp:1063` is dead: it feeds only the KV-shift path, and
+  `llama_kv_cache_dsv4::get_can_shift()` returns `false`.
+- **V4's indexer head layout is `[nope | rope]`** — the opposite of V3.2's, and
+  the same order as V4's own q and kv heads. `indexer_q_nope` is the view at
+  offset 0, `indexer_q_pe` the view at `row_size(nope)`, concatenated in that
+  order (`deepseek4.cpp:546-560`).
+
+#### What the Hadamard rotation actually gates
+
+`attn_rot_k` is normally on only for a quantized KV cache, but
+`llama-kv-cache.cpp:346-356` force-enables it when the arch is DEEPSEEK32,
+DEEPSEEK4 or GLM_DSA **and** `n_embd_head_k_full == indexer_head_size` — which
+is true for the LID cache by construction (`hparams_lid` sets both, lines
+1059-1062) and generally false for raw/CSA/HCA. That matters because
+`build_attention`'s CSA dispatch is guarded on `inp_dsv4->get_lid().k_rot` being
+non-null (`deepseek4.cpp:1053`): the guard passes for the reason above, but it
+is keyed on a quantisation artifact rather than on anything semantic. The
+rotation itself is orthogonal and applied to both sides of every dot product, so
+an unquantised port skips it entirely — as stage 3 already does.
 
 Budget stage 4 accordingly, and do not start it until stages 2–3 are solid.
 

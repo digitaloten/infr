@@ -2165,6 +2165,19 @@ pub(crate) fn mla_ff_bias_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/mla_ff_bias.spv"))))
 }
+/// SPIR-V for the int8 coopmat accumulator-layout known-answer probe (`coopmat_i8_layout.comp`) —
+/// dispatched once at init when the i8 coopmat tier is opted into, to check that this driver lays a
+/// 16x16 SINT32 accumulator fragment out the way `native_gemm_i8cm_q8_0.comp` reads it.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn coopmat_i8_layout_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/coopmat_i8_layout.spv"
+        )))
+    })
+}
 /// SPIR-V for the 256-thread subgroup RMSNorm (`y=rmsnorm(x,w)`). Used by the recorder's `rmsnorm`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn rmsnorm_spv() -> &'static [u32] {
@@ -2202,6 +2215,13 @@ pub(crate) fn rmsnorm_f16_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/rmsnorm_f16.spv"))))
 }
+/// SPIR-V for the WEIGHTLESS RMSNorm (`rmsnorm.comp`'s -DNO_WEIGHT build) — `Op::QkNorm` with
+/// `weight: None`, deepseek4's bare per-head `ggml_rms_norm` on Q. No `w` binding at all.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn rmsnorm_nw_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/rmsnorm_nw.spv"))))
+}
 /// SPIR-V for the 256-thread subgroup mean-centred LayerNorm (`layernorm.comp`, `Op::LayerNorm`)
 /// — deepseek32's `indexer_k_norm`. Used by the recorder's `layernorm`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -2228,6 +2248,40 @@ pub(crate) fn lightning_indexer_spv() -> &'static [u32] {
 pub(crate) fn topk_mask_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/topk_mask.spv"))))
+}
+/// SPIR-V for the DeepSeek V4 hyper-connection coefficients (`hyper_mix.comp`,
+/// `Op::HyperConnectMix`) — the `build_hc_head` form: `pre` only, no `post`/`comb`. Used by the
+/// recorder's `hyper_mix`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn hyper_mix_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/hyper_mix.spv"))))
+}
+/// SPIR-V for the sublayer-wrapping `hyper_mix.comp` build (`-DGATES`) — `pre`, `post` and the
+/// Sinkhorn-normalised `comb`. Used by the recorder's `hyper_mix`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn hyper_mix_gates_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/hyper_mix_gates.spv"
+        )))
+    })
+}
+/// SPIR-V for the hyper-connection stream collapse (`hyper_pre.comp`, `Op::HyperConnectPre`).
+/// Used by the recorder's `hyper_pre`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn hyper_pre_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/hyper_pre.spv"))))
+}
+/// SPIR-V for the hyper-connection stream re-expansion (`hyper_post.comp`,
+/// `Op::HyperConnectPost`). Used by the recorder's `hyper_post`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn hyper_post_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/hyper_post.spv"))))
 }
 /// SPIR-V for the 256-thread subgroup row-softmax (`y=softmax(x*scale)`). Used by the recorder's
 /// `softmax` (diffusion-gemma's in-graph self-conditioning).
@@ -2951,6 +3005,26 @@ pub(crate) fn rope_ff_neox_spv() -> &'static [u32] {
         )))
     })
 }
+/// SPIR-V for BACKWARD RoPE (`rope.comp`'s -DBACKWARD build): `sin` negated, `cos` untouched —
+/// llama.cpp's `ggml_rope_ext_back` (`Op::Rope::backward`), deepseek4's attention-output de-rope.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn rope_back_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/rope_back.spv"))))
+}
+/// SPIR-V for backward RoPE with YaRN freq_factors (`rope.comp`'s -DBACKWARD -DFREQ_FACTORS
+/// build) — V4's compressed layers rope (and de-rope) with the YaRN ramp; its ratio-0 layers use
+/// the plain [`rope_back_spv`].
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn rope_ff_back_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/rope_ff_back.spv"
+        )))
+    })
+}
 /// gemma4 E2B's per-layer fused inp_gate GEMV (`e2b_gate.comp`; weight read through a typed
 /// 64-bit buffer_reference — see the shader's STREAMED doc) — the ONLY weight build (the
 /// bound-SSBO resident build died with `Recorder::e2b_gate`'s own resident dispatch, its sole
@@ -3059,6 +3133,9 @@ dyn_spv!(attention_kv_q8_spv, "attention_kv_q8");
 dyn_spv!(attention_kv_kq8_spv, "attention_kv_kq8");
 dyn_spv!(attention_kv_vq8_spv, "attention_kv_vq8");
 dyn_spv!(attention_kv_dyn_q8_spv, "attention_kv_dyn_q8");
+// Per-head attention sinks (`attention_kv.comp`'s -DSINKS build, `Op::Attention::sinks`) — the one
+// build that carries them; the adapter routes a sinks op onto this scalar f16 path.
+dyn_spv!(attention_kv_sinks_spv, "attention_kv_sinks");
 // KV-cache u64/BDA twins (#74, slice 1): the `-DKV_BDA` builds of the scalar attention_kv family —
 // K/V read by 64-bit device address (kv_addr.glsl) instead of bound SSBOs. Bound twins above stay
 // for kv_addr_parity.rs; production forks here via Recorder::attention_kv_at / attention_kv_dyn_at.

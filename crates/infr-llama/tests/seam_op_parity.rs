@@ -197,6 +197,7 @@ fn gated_sigmoid_parity() {
         up_stride: 0,
         gate_stride: 0,
         gate_block_width: 0,
+        swiglu_clamp: None,
     });
     let gi = gen(rows * nff, 2);
     let ui = gen(rows * nff, 3);
@@ -231,6 +232,7 @@ fn gated_gelu_offset_parity() {
         up_stride: 0,
         gate_stride: 0,
         gate_block_width: 0,
+        swiglu_clamp: None,
     });
     let gi = gen(rows * nff, 2);
     let ui = gen(up_off + rows * nff + 8, 3);
@@ -255,7 +257,7 @@ fn qknorm_parity() {
     let dst = g.output(f32d(rows * n_head * head_dim));
     g.push(Op::QkNorm {
         x,
-        weight: w,
+        weight: Some(w),
         dst,
         rows: rows as u32,
         n_head: n_head as u32,
@@ -399,6 +401,7 @@ fn qknormrope_attn_chain() {
         scale: 1.0 / (hd as f32).sqrt(),
         mask: AttnMask::Causal,
         pos: 0,
+        sinks: None,
     });
     let xi = gen(rows * nh * hd, 4);
     let wi = gen(hd, 5).iter().map(|v| v + 1.0).collect::<Vec<_>>();
@@ -520,6 +523,7 @@ fn qwen35_attn_core_writekv() {
         scale: 1.0 / (hd as f32).sqrt(),
         mask: AttnMask::Causal,
         pos: 0,
+        sinks: None,
     });
     let qi = gen(rows * nh * hd, 4);
     let ki = gen(rows * nkv * hd, 8);
@@ -1360,6 +1364,8 @@ fn moe_sqrt_softplus_parity() {
         exp_probs_b: None,
         n_expert_groups: 0,
         n_expert_groups_used: 0,
+        swiglu_clamp: None,
+        expert_ids: None,
     });
     // Router rows = lead[e] * [1, 0, 0, …] → logits (x = 1) are [24, 1, 0.75, 0.5, -1.5, -1.0]:
     // expert 0's logit 24 > 20 exercises the softplus shortcut (`sp = v`), the rest take the exact
@@ -1458,6 +1464,8 @@ fn moe_groups_bias_parity() {
         exp_probs_b: Some(exp_probs_b),
         n_expert_groups: 2,
         n_expert_groups_used: 1,
+        swiglu_clamp: None,
+        expert_ids: None,
     });
     // Group 0 (experts 0-3, sigmoid of logits 3.0/2.5/2.0/1.5) has the higher unbiased probs and
     // would win top-k (group score 1.877 vs 1.442); group 1 (experts 4-7, logits 1.0/0.9/0.8/0.7)
@@ -2092,9 +2100,13 @@ fn lightning_indexer_scale_cannot_change_the_selection() {
 /// Hand-written reference for one `Op::Rope` dispatch, from the DEFINITION of the two rope types
 /// (llama.cpp `ggml_compute_forward_rope_f32`'s `is_neox` fork), not transcribed from the CPU arm.
 ///
-/// Pair `p` (of `rope_dim/2`) rotates by `position * theta^(-2p/rope_dim)`; the two elements it
-/// rotates are `(2p, 2p+1)` for NORM and `(p, p + rope_dim/2)` for NEOX. Dims at or past
-/// `rope_dim` pass through untouched in both.
+/// Pair `p` (of `rope_dim/2`) rotates by `position * theta^(-2p/rope_dim)`, DIVIDED by `ff[p]` when
+/// YaRN freq_factors are present; the two elements it rotates are `(2p, 2p+1)` for NORM and
+/// `(p, p + rope_dim/2)` for NEOX. Dims at or past `rope_dim` pass through untouched in both.
+///
+/// `backward` is `ggml_rope_ext_back`: `ggml_compute_forward_rope_back` runs the SAME kernel with
+/// `forward = false`, whose only effect is `sin_sign = -1` applied to the cached sine
+/// (`ggml_rope_cache_init`) — `cos` untouched. See `Op::Rope::backward`.
 #[allow(clippy::too_many_arguments)]
 fn rope_ref(
     x: &[f32],
@@ -2105,9 +2117,12 @@ fn rope_ref(
     rope_dim: usize,
     theta: f32,
     neox: bool,
+    freq_factors: Option<&[f32]>,
+    backward: bool,
 ) -> Vec<f32> {
     let mut out = x.to_vec();
     let hf = rope_dim / 2;
+    let sin_sign = if backward { -1.0f32 } else { 1.0 };
     for (r, &p0) in positions.iter().enumerate().take(rows) {
         for h in 0..n_head {
             let b = (r * n_head + h) * head_dim;
@@ -2117,8 +2132,11 @@ fn rope_ref(
                 } else {
                     (2 * p, 2 * p + 1)
                 };
-                let ang = p0 as f32 * theta.powf(-2.0 * p as f32 / rope_dim as f32);
-                let (s, c) = (ang.sin(), ang.cos());
+                let mut ang = p0 as f32 * theta.powf(-2.0 * p as f32 / rope_dim as f32);
+                if let Some(ff) = freq_factors {
+                    ang /= ff[p];
+                }
+                let (s, c) = (ang.sin() * sin_sign, ang.cos());
                 out[b + i0] = x[b + i0] * c - x[b + i1] * s;
                 out[b + i1] = x[b + i0] * s + x[b + i1] * c;
             }
@@ -2160,6 +2178,7 @@ fn rope_neox_and_norm_parity() {
             freq_factors: None,
             x_stride: 0,
             neox,
+            backward: false,
         });
         // `run` uploads f32 for every bound input; the positions tensor is I32, so bind by hand.
         let runner = |be: &dyn Backend| -> Vec<f32> {
@@ -2180,7 +2199,7 @@ fn rope_neox_and_norm_parity() {
             bytemuck::cast_slice::<u8, f32>(&bytes).to_vec()
         };
         let want = rope_ref(
-            &xi, &positions, rows, n_head, head_dim, rope_dim, theta, neox,
+            &xi, &positions, rows, n_head, head_dim, rope_dim, theta, neox, None, false,
         );
         let c = runner(&cpu);
         let e = maxerr(&c, &want);
@@ -2460,4 +2479,2381 @@ fn mla_key_bias_removes_the_masked_keys() {
             "Mla {name}: masking a key changed nothing — key_bias is not reaching the kernel"
         );
     }
+}
+
+// ── DeepSeek V4 attention primitives (docs/deepseek.md § Stage 4) ─────────────────────────────
+//
+// Four op-level capabilities, each with a reference written from the DEFINITION (llama.cpp's
+// `deepseek4.cpp` / `ggml`), in f64, deliberately NOT transcribed from the interpreter arms under
+// test. Nothing emits any of them yet.
+
+/// Hand-written reference for `Op::QkNorm { weight: None }` — DeepSeek V4's Q norm, which is a bare
+/// `ggml_rms_norm` over a `[head_dim, n_head, n_tokens]` reshape (`deepseek4.cpp`'s `build_attention`,
+/// the `q_norm` callback). `ggml_rms_norm` normalizes over `ne[0]`, so the reduction is PER HEAD:
+/// `out = x / sqrt(mean_head(x²) + eps)`, no weight anywhere. f64, from the definition.
+fn head_rmsnorm_ref(x: &[f32], rows: usize, n_head: usize, head_dim: usize, eps: f32) -> Vec<f32> {
+    let mut out = vec![0f32; rows * n_head * head_dim];
+    for hh in 0..rows * n_head {
+        let b = hh * head_dim;
+        let ss: f64 = (0..head_dim)
+            .map(|i| (x[b + i] as f64).powi(2))
+            .sum::<f64>()
+            / head_dim as f64;
+        let s = 1.0 / (ss + eps as f64).sqrt();
+        for i in 0..head_dim {
+            out[b + i] = (x[b + i] as f64 * s) as f32;
+        }
+    }
+    out
+}
+
+/// The MISTAKE this test exists to catch: one reduction over the whole `n_head*head_dim` row
+/// instead of one per head. Same formula, wrong `dim`.
+fn row_rmsnorm_ref(x: &[f32], rows: usize, n_head: usize, head_dim: usize, eps: f32) -> Vec<f32> {
+    head_rmsnorm_ref(x, rows, 1, n_head * head_dim, eps)
+}
+
+/// Rows whose per-head vectors have WILDLY different magnitudes (1e2 / 1e-2 / 1e0 / 3e1). A norm
+/// taken across the whole row is dominated by head 0 and crushes heads 1-3 toward zero, so the two
+/// references are far apart — which is what makes this input able to fail.
+fn head_scale_rows(rows: usize, n_head: usize, head_dim: usize) -> Vec<f32> {
+    let mag = [100.0f32, 0.01, 1.0, 30.0];
+    (0..rows * n_head * head_dim)
+        .map(|i| {
+            let h = (i / head_dim) % n_head;
+            let c = i % head_dim;
+            mag[h % mag.len()] * ((((c * 7 + h * 3) % 13) as f32 - 6.0) * 0.15 + 1.0)
+        })
+        .collect()
+}
+
+/// `Op::QkNorm` with NO weight (V4's Q norm) normalizes PER HEAD, on CPU and on Vulkan.
+///
+/// The input's four heads span four orders of magnitude, so the whole-row reduction — the one
+/// plausible wrong answer — is not merely different, it is off by orders of magnitude on three of
+/// the four heads. That gap is asserted explicitly (`well-posed`), so the test cannot pass by
+/// comparing two things that happen to agree.
+#[test]
+fn qknorm_weightless_normalizes_per_head() {
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, nh, hd) = (2usize, 4usize, 16usize);
+    let eps = 1e-6f32;
+    let n = rows * nh * hd;
+
+    let mut g = Graph::new();
+    let x = g.input(f32d(n));
+    let dst = g.output(f32d(n));
+    g.push(Op::QkNorm {
+        x,
+        weight: None,
+        dst,
+        rows: rows as u32,
+        n_head: nh as u32,
+        head_dim: hd as u32,
+        eps,
+        x_stride: 0,
+    });
+
+    let xi = head_scale_rows(rows, nh, hd);
+    let ins = [(x, &xi[..])];
+    let per_head = head_rmsnorm_ref(&xi, rows, nh, hd, eps);
+    let per_row = row_rmsnorm_ref(&xi, rows, nh, hd, eps);
+    let gap = maxerr(&per_head, &per_row);
+    println!("QkNorm(weightless) per-head-vs-per-row reference gap={gap:e}");
+    assert!(
+        gap > 0.5,
+        "input is not well posed: a whole-row norm would pass this test (gap={gap:e})"
+    );
+
+    let c = run(&cpu, &g, &ins, &[], dst, n);
+    let e = maxerr(&c, &per_head);
+    println!("QkNorm(weightless) cpu-vs-ref max_err={e:e}");
+    assert!(e < 1e-5, "weightless QkNorm diverges on CPU: max_err={e:e}");
+
+    if let Some(vk) = gpu() {
+        let v = run(&vk, &g, &ins, &[], dst, n);
+        let e = maxerr(&v, &per_head);
+        println!("QkNorm(weightless) vulkan-vs-ref max_err={e:e}");
+        assert!(
+            e < 1e-5,
+            "weightless QkNorm diverges on Vulkan: max_err={e:e}"
+        );
+    }
+}
+
+/// A weightless `Op::QkNorm` must equal a weighted one whose weight is all ones — the convention
+/// `Op::RmsNorm`'s doc records, and the reason `weight: None` is a REPRESENTATION change and not a
+/// numerics change. Pins that both arms compute the same thing on every backend.
+#[test]
+fn qknorm_weightless_matches_a_ones_weight() {
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, nh, hd) = (2usize, 4usize, 16usize);
+    let eps = 1e-6f32;
+    let n = rows * nh * hd;
+    let xi = head_scale_rows(rows, nh, hd);
+    let ones = vec![1.0f32; hd];
+
+    let build = |weighted: bool| {
+        let mut g = Graph::new();
+        let x = g.input(f32d(n));
+        let w = g.weight(f32d(hd));
+        let dst = g.output(f32d(n));
+        g.push(Op::QkNorm {
+            x,
+            weight: weighted.then_some(w),
+            dst,
+            rows: rows as u32,
+            n_head: nh as u32,
+            head_dim: hd as u32,
+            eps,
+            x_stride: 0,
+        });
+        (g, x, w, dst)
+    };
+    let each = |be: &dyn Backend, name: &str| {
+        let (gw, xw, ww, dw) = build(true);
+        let with = run(be, &gw, &[(xw, &xi)], &[(ww, &ones)], dw, n);
+        let (gn, xn, _, dn) = build(false);
+        let without = run(be, &gn, &[(xn, &xi)], &[], dn, n);
+        let e = maxerr(&with, &without);
+        println!("QkNorm ones-weight vs weightless ({name}) max_err={e:e}");
+        assert!(
+            e == 0.0,
+            "{name}: weightless QkNorm is not x*1.0 (err={e:e})"
+        );
+    };
+    each(&cpu, "cpu");
+    if let Some(vk) = gpu() {
+        each(&vk, "vulkan");
+    }
+}
+
+// ── Op::Attention sinks (deepseek4's attn_sinks) ─────────────────────────────────────────────
+
+/// Hand-written softmax attention with per-head SINKS, in f64, from
+/// `ggml_compute_forward_soft_max_f32`'s `src2` handling (llama.cpp `ggml/src/ggml-cpu/ops.cpp`):
+///
+/// ```text
+/// m = max_j(score[j]);  if sinks: m = max(m, sink[h])
+/// l = Σ_j exp(score[j] - m);  if sinks: l += exp(sink[h] - m)
+/// out = Σ_j (exp(score[j] - m) / l) * V[j]
+/// ```
+///
+/// `sink` is `None` for the plain softmax, `Some((s, extra_value))` otherwise: `extra_value` is the
+/// deliberate WRONG variant — the sink also contributing a value row (`Σ` gains `exp(sink-m)/l *
+/// V[extra]`), which is what "attention sinks" means in the register-token reading and is a
+/// different function from the one llama.cpp implements. The correct call passes `None` for it.
+#[allow(clippy::too_many_arguments)]
+fn attention_sinks_ref(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    rows: usize,
+    kv_len: usize,
+    n_head: usize,
+    n_kv: usize,
+    hd: usize,
+    scale: f32,
+    pos: usize,
+    sink: Option<(&[f32], Option<usize>)>,
+) -> Vec<f32> {
+    let group = n_head / n_kv;
+    let mut out = vec![0f32; rows * n_head * hd];
+    for ti in 0..rows {
+        for h in 0..n_head {
+            let kvh = h / group;
+            let qb = (ti * n_head + h) * hd;
+            let hi = (pos + ti + 1).min(kv_len);
+            let sc: Vec<f64> = (0..hi)
+                .map(|j| {
+                    let kb = (j * n_kv + kvh) * hd;
+                    (0..hd)
+                        .map(|d| q[qb + d] as f64 * k[kb + d] as f64)
+                        .sum::<f64>()
+                        * scale as f64
+                })
+                .collect();
+            let mut m = sc.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            if let Some((s, _)) = sink {
+                m = m.max(s[h] as f64);
+            }
+            let mut l: f64 = sc.iter().map(|&s| (s - m).exp()).sum();
+            if let Some((s, _)) = sink {
+                l += (s[h] as f64 - m).exp();
+            }
+            for (j, &s) in sc.iter().enumerate() {
+                let p = (s - m).exp() / l;
+                let vb = (j * n_kv + kvh) * hd;
+                for d in 0..hd {
+                    out[qb + d] += (p * v[vb + d] as f64) as f32;
+                }
+            }
+            // The wrong variant: the sink ALSO carries a value.
+            if let Some((s, Some(extra))) = sink {
+                let p = (s[h] as f64 - m).exp() / l;
+                let vb = (extra * n_kv + kvh) * hd;
+                for d in 0..hd {
+                    out[qb + d] += (p * v[vb + d] as f64) as f32;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `Op::Attention`'s sinks join the softmax MAX and DENOMINATOR only — never the numerator.
+///
+/// Two regimes, because they fail differently:
+///
+/// * **Dominant sink** (`+18`, far above every real score): every real key's weight collapses
+///   toward `exp(-18)`, so the output is ~1e-8 of the sink-free one. This is the case that catches
+///   "sink left out of the denominator" (which would return the sink-free output outright) and
+///   "sink also contributes a value" (which would return ≈`V[0]`). Both wrong answers are asserted
+///   to be far from the right one, so the test provably discriminates.
+/// * **Negligible sink** (`-18`): `exp(sink - m) ≈ 0`, so the output must be the sink-free one to
+///   within f32 noise. This is the case that catches a sink applied with the wrong sign or scaled
+///   by `scale`.
+///
+/// q and the KV cache are f16 — the seam's real producer→consumer dtype flow, and what the Vulkan
+/// `attention_kv` family reads (`qknormrope_attn_chain` above pins the same convention). The CPU
+/// interpreter converts them to f32 on load, so both backends see identical values.
+#[test]
+fn attention_sinks_are_denominator_only() {
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, nh, nkv, hd) = (3usize, 2usize, 1usize, 8usize);
+    let kv_len = rows;
+    let scale = 1.0 / (hd as f32).sqrt();
+    let n_out = rows * nh * hd;
+
+    let to_f16 = |v: &[f32]| -> Vec<u8> {
+        v.iter()
+            .flat_map(|&x| half::f16::from_f32(x).to_le_bytes())
+            .collect()
+    };
+    let deq = |b: &[u8]| -> Vec<f32> {
+        b.chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect()
+    };
+    let qf = to_f16(&gen(rows * nh * hd, 4));
+    let kf = to_f16(&gen(kv_len * nkv * hd, 8));
+    let vf = to_f16(&gen(kv_len * nkv * hd, 9));
+    // The references must see the SAME f16-rounded values the kernels read.
+    let (qd, kd, vd) = (deq(&qf), deq(&kf), deq(&vf));
+
+    let build = |with_sinks: bool| {
+        let mut g = Graph::new();
+        let q = g.input(TensorDesc::new(vec![rows * nh * hd], DType::F16));
+        let kc = g.input(TensorDesc::new(vec![kv_len * nkv * hd], DType::F16));
+        let vc = g.input(TensorDesc::new(vec![kv_len * nkv * hd], DType::F16));
+        let sk = g.weight(f32d(nh));
+        let dst = g.output(f32d(n_out));
+        g.push(Op::Attention {
+            q,
+            k_cache: kc,
+            v_cache: vc,
+            dst,
+            rows: rows as u32,
+            kv_len: kv_len as u32,
+            n_head: nh as u32,
+            n_kv: nkv as u32,
+            head_dim: hd as u32,
+            scale,
+            mask: AttnMask::Causal,
+            pos: 0,
+            sinks: with_sinks.then_some(sk),
+        });
+        (g, q, kc, vc, sk, dst)
+    };
+
+    // Bespoke runner: q/K/V are f16 BYTES, which `run` (f32 slices) cannot upload.
+    let go = |be: &dyn Backend, sinks: Option<&[f32]>| -> Vec<f32> {
+        let (g, q, kc, vc, sk, dst) = build(sinks.is_some());
+        let plan = be.compile(&g).expect("compile");
+        let up = |bytes: &[u8], usage| {
+            let b = be.alloc(bytes.len(), usage).expect("alloc");
+            be.upload(b.as_ref(), bytes).unwrap();
+            b
+        };
+        let qb = up(&qf, BufferUsage::Activations);
+        let kb = up(&kf, BufferUsage::KvCache);
+        let vb = up(&vf, BufferUsage::KvCache);
+        let sb = sinks.map(|s| up(bytemuck::cast_slice(s), BufferUsage::Weights));
+        let ob = be.alloc(n_out * 4, BufferUsage::Readback).unwrap();
+        let mut b = Bindings::new();
+        b.bind(q, qb.as_ref());
+        b.bind(kc, kb.as_ref());
+        b.bind(vc, vb.as_ref());
+        if let Some(sb) = &sb {
+            b.bind(sk, sb.as_ref());
+        }
+        b.bind(dst, ob.as_ref());
+        be.execute(plan.as_ref(), &b).expect("execute");
+        let mut o = vec![0f32; n_out];
+        be.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+            .unwrap();
+        o
+    };
+
+    let r = |sink: Option<(&[f32], Option<usize>)>| {
+        attention_sinks_ref(&qd, &kd, &vd, rows, kv_len, nh, nkv, hd, scale, 0, sink)
+    };
+    let no_sink = r(None);
+    let dominant = vec![18.0f32; nh];
+    let negligible = vec![-18.0f32; nh];
+    let want_dom = r(Some((&dominant, None)));
+    let want_neg = r(Some((&negligible, None)));
+    // The two wrong answers, computed from the same reference with one clause changed.
+    let dom_no_denom = no_sink.clone(); // sink dropped from the denominator
+    let dom_with_value = r(Some((&dominant, Some(0)))); // sink also contributes V[0]
+
+    let gap_denom = maxerr(&want_dom, &dom_no_denom);
+    let gap_numer = maxerr(&want_dom, &dom_with_value);
+    println!("Attention sinks: dominant-vs-no-denominator gap={gap_denom:e}");
+    println!("Attention sinks: dominant-vs-sink-has-value gap={gap_numer:e}");
+    assert!(
+        gap_denom > 0.1,
+        "input not well posed: dropping the sink from the denominator would pass (gap={gap_denom:e})"
+    );
+    assert!(
+        gap_numer > 0.1,
+        "input not well posed: giving the sink a value row would pass (gap={gap_numer:e})"
+    );
+
+    let check = |be: &dyn Backend, name: &str| {
+        let plain = go(be, None);
+        let e = maxerr(&plain, &no_sink);
+        println!("Attention sinks({name}) none-vs-ref max_err={e:e}");
+        assert!(e < 1e-3, "{name}: sink-free attention moved: max_err={e:e}");
+
+        let dom = go(be, Some(&dominant));
+        let e = maxerr(&dom, &want_dom);
+        println!("Attention sinks({name}) dominant-vs-ref max_err={e:e}");
+        assert!(e < 1e-4, "{name}: dominant sink wrong: max_err={e:e}");
+        // ...and it is genuinely a different answer from both wrong variants on this backend.
+        assert!(
+            maxerr(&dom, &dom_no_denom) > 0.1,
+            "{name}: dominant-sink output equals the sink-free one — the sink never reached the \
+             denominator"
+        );
+        assert!(
+            maxerr(&dom, &dom_with_value) > 0.1,
+            "{name}: dominant-sink output equals the sink-has-a-value one — the sink is in the \
+             numerator"
+        );
+
+        let neg = go(be, Some(&negligible));
+        let e = maxerr(&neg, &want_neg);
+        println!("Attention sinks({name}) negligible-vs-ref max_err={e:e}");
+        assert!(e < 1e-3, "{name}: negligible sink wrong: max_err={e:e}");
+        let e = maxerr(&neg, &no_sink);
+        println!("Attention sinks({name}) negligible-vs-sinkless max_err={e:e}");
+        assert!(
+            e < 1e-4,
+            "{name}: a sink 18 below the max changed the output: max_err={e:e}"
+        );
+    };
+    check(&cpu, "cpu");
+    if let Some(vk) = gpu() {
+        check(&vk, "vulkan");
+    }
+}
+
+// ── Op::Rope { backward } (deepseek4's attention-output de-rope) ──────────────────────────────
+
+/// De-roping is the exact inverse of roping: `Rope { backward: false }` then
+/// `Rope { backward: true }` at the SAME position/theta/freq_factors returns the input.
+///
+/// That is the property, so it is what is asserted — and it is a property only because
+/// `Op::Rope` carries no magnitude scale (see `Op::Rope::backward`: ggml's own `rope_back` is the
+/// transpose, not the inverse, whenever YaRN's `mscale != 1`, and V4's `dsv4_rope_attn_factor`
+/// is precisely the constant that makes `mscale == 1` at every one of its call sites).
+///
+/// The roundtrip alone would also pass if BOTH directions were no-ops, so the backward leg is
+/// additionally compared against the f64 reference and asserted to differ from the forward leg.
+/// Positions are non-trivial (37/38/39) and `rope_dim < head_dim`, so the pass-through tail is
+/// exercised too.
+#[test]
+fn rope_back_inverts_rope_forward() {
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, nh, hd, rope_dim) = (3usize, 2usize, 8usize, 4usize);
+    let theta = 1e4f32;
+    let n = rows * nh * hd;
+    let xi = gen(n, 11);
+    // Non-trivial positions: 37/38/39, not 0/1/2 (a de-rope at position 0 is the identity, so a
+    // dropped sign would pass unnoticed there).
+    let posv: Vec<i32> = vec![37, 38, 39];
+    // YaRN per-pair divisors: V4's compressed layers rope (and de-rope) with a ramp, its ratio-0
+    // layers plain. Both must invert, so both are run.
+    let ffi: Vec<f32> = (0..rope_dim / 2).map(|p| 1.0 + p as f32 * 0.37).collect();
+
+    for (name, use_ff) in [("plain", false), ("freq_factors", true)] {
+        let rope = |backward: bool| {
+            let mut g = Graph::new();
+            let x = g.input(f32d(n));
+            let p = g.input(TensorDesc::new(vec![rows], DType::I32));
+            let ff = g.input(f32d(rope_dim / 2));
+            let mid = g.internal(f32d(n));
+            let dst = g.output(f32d(n));
+            g.push(Op::Rope {
+                x,
+                positions: p,
+                dst: if backward { mid } else { dst },
+                rows: rows as u32,
+                n_head: nh as u32,
+                head_dim: hd as u32,
+                rope_dim: rope_dim as u32,
+                theta,
+                freq_factors: use_ff.then_some(ff),
+                x_stride: 0,
+                neox: false,
+                backward: false,
+            });
+            if backward {
+                g.push(Op::Rope {
+                    x: mid,
+                    positions: p,
+                    dst,
+                    rows: rows as u32,
+                    n_head: nh as u32,
+                    head_dim: hd as u32,
+                    rope_dim: rope_dim as u32,
+                    theta,
+                    freq_factors: use_ff.then_some(ff),
+                    x_stride: 0,
+                    neox: false,
+                    backward: true,
+                });
+            }
+            (g, x, p, ff, dst)
+        };
+        // A standalone backward rope, for the direct comparison against the reference.
+        let back_only = || {
+            let mut g = Graph::new();
+            let x = g.input(f32d(n));
+            let p = g.input(TensorDesc::new(vec![rows], DType::I32));
+            let ff = g.input(f32d(rope_dim / 2));
+            let dst = g.output(f32d(n));
+            g.push(Op::Rope {
+                x,
+                positions: p,
+                dst,
+                rows: rows as u32,
+                n_head: nh as u32,
+                head_dim: hd as u32,
+                rope_dim: rope_dim as u32,
+                theta,
+                freq_factors: use_ff.then_some(ff),
+                x_stride: 0,
+                neox: false,
+                backward: true,
+            });
+            (g, x, p, ff, dst)
+        };
+        // `positions` is an I32 input; `run` uploads f32 words, so bind the bit-patterns.
+        let posi: Vec<f32> = posv.iter().map(|&p| f32::from_bits(p as u32)).collect();
+        let ff_used = use_ff.then_some(&ffi[..]);
+        let fwd_ref = rope_ref(
+            &xi, &posv, rows, nh, hd, rope_dim, theta, false, ff_used, false,
+        );
+        let back_ref = rope_ref(
+            &xi, &posv, rows, nh, hd, rope_dim, theta, false, ff_used, true,
+        );
+        let sep = maxerr(&fwd_ref, &back_ref);
+        println!("Rope({name}) forward-vs-backward reference separation={sep:e}");
+        assert!(
+            sep > 0.01,
+            "{name}: input not well posed — forward and backward agree (sep={sep:e})"
+        );
+
+        let check = |be: &dyn Backend, bname: &str| {
+            let (g, x, p, ff, dst) = back_only();
+            let b = run(be, &g, &[(x, &xi), (p, &posi), (ff, &ffi)], &[], dst, n);
+            let e = maxerr(&b, &back_ref);
+            println!("Rope back({name},{bname}) vs ref max_err={e:e}");
+            assert!(e < 1e-5, "{bname} {name}: backward rope wrong: {e:e}");
+            let e = maxerr(&b, &fwd_ref);
+            assert!(
+                e > 0.01,
+                "{bname} {name}: backward rope equals the forward one — the sign flip never landed"
+            );
+
+            let (g, x, p, ff, dst) = rope(true);
+            let rt = run(be, &g, &[(x, &xi), (p, &posi), (ff, &ffi)], &[], dst, n);
+            let e = maxerr(&rt, &xi);
+            println!("Rope roundtrip({name},{bname}) vs input max_err={e:e}");
+            assert!(
+                e < 1e-5,
+                "{bname} {name}: forward∘backward is not the identity: max_err={e:e}"
+            );
+        };
+        check(&cpu, "cpu");
+        if let Some(vk) = gpu() {
+            check(&vk, "vulkan");
+        }
+    }
+}
+
+// ── The grouped low-rank output projection (deepseek4's wo_a/wo_b) ───────────────────────────
+//
+// NO new op: `deepseek4.cpp` reshapes the (de-roped) attention output to `[o_group_dim, n_groups,
+// nt]`, permutes, and runs ONE batched `ggml_mul_mat` against `wo_a` reshaped to `[o_group_dim,
+// o_lora_rank, n_groups]`. Because that batch axis is the OUTERMOST axis of both operands, group
+// `g` is exactly `Op::Linear` over rows `[g*o_lora_rank, (g+1)*o_lora_rank)` of `wo_a` — which is
+// what `Op::Linear::w_off` already selects (`w_off = g*o_lora_rank*o_group_dim`, row-aligned) —
+// applied to columns `[g*o_group_dim, (g+1)*o_group_dim)` of the output row, which is what
+// `Op::CopyStrided` already slices. So the composition below IS the batched matmul, built out of
+// two ops the seam already emits for exactly this shape of job (qwen35 splits its interleaved q|k|v
+// rows the same way). A batched-GEMM op would have one caller and one shape.
+
+/// Hand-written reference for the grouped projection, in f64, from `deepseek4.cpp`'s
+/// `attn_wo_a` block: for each token row and each group `g`,
+/// `oa[r, g*o_lora_rank + i] = Σ_d out[r, g*o_group_dim + d] * wo_a[g][i, d]`, then the plain
+/// `wo_b` Linear over the concatenated `[nt, o_lora_rank*n_groups]`.
+#[allow(clippy::too_many_arguments)]
+fn grouped_out_proj_ref(
+    out: &[f32],
+    wo_a: &[f32],
+    wo_b: &[f32],
+    m: usize,
+    n_groups: usize,
+    o_group_dim: usize,
+    o_lora_rank: usize,
+    n_embd: usize,
+    // Force every group to read group 0's weights AND group 0's input slice — the mistake a
+    // hard-coded offset makes.
+    pin_group0: bool,
+) -> Vec<f32> {
+    let oa_w = o_lora_rank * n_groups;
+    let mut oa = vec![0f64; m * oa_w];
+    for r in 0..m {
+        for g in 0..n_groups {
+            let sg = if pin_group0 { 0 } else { g };
+            for i in 0..o_lora_rank {
+                let wrow = (sg * o_lora_rank + i) * o_group_dim;
+                let xoff = r * (n_groups * o_group_dim) + sg * o_group_dim;
+                oa[r * oa_w + g * o_lora_rank + i] = (0..o_group_dim)
+                    .map(|d| out[xoff + d] as f64 * wo_a[wrow + d] as f64)
+                    .sum();
+            }
+        }
+    }
+    let mut dst = vec![0f32; m * n_embd];
+    for r in 0..m {
+        for o in 0..n_embd {
+            dst[r * n_embd + o] = (0..oa_w)
+                .map(|i| oa[r * oa_w + i] * wo_b[o * oa_w + i] as f64)
+                .sum::<f64>() as f32;
+        }
+    }
+    dst
+}
+
+/// V4's grouped low-rank output projection composes out of ops that already exist:
+/// `CopyStrided` (slice group `g`'s columns) → `Linear { w_off }` (group `g`'s `wo_a` rows) →
+/// `CopyStrided` (place into the concatenated `oa`) per group, then one `Linear` for `wo_b`.
+///
+/// The groups genuinely differ — group `g`'s weights are scaled by `(g+1)` — so a version that
+/// reused group 0's weights (or group 0's input slice) for every group produces a different answer.
+/// That variant is not merely described: the test BUILDS it (`pin_group0`, both offsets forced to
+/// 0) and asserts the real graph does not match it, so the offsets are proven load-bearing.
+///
+/// `wo_a` is **bf16**, not f32, and that is load-bearing rather than incidental: Vulkan's
+/// `Op::Linear` accepts `w_off` only on the offset-capable NATIVE-block kernels
+/// (`native_dense_dtypes` — every quant format plus bf16), and refuses it outright on the f32/f16
+/// fallbacks ("Linear w_off on a non-native weight"). A real V4 GGUF's `wo_a` is quantized, so the
+/// composition holds in production; an f32 `wo_a` would need a per-group pack copy instead. The
+/// reference rounds `wo_a` through bf16 first, so the comparison stays a test of the grouping and
+/// not of the weight's precision.
+#[test]
+fn grouped_output_projection_composes_from_linear_and_copystrided() {
+    let cpu = infr_cpu::CpuBackend::new();
+    // `o_group_dim` (the per-group `in_f`) and `oa_w` are multiples of 32: the native-block GEMV /
+    // GEMM kernels `w_off` rides on quantize the activation in 32-wide blocks, and an `in_f` below
+    // that granularity yields all-zero output rather than an error. V4's real `o_group_dim` is
+    // `n_head*head_dim/o_groups`, comfortably above it.
+    let (m, nh, hd, n_groups, o_lora_rank, n_embd) =
+        (3usize, 4usize, 32usize, 4usize, 8usize, 32usize);
+    let o_group_dim = nh * hd / n_groups;
+    let oa_w = o_lora_rank * n_groups;
+
+    // Group g's weights scaled by (g+1): the groups are unmistakably different. Rounded through
+    // bf16, which is the dtype actually uploaded (see this test's doc on `w_off`).
+    let wo_a: Vec<f32> = gen(n_groups * o_lora_rank * o_group_dim, 21)
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| {
+            half::bf16::from_f32(v * ((i / (o_lora_rank * o_group_dim)) + 1) as f32).to_f32()
+        })
+        .collect();
+    let wo_a_bytes: Vec<u8> = wo_a
+        .iter()
+        .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+        .collect();
+    let wo_b = gen(n_embd * oa_w, 23);
+    let outi = gen(m * nh * hd, 25);
+
+    let build = |pin_group0: bool| {
+        let mut g = Graph::new();
+        let out = g.input(f32d(m * nh * hd));
+        let wa = g.weight(TensorDesc::new(
+            vec![n_groups * o_lora_rank * o_group_dim],
+            DType::Bf16,
+        ));
+        let wb = g.weight(f32d(n_embd * oa_w));
+        let oa = g.internal(f32d(m * oa_w));
+        let dst = g.output(f32d(m * n_embd));
+        for gi in 0..n_groups {
+            let src_g = if pin_group0 { 0 } else { gi };
+            let packed = g.internal(f32d(m * o_group_dim));
+            let proj = g.internal(f32d(m * o_lora_rank));
+            g.push(Op::CopyStrided {
+                src: out,
+                src_off: (src_g * o_group_dim) as u32,
+                src_stride: (nh * hd) as u32,
+                dst: packed,
+                dst_off: 0,
+                dst_stride: o_group_dim as u32,
+                rows: m as u32,
+                n: o_group_dim as u32,
+            });
+            g.push(Op::Linear {
+                x: packed,
+                weight: wa,
+                dst: proj,
+                m: m as u32,
+                in_f: o_group_dim as u32,
+                out_f: o_lora_rank as u32,
+                w_off: (src_g * o_lora_rank * o_group_dim) as u32,
+            });
+            g.push(Op::CopyStrided {
+                src: proj,
+                src_off: 0,
+                src_stride: o_lora_rank as u32,
+                dst: oa,
+                dst_off: (gi * o_lora_rank) as u32,
+                dst_stride: oa_w as u32,
+                rows: m as u32,
+                n: o_lora_rank as u32,
+            });
+        }
+        g.push(Op::Linear {
+            x: oa,
+            weight: wb,
+            dst,
+            m: m as u32,
+            in_f: oa_w as u32,
+            out_f: n_embd as u32,
+            w_off: 0,
+        });
+        (g, out, wa, wb, dst)
+    };
+
+    let want = grouped_out_proj_ref(
+        &outi,
+        &wo_a,
+        &wo_b,
+        m,
+        n_groups,
+        o_group_dim,
+        o_lora_rank,
+        n_embd,
+        false,
+    );
+    let pinned = grouped_out_proj_ref(
+        &outi,
+        &wo_a,
+        &wo_b,
+        m,
+        n_groups,
+        o_group_dim,
+        o_lora_rank,
+        n_embd,
+        true,
+    );
+    let gap = maxerr(&want, &pinned);
+    println!("GroupedOutProj grouped-vs-pinned reference gap={gap:e}");
+    assert!(
+        gap > 0.1,
+        "input not well posed: pinning every group to group 0 would pass (gap={gap:e})"
+    );
+
+    // Bespoke runner: `wa` is bf16 BYTES, which `run` (f32 slices) cannot upload.
+    let go = |be: &dyn Backend, pin_group0: bool| -> Vec<f32> {
+        let (g, out, wa, wb, dst) = build(pin_group0);
+        let plan = be.compile(&g).expect("compile");
+        let up = |bytes: &[u8], usage| {
+            let b = be.alloc(bytes.len(), usage).expect("alloc");
+            be.upload(b.as_ref(), bytes).unwrap();
+            b
+        };
+        let xb = up(bytemuck::cast_slice(&outi), BufferUsage::Activations);
+        let ab = up(&wo_a_bytes, BufferUsage::Weights);
+        let bb = up(bytemuck::cast_slice(&wo_b), BufferUsage::Weights);
+        let ob = be.alloc(m * n_embd * 4, BufferUsage::Readback).unwrap();
+        let mut b = Bindings::new();
+        b.bind(out, xb.as_ref());
+        b.bind(wa, ab.as_ref());
+        b.bind(wb, bb.as_ref());
+        b.bind(dst, ob.as_ref());
+        be.execute(plan.as_ref(), &b).expect("execute");
+        let mut o = vec![0f32; m * n_embd];
+        be.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+            .unwrap();
+        o
+    };
+
+    let check = |be: &dyn Backend, name: &str| {
+        let got = go(be, false);
+        let e = maxerr(&got, &want);
+        println!("GroupedOutProj({name}) vs ref max_err={e:e}");
+        assert!(e < 1e-4, "{name}: grouped projection wrong: max_err={e:e}");
+
+        // The RED case, executed: same graph with both offsets pinned to group 0.
+        let got_p = go(be, true);
+        let e = maxerr(&got_p, &pinned);
+        println!("GroupedOutProj({name}) pinned vs pinned-ref max_err={e:e}");
+        assert!(
+            e < 1e-4,
+            "{name}: the pinned variant does not even match its own reference ({e:e}) — the test \
+             is not measuring what it claims"
+        );
+        assert!(
+            maxerr(&got, &got_p) > 0.1,
+            "{name}: pinning every group to group 0 changed nothing — w_off/src_off are not \
+             reaching the kernels"
+        );
+    };
+    check(&cpu, "cpu");
+    if let Some(vk) = gpu() {
+        check(&vk, "vulkan");
+    }
+}
+
+// ---- DeepSeek V4 Sinkhorn hyper-connections: `Op::HyperConnectMix` / `Pre` / `Post`.
+//
+// The references below are written from the DEFINITION — `ggml.h`'s `ggml_dsv4_hc_comb` /
+// `ggml_dsv4_hc_pre` / `ggml_dsv4_hc_post` header comments for the index formulas, and
+// `deepseek4.cpp`'s UNFUSED branches (`build_hc_pre`, `build_hc_sinkhorn`, `build_hc_post`) for the
+// arithmetic. They are NOT transcribed from `infr-cpu`'s op arms: they are plain f64 triple loops
+// written from the reference, so agreement between them and the CPU backend is evidence about the
+// port rather than a restatement of it.
+
+/// Shape + hyper-parameters of one hyper-connection case.
+#[derive(Clone, Copy)]
+struct HcDims {
+    rows: usize,
+    hc: usize,
+    n_embd: usize,
+    eps: f32,
+    n_iter: u32,
+    /// `true` = `build_hc_head`'s form — `mixes` is the `pre` chunk alone, no `post`/`comb`.
+    head: bool,
+}
+
+impl HcDims {
+    /// `(2 + hc)*hc` for the sublayer wrap, `hc` for the head (whose `output_hc_fn` is
+    /// `{hc_dim, hc}`).
+    fn mix_dim(&self) -> usize {
+        if self.head {
+            self.hc
+        } else {
+            (2 + self.hc) * self.hc
+        }
+    }
+    /// `hc_scale` is `{3}` for the wrap and `{1}` for the head.
+    fn n_scale(&self) -> usize {
+        if self.head {
+            1
+        } else {
+            3
+        }
+    }
+}
+
+/// One deliberate deviation from the definition, for the negative controls. [`FAITHFUL`] is the
+/// definition itself; each field below names exactly one thing done wrong, and the test that flips
+/// it asserts the answer MOVES — which is how each of these details is shown to be load-bearing
+/// rather than decorative. Every one of them still runs and still produces plausible numbers.
+#[derive(Clone, Copy)]
+struct HcVariant {
+    /// Read `comb`'s chunk as `src + hc*dst` instead of `dst + hc*src`.
+    transpose_comb: bool,
+    /// Run `n_iter` of BOTH normalisations instead of `n_iter` over-src and `n_iter - 1` over-dst.
+    symmetric_iters: bool,
+    /// Give the EXTRA normalisation to the `dst` axis instead of `src` — start and end on
+    /// `norm_dst`. This is what trusting llama.cpp's `norm_rows`/`norm_cols` NAMES produces: the
+    /// lambdas are named for the opposite axis to the one they reduce over.
+    swap_norm_axes: bool,
+    /// Drop the `+ eps` applied to every element right after the softmax.
+    drop_eps_softmax: bool,
+    /// Drop the `+ eps` on the over-src sum before it divides.
+    drop_eps_src: bool,
+    /// Drop the `+ eps` on the over-dst sum before it divides.
+    drop_eps_dst: bool,
+    /// Drop the `+ eps` on `pre` after its sigmoid (the fourth, non-Sinkhorn site).
+    drop_eps_pre: bool,
+    /// Swap the `pre` and `post` chunk offsets (and their scale index / base offset with them) —
+    /// adjacent, equal-width chunks of the same tensor.
+    swap_pre_post: bool,
+}
+
+const FAITHFUL: HcVariant = HcVariant {
+    transpose_comb: false,
+    symmetric_iters: false,
+    swap_norm_axes: false,
+    drop_eps_softmax: false,
+    drop_eps_src: false,
+    drop_eps_dst: false,
+    drop_eps_pre: false,
+    swap_pre_post: false,
+};
+
+/// `build_hc_sinkhorn` in f64, in place over `m` laid out `dst + hc*src`.
+fn hc_ref_sinkhorn(m: &mut [f64], hc: usize, eps: f64, n_iter: u32, v: HcVariant) {
+    // ggml_soft_max over ne[0] — for `comb` reshaped `[dst_hc, src_hc, n_tokens]` that is the
+    // `dst` axis, one softmax per src column. Then `ggml_add(comb, eps)`.
+    let e_soft = if v.drop_eps_softmax { 0.0 } else { eps };
+    for src in 0..hc {
+        let col = &mut m[src * hc..][..hc];
+        let mx = col.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let mut s = 0.0;
+        for x in col.iter_mut() {
+            *x = (*x - mx).exp();
+            s += *x;
+        }
+        for x in col.iter_mut() {
+            *x = *x / s + e_soft;
+        }
+    }
+    let e_src = if v.drop_eps_src { 0.0 } else { eps };
+    let e_dst = if v.drop_eps_dst { 0.0 } else { eps };
+    // llama.cpp's `norm_cols`: permute so `src` is ne[0], `ggml_sum_rows` (i.e. sum over SRC),
+    // add eps, divide. Reduces over src, despite the name.
+    let norm_src = |m: &mut [f64]| {
+        for dst in 0..hc {
+            let s: f64 = (0..hc).map(|src| m[dst + hc * src]).sum();
+            let q = s + e_src;
+            for src in 0..hc {
+                m[dst + hc * src] /= q;
+            }
+        }
+    };
+    // llama.cpp's `norm_rows`: `ggml_sum_rows` of the matrix as laid out, whose ne[0] is DST.
+    // Reduces over dst, despite the name.
+    let norm_dst = |m: &mut [f64]| {
+        for src in 0..hc {
+            let col = &mut m[src * hc..][..hc];
+            let q: f64 = col.iter().sum::<f64>() + e_dst;
+            for x in col.iter_mut() {
+                *x /= q;
+            }
+        }
+    };
+    if v.symmetric_iters {
+        for _ in 0..n_iter {
+            norm_dst(m);
+            norm_src(m);
+        }
+    } else if v.swap_norm_axes {
+        norm_dst(m);
+        for _ in 1..n_iter {
+            norm_src(m);
+            norm_dst(m);
+        }
+    } else {
+        norm_src(m);
+        for _ in 1..n_iter {
+            norm_dst(m);
+            norm_src(m);
+        }
+    }
+}
+
+/// `build_hc_pre`'s coefficient half in f64 — returns `(pre, post, comb)`, the latter two empty in
+/// the head form.
+fn hc_ref_mix(
+    mixes: &[f32],
+    scale: &[f32],
+    base: &[f32],
+    d: HcDims,
+    v: HcVariant,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let (hc, md, eps) = (d.hc, d.mix_dim(), d.eps as f64);
+    // The pre chunk is at offset 0 with scale[0]; post at hc with scale[1]. `swap_pre_post` reads
+    // them the other way round — the mistake nothing but a value check catches.
+    let (pre_off, post_off) = if v.swap_pre_post { (hc, 0) } else { (0, hc) };
+    let (pre_si, post_si) = if v.swap_pre_post { (1, 0) } else { (0, 1) };
+    let e_pre = if v.drop_eps_pre { 0.0 } else { eps };
+    let sig = |z: f64| 1.0 / (1.0 + (-z).exp());
+    let mut pre = vec![0f64; d.rows * hc];
+    for t in 0..d.rows {
+        for h in 0..hc {
+            let z = mixes[t * md + pre_off + h] as f64 * scale[pre_si] as f64
+                + base[pre_off + h] as f64;
+            pre[t * hc + h] = sig(z) + e_pre;
+        }
+    }
+    if d.head {
+        return (pre, Vec::new(), Vec::new());
+    }
+    let mut post = vec![0f64; d.rows * hc];
+    let mut comb = vec![0f64; d.rows * hc * hc];
+    for t in 0..d.rows {
+        for h in 0..hc {
+            let z = mixes[t * md + post_off + h] as f64 * scale[post_si] as f64
+                + base[post_off + h] as f64;
+            post[t * hc + h] = 2.0 * sig(z);
+        }
+        let m = &mut comb[t * hc * hc..][..hc * hc];
+        for dst in 0..hc {
+            for src in 0..hc {
+                // logits[dst, src, t] = mixes[2*hc + dst + hc*src, t]*scale[2] + base[2*hc + ...]
+                let k = if v.transpose_comb {
+                    src + hc * dst
+                } else {
+                    dst + hc * src
+                };
+                m[dst + hc * src] =
+                    mixes[t * md + 2 * hc + k] as f64 * scale[2] as f64 + base[2 * hc + k] as f64;
+            }
+        }
+        hc_ref_sinkhorn(m, hc, eps, d.n_iter, v);
+    }
+    (pre, post, comb)
+}
+
+/// `ggml_dsv4_hc_pre`: `result[i, t] = Σ_h x[i, h, t]*weights[h, t]`.
+fn hc_ref_pre(x: &[f32], w: &[f32], d: HcDims) -> Vec<f64> {
+    let (hc, ne) = (d.hc, d.n_embd);
+    let mut out = vec![0f64; d.rows * ne];
+    for t in 0..d.rows {
+        for h in 0..hc {
+            for i in 0..ne {
+                out[t * ne + i] += x[(t * hc + h) * ne + i] as f64 * w[t * hc + h] as f64;
+            }
+        }
+    }
+    out
+}
+
+/// `ggml_dsv4_hc_post`: `result[i, dst, t] = x[i,t]*post[dst,t] + Σ_src residual[i,src,t]*comb[dst,src,t]`.
+fn hc_ref_post(x: &[f32], residual: &[f32], post: &[f32], comb: &[f32], d: HcDims) -> Vec<f64> {
+    let (hc, ne) = (d.hc, d.n_embd);
+    let mut out = vec![0f64; d.rows * hc * ne];
+    for t in 0..d.rows {
+        for dst in 0..hc {
+            for i in 0..ne {
+                let mut acc = x[t * ne + i] as f64 * post[t * hc + dst] as f64;
+                for src in 0..hc {
+                    acc += residual[(t * hc + src) * ne + i] as f64
+                        * comb[t * hc * hc + dst + hc * src] as f64;
+                }
+                out[(t * hc + dst) * ne + i] = acc;
+            }
+        }
+    }
+    out
+}
+
+fn maxerr64(a: &[f32], b: &[f64]) -> f64 {
+    assert_eq!(a.len(), b.len(), "reference/backend length mismatch");
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (*x as f64 - y).abs())
+        .fold(0.0, f64::max)
+}
+
+fn maxdiff64(a: &[f64], b: &[f64]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f64::max)
+}
+
+/// `mixes` values for a case: mixed-sign, no symmetry between the `dst`/`src` axes of the `comb`
+/// chunk (a symmetric one would hide a transposed index) and spread wide enough that the softmax
+/// inside Sinkhorn is not near-uniform.
+fn hc_mixes(rows: usize, mix_dim: usize) -> Vec<f32> {
+    (0..rows * mix_dim)
+        .map(|i| (((i * 37 + 11) % 23) as f32 - 11.0) * 0.31)
+        .collect()
+}
+
+/// Build + run one `Op::HyperConnectMix`, returning `(pre, post, comb)` (the latter two empty in
+/// the head form). Bespoke because the op writes THREE outputs and `run` handles one.
+fn hc_run_mix(
+    be: &dyn Backend,
+    mixes: &[f32],
+    scale: &[f32],
+    base: &[f32],
+    d: HcDims,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let (hc, md) = (d.hc, d.mix_dim());
+    let mut g = Graph::new();
+    let mx = g.input(f32d(d.rows * md));
+    let sc = g.weight(f32d(d.n_scale()));
+    let bs = g.weight(f32d(md));
+    let pre = g.output(f32d(d.rows * hc));
+    let gates = (!d.head).then(|| infr_core::graph::HyperGates {
+        post: g.output(f32d(d.rows * hc)),
+        comb: g.output(f32d(d.rows * hc * hc)),
+    });
+    g.push(Op::HyperConnectMix {
+        mixes: mx,
+        scale: sc,
+        base: bs,
+        pre,
+        gates,
+        rows: d.rows as u32,
+        hc: hc as u32,
+        eps: d.eps,
+        n_iter: d.n_iter,
+    });
+
+    let plan = be.compile(&g).expect("compile HyperConnectMix");
+    let up = |data: &[f32], usage| {
+        let b = be.alloc(data.len().max(1) * 4, usage).expect("alloc");
+        be.upload(b.as_ref(), bytemuck::cast_slice(data)).unwrap();
+        b
+    };
+    let mb = up(mixes, BufferUsage::Activations);
+    let sb = up(scale, BufferUsage::Weights);
+    let bb = up(base, BufferUsage::Weights);
+    let pb = be
+        .alloc(d.rows * hc * 4, BufferUsage::Readback)
+        .expect("alloc pre");
+    let mut b = Bindings::new();
+    b.bind(mx, mb.as_ref());
+    b.bind(sc, sb.as_ref());
+    b.bind(bs, bb.as_ref());
+    b.bind(pre, pb.as_ref());
+    let gb = gates.map(|gt| {
+        (
+            gt,
+            be.alloc(d.rows * hc * 4, BufferUsage::Readback).unwrap(),
+            be.alloc(d.rows * hc * hc * 4, BufferUsage::Readback)
+                .unwrap(),
+        )
+    });
+    if let Some((gt, ob, cb)) = &gb {
+        b.bind(gt.post, ob.as_ref());
+        b.bind(gt.comb, cb.as_ref());
+    }
+    be.execute(plan.as_ref(), &b).expect("execute");
+    let dl = |buf: &dyn infr_core::backend::Buffer, n: usize| {
+        let mut o = vec![0f32; n];
+        be.download(buf, bytemuck::cast_slice_mut(&mut o)).unwrap();
+        o
+    };
+    let pre_o = dl(pb.as_ref(), d.rows * hc);
+    match &gb {
+        Some((_, ob, cb)) => (
+            pre_o,
+            dl(ob.as_ref(), d.rows * hc),
+            dl(cb.as_ref(), d.rows * hc * hc),
+        ),
+        None => (pre_o, Vec::new(), Vec::new()),
+    }
+}
+
+/// The case table shared by every hyper-connection test below. `hc = 4` is production (llama.cpp
+/// `GGML_ASSERT`s it); the rest move the axes a kernel can get wrong — `hc = 1` (a degenerate
+/// 1×1 Sinkhorn), `hc = 3` (not a power of two), `hc = 8` (`HYPER_CONNECT_MAX_MULT`, the widest
+/// any backend accepts) — across `n_iter` 1 (the loop body never runs, only the lone `norm_src`),
+/// 2, 3 and 5.
+fn hc_cases() -> Vec<(&'static str, HcDims)> {
+    let e = 1e-6f32;
+    vec![
+        (
+            "production hc=4 n_iter=3, 7 tokens",
+            HcDims {
+                rows: 7,
+                hc: 4,
+                n_embd: 5,
+                eps: e,
+                n_iter: 3,
+                head: false,
+            },
+        ),
+        (
+            "hc=4 n_iter=1 (only the lone norm_src runs)",
+            HcDims {
+                rows: 5,
+                hc: 4,
+                n_embd: 6,
+                eps: e,
+                n_iter: 1,
+                head: false,
+            },
+        ),
+        (
+            "hc=3 (not a power of two) n_iter=2",
+            HcDims {
+                rows: 6,
+                hc: 3,
+                n_embd: 7,
+                eps: e,
+                n_iter: 2,
+                head: false,
+            },
+        ),
+        (
+            "hc=1 (degenerate 1x1 Sinkhorn) n_iter=4",
+            HcDims {
+                rows: 3,
+                hc: 1,
+                n_embd: 9,
+                eps: e,
+                n_iter: 4,
+                head: false,
+            },
+        ),
+        (
+            "hc=8 (HYPER_CONNECT_MAX_MULT) n_iter=5",
+            HcDims {
+                rows: 4,
+                hc: 8,
+                n_embd: 3,
+                eps: e,
+                n_iter: 5,
+                head: false,
+            },
+        ),
+        (
+            "model head form (pre only), hc=4",
+            HcDims {
+                rows: 7,
+                hc: 4,
+                n_embd: 5,
+                eps: e,
+                n_iter: 3,
+                head: true,
+            },
+        ),
+        (
+            "large eps 1e-2 (every eps site visible), hc=4 n_iter=3",
+            HcDims {
+                rows: 5,
+                hc: 4,
+                n_embd: 4,
+                eps: 1e-2,
+                n_iter: 3,
+                head: false,
+            },
+        ),
+    ]
+}
+
+/// Scale/base for a case. `base` is per-element and mixed-sign, `scale` differs per chunk so
+/// reading the wrong index is visible.
+fn hc_scale_base(d: HcDims) -> (Vec<f32>, Vec<f32>) {
+    let scale: Vec<f32> = vec![0.7, -1.3, 1.9][..d.n_scale()].to_vec();
+    let base = (0..d.mix_dim())
+        .map(|i| (((i * 13 + 5) % 17) as f32 - 8.0) * 0.17)
+        .collect();
+    (scale, base)
+}
+
+/// Tolerance for every hyper-connection backend comparison (CPU vs the f64 reference, and each GPU
+/// vs CPU). All these outputs are O(1) — `pre` and `comb` are in `(0, 1]`, `post` in `(0, 2)` — so
+/// an absolute bound is the meaningful one.
+///
+/// Chosen, not measured-and-rounded: f32 carries ~1e-7 relative, a Sinkhorn round is a handful of
+/// dependent ops, and a GPU `exp` is only required to be within ~3 ULP of the host's, so ~1e-6 is
+/// the floor a correct port can reach. `1e-5` sits an order of magnitude above that and two orders
+/// BELOW the smallest structural defect `hyper_connect_details_are_load_bearing` measures (a
+/// transposed `comb`, a swapped `pre`/`post`, or a symmetric iteration count each move the answer
+/// by >1e-3). Observed with this table: CPU vs reference ≤1.8e-7, Vulkan vs CPU ≤2.4e-7.
+const HC_TOL: f32 = 1e-5;
+
+/// `Op::HyperConnectMix` — CPU vs the from-definition f64 reference, plus CPU-vs-Vulkan.
+#[test]
+fn hyper_connect_mix_parity() {
+    let cpu = infr_cpu::CpuBackend::new();
+    for (name, d) in hc_cases() {
+        let mixes = hc_mixes(d.rows, d.mix_dim());
+        let (scale, base) = hc_scale_base(d);
+        let (wpre, wpost, wcomb) = hc_ref_mix(&mixes, &scale, &base, d, FAITHFUL);
+        let (pre, post, comb) = hc_run_mix(&cpu, &mixes, &scale, &base, d);
+        let (ep, eo, ec) = (
+            maxerr64(&pre, &wpre),
+            maxerr64(&post, &wpost),
+            maxerr64(&comb, &wcomb),
+        );
+        println!("HyperConnectMix {name}: cpu vs ref pre={ep:e} post={eo:e} comb={ec:e}");
+        let tol = HC_TOL as f64;
+        assert!(ep < tol, "{name}: pre diverges from the reference ({ep:e})");
+        assert!(
+            eo < tol,
+            "{name}: post diverges from the reference ({eo:e})"
+        );
+        assert!(
+            ec < tol,
+            "{name}: comb diverges from the reference ({ec:e})"
+        );
+
+        if let Some(vk) = gpu() {
+            let (vp, vo, vc) = hc_run_mix(&vk, &mixes, &scale, &base, d);
+            let (ep, eo, ec) = (maxerr(&vp, &pre), maxerr(&vo, &post), maxerr(&vc, &comb));
+            println!("HyperConnectMix {name}: vulkan vs cpu pre={ep:e} post={eo:e} comb={ec:e}");
+            assert!(ep < HC_TOL, "{name}: Vulkan pre diverges from CPU ({ep:e})");
+            assert!(
+                eo < HC_TOL,
+                "{name}: Vulkan post diverges from CPU ({eo:e})"
+            );
+            assert!(
+                ec < HC_TOL,
+                "{name}: Vulkan comb diverges from CPU ({ec:e})"
+            );
+        }
+    }
+}
+
+/// **The doubly-stochastic property itself** — the whole point of the Sinkhorn iteration, asserted
+/// on the CPU BACKEND's output (not on the reference).
+///
+/// Two data sets, because the property and the ORIENTATION of the normalisations cannot be shown
+/// by the same one:
+///
+/// * `converged` — mild logits (`|z| < 1`) and 40 iterations. Sinkhorn converges and BOTH sums
+///   land within 1e-4: that is the property.
+/// * `production` — the `hc = 4, n_iter = 3` case from the shared table, with the table's peaked
+///   logits. Sinkhorn has NOT converged there (its rate collapses as the matrix approaches a
+///   permutation — a property of the algorithm, not a port bug: `|sum_dst - 1| ≈ 0.5`), and that
+///   is exactly what makes the orientation visible. `norm_src` is the LAST normalisation the
+///   asymmetric loop runs and it divides by `sum + eps`, so `sum_src` is exact to eps level while
+///   `sum_dst` is only as close as the iteration got.
+///
+/// The RED case here is `swap_norm_axes` — giving the extra normalisation to `dst`, which is what
+/// trusting llama.cpp's INVERTED `norm_rows`/`norm_cols` names produces. It swaps which axis comes
+/// out exact and is asserted to fail the tight bound.
+///
+/// What these sums do NOT catch, asserted so the gap is on the record rather than assumed: a
+/// transposed `comb` INDEX (`src + hc*dst`). Sinkhorn applied to a transposed matrix is just
+/// Sinkhorn applied to a different matrix — it still ends on `norm_src` and its sums are just as
+/// well behaved. That one is caught by value: `hyper_connect_details_are_load_bearing` and
+/// `hyper_connect_post_parity`'s executed transpose, which move the answer by ~1.
+#[test]
+fn hyper_connect_comb_is_doubly_stochastic() {
+    let cpu = infr_cpu::CpuBackend::new();
+    let converged = HcDims {
+        rows: 5,
+        hc: 4,
+        n_embd: 4,
+        eps: 1e-6,
+        n_iter: 40,
+        head: false,
+    };
+    let production = hc_cases()[0].1;
+    for (name, d, want_converged) in [
+        ("converged (mild logits, n_iter=40)", converged, true),
+        ("production hc=4 n_iter=3", production, false),
+    ] {
+        let (hc, eps) = (d.hc, d.eps as f64);
+        // The converged case needs logits small enough that the softmax is not near-one-hot; the
+        // production case uses the shared generator unchanged.
+        let mixes: Vec<f32> = if want_converged {
+            (0..d.rows * d.mix_dim())
+                .map(|i| (((i * 37 + 11) % 23) as f32 - 11.0) * 0.04)
+                .collect()
+        } else {
+            hc_mixes(d.rows, d.mix_dim())
+        };
+        let (scale, base) = if want_converged {
+            (
+                vec![0.7, -1.3, 0.5],
+                (0..d.mix_dim())
+                    .map(|i| (((i * 13 + 5) % 17) as f32 - 8.0) * 0.02)
+                    .collect::<Vec<f32>>(),
+            )
+        } else {
+            hc_scale_base(d)
+        };
+        let (_, _, comb) = hc_run_mix(&cpu, &mixes, &scale, &base, d);
+        // The RED variant: the extra normalisation given to `dst` instead of `src`.
+        let (_, _, swapped) = hc_ref_mix(
+            &mixes,
+            &scale,
+            &base,
+            d,
+            HcVariant {
+                swap_norm_axes: true,
+                ..FAITHFUL
+            },
+        );
+        // And the transposed INDEX, which these sums are asserted below NOT to be able to see.
+        let (_, _, tcomb) = hc_ref_mix(
+            &mixes,
+            &scale,
+            &base,
+            d,
+            HcVariant {
+                transpose_comb: true,
+                ..FAITHFUL
+            },
+        );
+
+        let sums = |m: &[f64]| -> (f64, f64) {
+            let (mut esrc, mut edst) = (0f64, 0f64);
+            for t in 0..d.rows {
+                let b = t * hc * hc;
+                for dst in 0..hc {
+                    let s: f64 = (0..hc).map(|src| m[b + dst + hc * src]).sum();
+                    esrc = esrc.max((s - 1.0).abs());
+                }
+                for src in 0..hc {
+                    let s: f64 = (0..hc).map(|dst| m[b + dst + hc * src]).sum();
+                    edst = edst.max((s - 1.0).abs());
+                }
+            }
+            (esrc, edst)
+        };
+        let got: Vec<f64> = comb.iter().map(|&v| v as f64).collect();
+        let (esrc, edst) = sums(&got);
+        println!("comb[{name}]: |sum_src - 1| = {esrc:e}, |sum_dst - 1| = {edst:e} (eps={eps:e})");
+        let tight = 4.0 * eps + hc as f64 * 1e-6;
+        let (wsrc, wdst) = sums(&swapped);
+        let (tsrc, tdst) = sums(&tcomb);
+        println!("comb[{name}] swapped norm axes: src={wsrc:e} dst={wdst:e}");
+        println!("comb[{name}] transposed index:  src={tsrc:e} dst={tdst:e}");
+        // The gap, asserted rather than assumed: a transposed INDEX leaves both sums exactly as
+        // well behaved as the faithful one, so nothing here can see it.
+        assert!(
+            (tsrc < tight) == (esrc < tight) && (tdst < tight) == (edst < tight),
+            "{name}: a transposed comb index changed which axis is exact (src {tsrc:e} vs \
+             {esrc:e}, dst {tdst:e} vs {edst:e}) — then the doc above is wrong and this test \
+             could have been asserting the index too"
+        );
+        if want_converged {
+            assert!(
+                esrc < 1e-4 && edst < 1e-4,
+                "{name}: comb is not doubly stochastic (src {esrc:e}, dst {edst:e})"
+            );
+        } else {
+            // Stated as an assertion so it goes red if it ever stops being true: at n_iter=3 on
+            // peaked logits the over-dst sums have NOT converged, which is why the case above
+            // exists at all.
+            assert!(
+                edst > 1e-2,
+                "{name}: sum_dst is already converged ({edst:e}) — the `converged` case above is \
+                 no longer testing anything the production one does not"
+            );
+            // The orientation. `norm_src` divides by `sum + eps`, so `sum_src`'s residual is
+            // bounded by eps regardless of convergence; f32 storage of comb adds ~hc ULP.
+            assert!(
+                esrc < tight,
+                "{name}: the LAST normalisation is over src, so |sum_src - 1| must be at eps \
+                 level, not {esrc:e} (> {tight:e}) — comb is transposed"
+            );
+            // The RED half: the same bound applied to a Sinkhorn whose extra normalisation went
+            // to `dst` must FAIL, and `sum_dst` must be the exact one there instead.
+            assert!(
+                wsrc > tight,
+                "{name}: swapping the normalisation axes passes the tight sum_src bound \
+                 ({wsrc:e} <= {tight:e}) — the assertion above proves nothing"
+            );
+            assert!(
+                wdst < tight,
+                "{name}: with the axes swapped, sum_dst should be the exact one ({wdst:e})"
+            );
+        }
+    }
+}
+
+/// Each detail `docs/deepseek.md` warns about, shown to CHANGE the answer. If the CPU arm had
+/// implemented any of these variants, `hyper_connect_mix_parity` would be comparing against the
+/// wrong reference and would still pass — so this test is what makes that one mean something.
+///
+/// Bounds, and what each says:
+///
+/// * a STRUCTURAL variant (swapped `pre`/`post` offsets, transposed `comb` index, the extra
+///   normalisation given to `dst`) must move the answer by >1e-3, two orders above `HC_TOL`. Those
+///   are pinned by the backend parity test on every case.
+/// * an EPS-SITE drop must move it by >1e-9 — unambiguously not inert. At `eps = 1e-6` that can
+///   fall BELOW `HC_TOL` (the over-dst site is the smallest, since the final over-src
+///   normalisation partly washes it out), which is why the table carries an `eps = 1e-2` case
+///   where every site is required to clear `HC_TOL` and the backends are pinned too.
+/// * `symmetric_iters` gets its own, much smaller bound — see the comment at its call site.
+///
+/// Three details are genuinely INERT on some cases, and each is asserted to move the answer by
+/// EXACTLY zero there rather than skipped quietly: `comb`'s index at `hc = 1` (a 1×1 transpose is
+/// the identity), the over-dst eps site at `n_iter = 1` (the reference's `for (i = 1; i < n_iter)`
+/// body never runs, so `norm_dst` is never called — a direct check that the loop is the asymmetric
+/// one), and every `comb`/`post` variant in the head form, which has neither.
+#[test]
+fn hyper_connect_details_are_load_bearing() {
+    for (name, d) in hc_cases() {
+        let mixes = hc_mixes(d.rows, d.mix_dim());
+        let (scale, base) = hc_scale_base(d);
+        let (pre0, post0, comb0) = hc_ref_mix(&mixes, &scale, &base, d, FAITHFUL);
+        // How far this variant moves the faithful answer, over all three outputs.
+        let moved = |what: &str, v: HcVariant| -> f64 {
+            let (pre, post, comb) = hc_ref_mix(&mixes, &scale, &base, d, v);
+            let e = maxdiff64(&pre0, &pre)
+                .max(maxdiff64(&post0, &post))
+                .max(maxdiff64(&comb0, &comb));
+            println!("HyperConnect {name}: {what} moves the answer by {e:e}");
+            e
+        };
+        let must_move = |what: &str, v: HcVariant, min: f64| {
+            let e = moved(what, v);
+            assert!(
+                e > min,
+                "{name}: {what} changed the answer by only {e:e} (<= {min:e}) — that detail is \
+                 not pinned by this case"
+            );
+        };
+        let must_be_inert = |what: &str, v: HcVariant, why: &str| {
+            let e = moved(what, v);
+            assert_eq!(
+                e, 0.0,
+                "{name}: {what} was expected to be inert here ({why}) but moved \
+                 the answer by {e:e}"
+            );
+        };
+
+        let big_eps = d.eps as f64 >= 1e-3;
+        // An eps site must not be inert; on the large-eps case it must also clear the tolerance
+        // the backend comparisons run at.
+        let tiny = if big_eps { 10.0 * HC_TOL as f64 } else { 1e-9 };
+
+        must_move(
+            "dropping eps on pre",
+            HcVariant {
+                drop_eps_pre: true,
+                ..FAITHFUL
+            },
+            tiny,
+        );
+        if d.head {
+            continue; // no post, no comb, no Sinkhorn
+        }
+        must_move(
+            "reading pre/post at each other's offsets",
+            HcVariant {
+                swap_pre_post: true,
+                ..FAITHFUL
+            },
+            1e-3,
+        );
+        if d.hc == 1 {
+            // Every Sinkhorn detail below is genuinely inert on a 1x1 matrix, for three separate
+            // reasons — see `hyper_connect_hc1_sinkhorn_details_are_inert`, which asserts each one.
+            continue;
+        }
+        must_move(
+            "indexing comb as src + hc*dst",
+            HcVariant {
+                transpose_comb: true,
+                ..FAITHFUL
+            },
+            1e-3,
+        );
+        must_move(
+            "dropping eps after the softmax",
+            HcVariant {
+                drop_eps_softmax: true,
+                ..FAITHFUL
+            },
+            tiny,
+        );
+        must_move(
+            "dropping eps on the over-src sum",
+            HcVariant {
+                drop_eps_src: true,
+                ..FAITHFUL
+            },
+            tiny,
+        );
+        let drop_dst = HcVariant {
+            drop_eps_dst: true,
+            ..FAITHFUL
+        };
+        // At n_iter = 1 the reference's `for (i = 1; i < n_iter)` body never runs, so `norm_dst`
+        // is never called — a direct check that the loop really is the asymmetric one.
+        if d.n_iter > 1 {
+            must_move("dropping eps on the over-dst sum", drop_dst, tiny);
+        } else {
+            must_be_inert(
+                "dropping eps on the over-dst sum",
+                drop_dst,
+                "at n_iter = 1 the loop body never runs, so norm_dst is never called",
+            );
+        }
+        must_move(
+            "giving the extra normalisation to dst (llama.cpp's inverted lambda names)",
+            HcVariant {
+                swap_norm_axes: true,
+                ..FAITHFUL
+            },
+            1e-3,
+        );
+        // The count itself is pinned, but only just, and the mechanism is worth stating: the
+        // softmax already left every src column summing to `1 + hc*eps`, so the symmetric
+        // variant's EXTRA LEADING `norm_dst` divides the whole matrix by one and the same
+        // constant — a uniform rescale that the following `norm_src` undoes. What survives is
+        // second order in eps, ~1e-11 at eps = 1e-6 and ~1e-4 at eps = 1e-2. So the count IS
+        // observable, but below `HC_TOL` on the small-eps cases: the large-eps case is what pins
+        // it for the backends.
+        must_move(
+            "running n_iter of BOTH normalisations",
+            HcVariant {
+                symmetric_iters: true,
+                ..FAITHFUL
+            },
+            if big_eps { HC_TOL as f64 } else { 1e-13 },
+        );
+    }
+}
+
+/// `hc = 1` is degenerate three times over, and each degeneracy makes a Sinkhorn detail inert.
+/// `hyper_connect_details_are_load_bearing` therefore runs only its non-Sinkhorn checks there, and
+/// this test states exactly what is lost — as assertions, so a change that made any of them
+/// observable would show up here rather than silently widen that test's coverage claim:
+///
+/// * a 1×1 matrix is its own transpose, so `comb`'s index formula cannot be got wrong;
+/// * `norm_src` and `norm_dst` are THE SAME operation on a 1×1 matrix, so the asymmetric loop and
+///   its axis-swapped variant collapse onto each other;
+/// * `v ← v/(v + eps)` has a fixed point independent of the initial value, and `n_iter = 4`
+///   reaches it — so a perturbation applied BEFORE the iteration (the post-softmax eps) is washed
+///   out entirely.
+///
+/// What is NOT lost, asserted too: the eps sites INSIDE the normalisations change the fixed point
+/// itself, so they still move the answer — the over-src one at first order in eps (it runs last,
+/// so nothing re-normalises after it) and the over-dst one at second order (the following
+/// `norm_src` almost washes it out, the same mechanism that makes `symmetric_iters` tiny).
+/// `hc = 1` is in the shared table for kernel SHAPE coverage (a degenerate loop bound on every
+/// backend), not for semantics.
+#[test]
+fn hyper_connect_hc1_sinkhorn_details_are_inert() {
+    let d = HcDims {
+        rows: 3,
+        hc: 1,
+        n_embd: 9,
+        eps: 1e-6,
+        n_iter: 4,
+        head: false,
+    };
+    let mixes = hc_mixes(d.rows, d.mix_dim());
+    let (scale, base) = hc_scale_base(d);
+    let (_, _, c0) = hc_ref_mix(&mixes, &scale, &base, d, FAITHFUL);
+    let comb_of = |v: HcVariant| hc_ref_mix(&mixes, &scale, &base, d, v).2;
+    for (what, v) in [
+        (
+            "transposing comb's index",
+            HcVariant {
+                transpose_comb: true,
+                ..FAITHFUL
+            },
+        ),
+        (
+            "swapping the normalisation axes",
+            HcVariant {
+                swap_norm_axes: true,
+                ..FAITHFUL
+            },
+        ),
+        (
+            "dropping eps after the softmax",
+            HcVariant {
+                drop_eps_softmax: true,
+                ..FAITHFUL
+            },
+        ),
+    ] {
+        assert_eq!(
+            c0,
+            comb_of(v),
+            "hc=1: {what} was expected to be exactly inert"
+        );
+    }
+    for (what, v, min) in [
+        (
+            "dropping eps on the over-src sum",
+            HcVariant {
+                drop_eps_src: true,
+                ..FAITHFUL
+            },
+            1e-9, // first order in eps: nothing re-normalises after the last norm_src
+        ),
+        (
+            "dropping eps on the over-dst sum",
+            HcVariant {
+                drop_eps_dst: true,
+                ..FAITHFUL
+            },
+            1e-13, // second order: the following norm_src almost washes it out
+        ),
+    ] {
+        let e = maxdiff64(&c0, &comb_of(v));
+        println!("HyperConnect hc=1: {what} moves comb by {e:e}");
+        assert!(
+            e > min,
+            "hc=1: {what} changes the iteration's fixed point, so it must still move the answer \
+             (moved {e:e}, wanted > {min:e})"
+        );
+    }
+}
+
+/// `Op::HyperConnectPre` — CPU vs the from-definition reference, plus CPU-vs-Vulkan.
+///
+/// The `hc` streams are given magnitudes that differ by three orders of magnitude (stream `h` is
+/// scaled by `100^h`), so a collapse that dropped `weights`, used the wrong stream, or summed the
+/// streams unweighted is off by orders of magnitude rather than by a rounding error. The
+/// `weights` are a real `Op::HyperConnectMix` output (sigmoids in `(0, 1]`), not a synthetic
+/// vector, so this exercises the pair as it will be wired.
+#[test]
+fn hyper_connect_pre_parity() {
+    let cpu = infr_cpu::CpuBackend::new();
+    for (name, d) in hc_cases() {
+        let mixes = hc_mixes(d.rows, d.mix_dim());
+        let (scale, base) = hc_scale_base(d);
+        let (w, _, _) = hc_run_mix(&cpu, &mixes, &scale, &base, d);
+        let x: Vec<f32> = (0..d.rows * d.hc * d.n_embd)
+            .map(|i| {
+                let h = (i / d.n_embd) % d.hc;
+                (((i * 7 + 3) % 11) as f32 - 5.0) * 0.25 * 100f32.powi(h as i32)
+            })
+            .collect();
+        let want = hc_ref_pre(&x, &w, d);
+
+        let mut g = Graph::new();
+        let xi = g.input(f32d(d.rows * d.hc * d.n_embd));
+        let wi = g.input(f32d(d.rows * d.hc));
+        let dst = g.output(f32d(d.rows * d.n_embd));
+        g.push(Op::HyperConnectPre {
+            x: xi,
+            weights: wi,
+            dst,
+            rows: d.rows as u32,
+            hc: d.hc as u32,
+            n_embd: d.n_embd as u32,
+        });
+        let go = |be: &dyn Backend| run(be, &g, &[(xi, &x), (wi, &w)], &[], dst, d.rows * d.n_embd);
+        let c = go(&cpu);
+        // Relative: stream 3's magnitude is ~1e6, so an absolute f32 bound would be meaningless.
+        let scale_of = want.iter().fold(0f64, |m, v| m.max(v.abs())).max(1.0);
+        let e = maxerr64(&c, &want) / scale_of;
+        println!("HyperConnectPre {name}: cpu vs ref rel={e:e} (|out|max={scale_of:e})");
+        assert!(
+            e < HC_TOL as f64,
+            "{name}: HyperConnectPre diverges from the reference ({e:e})"
+        );
+        if let Some(vk) = gpu() {
+            let v = go(&vk);
+            let e = maxerr(&v, &c) as f64 / scale_of;
+            println!("HyperConnectPre {name}: vulkan vs cpu rel={e:e}");
+            assert!(
+                e < HC_TOL as f64,
+                "{name}: Vulkan HyperConnectPre diverges from CPU ({e:e})"
+            );
+        }
+    }
+}
+
+/// `Op::HyperConnectPost` — CPU vs the from-definition reference, plus CPU-vs-Vulkan. `post` and
+/// `comb` are real `Op::HyperConnectMix` outputs. The residual streams again differ by orders of
+/// magnitude, which is what makes a transposed `comb` (or an ignored `post`) a large error rather
+/// than a small one.
+#[test]
+fn hyper_connect_post_parity() {
+    let cpu = infr_cpu::CpuBackend::new();
+    for (name, d) in hc_cases() {
+        if d.head {
+            continue; // the head form has no post/comb, and no sublayer to wrap
+        }
+        let mixes = hc_mixes(d.rows, d.mix_dim());
+        let (scale, base) = hc_scale_base(d);
+        let (_, post, comb) = hc_run_mix(&cpu, &mixes, &scale, &base, d);
+        let residual: Vec<f32> = (0..d.rows * d.hc * d.n_embd)
+            .map(|i| {
+                let h = (i / d.n_embd) % d.hc;
+                (((i * 5 + 2) % 13) as f32 - 6.0) * 0.25 * 100f32.powi(h as i32)
+            })
+            .collect();
+        let x: Vec<f32> = (0..d.rows * d.n_embd)
+            .map(|i| (((i * 11 + 4) % 9) as f32 - 4.0) * 0.5)
+            .collect();
+        let want = hc_ref_post(&x, &residual, &post, &comb, d);
+
+        let mut g = Graph::new();
+        let xi = g.input(f32d(d.rows * d.n_embd));
+        let ri = g.input(f32d(d.rows * d.hc * d.n_embd));
+        let pi = g.input(f32d(d.rows * d.hc));
+        let ci = g.input(f32d(d.rows * d.hc * d.hc));
+        let dst = g.output(f32d(d.rows * d.hc * d.n_embd));
+        g.push(Op::HyperConnectPost {
+            x: xi,
+            residual: ri,
+            post: pi,
+            comb: ci,
+            dst,
+            rows: d.rows as u32,
+            hc: d.hc as u32,
+            n_embd: d.n_embd as u32,
+        });
+        let ins = [
+            (xi, &x[..]),
+            (ri, &residual[..]),
+            (pi, &post[..]),
+            (ci, &comb[..]),
+        ];
+        let n = d.rows * d.hc * d.n_embd;
+        let go = |be: &dyn Backend| run(be, &g, &ins, &[], dst, n);
+        let c = go(&cpu);
+        let scale_of = want.iter().fold(0f64, |m, v| m.max(v.abs())).max(1.0);
+        let e = maxerr64(&c, &want) / scale_of;
+        println!("HyperConnectPost {name}: cpu vs ref rel={e:e} (|out|max={scale_of:e})");
+        assert!(
+            e < HC_TOL as f64,
+            "{name}: HyperConnectPost diverges from the reference ({e:e})"
+        );
+
+        // The RED case, executed on the backend: feed the op a TRANSPOSED comb and confirm the
+        // output moves. `dst + hc*src` vs `src + hc*dst` is otherwise invisible — same buffer
+        // length, same value distribution, and (per the test above) still doubly stochastic.
+        // Skipped at `hc = 1`, where the transpose is the identity — see
+        // `hyper_connect_hc1_transpose_is_genuinely_inert`.
+        if d.hc > 1 {
+            let mut tcomb = comb.clone();
+            for t in 0..d.rows {
+                for dst_h in 0..d.hc {
+                    for src in 0..d.hc {
+                        tcomb[t * d.hc * d.hc + dst_h + d.hc * src] =
+                            comb[t * d.hc * d.hc + src + d.hc * dst_h];
+                    }
+                }
+            }
+            let ins_t = [
+                (xi, &x[..]),
+                (ri, &residual[..]),
+                (pi, &post[..]),
+                (ci, &tcomb[..]),
+            ];
+            let ct = run(&cpu, &g, &ins_t, &[], dst, n);
+            let moved = maxerr(&c, &ct) as f64 / scale_of;
+            println!("HyperConnectPost {name}: transposed comb moves the output by rel={moved:e}");
+            assert!(
+                moved > 1e-3,
+                "{name}: transposing comb changed the output by only {moved:e} — this case cannot \
+             detect the index formula being backwards"
+            );
+        }
+
+        if let Some(vk) = gpu() {
+            let v = go(&vk);
+            let e = maxerr(&v, &c) as f64 / scale_of;
+            println!("HyperConnectPost {name}: vulkan vs cpu rel={e:e}");
+            assert!(
+                e < HC_TOL as f64,
+                "{name}: Vulkan HyperConnectPost diverges from CPU ({e:e})"
+            );
+        }
+    }
+}
+
+/// The `hc_mult` bound is the ONLY thing keeping the GPU kernels' fixed-size per-token matrix in
+/// range (an out-of-range private-array write is undefined, and neither kernel can refuse its own
+/// dispatch), so it has to be shown to fire rather than assumed. `HYPER_CONNECT_MAX_MULT + 1`
+/// must be refused — loudly, before anything is dispatched — on every backend.
+///
+/// CPU refuses by panicking (the interpreter has no error channel in the op loop, like every other
+/// precondition there); Vulkan refuses with an `Err` from compile or execute.
+#[test]
+fn hyper_connect_refuses_hc_above_the_bound() {
+    let hc = infr_core::graph::HYPER_CONNECT_MAX_MULT as usize + 1;
+    let (rows, md) = (2usize, (2 + hc) * hc);
+    let build = || {
+        let mut g = Graph::new();
+        let mx = g.input(f32d(rows * md));
+        let sc = g.weight(f32d(3));
+        let bs = g.weight(f32d(md));
+        let pre = g.output(f32d(rows * hc));
+        let gates = infr_core::graph::HyperGates {
+            post: g.output(f32d(rows * hc)),
+            comb: g.output(f32d(rows * hc * hc)),
+        };
+        g.push(Op::HyperConnectMix {
+            mixes: mx,
+            scale: sc,
+            base: bs,
+            pre,
+            gates: Some(gates),
+            rows: rows as u32,
+            hc: hc as u32,
+            eps: 1e-6,
+            n_iter: 3,
+        });
+        (g, mx, sc, bs, pre, gates)
+    };
+    let go = |be: &dyn Backend| -> Result<(), infr_core::error::Error> {
+        let (g, mx, sc, bs, pre, gates) = build();
+        let plan = be.compile(&g)?;
+        let alloc = |n: usize| be.alloc(n * 4, BufferUsage::Activations).unwrap();
+        let (mb, sb, bb) = (alloc(rows * md), alloc(3), alloc(md));
+        let (pb, ob, cb) = (alloc(rows * hc), alloc(rows * hc), alloc(rows * hc * hc));
+        let mut b = Bindings::new();
+        b.bind(mx, mb.as_ref());
+        b.bind(sc, sb.as_ref());
+        b.bind(bs, bb.as_ref());
+        b.bind(pre, pb.as_ref());
+        b.bind(gates.post, ob.as_ref());
+        b.bind(gates.comb, cb.as_ref());
+        be.execute(plan.as_ref(), &b)
+    };
+
+    let cpu = std::panic::catch_unwind(|| go(&infr_cpu::CpuBackend::new()));
+    assert!(
+        cpu.is_err(),
+        "CPU accepted hc = {hc}, past HYPER_CONNECT_MAX_MULT"
+    );
+    if let Some(vk) = gpu() {
+        let e = go(&vk).expect_err("Vulkan accepted hc past HYPER_CONNECT_MAX_MULT");
+        let msg = e.to_string();
+        println!("Vulkan refusal: {msg}");
+        assert!(
+            msg.contains("hc_mult"),
+            "Vulkan refused hc = {hc} for the wrong reason: {msg}"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// DeepSeek V4: per-layer SwiGLU clamping + hash-routed MoE (`docs/deepseek.md` § Stage 4, 8-10).
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Hand-written f64 reference for one clamped gated-FFN element, written from the DEFINITION in
+/// `llm_graph_context::build_ffn` / `build_moe_ffn` (llama.cpp `src/llama-graph.cpp`, the
+/// `LLM_FFN_SILU` arms' `arch == LLM_ARCH_DEEPSEEK4` branch), NOT transcribed from infr's CPU arm:
+///
+/// ```text
+/// up   = ggml_clamp(up,   -limit, +limit);          // symmetric
+/// gate = ggml_clamp(gate, -INFINITY, limit);        // one-sided, UPPER bound only
+/// out  = silu(gate) * up;                            // clamp is BEFORE the activation
+/// ```
+///
+/// Every other arch llama.cpp clamps runs `silu` first and clamps the RESULT; V4 does not.
+fn swiglu_clamp_ref(gate: f64, up: f64, limit: Option<f64>) -> f64 {
+    let silu = |z: f64| z / (1.0 + (-z).exp());
+    match limit {
+        None => silu(gate) * up,
+        Some(l) => {
+            let u = up.clamp(-l, l);
+            let g = gate.min(l); // ggml_clamp(gate, -INFINITY, limit)
+            silu(g) * u
+        }
+    }
+}
+
+/// The gate values the clamp cases run on. Chosen so the pre-SiLU and post-SiLU orders genuinely
+/// disagree: values ABOVE the limit (where clamping the gate changes what SiLU sees) and values
+/// BELOW ZERO, which is where SiLU's non-monotone lobe makes the two orders diverge most —
+/// `silu(-4) = -0.072`, so clamping after SiLU at limit 0.5 leaves it untouched while clamping
+/// before does nothing there either, but at limit `-0.05` (exercised by `limit` sweeps below) the
+/// orders separate. The `up` values straddle ±limit so the symmetric bound bites on both signs.
+const CLAMP_GATES: [f32; 12] = [
+    -6.0, -4.0, -2.5, -1.5, -0.75, -0.25, 0.1, 0.6, 1.2, 2.0, 4.0, 9.0,
+];
+const CLAMP_UPS: [f32; 12] = [
+    3.0, -3.0, 0.4, -0.4, 1.1, -1.1, 0.9, -0.9, 5.0, -5.0, 0.05, -0.05,
+];
+
+/// `Op::GatedAct` and `Op::GatedActFused` with DeepSeek V4's per-layer SwiGLU clamp, on the CPU
+/// reference and (when a GPU is present) on Vulkan, against `swiglu_clamp_ref`.
+///
+/// Four things this pins, each shown red before green by injecting the deviation into the CPU arm
+/// (`infr-cpu`'s `gated_act_fn`) — see the commit message for the pasted failures:
+/// 1. the gate clamp is PRE-activation, not post;
+/// 2. the gate clamp is ONE-SIDED (upper bound only);
+/// 3. the `up` clamp is SYMMETRIC;
+/// 4. `infr_core::graph::swiglu_clamp(limit)` disables at `limit <= 1e-6`, and the disabled path
+///    is BIT-identical to a graph built with no clamp at all.
+#[test]
+fn swiglu_clamp_gated_act_parity() {
+    let cpu = infr_cpu::CpuBackend::new();
+    let rows = 4usize;
+    let nff = CLAMP_GATES.len();
+    // One row per (gate, up) rotation so every gate meets several `up` signs/magnitudes.
+    let gi: Vec<f32> = (0..rows * nff)
+        .map(|i| CLAMP_GATES[i % nff])
+        .collect::<Vec<_>>();
+    let ui: Vec<f32> = (0..rows * nff)
+        .map(|i| CLAMP_UPS[(i + i / nff) % nff])
+        .collect();
+    let gu: Vec<f32> = (0..rows)
+        .flat_map(|r| {
+            gi[r * nff..(r + 1) * nff]
+                .iter()
+                .chain(&ui[r * nff..(r + 1) * nff])
+                .copied()
+                .collect::<Vec<f32>>()
+        })
+        .collect();
+
+    for limit in [0.5f32, 1.0, 3.0] {
+        let clamp = infr_core::graph::swiglu_clamp(limit);
+        assert_eq!(clamp, Some(limit), "limit {limit} must clamp");
+        let want: Vec<f64> = (0..rows * nff)
+            .map(|i| swiglu_clamp_ref(gi[i] as f64, ui[i] as f64, Some(limit as f64)))
+            .collect();
+
+        // Split gate/up form.
+        let mut g = Graph::new();
+        let gate = g.input(f32d(rows * nff));
+        let up = g.input(f32d(rows * nff));
+        let dst = g.output(f32d(rows * nff));
+        g.push(Op::GatedAct {
+            gate,
+            up,
+            dst,
+            rows: rows as u32,
+            nff: nff as u32,
+            act: Activation::Silu,
+            up_off: 0,
+            up_stride: 0,
+            gate_stride: 0,
+            gate_block_width: 0,
+            swiglu_clamp: clamp,
+        });
+        let ins = [(gate, &gi[..]), (up, &ui[..])];
+        let c = run(&cpu, &g, &ins, &[], dst, rows * nff);
+        let e = maxerr64(&c, &want);
+        println!("GatedAct(clamp={limit}) cpu-vs-ref max_err={e:e}");
+        assert!(e < 1e-6, "GatedAct clamp={limit} diverges: max_err={e:e}");
+        if let Some(vk) = gpu() {
+            let v = run(&vk, &g, &ins, &[], dst, rows * nff);
+            let e = maxerr64(&v, &want);
+            println!("GatedAct(clamp={limit}) vulkan-vs-ref max_err={e:e}");
+            assert!(e < 1e-5, "GatedAct clamp={limit} diverges on Vulkan: {e:e}");
+        }
+
+        // Fused [rows, 2*nff] gate|up form — same reference, different buffer layout.
+        let mut g2 = Graph::new();
+        let gub = g2.input(f32d(rows * 2 * nff));
+        let dst2 = g2.output(f32d(rows * nff));
+        g2.push(Op::GatedActFused {
+            gu: gub,
+            dst: dst2,
+            rows: rows as u32,
+            nff: nff as u32,
+            act: Activation::Silu,
+            swiglu_clamp: clamp,
+        });
+        let ins2 = [(gub, &gu[..])];
+        let c2 = run(&cpu, &g2, &ins2, &[], dst2, rows * nff);
+        let e = maxerr64(&c2, &want);
+        println!("GatedActFused(clamp={limit}) cpu-vs-ref max_err={e:e}");
+        assert!(e < 1e-6, "GatedActFused clamp={limit} diverges: {e:e}");
+        if let Some(vk) = gpu() {
+            let v = run(&vk, &g2, &ins2, &[], dst2, rows * nff);
+            let e = maxerr64(&v, &want);
+            println!("GatedActFused(clamp={limit}) vulkan-vs-ref max_err={e:e}");
+            assert!(e < 1e-5, "GatedActFused clamp={limit} on Vulkan: {e:e}");
+        }
+    }
+}
+
+/// The pre-SiLU vs post-SiLU orders are not interchangeable, and the two one-sidedness choices are
+/// not either — stated as a property of the REFERENCE so the numbers this suite asserts on are
+/// known to be capable of separating the variants. Without this, a backend that clamped in the
+/// wrong order could still pass `swiglu_clamp_gated_act_parity` if the inputs happened not to
+/// distinguish them.
+///
+/// One thing worth writing down because it is the opposite of what one expects: for a POSITIVE
+/// limit the two orders agree everywhere the gate is negative. `silu(g) < 0 < limit` there, so
+/// `min(silu(g), limit) == silu(g) == silu(min(g, limit))` — the whole negative lobe is inert, and
+/// the orders separate only where `gate > limit`. The separation therefore grows with the limit
+/// (`|silu(l) - l|` times the clamped `up`), not with how far the gate reaches below zero.
+#[test]
+fn swiglu_clamp_orders_are_distinguishable() {
+    let silu = |z: f64| z / (1.0 + (-z).exp());
+    for limit in [0.5f64, 1.0, 3.0] {
+        // Post-SiLU (every arch but V4): silu first, then clamp the ACTIVATION.
+        let post = |gate: f64, up: f64| silu(gate).min(limit) * up.clamp(-limit, limit);
+        // Symmetric gate clamp instead of one-sided.
+        let sym = |gate: f64, up: f64| silu(gate.clamp(-limit, limit)) * up.clamp(-limit, limit);
+        // One-sided `up` clamp instead of symmetric.
+        let one_up = |gate: f64, up: f64| silu(gate.min(limit)) * up.min(limit);
+
+        let (mut d_post, mut d_sym, mut d_up) = (0.0f64, 0.0f64, 0.0f64);
+        let mut neg_lobe = 0.0f64;
+        // Full cross product, matching the parity test's row rotation: pairing each gate with ONE
+        // `up` would let the largest gate land on the smallest `|up|` and understate every gap.
+        for &gz in CLAMP_GATES.iter() {
+            for &uz in CLAMP_UPS.iter() {
+                let (gz, uz) = (gz as f64, uz as f64);
+                let want = swiglu_clamp_ref(gz, uz, Some(limit));
+                d_post = d_post.max((want - post(gz, uz)).abs());
+                d_sym = d_sym.max((want - sym(gz, uz)).abs());
+                d_up = d_up.max((want - one_up(gz, uz)).abs());
+                if gz < 0.0 {
+                    neg_lobe = neg_lobe.max((want - post(gz, uz)).abs());
+                }
+            }
+        }
+        println!(
+            "clamp variant separation @limit={limit}: post-SiLU={d_post:e} sym-gate={d_sym:e} \
+             one-sided-up={d_up:e} (negative-gate-only post-SiLU={neg_lobe:e})"
+        );
+        assert!(
+            d_post > 1e-2,
+            "post-SiLU clamp indistinguishable @{limit}: {d_post:e}"
+        );
+        assert!(
+            d_sym > 1e-2,
+            "symmetric gate clamp indistinguishable @{limit}: {d_sym:e}"
+        );
+        assert!(
+            d_up > 1e-2,
+            "one-sided up clamp indistinguishable @{limit}: {d_up:e}"
+        );
+        assert_eq!(
+            neg_lobe, 0.0,
+            "a positive limit cannot separate the orders on a negative gate — if this fires the \
+             reasoning above is wrong, not the number"
+        );
+    }
+}
+
+/// `limit <= 1e-6` is llama.cpp's DISABLED state, not "clamp everything to zero".
+/// [`infr_core::graph::swiglu_clamp`] is the single place that gate lives, and a graph built from a
+/// disabled per-layer entry must be BIT-identical to one with no clamp field set at all.
+#[test]
+fn swiglu_clamp_disabled_is_bit_identical() {
+    for off in [0.0f32, 1e-9, 1e-7, 1e-6] {
+        assert_eq!(
+            infr_core::graph::swiglu_clamp(off),
+            None,
+            "limit {off} must read as DISABLED (llama.cpp gates on `limit > 1e-6`)"
+        );
+    }
+    assert_eq!(infr_core::graph::swiglu_clamp(1.1e-6), Some(1.1e-6));
+
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, nff) = (4usize, CLAMP_GATES.len());
+    let gi: Vec<f32> = (0..rows * nff).map(|i| CLAMP_GATES[i % nff]).collect();
+    let ui: Vec<f32> = (0..rows * nff).map(|i| CLAMP_UPS[i % nff]).collect();
+    let build = |clamp: Option<f32>| {
+        let mut g = Graph::new();
+        let gate = g.input(f32d(rows * nff));
+        let up = g.input(f32d(rows * nff));
+        let dst = g.output(f32d(rows * nff));
+        g.push(Op::GatedAct {
+            gate,
+            up,
+            dst,
+            rows: rows as u32,
+            nff: nff as u32,
+            act: Activation::Silu,
+            up_off: 0,
+            up_stride: 0,
+            gate_stride: 0,
+            gate_block_width: 0,
+            swiglu_clamp: clamp,
+        });
+        (g, gate, up, dst)
+    };
+    let go = |be: &dyn Backend, clamp: Option<f32>| -> Vec<f32> {
+        let (g, gate, up, dst) = build(clamp);
+        run(
+            be,
+            &g,
+            &[(gate, &gi[..]), (up, &ui[..])],
+            &[],
+            dst,
+            rows * nff,
+        )
+    };
+    // `swiglu_clamp(0.0)` is the per-layer array entry a non-clamping V4 layer carries.
+    let disabled = go(&cpu, infr_core::graph::swiglu_clamp(0.0));
+    let none = go(&cpu, None);
+    assert_eq!(
+        disabled.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        none.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        "a disabled clamp must be bit-identical to no clamp on CPU"
+    );
+    if let Some(vk) = gpu() {
+        let d = go(&vk, infr_core::graph::swiglu_clamp(0.0));
+        let n = go(&vk, None);
+        assert_eq!(
+            d.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            n.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "a disabled clamp must be bit-identical to no clamp on Vulkan"
+        );
+    }
+}
+
+/// Hand-written f64 reference for a hash-routed / clamped `Op::MoeFfn`, written from
+/// `deepseek4.cpp`'s MoE block plus `llm_graph_context::build_moe_ffn` (llama.cpp
+/// `src/llama-graph.cpp`), NOT transcribed from infr's CPU arm.
+///
+/// `expert_ids = Some(ids)` is llama.cpp's `selected_experts_in`. Read off `build_moe_ffn`: the
+/// router matmul STILL runs and the gating function still produces `probs`; only `ggml_argsort_top_k`
+/// (and the `selection_probs` it consumes) is skipped. The routing weights stay
+/// `ggml_get_rows(probs, selected_experts)` — the ROUTER's probability at each hash-chosen expert —
+/// then `norm_w` renormalizes over the selected set and `w_scale` scales. They are NOT uniform.
+#[allow(clippy::too_many_arguments)]
+fn moe_v4_ref(
+    x: &[f32],
+    router: &[f32],
+    gate: &[f32],
+    up: &[f32],
+    down: &[f32],
+    ne: usize,
+    n_expert: usize,
+    n_used: usize,
+    n_ff_exp: usize,
+    scale: f64,
+    expert_ids: Option<&[usize]>,
+    swiglu_clamp: Option<f64>,
+) -> Vec<f64> {
+    let rows = x.len() / ne;
+    let dot = |w: &[f32], v: &[f64]| w.iter().zip(v).map(|(a, b)| *a as f64 * b).sum::<f64>();
+    let mut out = vec![0f64; rows * ne];
+    for row in 0..rows {
+        let xr: Vec<f64> = x[row * ne..(row + 1) * ne]
+            .iter()
+            .map(|&v| v as f64)
+            .collect();
+        // Router logits → sqrt(softplus) probs (V4's mandatory gating).
+        let probs: Vec<f64> = (0..n_expert)
+            .map(|e| {
+                let l = dot(&router[e * ne..(e + 1) * ne], &xr);
+                (1.0 + l.exp()).ln().sqrt()
+            })
+            .collect();
+        let idx: Vec<usize> = match expert_ids {
+            Some(ids) => ids[row * n_used..(row + 1) * n_used].to_vec(),
+            None => {
+                let mut i: Vec<usize> = (0..n_expert).collect();
+                i.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+                i.truncate(n_used);
+                i
+            }
+        };
+        let wsum: f64 = idx.iter().map(|&e| probs[e]).sum::<f64>().max(1e-20);
+        for &e in &idx {
+            let gs = e * n_ff_exp * ne;
+            let ds = e * ne * n_ff_exp;
+            let actv: Vec<f64> = (0..n_ff_exp)
+                .map(|j| {
+                    let gv = dot(&gate[gs + j * ne..gs + (j + 1) * ne], &xr);
+                    let uv = dot(&up[gs + j * ne..gs + (j + 1) * ne], &xr);
+                    swiglu_clamp_ref(gv, uv, swiglu_clamp)
+                })
+                .collect();
+            let w_e = probs[e] / wsum * scale;
+            for i in 0..ne {
+                out[row * ne + i] += w_e
+                    * down[ds + i * n_ff_exp..ds + (i + 1) * n_ff_exp]
+                        .iter()
+                        .zip(&actv)
+                        .map(|(a, b)| *a as f64 * b)
+                        .sum::<f64>();
+            }
+        }
+    }
+    out
+}
+
+/// Two tokens whose `ffn_gate_tid2eid` rows name DIFFERENT experts, plus a per-layer SwiGLU clamp
+/// on the routed experts. Pins, red-then-green (deviations injected into the CPU arm — see the
+/// commit message):
+/// * the ids drive the selection (falling back to top-k routes both rows the same and goes red);
+/// * the routing WEIGHTS are the router's own `sqrt(softplus)` probs at the hash ids, renormalized
+///   — the other plausible reading, uniform `1/n_used`, is asserted to differ and to fail;
+/// * the routed-expert clamp is the same pre-SiLU / one-sided-gate arithmetic as the dense path.
+///
+/// `ne`/`n_ff_exp` = 32: the Vulkan expert id-GEMV decodes 32-element sub-blocks, so anything
+/// smaller would cross-check against a silent all-zero GPU output.
+#[test]
+fn moe_hash_routing_parity() {
+    let cpu = infr_cpu::CpuBackend::new();
+    let (ne, n_expert, n_used, n_ff_exp) = (32usize, 6usize, 2usize, 32usize);
+    let rows = 2usize;
+    // Row 0 → experts {4, 1}; row 1 → experts {0, 5}. Disjoint, and NEITHER is the top-2 the
+    // router would pick (the router's lead terms below rank 0 > 1 > 2 > 3 > 5 > 4 for both rows).
+    let ids: [usize; 4] = [4, 1, 0, 5];
+    // The handle is I32; `run` uploads an f32 slice verbatim, so carry the i32 BYTES through the
+    // f32 wire type. Backends widen them back to plain integers (`bytes_to_f32`'s I32 arm).
+    let idwire: Vec<f32> = ids.iter().map(|&e| f32::from_bits(e as u32)).collect();
+    let limit = 0.5f32;
+
+    let build = |hash: bool, clamp: Option<f32>| {
+        let mut g = Graph::new();
+        let x = g.input(f32d(rows * ne));
+        let router_x = g.input(f32d(rows * ne));
+        let eids = g.input(TensorDesc::new(vec![rows, n_used], DType::I32));
+        let router = g.weight(f32d(n_expert * ne));
+        let gate_exps = g.weight(f32d(n_expert * n_ff_exp * ne));
+        let up_exps = g.weight(f32d(n_expert * n_ff_exp * ne));
+        let down_exps = g.weight(f32d(n_expert * ne * n_ff_exp));
+        let dst = g.output(f32d(rows * ne));
+        g.push(Op::MoeFfn {
+            x,
+            router_x,
+            router,
+            gate_exps,
+            up_exps,
+            down_exps,
+            down_scale: None,
+            fused_gate_up: false,
+            dst,
+            ne: ne as u32,
+            n_expert: n_expert as u32,
+            n_used: n_used as u32,
+            n_ff_exp: n_ff_exp as u32,
+            scale: 1.0,
+            act: Activation::Silu,
+            swiglu_clamp: clamp,
+            gating: MoeGating::SqrtSoftplus,
+            norm_w: true,
+            weight_before: false,
+            ep_band: None,
+            exp_probs_b: None,
+            n_expert_groups: 0,
+            n_expert_groups_used: 0,
+            expert_ids: hash.then_some(eids),
+        });
+        (
+            g, x, router_x, eids, router, gate_exps, up_exps, down_exps, dst,
+        )
+    };
+
+    // Router rows = lead[e] * [1, 0, …]; `x` rows differ in their first element, so the two tokens
+    // get different logits (and different weights) while the top-2 ranking stays 0, 1 for both.
+    let lead = [3.0f32, 2.0, 1.5, 1.0, -1.0, 0.5];
+    let mut xi = gen(rows * ne, 21);
+    xi[0] = 1.0;
+    xi[ne] = 0.6;
+    let ri: Vec<f32> = (0..n_expert * ne)
+        .map(|i| if i % ne == 0 { lead[i / ne] } else { 0.0 })
+        .collect();
+    // Scaled up so the gate/up projections land well outside ±limit and the clamp actually bites.
+    let gi: Vec<f32> = gen(n_expert * n_ff_exp * ne, 12)
+        .iter()
+        .map(|v| v * 4.0)
+        .collect();
+    let ui: Vec<f32> = gen(n_expert * n_ff_exp * ne, 13)
+        .iter()
+        .map(|v| v * 4.0)
+        .collect();
+    let di = gen(n_expert * ne * n_ff_exp, 14);
+
+    let go = |be: &dyn Backend, hash: bool, clamp: Option<f32>| -> Vec<f32> {
+        let (g, x, rx, eids, router, ge, ue, de, dst) = build(hash, clamp);
+        run(
+            be,
+            &g,
+            &[(x, &xi[..]), (rx, &xi[..]), (eids, &idwire[..])],
+            &[
+                (router, &ri[..]),
+                (ge, &gi[..]),
+                (ue, &ui[..]),
+                (de, &di[..]),
+            ],
+            dst,
+            rows * ne,
+        )
+    };
+    let reference = |hash: bool, clamp: Option<f32>| -> Vec<f64> {
+        moe_v4_ref(
+            &xi,
+            &ri,
+            &gi,
+            &ui,
+            &di,
+            ne,
+            n_expert,
+            n_used,
+            n_ff_exp,
+            1.0,
+            hash.then_some(&ids[..]),
+            clamp.map(|l| l as f64),
+        )
+    };
+
+    for clamp in [None, infr_core::graph::swiglu_clamp(limit)] {
+        let want = reference(true, clamp);
+        let c = go(&cpu, true, clamp);
+        let e = maxerr64(&c, &want);
+        println!("MoeFfn(hash, clamp={clamp:?}) cpu-vs-ref max_err={e:e}");
+        assert!(
+            e < 1e-4,
+            "hash-routed MoeFfn diverges (clamp={clamp:?}): {e:e}"
+        );
+        if let Some(vk) = gpu() {
+            let v = go(&vk, true, clamp);
+            let e = maxerr(&c, &v);
+            println!("MoeFfn(hash, clamp={clamp:?}) cpu-vs-vulkan max_err={e:e}");
+            assert!(e < 1e-3, "hash-routed MoeFfn diverges on Vulkan: {e:e}");
+        }
+    }
+
+    // The ids must actually SELECT: top-k routing over the same inputs picks experts {0, 1} for
+    // both rows, so ignoring them is a visibly different output rather than a no-op.
+    let hashed = go(&cpu, true, None);
+    let topk = go(&cpu, false, None);
+    let sep = maxerr(&hashed, &topk);
+    println!("hash-vs-topk separation: {sep:e}");
+    assert!(
+        sep > 1e-2,
+        "hash ids and top-k route to the same experts here — the test cannot fail"
+    );
+    // And the two ROWS must route differently from each other: rows 0/1 share `x` up to their
+    // first element, so with a single shared selection their outputs would be near-identical.
+    let cross = maxerr(&hashed[..ne], &hashed[ne..]);
+    println!("row0-vs-row1 separation: {cross:e}");
+    assert!(
+        cross > 1e-2,
+        "the two tokens' hash rows did not route differently"
+    );
+
+    // The WEIGHTS are the router's probs at the hash ids, not uniform. Assert the other plausible
+    // reading is measurably different and does NOT match the backend.
+    let uniform: Vec<f64> = {
+        let mut r = vec![0f64; rows * ne];
+        for row in 0..rows {
+            let xr: Vec<f64> = xi[row * ne..(row + 1) * ne]
+                .iter()
+                .map(|&v| v as f64)
+                .collect();
+            for k in 0..n_used {
+                let e = ids[row * n_used + k];
+                let (gs, ds) = (e * n_ff_exp * ne, e * ne * n_ff_exp);
+                let actv: Vec<f64> = (0..n_ff_exp)
+                    .map(|j| {
+                        let gv: f64 = gi[gs + j * ne..gs + (j + 1) * ne]
+                            .iter()
+                            .zip(&xr)
+                            .map(|(a, b)| *a as f64 * b)
+                            .sum();
+                        let uv: f64 = ui[gs + j * ne..gs + (j + 1) * ne]
+                            .iter()
+                            .zip(&xr)
+                            .map(|(a, b)| *a as f64 * b)
+                            .sum();
+                        swiglu_clamp_ref(gv, uv, None)
+                    })
+                    .collect();
+                for i in 0..ne {
+                    r[row * ne + i] += (1.0 / n_used as f64)
+                        * di[ds + i * n_ff_exp..ds + (i + 1) * n_ff_exp]
+                            .iter()
+                            .zip(&actv)
+                            .map(|(a, b)| *a as f64 * b)
+                            .sum::<f64>();
+                }
+            }
+        }
+        r
+    };
+    let d_uniform = maxerr64(&hashed, &uniform);
+    println!("hash weights: router-probs-vs-uniform separation={d_uniform:e}");
+    assert!(
+        d_uniform > 1e-2,
+        "uniform 1/n_used weights are indistinguishable from the router probs here — the \
+         weight-source assertion cannot fail"
+    );
 }

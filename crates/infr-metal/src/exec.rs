@@ -540,6 +540,7 @@ mod tests {
             freq_factors: None,
             x_stride: 0,
             neox: false,
+            backward: false,
         });
 
         let norm_weight = g.weight(TensorDesc::new(vec![64], DType::F32));
@@ -572,6 +573,7 @@ mod tests {
             scale: 0.125,
             mask: AttnMask::Causal,
             pos: 0,
+            sinks: None,
         });
 
         let ids = g.input(TensorDesc::new(vec![1], DType::I32));
@@ -763,6 +765,7 @@ mod tests {
             freq_factors: None,
             x_stride: 0,
             neox: false,
+            backward: false,
         });
         let bad_ids = unsupported.input(TensorDesc::new(vec![1], DType::I32));
         let bad_table = unsupported.weight(TensorDesc::new(vec![8, 64], DType::F16));
@@ -1399,6 +1402,9 @@ fn op_name(op: &Op) -> &'static str {
         Op::Mla { .. } => "Mla",
         Op::LightningIndexer { .. } => "LightningIndexer",
         Op::TopkMask { .. } => "TopkMask",
+        Op::HyperConnectMix { .. } => "HyperConnectMix",
+        Op::HyperConnectPre { .. } => "HyperConnectPre",
+        Op::HyperConnectPost { .. } => "HyperConnectPost",
         Op::GatedAct { .. } => "GatedAct",
         Op::GatedActFused { .. } => "GatedActFused",
         Op::Add { .. } => "Add",
@@ -1417,6 +1423,20 @@ fn op_name(op: &Op) -> &'static str {
         Op::DeltaNet { .. } => "DeltaNet",
         Op::MoeSharedExpertAdd { .. } => "MoeSharedExpertAdd",
     }
+}
+
+/// Refuse a stream count wider than the fixed-size private array `hyper_mix_f32` holds a token's
+/// mixing matrix in (`HC_MAX*HC_MAX` floats). The kernel cannot bounds-check itself, so the
+/// refusal has to happen before the encode. See `infr_core::graph::HYPER_CONNECT_MAX_MULT`.
+fn hyper_check_hc(hc: u32, what: &str) -> Result<()> {
+    let max = infr_core::graph::HYPER_CONNECT_MAX_MULT;
+    if hc < 1 || hc > max {
+        return Err(Error::Unsupported(format!(
+            "{what}: hc_mult {hc} outside the supported 1..={max} (every shipped DeepSeek V4 \
+             config uses 4)"
+        )));
+    }
+    Ok(())
 }
 
 /// Gated-FFN activation applied to the gate value (matches `infr-cpu`'s `act_fn`).
@@ -2642,23 +2662,41 @@ impl MetalBackend {
                 );
                 let (rows, nh, hd) = (rows as usize, n_head as usize, head_dim as usize);
                 let bx = self.ensure_device(r, x);
-                let bw = self.weight_buf(weight, g, bindings)?;
                 let bd = self.dev_dst(r, dst, rows * nh * hd);
-                let pso = self.pipelines.get("qknorm_f32")?;
                 let mut p = (rows as u32).to_ne_bytes().to_vec();
                 p.extend_from_slice(&(nh as u32).to_ne_bytes());
                 p.extend_from_slice(&(hd as u32).to_ne_bytes());
                 p.extend_from_slice(&eps.to_ne_bytes());
-                // One simdgroup per (row, head) — see `qknorm_f32`.
-                self.encode_tg_w(
-                    r,
-                    &pso,
-                    &[bx.as_ref(), bw.as_ref(), bd.as_ref()],
-                    1 << 2,
-                    &p,
-                    rows * nh * 32,
-                    32,
-                );
+                // One simdgroup per (row, head) — see `qknorm_f32`. `weight: None` (deepseek4's
+                // bare per-head `ggml_rms_norm` on Q) takes the weightless kernel: same reduction,
+                // one buffer fewer, so the write mask shifts with the binding count.
+                match weight {
+                    Some(w) => {
+                        let bw = self.weight_buf(w, g, bindings)?;
+                        let pso = self.pipelines.get("qknorm_f32")?;
+                        self.encode_tg_w(
+                            r,
+                            &pso,
+                            &[bx.as_ref(), bw.as_ref(), bd.as_ref()],
+                            1 << 2,
+                            &p,
+                            rows * nh * 32,
+                            32,
+                        );
+                    }
+                    None => {
+                        let pso = self.pipelines.get("qknorm_nw_f32")?;
+                        self.encode_tg_w(
+                            r,
+                            &pso,
+                            &[bx.as_ref(), bd.as_ref()],
+                            1 << 1,
+                            &p,
+                            rows * nh * 32,
+                            32,
+                        );
+                    }
+                }
                 r.loc[dst.0 as usize] = Loc::Device;
             }
             Op::GatedRmsNorm {
@@ -3319,6 +3357,7 @@ impl MetalBackend {
                 freq_factors,
                 x_stride,
                 neox,
+                backward,
             } => {
                 // The runner only strides the fused QkNormRope (qwen35 q+g interleave); the plain
                 // llama-family Rope always reads packed rows.
@@ -3342,6 +3381,7 @@ impl MetalBackend {
                 p.extend_from_slice(&theta.to_ne_bytes());
                 p.extend_from_slice(&(freq_factors.is_some() as u32).to_ne_bytes());
                 p.extend_from_slice(&u32::from(neox).to_ne_bytes());
+                p.extend_from_slice(&u32::from(backward).to_ne_bytes());
                 // One thread per (row, head, pair) + pass-through dims — see `rope_f32`.
                 let per = (rope_dim as usize / 2) + (hd - rope_dim as usize);
                 self.encode_w(
@@ -3731,7 +3771,13 @@ impl MetalBackend {
                 up_stride,
                 gate_stride,
                 gate_block_width,
+                swiglu_clamp,
             } => {
+                if swiglu_clamp.is_some() && matches!(act, infr_core::graph::Activation::Sigmoid) {
+                    return Err(Error::Unsupported(
+                        "metal backend: Op::GatedAct swiglu_clamp needs a gated SiLU/GELU".into(),
+                    ));
+                }
                 let (rows, nff) = (rows as usize, nff as usize);
                 let bg = self.ensure_device(r, gate);
                 let bu = self.ensure_device(r, up);
@@ -3749,6 +3795,8 @@ impl MetalBackend {
                 p.extend_from_slice(&up_stride.to_ne_bytes());
                 p.extend_from_slice(&gate_stride.to_ne_bytes());
                 p.extend_from_slice(&gate_block_width.to_ne_bytes());
+                p.extend_from_slice(&u32::from(swiglu_clamp.is_some()).to_ne_bytes());
+                p.extend_from_slice(&swiglu_clamp.unwrap_or(0.0).to_ne_bytes());
                 self.encode_w(
                     r,
                     &pso,
@@ -3767,7 +3815,14 @@ impl MetalBackend {
                 rows,
                 nff,
                 act,
+                swiglu_clamp,
             } => {
+                if swiglu_clamp.is_some() && matches!(act, infr_core::graph::Activation::Sigmoid) {
+                    return Err(Error::Unsupported(
+                        "metal backend: Op::GatedActFused swiglu_clamp needs a gated SiLU/GELU"
+                            .into(),
+                    ));
+                }
                 let (rows, nff) = (rows as usize, nff as usize);
                 let bg = self.ensure_device(r, gu);
                 let bd = self.dev_dst(r, dst, rows * nff);
@@ -3780,7 +3835,9 @@ impl MetalBackend {
                 let mut p = (rows as u32).to_ne_bytes().to_vec();
                 p.extend_from_slice(&(nff as u32).to_ne_bytes());
                 p.extend_from_slice(&act_code.to_ne_bytes());
-                p.extend_from_slice(&0u32.to_ne_bytes()); // pad to GatedParams
+                p.extend_from_slice(&0u32.to_ne_bytes()); // up_off: unused by the fused form
+                p.extend_from_slice(&u32::from(swiglu_clamp.is_some()).to_ne_bytes());
+                p.extend_from_slice(&swiglu_clamp.unwrap_or(0.0).to_ne_bytes());
                 self.encode_w(r, &pso, &[bg.as_ref(), bd.as_ref()], 1 << 1, &p, rows * nff);
                 r.loc[dst.0 as usize] = Loc::Device;
             }
@@ -3886,6 +3943,7 @@ impl MetalBackend {
                 scale,
                 mask,
                 pos,
+                sinks,
             } => {
                 let (rows, kv_len, nh, nkv, hd) = (
                     rows as usize,
@@ -3948,6 +4006,55 @@ impl MetalBackend {
                          — f16 cache (native or block-quant dequant-prepassed) only so far"
                             .into(),
                     ));
+                }
+                // Per-head attention sinks (deepseek4, `Op::Attention::sinks`) live in exactly ONE
+                // kernel pair (`ATTN_SINKS_KERNEL` in attention.metal). None of the split / flash /
+                // vec / q8 tiers below knows about them, and a tier that quietly ignored the sink
+                // would produce a plausible softmax over the wrong denominator — so route here
+                // unconditionally and refuse the shapes this pair cannot serve.
+                if let Some(sk) = sinks {
+                    let (kdt, vdt) = (g.desc(k_cache).dtype, g.desc(v_cache).dtype);
+                    if canvas_lo.is_some() || r.posbuf.is_some() {
+                        return Err(Error::Unsupported(
+                            "metal attention: sinks under AttnMask::Canvas or on a decode-replay \
+                             tape have no kernel (the sinks pair is causal/SWA, static)"
+                                .into(),
+                        ));
+                    }
+                    if kdt != vdt || !matches!(kdt, DType::F32 | DType::F16) {
+                        return Err(Error::Unsupported(format!(
+                            "metal attention: sinks need a coupled f32 or f16 KV cache, got \
+                             K={kdt:?} V={vdt:?} — the sinks kernels have no quant read and skip \
+                             the dequant prepass"
+                        )));
+                    }
+                    let bsk = self.weight_buf(sk, g, bindings)?;
+                    let kern = if kdt == DType::F16 {
+                        "attention_sinks_f16kv"
+                    } else {
+                        "attention_sinks_f32"
+                    };
+                    let pso = self.pipelines.get(kern)?;
+                    let mut p = (rows as u32).to_ne_bytes().to_vec();
+                    p.extend_from_slice(&(kv_len as u32).to_ne_bytes());
+                    p.extend_from_slice(&(nh as u32).to_ne_bytes());
+                    p.extend_from_slice(&(nkv as u32).to_ne_bytes());
+                    p.extend_from_slice(&(hd as u32).to_ne_bytes());
+                    p.extend_from_slice(&scale.to_ne_bytes());
+                    p.extend_from_slice(&window.to_ne_bytes());
+                    p.extend_from_slice(&pos.to_ne_bytes());
+                    // One simdgroup per (query, head), like the sink-free `attention_*` pair.
+                    self.encode_tg_w(
+                        r,
+                        &pso,
+                        &[bq.as_ref(), &kbuf.raw, &vbuf.raw, bsk.as_ref(), bd.as_ref()],
+                        1 << 4,
+                        &p,
+                        rows * nh * 32,
+                        32,
+                    );
+                    r.loc[dst.0 as usize] = Loc::Device;
+                    return Ok(());
                 }
                 if let Some(posbuf) = r.posbuf.clone() {
                     // Recording a replay tape (rows==1, f16/q8/coupled-q4_0/iq4_nl cache, hd
@@ -4456,7 +4563,8 @@ impl MetalBackend {
                 exp_probs_b,
                 n_expert_groups,
                 n_expert_groups_used,
-                ..
+                expert_ids,
+                swiglu_clamp,
             } => {
                 // The Metal MoE path implements only softmax gating + top-k renorm + output-
                 // weighting; llama4's sigmoid/no-renorm/weight-before-FFN routing is CPU-only (see
@@ -4480,6 +4588,9 @@ impl MetalBackend {
                      {n_expert_groups_used}) — run this model on the CPU or Vulkan backend",
                     exp_probs_b.is_some(),
                 );
+                // DeepSeek V4 hash routing supplies the selection outright, so the two
+                // SELECTION-only inputs above have nothing left to act on — the assert already
+                // rules them out here, which is the same exclusion the CPU reference enforces.
                 let (ne, n_expert, n_used, nffx) = (
                     ne as usize,
                     n_expert as usize,
@@ -4541,15 +4652,23 @@ impl MetalBackend {
                         32,
                     );
                     let tbl = self.scratch_buf(rows * 32, 1);
+                    // Hash routing: the pre-gathered `[rows, n_used]` ids replace the kernel's
+                    // top-k. Absent, `logits` is rebound as a harmless placeholder the kernel
+                    // never reads (`hash == 0`) — Metal needs every declared buffer bound.
+                    let hb = match expert_ids {
+                        Some(hid) => self.ensure_device(r, hid),
+                        None => logits.clone(),
+                    };
                     let pso = self.pipelines.get("moe_topk")?;
                     let mut p = (n_expert as u32).to_ne_bytes().to_vec();
                     p.extend_from_slice(&(n_used as u32).to_ne_bytes());
                     p.extend_from_slice(&scale.to_ne_bytes());
+                    p.extend_from_slice(&u32::from(expert_ids.is_some()).to_ne_bytes());
                     self.encode_tg_w(
                         r,
                         &pso,
-                        &[logits.as_ref(), tbl.as_ref()],
-                        1 << 1,
+                        &[logits.as_ref(), hb.as_ref(), tbl.as_ref()],
+                        1 << 2,
                         &p,
                         rows * 32,
                         32,
@@ -4690,9 +4809,11 @@ impl MetalBackend {
                             p.extend_from_slice(&(nffx as u32).to_ne_bytes());
                             p.extend_from_slice(&act_code.to_ne_bytes());
                             // up_off + up_stride/gate_stride/gate_block_width — all 0 (packed):
-                            // the shader reads the full 7-field GatedActParams, so every dispatch
-                            // site must push all of it or the tail fields read garbage.
+                            // the shader reads the full GatedActParams, so every dispatch site
+                            // must push all of it or the tail fields read garbage.
                             p.extend_from_slice(&[0u8; 16]);
+                            p.extend_from_slice(&u32::from(swiglu_clamp.is_some()).to_ne_bytes());
+                            p.extend_from_slice(&swiglu_clamp.unwrap_or(0.0).to_ne_bytes());
                             self.encode(
                                 r,
                                 &pso,
@@ -4757,9 +4878,11 @@ impl MetalBackend {
                         p.extend_from_slice(&(nffx as u32).to_ne_bytes());
                         p.extend_from_slice(&act_code.to_ne_bytes());
                         // up_off + up_stride/gate_stride/gate_block_width — all 0 (packed): the
-                        // shader reads the full 7-field GatedActParams, so every dispatch site
-                        // must push all of it or the tail fields read garbage.
+                        // shader reads the full GatedActParams, so every dispatch site must push
+                        // all of it or the tail fields read garbage.
                         p.extend_from_slice(&[0u8; 16]);
+                        p.extend_from_slice(&u32::from(swiglu_clamp.is_some()).to_ne_bytes());
+                        p.extend_from_slice(&swiglu_clamp.unwrap_or(0.0).to_ne_bytes());
                         self.encode_w(
                             r,
                             &pso,
@@ -4826,6 +4949,10 @@ impl MetalBackend {
                     (Some(b), dt, s)
                 };
                 let dscale = down_scale.map(|id| self.weight_host(id, g, bindings));
+                let hash_ids: Option<Vec<f32>> = expert_ids.map(|id| {
+                    self.ensure_host(r, g, id);
+                    r.vals[id.0 as usize].clone()
+                });
                 let mut out = vec![0f32; rows * ne];
                 for (row, orow) in out.chunks_mut(ne).enumerate() {
                     let xr = &xs[row * ne..row * ne + ne];
@@ -4839,13 +4966,32 @@ impl MetalBackend {
                     for p in probs.iter_mut() {
                         *p /= psum;
                     }
-                    let mut idx: Vec<usize> = (0..n_expert).collect();
-                    idx.sort_by(|&a, &b| {
-                        probs[b]
-                            .partial_cmp(&probs[a])
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                    idx.truncate(n_used);
+                    // Hash routing (V4): the pre-gathered ids ARE the selection, so the sort
+                    // below never runs — it exists only to RANK experts. The I32 handle's values
+                    // are plain integers widened to f32 by the host read.
+                    let idx: Vec<usize> = match &hash_ids {
+                        Some(h) => (0..n_used)
+                            .map(|k| {
+                                let e = h[row * n_used + k] as usize;
+                                assert!(
+                                    e < n_expert,
+                                    "metal Op::MoeFfn: hash-routed expert id {e} at (row {row}, \
+                                     slot {k}) is past n_expert {n_expert}"
+                                );
+                                e
+                            })
+                            .collect(),
+                        None => {
+                            let mut idx: Vec<usize> = (0..n_expert).collect();
+                            idx.sort_by(|&a, &b| {
+                                probs[b]
+                                    .partial_cmp(&probs[a])
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            idx.truncate(n_used);
+                            idx
+                        }
+                    };
                     let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
                     for &e in &idx {
                         // Dequant only this expert's slices, then matvec on the GPU.
@@ -4863,8 +5009,12 @@ impl MetalBackend {
                                 self.gpu_matvec(xr, &uw, ne, nffx)?,
                             )
                         };
-                        let actv: Vec<f32> =
-                            (0..nffx).map(|i| act_fn(act, gate[i]) * up[i]).collect();
+                        let actv: Vec<f32> = (0..nffx)
+                            .map(|i| match swiglu_clamp {
+                                None => act_fn(act, gate[i]) * up[i],
+                                Some(l) => act_fn(act, gate[i].min(l)) * up[i].clamp(-l, l),
+                            })
+                            .collect();
                         let dw = bytes_to_f32(&Self::read_bytes_range(dbuf, e * dsz, dsz), ddt);
                         let mut y = self.gpu_matvec(&actv, &dw, nffx, ne)?;
                         if let Some(ds) = &dscale {
@@ -5513,6 +5663,128 @@ impl MetalBackend {
                     1 << 1,
                     &p,
                     rows as usize,
+                );
+                r.loc[dst.0 as usize] = Loc::Device;
+            }
+            Op::HyperConnectMix {
+                mixes,
+                scale,
+                base,
+                pre,
+                gates,
+                rows,
+                hc,
+                eps,
+                n_iter,
+            } => {
+                hyper_check_hc(hc, "metal Op::HyperConnectMix")?;
+                if n_iter < 1 {
+                    return Err(Error::Unsupported(format!(
+                        "metal Op::HyperConnectMix: n_iter {n_iter} — Sinkhorn runs at least one \
+                         normalisation over src"
+                    )));
+                }
+                let (rows_u, hc_u) = (rows as usize, hc as usize);
+                let bm = self.ensure_device(r, mixes);
+                let bs = self.weight_buf(scale, g, bindings)?;
+                let bb = self.weight_buf(base, g, bindings)?;
+                let bp = self.dev_dst(r, pre, rows_u * hc_u);
+                // (2 + hc)*hc for the wrapping form, hc for `build_hc_head`'s narrower `mixes`.
+                let mix_dim = if gates.is_some() { (2 + hc) * hc } else { hc };
+                let mut p = rows.to_ne_bytes().to_vec();
+                p.extend_from_slice(&hc.to_ne_bytes());
+                p.extend_from_slice(&mix_dim.to_ne_bytes());
+                p.extend_from_slice(&eps.to_ne_bytes());
+                p.extend_from_slice(&n_iter.to_ne_bytes());
+                let mut bufs: Vec<&MtlBuffer> =
+                    vec![bm.as_ref(), bs.as_ref(), bb.as_ref(), bp.as_ref()];
+                let gb = gates.map(|infr_core::graph::HyperGates { post, comb }| {
+                    (
+                        post,
+                        self.dev_dst(r, post, rows_u * hc_u),
+                        comb,
+                        self.dev_dst(r, comb, rows_u * hc_u * hc_u),
+                    )
+                });
+                if let Some((_, ob, _, cb)) = &gb {
+                    bufs.push(ob.as_ref());
+                    bufs.push(cb.as_ref());
+                }
+                let (pso, wmask) = match gb {
+                    Some(_) => (
+                        self.pipelines.get("hyper_mix_gates_f32")?,
+                        (1 << 3) | (1 << 4) | (1 << 5),
+                    ),
+                    None => (self.pipelines.get("hyper_mix_f32")?, 1 << 3),
+                };
+                self.encode_w(r, &pso, &bufs, wmask, &p, rows_u);
+                r.loc[pre.0 as usize] = Loc::Device;
+                if let Some((post, _, comb, _)) = gb {
+                    r.loc[post.0 as usize] = Loc::Device;
+                    r.loc[comb.0 as usize] = Loc::Device;
+                }
+            }
+            Op::HyperConnectPre {
+                x,
+                weights,
+                dst,
+                rows,
+                hc,
+                n_embd,
+            } => {
+                hyper_check_hc(hc, "metal Op::HyperConnectPre")?;
+                let total = (rows as usize) * (n_embd as usize);
+                let bx = self.ensure_device(r, x);
+                let bw = self.ensure_device(r, weights);
+                let bd = self.dev_dst(r, dst, total);
+                let mut p = hc.to_ne_bytes().to_vec();
+                p.extend_from_slice(&n_embd.to_ne_bytes());
+                p.extend_from_slice(&(total as u32).to_ne_bytes());
+                let pso = self.pipelines.get("hyper_pre_f32")?;
+                self.encode_w(
+                    r,
+                    &pso,
+                    &[bx.as_ref(), bw.as_ref(), bd.as_ref()],
+                    1 << 2,
+                    &p,
+                    total,
+                );
+                r.loc[dst.0 as usize] = Loc::Device;
+            }
+            Op::HyperConnectPost {
+                x,
+                residual,
+                post,
+                comb,
+                dst,
+                rows,
+                hc,
+                n_embd,
+            } => {
+                hyper_check_hc(hc, "metal Op::HyperConnectPost")?;
+                let total = (rows as usize) * (hc as usize) * (n_embd as usize);
+                let bx = self.ensure_device(r, x);
+                let br = self.ensure_device(r, residual);
+                let bo = self.ensure_device(r, post);
+                let bc = self.ensure_device(r, comb);
+                let bd = self.dev_dst(r, dst, total);
+                let mut p = hc.to_ne_bytes().to_vec();
+                p.extend_from_slice(&n_embd.to_ne_bytes());
+                p.extend_from_slice(&(total as u32).to_ne_bytes());
+                let pso = self.pipelines.get("hyper_post_f32")?;
+                self.encode_w(
+                    r,
+                    &pso,
+                    &[
+                        bx.as_ref(),
+                        br.as_ref(),
+                        bo.as_ref(),
+                        bc.as_ref(),
+                        bd.as_ref(),
+                    ],
+                    1 << 4,
+                    &p,
+                    total,
                 );
                 r.loc[dst.0 as usize] = Loc::Device;
             }
