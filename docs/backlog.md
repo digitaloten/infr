@@ -982,33 +982,6 @@ on 2026-08-05:
   was standing in for. Count is from
   `grep -rn "config-plan.md" --include=*.md --include=*.rs .`
 
-### B39 — Vulkan MoE id-GEMV silently no-ops for `in_f < 32` (2026-08-07)
-
-**Tag:** vulkan · **Blocked on:** nothing; found while writing the deepseek2 MoE
-op-parity tests, which needed ne=32 to make the Vulkan cross-check meaningful
-
-`native_gemv_id_multi.comp` computes `nsub = pc.in_f/32` (integer division), so
-an expert bank with `in_f < 32` runs **zero** sub-blocks and the dispatched op
-leaves `dst` all-zero — a silent wrong output, no error. The existing adapter
-test `moe_ffn_graph_matches_host` deliberately uses ne=32 (the kernels' floor),
-and every production model has ne/n_ff ≥ 32, so no real GGUF hits it — the
-hazard is synthetic tests and any future small-`ne` arch. Fix options: assert
-`in_f >= 32` at adapter dispatch (fail loudly instead of zeros), or add a
-sub-block floor (`nsub = max(in_f/32, 1)` with clamped reads) to the kernel. The
-seam tests `moe_sqrt_softplus_parity` / `moe_groups_bias_parity` document the
-constraint in their comments.
-
-**The DENSE native path has the same hazard (2026-08-10).** Writing
-`grouped_output_projection_composes_from_linear_and_copystrided` (deepseek4
-slice 2), a plain `Op::Linear` with a bf16 weight at `in_f = 8` returned all
-zeros on Vulkan while the CPU interpreter returned the right answer — same
-graph, same bindings, no error anywhere. Raising `in_f` to 32 made both agree
-exactly. So whatever `native_dense_dtypes` weights dispatch through inherits the
-same `in_f/32` floor as the MoE id-GEMV, and a fix should cover both. NOT
-root-caused to a specific kernel (the dense path picks among several by
-`m`/dtype/tier); the observation is the m=3 bf16 case. The seam test documents
-the constraint in its comment and uses block-aligned dims.
-
 ### B48 — a failing op leaks its in-flight Vulkan recorder on most error paths (2026-08-10)
 
 **Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing; surfaced by the B45
@@ -1334,6 +1307,49 @@ weights, so the shared bias argument is weaker and they may well be fine, but
 they have not been re-examined against a probability cosine and should not be
 assumed sound just because they are high.
 
+### B61 — the native-block GEMM/MMQ family keeps the unguarded `k/BLK` floor (2026-08-12)
+
+**Tag:** vulkan · **Blocked on:** nothing; a decision about how far the B39
+guard should reach, not a discovery
+
+B39 (Vulkan native-block GEMV silently returning zeros below the 32-element
+sub-block floor) was fixed by asserting the K invariant at dispatch —
+`assert_native_k` in `crates/infr-vulkan/src/recorder.rs`, called from every
+terminal native GEMV/gather dispatcher (the `linear_native*`, `linear_mmv*`,
+`linear_native_id*` and `embed_gather_at` entry points). The **prefill GEMM /
+batched-MoE MMQ** family was checked and deliberately left alone: every
+`shaders/native_gemm_mmq_*.comp` opens with `nblk = pc.k / BLK` (plus
+`kw = pc.k / 4`), and `native_gemm_i8cm_q8_0.comp` with `nblk = pc.k / BK`, all
+of which floor to zero exactly the same way. Their host entry points
+(`Recorder::matmul_mmq_at`, `matmul_mmq_experts`, `matmul_mmq_experts_paged`,
+`matmul_i8cm_q8_0_at`, …) assert nothing about `k`.
+
+Why it was not swept in with B39: those particular shaders are reachable only
+for quantized dtypes (the `native_gemm_mmq_*` kernel tables and
+`infr_core::tensor::MOE_MMQ_DTYPES`; `i8cm` is Q8*0 only), whose GGUF block
+sizes are 32/64/256 and therefore already divide any legal `k` — so unlike the
+GEMV path there is no dtype (BF16/F16/F32) that can even express an off-grid
+row. Reaching it needs a hand-built synthetic tensor, which is precisely the
+hazard B39 was about, so this is a real gap and not a non-issue. The reason to
+stop was scope: each `matmul*\*` entry carries its own tiling constraints
+(`gemm.rs`'s `matmul_f16`already asserts`m,n %64 && k %32`) and several take `k`
+with different meanings, so a uniform guard needs its own read of the family
+rather than a mechanical sweep.
+
+**Not the same defect, checked while here:** `native_gemm.comp` (the coopmat
+prefill GEMM, the one path that DOES take BF16) steps
+`for (k0 = 0; k0 < pc.k; k0 += BK)`, so it never runs zero iterations — an
+off-grid `k` makes its `dqblk` over-read past the row instead. Its tier is
+already gated on `in_f % 32 == 0` in `adapter.rs`'s `Op::Linear` arm
+(`gemm_ok`), so it is unreachable off-grid today; noted so a future reader does
+not mistake it for another instance of the floor-to-zero bug.
+
+To finish: audit the `matmul_*` dispatchers in `recorder.rs` for what each one's
+`k` actually indexes, then add `assert_native_k` (or a tile-aware equivalent) at
+each. Not verified: whether any existing test drives a `matmul_*` entry with an
+off-grid `k` — that is what would turn the sweep from mechanical into a real
+change.
+
 ### B-DSV4-WIRING — what the V4 graph slice still owes (2026-08-10)
 
 **Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing
@@ -1378,8 +1394,27 @@ assumed sound just because they are high.
   backend-generic, so Metal will take it as soon as its own gaps close — but its
   DEVICE MoE path asserts `MoeGating::Softmax` and V4's gating is mandatory
   `SqrtSoftplus` (§ B-DSV4-HASH), so a V4 MoE layer aborts there first.
-- **No real V4 GGUF has been opened.** Every dimension in the fixture came from
-  the reference's formulas — see `docs/deepseek.md` § "Open questions" 1.
+- **A real V4 GGUF HAS now been opened** (2026-08-12) —
+  `ggml-org/DeepSeek-V4-Flash-0731-GGUF:Q2_K_S`, 43 layers, 1328 tensors. Every
+  tensor name and every shape `dsv4_model`'s formulas derive, evaluated at the
+  real file's hyperparameters, matches the file exactly: no missing tensor, no
+  extra tensor, no shape mismatch. `Config::from_gguf` and `wload`'s `is_dsv4`
+  arm both run clean and the model reaches the designed compressed-layer
+  refusal. The formulas that were only inferred and are now MEASURED:
+  `attn_output_a` = `[n_head·key_length/o_groups, o_lora_rank·o_groups]`,
+  `attn_output_b` = `[o_groups·o_lora_rank, n_embd]`, `hc_*_fn` =
+  `[hc_mult·n_embd, (2+hc_mult)·hc_mult]` with a `[3]` scale, the compressor's
+  `coff = 2 iff ratio == 4` channel doubling, and `attn_compressor_norm` staying
+  `[key_length]` in BOTH tiers while `_kv`/`_gate`/`_ape` widen with `coff`.
+  What is still NOT verified against a real file: any NUMBER the graph computes
+  — the refusal fires before a single forward pass, so shapes and names are all
+  this proves.
+- **The real file's dtype set is wider than the fixture's.** The fixture writes
+  f32 for everything but `ffn_gate_tid2eid` (now i32, matching); the real file
+  is `{Q2_K: 129, Q8_0: 660, F32: 492, BF16: 43, Q6_K: 1, I32: 3}`. The 43 BF16
+  tensors are the per-layer `ffn_gate_inp.weight` routers — a bf16 router has
+  never been exercised by any V4 test, and the fixture cannot express one
+  without a per-tensor dtype beyond the i32 arm added for the routing table.
 
 ### B-DSV4 — what the V4 attention primitives do NOT cover yet (2026-08-10)
 
@@ -1602,6 +1637,50 @@ fails. Confirmed present at `HEAD`
 The workspace clippy run is green because those lines are Apple-only and a Linux
 build never compiles them. Worth checking whether CI lints that target at all;
 if it does, it has been red since `key_bias` landed.
+
+### B-DSV4-REAL — the shipped V4 file needs BOTH missing slices, not either (2026-08-12)
+
+**Tag:** deepseek · **Blocked on:** B-DSV4-WIRING slice B and B-DSV4-HASH
+
+Measured from `ggml-org/DeepSeek-V4-Flash-0731-GGUF:Q2_K_S` (`block_count = 43`,
+`hash_layer_count = 3`, `compress_ratios` = `[0, 0, 4, 128, 4, 128, …, 4]` over
+the 43 layers, then three surplus zeros): **no layer of the real model is both
+ratio-0 and bias-routed.** Layers 0 and 1 are the only ratio-0 layers and both
+are hash-routed; layers 2..42 are all compressed (alternating 4/128), and layer
+2 is compressed AND hash-routed.
+
+So the implemented ratio-0 tier covers 2 of 43 layers, and neither of those two
+can run either. Landing slice B alone, or B-DSV4-HASH alone, still leaves this
+checkpoint refusing — worth knowing before either is scheduled as "the one that
+makes V4 work". The order of the two refusals in `generate_dense_backend` means
+the compressed-layer message is what a user sees today (layer 2, ratio 4); the
+hash message is behind it.
+
+Verified by running `infr run` against the file on the CPU backend: config
+parses, `wload` resolves every tensor, and the refusal is reached.
+
+### B-GGUF-META-IGNORED — keys the reference conversion carries that infr never reads (2026-08-12)
+
+**Tag:** gguf · **Blocked on:** a decision on whether to honour them
+
+Two metadata families the real DeepSeek-V4 file declares and infr has no reader
+for. Neither is a V4 problem — both are general — and neither is wrong today,
+but both are silent.
+
+- **`general.sampling.*`** (`llama-arch.h`'s `LLM_KV_GENERAL_SAMPLING_*`:
+  `temp`, `top_k`, `top_p`, `min_p`, `xtc_*`, `penalty_last_n`, `sequence`). The
+  V4 file sets `general.sampling.temp = 1.0` and `general.sampling.top_p = 1.0`;
+  infr applied its own per-arch defaults (`temp = 0.6, top_k = 20, top_p = 0.95`
+  for `deepseek4`) and never looked. `grep -rn "general.sampling" crates/` is
+  empty. The question is precedence: a model-declared sampler should presumably
+  sit between infr's arch defaults and the user's flags, but nothing implements
+  any of the three orderings today.
+- **`{arch}.embedding_length_out`** = 16384 on V4 (= `hc_mult · n_embd`, the
+  un-collapsed hyper-connection residual). In llama.cpp this feeds
+  `llama_hparams::n_embd_out()`, which sizes the EMBEDDINGS output buffer only —
+  never the logits path — so ignoring it costs nothing while infr has no
+  embeddings endpoint. It becomes wrong the moment one exists for an arch whose
+  output width differs from `embedding_length`.
 
 <!-- ── hardware-capability audit, 2026-08-11 ─────────────────────────────────
      Three follow-up slices came out of one read-only audit of what infr detects
@@ -1893,41 +1972,97 @@ opt-in specifically because "this dev box has none" (read in `adapter.rs`'s
 `bf16cm_ok` comment). Any claim that those tiers are correct is currently a
 compile-time claim only.
 
-### B-DSHW-MLA-SCALAR-TIER — DeepSeek attention runs one scalar kernel at every depth and loses the decode replay tape (2026-08-11)
+### B-DSHW-MLA-SCALAR-TIER — DeepSeek attention has one subgroup tier now; the occupancy arm is still missing (2026-08-11, re-measured 2026-08-12)
 
 **Tag:** deepseek · vulkan · perf · **Blocked on:** nothing
 
-**Now measured** (2026-08-11, RX 7900 XTX / RADV,
+**Re-measured 2026-08-12** on the forward that adds attention to the residual
+ONCE (7e778ee) — every number below is from this box today, RX 7900 XTX / RADV,
 `JenniSD/DeepSeek-V2-Lite-Chat-Q4_K_M-GGUF`, oracle = `llama-bench` on
-llama.cpp's **Vulkan** backend, same GGUF; the built binary reports
-`build: c629da5 (417)`, i.e. the pin BEFORE B-DSHW-PULL's — the `build-vk` tree
-was not rebuilt at `030ebb5`):
+llama.cpp's **Vulkan** backend, same GGUF, `build: c629da5 (417)`. `infr` rows
+are the means of three reps with the arms ALTERNATED (`INFR_NO_MLA_SG` toggled
+between reps, not run in blocks):
 
-| bench       | infr  | llama.cpp Vulkan | ratio |
-| ----------- | ----- | ---------------- | ----- |
-| pp512       | 975.5 | 4435.92 ± 110.89 | 4.5×  |
-| pp2048      | 673.4 | 3999.80 ± 24.79  | 5.9×  |
-| tg64        | 111.2 | 228.15 ± 7.64    | 2.1×  |
-| tg64 @ 2048 | 6.3   | 215.11 ± 4.79    | 34×   |
+| bench       | before (scalar `mla`) | after (`mla_sg`)       | gain  | llama.cpp Vulkan | ratio now |
+| ----------- | --------------------- | ---------------------- | ----- | ---------------- | --------- |
+| pp512       | 965.8 [963.3–969.7]   | 1035.5 [1030.2–1042.8] | 1.07× | 4470.77 ± 100.32 | 4.3×      |
+| pp2048      | 671.3 [670.6–672.0]   | 851.1 [847.2–855.4]    | 1.27× | 4001.94 ± 13.56  | 4.7×      |
+| tg64        | 111.6 [111.5–111.8]   | 128.7 [127.9–129.4]    | 1.15× | 225.73 ± 7.17    | 1.8×      |
+| tg64 @ 2048 | 6.3 [6.3–6.3]         | 11.9 [11.9–11.9]       | 1.89× | 216.52 ± 2.95    | 18×       |
 
-The two costs, re-read against those numbers — the first is now the whole
-remaining gap, the second is noise:
+The pre-7e778ee numbers this entry used to carry (975.5 / 673.4 / 111.2 / 6.3)
+are within noise of the "before" column, so the doubled-residual fix moved
+throughput by nothing — it removed one `Op::Add` per layer against a kernel that
+was 90%+ of the frame.
 
-- **`mla.comp` is the only MLA kernel, and it is where all the time goes.**
-  There is no coopmat variant, no flash variant, no split-K arm, no mrows tier —
-  the whole tier ladder that `Op::Attention` picks from does not exist for
-  `Op::Mla`. Its shared arrays are fixed-size, and the adapter enforces the
-  ceiling on its behalf (`MLA_MAX_KEY_LEN` = 576, `MLA_MAX_KV_LORA_RANK` = 512,
-  both mirroring `#define`s in the shader) with a loud error, because "shared
-  memory is not bounds checked — the symptom is corrupted neighbours or a lost
-  device". The refusal is right; the missing tiers are the perf item.
-  `INFR_PROF_OPS` puts `mla_ff` at **51.9%** of decode GPU time at a short
-  context and **97.3%** at `-d 2048` (1.22s of a 1.26s 8-token decode, 5.7ms per
-  layer dispatch). That is the 34× row above, and nothing else in the profile is
-  within two orders of magnitude of it. The shape explains it: one workgroup per
-  (row, head) — `n_head` = 16 workgroups on a 96-CU part at decode — and TWO
-  serialized passes over the whole key range, each doing a 128-lane tree
-  reduction with 7 `barrier()`s **per key**.
+**What shipped: `mla.comp`'s `-DMLA_SG` builds** (`mla_sg`, `mla_sg_ff`,
+`mla_sg_bias`, `mla_sg_ff_bias`), selected by `gemm::mla_sg_tier` and dispatched
+through `kernel_sg(.., MLA_SG_WIDTH)`. Two structural changes to the key loop,
+nothing else — same dispatch shape, same bindings, same push constants:
+
+- **One pass, not two.** The scalar build walks the key range twice (once for
+  the row max, once to exponentiate), computing every `sq · K[j]` dot twice. The
+  tier carries a running max and running denominator and rescales `sv` by
+  `exp(m_old − m_new)` on the keys that raise the max — the same online softmax
+  `attn_flash_partial.comp` already uses.
+- **`subgroupAdd` + a batch, not a 7-deep tree per key.** The scalar reduction
+  is a 128-lane shared-memory tree costing 9 `barrier()`s per key per pass, 18
+  per key in total. The tier scores `MLA_SG_KB` keys per barrier (a
+  `subgroupAdd` each, then one ping-ponged cross-subgroup fixup), so it pays ONE
+  barrier per 8 keys — and the batch's V contributions sum in a register,
+  turning 8 read-modify-writes of `sv` into one.
+
+`MLA_SG_KB` = 8 was picked by sweeping it, everything else held (3 reps each):
+
+| `MLA_SG_KB` | 1     | 2     | 4     | 6     | 8      | 16     |
+| ----------- | ----- | ----- | ----- | ----- | ------ | ------ |
+| pp2048      | 839.8 | 904.9 | 936.1 | 947.8 | 852.7¹ | 834.9¹ |
+| tg64 @ 2048 | 10.7  | 12.1  | 13.2  | —     | 11.8¹  | 11.6¹  |
+
+¹ the 8/16 columns are the SHIPPED (re-reading) form; 1–6 were measured on the
+held-K form below, so the two halves of that row are not directly comparable —
+they are here for the shape, and the shipped column is the A/B table above.
+
+**Still open, and now the whole remaining gap: occupancy at decode.**
+`INFR_PROF_OPS` at `-d 2048` (8 tokens, `INFR_SEAM_NO_REPLAY=1`) puts
+`mla_sg_ff` at **94.9%** of decode GPU time — 621.2 ms of 654.4 ms, 2.9 ms per
+layer dispatch, down from 5.6 ms and 97.3% before. At prefill (`-p 2048`) it is
+**86.8%**, 2.08 s of 2.40 s, 38.5 ms per dispatch, from 50.1 ms and 89.4%. So
+the kernel is still the frame, and the shape that has NOT been touched is the
+one the original entry named first: **one workgroup per (row, head)**, i.e.
+`n_head` = 16 workgroups on a 96-CU part at decode, ~83% of the device idle.
+`Op::Attention`'s split-K decomposition (`attn_partial` + `attn_combine`, chunk
+policy in `infr_core::tier::adaptive_chunk`, partials pooled as
+`split_pm`/`split_pl`/`split_pacc`) is the pattern to copy; `Op::Mla` has no arm
+of it. Note prefill CANNOT be an occupancy story — 16384 workgroups there — so a
+split-K arm buys the decode rows only.
+
+**Measured and NOT shipped: holding the fetched K across the barrier.** V is the
+leading `kv_lora_rank` columns of the same K row, so the V accumulation re-reads
+columns the score loop already fetched. Holding them in registers
+(`kk[MLA_SG_KB][MLA_SG_VSLOTS]`) was implemented and benched at `MLA_SG_KB` = 8:
+pp512 857.2, pp2048 955.3, tg64 130.9, tg64 @ 2048 13.8 — i.e. **+12% pp2048 and
++17% tg64@2048 against the shipped form, but −18% pp512**, a regression against
+the kernel it replaces on the short-prompt row. Shipped the form that regresses
+nothing and recorded the trade here rather than defending a 12% prefill loss.
+
+The mechanism is NOT understood, and the obvious hypothesis is RULED OUT:
+`RADV_DEBUG=shaderstats` reports **96 VGPRs and 0 scratch for BOTH forms** (the
+mla build is the largest compute shader in the dump — code size 18548 held vs
+14692 re-reading), so occupancy per SIMD is identical and register pressure
+cannot be the explanation. Trimming the provably-dead fifth held slot moved
+pp512 by 3 t/s (857.2 vs 854), which also says registers are not the lever.
+Whoever picks this up: the two forms differ only in the V loop, so a selection
+on `rows`/`kv_len` (the way `flash_min_rows` and the `rows >= 64` gates already
+work for `Op::Attention`) would take both wins — but find the mechanism first.
+
+**Not tried, and the next cheap idea:** `kread` issues one dword load per column
+and throws half of it away — the f16 cache packs two adjacent columns per
+`uint`. Giving each lane a PAIR of adjacent columns instead of a stride-128
+single would halve the load instruction count outright. `key_len` is already
+required to be even (`kread` addresses the row as u32 pairs), so the shape
+allows it.
+
 - **`Op::Mla` and `Op::LightningIndexer` each disqualify a graph from
   record-once decode replay — and that costs almost nothing.** The
   decode-eligibility loop in `adapter.rs` returns false on either, for stated
@@ -1953,78 +2088,167 @@ pp512 39.1 → 975.5 (25×), pp2048 12.3 → 673.4 (54×); `deepseek` V1
 MLA) pp512 229.0 → 4185.0, which is parity with llama.cpp Vulkan's 4320.07 ±
 358.49 on that model. Decode is untouched by it (tg64 111.0 → 111.2). The V1
 parity is the useful control: the batched MoE path itself is fine, so V2-Lite's
-remaining 4.5× prefill gap is `mla.comp` too.
+remaining prefill gap is `mla.comp` too.
 
-**These are throughput numbers on a model whose output is wrong** — see
-B-DSV2-DEGENERATE below. That does not invalidate the ratios (both engines run
-the same shapes either way), but no `mla.comp` rewrite should be blessed on
-speed alone until that bug is closed.
+**A coverage gap in the kernel's own parity test, found while landing the
+tier.** `recorder::tests::mla_matches_cpu_reference` is the DeepSeek-SIZED
+dispatch (`kv_lora_rank` 512, 16 heads) and it is SATURATED: its synthetic q and
+K make the two attended keys' scores differ by ~1e7, so the softmax is a hard
+argmax and the output is the winner's V regardless of the scores. Multiplying
+every score by 1.01 inside the kernel leaves its `max_err` at exactly 0 — the
+test cannot see a score-path defect at all, only a V/absorption/layout one. (It
+already carries a comment worrying about this shape for a different reason.)
+`mla_ring_and_mask_matches_cpu_reference` DOES catch it (the same perturbation
+takes it to `max_err` 1.97e-4 against a 1e-4 floor), so the pair is covered —
+but the big-shape test is not the guard its size suggests. Fix would be scaling
+its synthetic inputs so the scores land within a few units of each other.
 
 **Calibration, so this is not read as further behind than it is:** llama.cpp's
 **Vulkan** backend has no fused indexer either (see B-DSHW-FUSED-REF). `infr` is
 behind llama.cpp's CUDA backend here, not its Vulkan one.
 
-### B-DSV2-DEGENERATE — DeepSeek-V2-Lite output decays into repetition as the context grows (2026-08-11)
+### B-DSV2-ACTIVATION-PRECISION — int8 activations are not a DeepSeek defect, and landing f16 for `cfg.deepseek2` was declined (2026-08-11, closed 2026-08-12)
 
-**Tag:** deepseek · correctness · **Blocked on:** nothing — this is a real bug,
-undiagnosed
+**Tag:** deepseek · reference · **Blocked on:** nothing; this is a decision
+record and a ruled-out list, not a defect
 
-`infr` produces text that starts correct and then collapses into a repeating
-phrase on `JenniSD/DeepSeek-V2-Lite-Chat-Q4_K_M-GGUF` — **on Vulkan only**.
-Measured on Vulkan (RX 7900 XTX / RADV), `INFR_TEMP=0`, `--max-new 60`, prompt
-`Why is the sky blue?`:
+This entry used to be B-DSV2-DEGENERATE — "DeepSeek-V2-Lite output decays into
+repetition on Vulkan". **That symptom is fixed** and its cause was not
+activation precision: `MixerW::Mla` in `seam/runner.rs` pushed its own
+`Op::Add{a: hidden, b: sub, dst: hidden}` AND fell through to the shared
+post-mixer residual add, so the attention output entered the residual stream
+TWICE on every DeepSeek2 layer, on both backends. Removed 2026-08-12; the
+generation that named this entry now reads
 
 ```
-The sky is blue due to a phenomenon called Rayleigh scattering, which is the
-scattering of light particles, such as photons, off particles in space, in
-space, in space, in space, in the physical environment, in the physical
-environment, in the physical environment, in the physical regard, in the
+The sky appears blue because of a phenomenon called Rayleigh scattering. When
+sunlight enters the Earth's atmosphere, it collides with molecules and small
+particles in the air. …
 ```
 
-llama.cpp on the **same GGUF blob**, `--temp 0 -st -no-cnv -ngl 99`, stays
-coherent all the way
-(`...Blue light is scattered more than other colors because it travels as shorter, smaller waves.`).
-So the file is fine and the divergence is ours.
+on Vulkan (`--temp 0 --max-new 60`, `Why is the sky blue?`), with the CPU run
+differing in one word ("process" for "phenomenon") — a near-tie flip, not
+degeneration. `gpu_seam_matches_cpu_deepseek2` measures the whole-vocab
+CPU/Vulkan cosine at **0.99861** on the 55-token sky paragraph, against the
+0.9385 recorded here at 56 tokens before the fix, and that prompt + a 0.99 floor
+is now what the test carries.
 
-**Shape of the failure, which is the part that decides where to look:**
+What is worth keeping is everything that was ruled OUT on the way, each by
+measurement, plus one decision.
 
-- It is **not** wrong from the first token. The opening clause is right, and it
-  tracks llama.cpp's own wording (`a phenomenon called Rayleigh scattering`) for
-  roughly twenty tokens before decaying.
-- A short answer is **correct**:
-  `What is the capital of France? Answer with only the city name.` → ` Paris`,
-  greedy.
-- So it degrades as the context lengthens rather than diverging at the forward's
-  first output. An earlier note in this backlog claimed divergence at the first
-  sampled token and degeneration into repeated `**`; both were checked against
-  the runs above and are wrong. Do not start from them.
-- The `deepseek` V1 GGUF (`mradermacher/deepseek-moe-16b-chat-GGUF`, same
-  dense-lead MoE shape, **no MLA**) is coherent, which localizes this to the
-  deepseek2/MLA path and not to dense-lead MoE routing.
-- **The CPU backend is COHERENT on the identical prompt and file.**
-  `INFR_DEV=cpu INFR_TEMP=0 --max-new 60` runs clean to the end
-  (`...Specifically, it occurs in the blue and violet light wavelengths of sunlight...`).
-  This is the discriminator: same weights, same config, same tokenizer, same
-  sampler — only the backend differs. An earlier note claimed the CPU backend
-  degenerates too; it was checked and it does not.
+#### The activation-precision lead is DEAD — do not re-open it
 
-**So the defect is in the Vulkan MLA path**, and the CPU implementation is a
-working reference to difference against. `Op::Mla` on Vulkan is served by the
-single `mla.comp` (B-DSHW-MLA-SCALAR-TIER), so that shader and the KV rows it
-reads are the search space — not the config, the YaRN ramp, or the graph, all of
-which the coherent CPU run exercises identically.
+The reading that the Vulkan `Op::Linear` int8 activation prepass (`quant_q8`,
+per-32-block symmetric) was the error rested on a layer-0 isolation showing the
+int8 route at 6.423e-3 relative L2 against an f64 oracle where the
+f32-activation GEMV is 9.081e-8. That isolation is correct about the MATMUL and
+wrong about the CONCLUSION. Two independent measurements killed it, both taken
+while the doubled residual was still in the tree:
 
-Given "correct for ~20 tokens, then decays", look at what changes with `pos`:
-the second pass over the key range, the causal bound, and the compressed-KV rows
-as the cache fills. `gpu_seam_matches_cpu_deepseek2` passes, so whatever this is
-either needs more tokens than that test drives or lies outside the seam it
-compares — establishing which is the cheapest next step. Same question for the
-blessed `cpu_deepseek_v32_golden`: it passes, and it is a CPU test, so it could
-never have caught a Vulkan-only fault.
+**1. Taking every activation off int8 did not fix the output, and barely moved
+the agreement.** Whole-vocab CPU-vs-Vulkan logits cosine on llama.cpp's own 56
+token ids for the sky-scattering paragraph, one model load per row:
 
-The decode-at-depth throughput collapse in B-DSHW-MLA-SCALAR-TIER (tg64 111 →
-6.3 at `-d 2048`) is in the same kernel and the same depth-dependent direction;
-whether the two share a cause is **a guess, not a finding**.
+| activation route                                                     | cos(cpu, vk) | pp512     | tg64  |
+| -------------------------------------------------------------------- | -----------: | --------- | ----- |
+| int8 `quant_q8` + dp4a mmq (shipping default)                        |       0.9385 | 977.6 t/s | 111.5 |
+| f16 (`INFR_NO_MMQ=1` → coopmat GEMM, f16 A staging)                  |       0.9503 | 968.0 t/s | 111.6 |
+| f32 (`INFR_NO_COOPMAT=1 INFR_NO_MMQ_FALLBACK=1 INFR_MOE_SMALL_M=64`) |       0.9625 | 708.6 t/s | 111.2 |
+
+All three still degenerated end to end. The perf column is the honest price of
+each: f16 costs **1.0% of pp512**, f32 costs **27.5%** — the latter reproducing
+the −28% the reverted `exact_linear_acts` flag measured, which is the
+corroboration that this row really is the all-f32-activation route.
+
+Coverage was checked rather than assumed. `mmq` off removes the only int8
+dense-Linear arm a Q4_K prefill can take on this box (`nc_mmq` needs
+`!f16_coopmat()`, which is false on RADV); `moe_small_m = 64` routes the whole
+56-row MoE onto `linear_native_id_multi`'s native-block f32 GEMVs instead of
+`quant_q8_gather` + `matmul_mmq_experts`; the m=1 decode GEMV was already
+`linear_native` on AMD (`mmv_mw_choice` returns `None`, `mmv_decode` defaults
+off), which is why tg64 is flat across all three rows. `gemm_warp` off on top of
+the f16 row changed the output BIT-IDENTICALLY (cos 0.951823 twice), i.e. no
+warp-tile shape was in play to begin with.
+
+**2. llama.cpp's Vulkan backend uses the SAME int8 activation prepass here.**
+Read at pin 030ebb5. `ggml_vk_mul_mat_q_f16`
+(`ggml/src/ggml-vulkan/ggml-vulkan.cpp:9172`) sets `quantize_y` from
+`device->integer_dot_product && src1 is contiguous f32 && (ne11*ne10)%4==0` and
+then tries the mmq pipeline FIRST, with no perf heuristic — it is demoted only
+if no q8_1 pipeline exists for the dtype, and Q4_K has one. `quantize_q8_1.comp`
+is a per-32-block symmetric `d = amax/127` quantizer, and `mul_mmq_funcs.glsl`'s
+Q4_K arm is `dotPacked4x8EXT` integer dot. The gate is
+`VK_KHR_shader_integer_dot_product` +
+`integerDotProduct4x8BitPackedSignedAccelerated`, on by default (kill switch:
+`GGML_VK_DISABLE_INTEGER_DOT_PRODUCT`), which RADV satisfies. Decode is the same
+prepass behind a per-vendor `k` threshold (`ggml_vk_should_use_mmvq`: AMD uses
+int8 once `k >= 2048`). The one architecture that never gets int8 activations at
+prefill is coopmat2 (NVIDIA `VK_NV_cooperative_matrix2`), which force-converts
+src1 to f16 at `ggml-vulkan.cpp:9163` and builds no q8_1 pipelines at all.
+
+So **infr's int8-activation default is not a divergence from upstream**: the
+coherent reference implementation reduces activations exactly the same way on
+exactly this hardware.
+
+#### Also ruled OUT by measurement — do not re-walk these
+
+- **`mla.comp` is not a defect.** Two independent checks. (1) A DeepSeek-sized
+  sweep (`n_head` 16, `kv_lora_rank` 512, `qk_nope_dim` 128, `qk_rope_dim` 64,
+  `v_head_dim` 128) over `kv_len` 2…2048, with and without the `-DFREQ_FACTORS`
+  build, against an f64 reference: max relative error 6e-7…4e-6. (2) The REAL
+  layer-0 `Op::Mla` inputs (`q`, the f16 KV rows, `wk_b`, `wv_b`,
+  `freq_factors`, `rows`=59, `kv_len`=59) captured out of the CPU backend's own
+  arm and replayed through `Recorder::mla`: per-row cosine 1.00000000 against
+  the CPU's output, max absolute error 1.8e-7.
+- **Not the YaRN trunk scale, not the rope type, not the freq_factors ramp** —
+  every constant read out of llama.cpp at the pinned revision and compared to
+  what infr dispatches: `kq_scale` 0.11472137 on both,
+  `llama_model_rope_type(LLM_ARCH_DEEPSEEK2)` is `LLAMA_ROPE_TYPE_NORM`
+  (`neox: false`), and infr's `yarn_ff` divisors reproduce `rope_yarn_ramp`
+  exactly (p=0 → 1.0, p=11 → 1.081081, p≥23 → 40.0).
+- **Not the in-shader Q4_K WEIGHT dequant.** `native_decode.glsl`'s `dqblk` was
+  read out of the device for EVERY element of the real
+  `blk.0.attn_kv_a_mqa.weight` (Q4_K, 2048→576) by dispatching
+  `native_gemv.comp` with one-hot activations: 1179648 elements, **0 not
+  bit-identical** to `infr_gguf::dequant::dequant_block`.
+- **Not `Op::EmbedGather`'s dequant of `token_embd`** (Q4_K, 2048×102400): 64
+  rows spread across the vocabulary gathered on the GPU, 131072 elements, **0
+  not bit-identical**.
+- **Not `Op::RmsNorm` on `attn_norm`**: real weight, real embedding rows, eps
+  from the file, against an f64 reference — max relative error 2.365e-7
+  (256-thread prefill build) / 1.191e-7 (`-DWIDE` decode build).
+
+All three dequant/norm results are guarded by
+`crates/infr-vulkan/tests/weight_dequant_parity.rs`, and each assertion was
+shown to go red before being trusted.
+
+#### Considered and declined
+
+**Landing the f16 activation route for `cfg.deepseek2`.** It is nearly free
+(1.0% of pp512, measured above, vs 27.5% for f32) and its matmul really is more
+accurate than int8. Declined: it did not fix the reported bug (the residual
+did), its CPU-agreement gain was not even monotone across prompt lengths (worse
+than int8 at len 16 and 32, better at 56), and upstream ships int8 on this exact
+path. The lever already exists as `INFR_NO_MMQ` if a later slice wants to A/B it
+again — nothing needs to be built.
+
+#### Coverage gaps, stated plainly
+
+- `weight_dequant_parity` covers Q4_K only. Every other format's `dqblk` arm in
+  `native_decode.glsl` is still compared only against another Vulkan build
+  (`weight_addr_parity`), never against the host.
+- The f32-activation row above also drops coopmat from the ATTENTION kernels
+  (`INFR_NO_COOPMAT` disables the device feature wholesale), so it is not a pure
+  activation-precision A/B. Its pp512 matching the earlier `exact_linear_acts`
+  measurement to within a point is what makes it trustworthy as one anyway.
+- The Metal MLA path was not looked at at all, and the residual fix was verified
+  on CPU and Vulkan only. Metal shares the same `seam/runner.rs` emit, so it
+  gets the fix by construction, but nothing was RUN there.
+- Whether V3/V3.2/V4 were affected is **untested**. They share the `MixerW::Mla`
+  arm, so they were, but the 671B V3.2 has no llama.cpp oracle on this box (it
+  cannot load there) and `cpu_deepseek_v32_golden` was NOT re-blessed by this
+  slice — it is `#[ignore]`d, costs minutes per token through the host pager,
+  and will be stale until someone runs it.
 
 ### B-DSHW-FUSED-REF — upstream's fused DeepSeek kernels exist on CUDA and SYCL only (2026-08-11)
 

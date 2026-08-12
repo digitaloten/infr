@@ -8,6 +8,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **GGUFs carrying `GGML_TYPE_I32` tensors open.** Integer tensors are lookup
+  tables a kernel indexes with rather than weights, and `Gguf::open` refused
+  them outright (`unsupported: ggml type 26`). The first shipped model to need
+  one is DeepSeek-V4, whose hash-routed layers each carry an i32
+  `blk.N.ffn_gate_tid2eid.weight` token-id → expert-id table: the reference
+  conversion `ggml-org/DeepSeek-V4-Flash-0731-GGUF` would not open at all,
+  failing before a single tensor shape was read. It now loads end to end — the
+  config parses, every one of its 1328 tensors resolves, and the model reaches
+  the existing designed refusal naming its compressed (ratio 4/128) layers,
+  which are still unimplemented.
+
 - **`infr pull` splits ONE file across connections too.** Shard-level
   concurrency did nothing for a model that ships as a single file, which most
   do: `unsloth/DeepSeek-V3.2-GGUF`'s `UD-TQ1_0` is one 161 GB GGUF and still
@@ -234,6 +245,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **DeepSeek MLA attention gained a subgroup kernel tier, and it is the whole
+  DeepSeek frame.** `mla.comp` was the only MLA kernel at any depth, and
+  `INFR_PROF_OPS` measured it at 97.3% of decode GPU time at `-d 2048` and 89.4%
+  of prefill. Its `-DMLA_SG` builds now walk the key range ONCE with an online
+  softmax instead of twice, and score eight keys per `barrier()` with
+  `subgroupAdd` instead of running a 128-lane shared-memory tree costing 18
+  barriers per key. On an RX 7900 XTX with
+  `JenniSD/DeepSeek-V2-Lite-Chat-Q4_K_M-GGUF`, three reps with the arms
+  alternated: pp512 965.8 → 1035.5, pp2048 671.3 → 851.1, tg64 111.6 → 128.7,
+  and tg64 at depth 2048 **6.3 → 11.9** t/s. Output is not bit-identical to the
+  kernel it replaces (the online softmax sums the same terms in a different
+  order); the CPU/Vulkan whole-vocab cosine on the 55-token seam test is
+  0.99872, against 0.99861 for the kernel it replaces. `INFR_NO_MLA_SG` selects
+  the scalar builds, which are unchanged and are also what a device that cannot
+  pin a 32-wide subgroup gets.
+
 - `Gguf::path()` → `Gguf::shards()`, which returns `(path, length)` per shard in
   order. `TensorBytes::file_range` / `Gguf::tensor_file_range` now report
   offsets in the model's concatenated file address space; for a single-file
@@ -287,6 +314,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   through `rayon`, so it applies to every CPU-backend build.
 
 ### Fixed
+
+- **Every DeepSeek V2/V3 model added its attention output to the residual stream
+  twice.** The MLA mixer arm in `seam/runner.rs` pushed its own `hidden += sub`
+  and then fell through to the shared post-mixer residual add, so every layer of
+  every `deepseek2`-family model (V2, V2-Lite, V3, V3.1, V3.2) ran
+  `x + 2·Wo·attn` instead of `x + Wo·attn` — on the CPU, Vulkan and Metal
+  backends alike, because the defect was in the shared graph rather than in a
+  kernel. V4 is NOT affected: it builds `MixerW::Dsv4`, whose hyper-connection
+  POST closes the residual wrap in place of the shared add, so it never emitted
+  the second one. It never produced obviously broken text, which is why it
+  survived: the only thing that catches it is an external oracle. Scored against
+  llama.cpp 030ebb5's own logits over its own token ids, on
+  `JenniSD/DeepSeek-V2-Lite-Chat-Q4_K_M-GGUF`, next-token probability cosine
+  (CPU / Vulkan) goes 0.956/0.955 → 0.997/0.995 at 2 tokens, 0.334/0.316 →
+  0.9998/0.99998 at 10, 0.862/0.862 → 0.997/0.999 at 27, and 0.980/0.920 →
+  0.9999/0.9997 at 56. `infr`'s greedy continuation of "The capital of France
+  is" is now llama.cpp's token for token, and the Vulkan repetition loop that
+  DeepSeek-V2-Lite fell into after a dozen tokens is gone.
 
 - **Every DeepSeek model prefilled one token per submit.** The batched-prefill
   eligibility scan (`moe_batched_ok` in `seam/runner.rs`) demanded a dp4a-mmq
